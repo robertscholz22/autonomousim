@@ -122,8 +122,10 @@ impl History {
 fn live_sample(world: &WorldInstance, i: usize) -> (Tracking, Sample) {
     let agent = world.agent(i);
     let v = &agent.vehicle;
-    let est = StateEstimate::of(v);
-    let (tracking, command, actual) = tracking(agent.setpoint(), &est, v.motor_speeds());
+    let (tracking, command, actual) = match (v.as_multirotor(), agent.command().as_multirotor()) {
+        (Some(m), Some(sp)) => tracking(sp, &StateEstimate::of(m), m.motor_speeds()),
+        _ => (Tracking::default(), [f64::NAN; 3], [f64::NAN; 3]),
+    };
     let sample = Sample {
         time: world.time(),
         agl: agent.agl_now(world.map()),
@@ -140,6 +142,7 @@ fn episode_samples(replay: &Replay, world: &WorldInstance, agent: usize) -> (Tra
     let ep = replay.current();
     let map = &world.scenario().maps[ep.map];
     let group = &world.scenario().groups[world.agent(agent).group];
+    let Some(action_map) = group.action_map.as_multirotor() else { return (Tracking::default(), Vec::new()) };
     let (Some(states), actions) = (ep.states.get(agent), ep.actions.get(agent).map_or(&[][..], |a| &a[..])) else {
         return (Tracking::default(), Vec::new());
     };
@@ -156,8 +159,8 @@ fn episode_samples(replay: &Replay, world: &WorldInstance, agent: usize) -> (Tra
             };
             let k = actions.partition_point(|a| a.time <= s.time);
             let (command, actual) = match k.checked_sub(1).map(|k| &actions[k]) {
-                Some(a) if a.action.len() == group.action_map.dim() => {
-                    let (t, c, m) = tracking(&group.action_map.setpoint(&a.action, &est), &est, &s.motors);
+                Some(a) if a.action.len() == action_map.dim() => {
+                    let (t, c, m) = tracking(&action_map.setpoint(&a.action, &est), &est, &s.motors);
                     kind = t;
                     (c, m)
                 }

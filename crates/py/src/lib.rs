@@ -307,7 +307,7 @@ impl BatchSim {
         self.scenario.map_hashes.iter().map(|h| h.hex()).collect()
     }
 
-    /// Layout of a group: name, count, vehicle, action mode, `obs_dim`, `act_dim` and the
+    /// Layout of a group: name, count, vehicle, family, action mode, `obs_dim`, `act_dim` and the
     /// observation terms as `(name, offset, length)`.
     #[pyo3(signature = (group = GroupRef::Index(0)))]
     fn group_info<'py>(&self, py: Python<'py>, group: GroupRef) -> PyResult<Bound<'py, PyDict>> {
@@ -315,12 +315,13 @@ impl BatchSim {
         let d = PyDict::new(py);
         d.set_item("name", &g.spec.name)?;
         d.set_item("count", g.spec.count)?;
-        d.set_item("vehicle", &g.def.name)?;
-        d.set_item("action_mode", g.spec.action_mode.name())?;
+        d.set_item("vehicle", g.def.name())?;
+        d.set_item("family", g.family().name())?;
+        d.set_item("action_mode", g.action_mode().name())?;
         d.set_item("obs_dim", g.obs_dim())?;
         d.set_item("act_dim", g.act_dim())?;
-        d.set_item("num_rotors", g.def.rotors.len())?;
-        d.set_item("mass", g.def.body.mass)?;
+        d.set_item("num_rotors", g.def.as_multirotor().map_or(0, |d| d.rotors.len()))?;
+        d.set_item("mass", g.def.mass())?;
         d.set_item("obs_layout", g.obs.layout())?;
         Ok(d)
     }

@@ -5,7 +5,6 @@
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::{RecordedEpisode, RecordedState, Recording};
 use autonomousim_sim::{Events, WorldInstance};
-use autonomousim_vehicles::multirotor::{InitialState, MotorInit};
 use glam::DVec3;
 
 pub struct Replay {
@@ -126,15 +125,11 @@ impl Replay {
         for i in 0..world.agents().len() {
             let Some(s) = self.sample(i) else { continue };
             let agent = world.agent_mut(i);
-            agent.vehicle.reset(&InitialState {
-                pose: s.pose,
-                lin_vel_world: s.velocity,
-                ang_vel_body: s.rates,
-                motors: MotorInit::Idle,
-                soc: 1.0,
-            });
-            if s.motors.len() == agent.vehicle.motor_speeds().len() {
-                agent.vehicle.set_motor_speeds(&s.motors);
+            agent.vehicle.place(s.pose, s.velocity, s.rates);
+            if let Some(v) = agent.vehicle.as_multirotor_mut()
+                && s.motors.len() == v.motor_speeds().len()
+            {
+                v.set_motor_speeds(&s.motors);
             }
             agent.events = Events(s.last.events);
             agent.disabled = s.last.disabled;
@@ -162,7 +157,7 @@ mod tests {
     fn recording() -> (Recording, WorldInstance) {
         let sc = Scenario {
             map: MapSource::Testworld(Testworld::Flat { size: 100.0 }),
-            groups: vec![GroupSpec { count: 2, action_mode: ActionMode::Ctbr, ..Default::default() }],
+            groups: vec![GroupSpec { count: 2, action_mode: Some(ActionMode::Ctbr.into()), ..Default::default() }],
             ..Default::default()
         };
         let sc = Arc::new(sc.compile().unwrap());

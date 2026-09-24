@@ -27,13 +27,21 @@
 //!     { term = "ang_vel_body", scale = 0.1 },
 //!     { term = "last_action" },
 //! ]
+//!
+//! [[groups]]
+//! name = "cars"
+//! vehicle = "sedan_like"   # wheeled: modes raw, vk (default), vw, per_wheel
+//! action_mode = "vk"
+//! ground_action_limits = { speed = 10.0 }
 //! ```
 //!
 //! Angles in scenario files are in degrees (`*_deg`); everything else is SI.
 
 use crate::SimError;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
-use autonomousim_control::multirotor::{ActionLimits, ActionMap, ActionMode, ControllerConfig, MultirotorController};
+use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
+use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
+use autonomousim_control::{ActionMapping, AgentActionMode, Controller};
 use autonomousim_core::material::MaterialId;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::from_yaw;
@@ -43,9 +51,9 @@ use autonomousim_core::time::Clock;
 use autonomousim_procgen::MapCache;
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
 use autonomousim_sensors::{Sensor, SensorSpec};
-use autonomousim_vehicles::VehicleDef;
-use autonomousim_vehicles::multirotor::{MotorInit, MultirotorDef, MultirotorScales};
+use autonomousim_vehicles::multirotor::{MotorInit, MultirotorScales};
 use autonomousim_vehicles::presets;
+use autonomousim_vehicles::{Family, SharedDef, VehicleDef};
 use autonomousim_world::environment::{EnvironmentConfig, Gust};
 use autonomousim_world::testworlds;
 use autonomousim_world::{MapHash, StaticWorld};
@@ -426,6 +434,9 @@ impl VehicleRef {
 
 /// Agents that share a vehicle type, action mode and observation layout. Python sees each
 /// group as arrays of shape `[num_envs, count, dim]`.
+///
+/// `controller`, `action_limits` and `randomize` configure multirotors; `ground_controller`
+/// and `ground_action_limits` wheeled vehicles. Setting those of the other family is an error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -433,8 +444,15 @@ pub struct GroupSpec {
     pub count: usize,
     pub vehicle: VehicleRef,
     pub controller: ControllerConfig,
-    pub action_mode: ActionMode,
+    /// A mode of the vehicle's family (`ctbr`, `velocity`, …; `vk`, `vw`, …). `None`: the
+    /// family's default, filled in when the scenario is compiled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_mode: Option<AgentActionMode>,
     pub action_limits: ActionLimits,
+    #[serde(skip_serializing_if = "is_default")]
+    pub ground_controller: GroundConfig,
+    #[serde(skip_serializing_if = "is_default")]
+    pub ground_action_limits: GroundActionLimits,
     pub sensors: Vec<SensorSpec>,
     /// Observation terms in order; empty: the default hover observation.
     pub obs: Vec<ObsTerm>,
@@ -453,8 +471,10 @@ impl Default for GroupSpec {
             count: 1,
             vehicle: VehicleRef::default(),
             controller: ControllerConfig::default(),
-            action_mode: ActionMode::default(),
+            action_mode: None,
             action_limits: ActionLimits::default(),
+            ground_controller: GroundConfig::default(),
+            ground_action_limits: GroundActionLimits::default(),
             sensors: Vec::new(),
             obs: Vec::new(),
             spawn: SpawnSpec::default(),
@@ -463,6 +483,10 @@ impl Default for GroupSpec {
             disable_on_terminal: true,
         }
     }
+}
+
+fn is_default<T: Default + PartialEq>(x: &T) -> bool {
+    *x == T::default()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,7 +518,8 @@ pub struct SpawnSpec {
     pub margin: f64,
     /// Height of the centre of mass above the ground or water surface (m).
     pub agl: [f64; 2],
-    /// Start resting on the ground (motors idle unless set otherwise); ignores `agl`.
+    /// Start resting on the ground (motors idle unless set otherwise); ignores `agl`. Ground
+    /// vehicles always do.
     pub on_ground: bool,
     /// Free radius around the vehicle (m).
     pub clearance: f64,
@@ -629,7 +654,8 @@ impl VehicleRandomization {
 // ------------------------------------------------------------------------------- compiled
 
 /// A validated scenario with its maps built and vehicles resolved, shared by `Arc` between
-/// the world instances of a batch.
+/// the world instances of a batch. `spec` has the defaults that depend on the vehicle filled
+/// in (the action mode; ground vehicles start on the ground).
 #[derive(Debug)]
 pub struct CompiledScenario {
     pub spec: Scenario,
@@ -647,11 +673,12 @@ pub struct CompiledScenario {
 
 #[derive(Debug)]
 pub struct CompiledGroup {
+    /// The group as specified, with the action mode filled in.
     pub spec: GroupSpec,
-    pub def: Arc<MultirotorDef>,
+    pub def: SharedDef,
     /// Controller at its initial state; agents start from a clone.
-    pub controller: MultirotorController,
-    pub action_map: ActionMap,
+    pub controller: Controller,
+    pub action_map: ActionMapping,
     pub obs: CompiledObs,
     /// Depth of the lowest collider point below the centre of mass (m).
     pub bottom: f64,
@@ -669,10 +696,18 @@ impl CompiledGroup {
     pub fn obs_dim(&self) -> usize {
         self.obs.dim()
     }
+
+    pub fn family(&self) -> Family {
+        self.def.family()
+    }
+
+    pub fn action_mode(&self) -> AgentActionMode {
+        self.action_map.mode()
+    }
 }
 
 impl CompiledScenario {
-    fn new(spec: Scenario) -> Result<Self, SimError> {
+    fn new(mut spec: Scenario) -> Result<Self, SimError> {
         let clock = Clock::new(spec.physics_hz.max(1));
         if spec.physics_hz == 0 {
             return Err(SimError::Scenario("physics_hz must be positive".into()));
@@ -702,6 +737,10 @@ impl CompiledScenario {
             groups.push(CompiledGroup::new(g.clone(), &clock, first_agent)?);
             first_agent += g.count;
         }
+        // Defaults that depend on the vehicle, filled in.
+        for (s, g) in spec.groups.iter_mut().zip(&groups) {
+            s.clone_from(&g.spec);
+        }
         Ok(Self { spec, clock, decimation, environment_divider, maps, map_hashes, groups })
     }
 
@@ -729,20 +768,33 @@ impl CompiledScenario {
 }
 
 impl CompiledGroup {
-    fn new(spec: GroupSpec, clock: &Clock, first_agent: usize) -> Result<Self, SimError> {
-        let def = match spec.vehicle.resolve()? {
-            VehicleDef::Multirotor(m) => Arc::new(m),
-            VehicleDef::Wheeled(w) => {
-                return Err(SimError::Scenario(format!(
-                    "group {:?}: wheeled vehicle {:?} is not supported in scenarios yet",
-                    spec.name, w.name
-                )));
-            }
-        };
+    fn new(mut spec: GroupSpec, clock: &Clock, first_agent: usize) -> Result<Self, SimError> {
+        let def = SharedDef::from(spec.vehicle.resolve()?);
+        let family = def.family();
         let name = spec.name.clone();
         let fail = move |what: String| SimError::Scenario(format!("group {name:?}: {what}"));
-        let controller = MultirotorController::new(&def, clock.dt(), &spec.controller)?;
-        let action_map = ActionMap::new(spec.action_mode, spec.action_limits.clone(), &def, controller.max_thrust());
+        let foreign = match family {
+            Family::Multirotor => [
+                ("ground_controller", !is_default(&spec.ground_controller)),
+                ("ground_action_limits", !is_default(&spec.ground_action_limits)),
+                ("", false),
+            ],
+            Family::Wheeled => [
+                ("controller", !is_default(&spec.controller)),
+                ("action_limits", !is_default(&spec.action_limits)),
+                ("randomize", !is_default(&spec.randomize)),
+            ],
+        };
+        if let Some((field, _)) = foreign.iter().find(|f| f.1) {
+            return Err(fail(format!("`{field}` does not apply to {family} vehicles ({:?})", def.name())));
+        }
+        let mode = *spec.action_mode.get_or_insert(AgentActionMode::default_for(family));
+        if family == Family::Wheeled {
+            spec.spawn.on_ground = true;
+        }
+        let controller = Controller::new(&def, clock.dt(), &spec.controller, &spec.ground_controller)?;
+        let action_map = ActionMapping::new(mode, &spec.action_limits, &spec.ground_action_limits, &def, &controller)
+            .map_err(|e| fail(e.to_string()))?;
         spec.randomize.validate()?;
         for (i, s) in spec.sensors.iter().enumerate() {
             if spec.sensors[..i].iter().any(|o| o.name == s.name) {
@@ -751,8 +803,9 @@ impl CompiledGroup {
             Sensor::new(&s.config, clock, Seed::from_u64(0))?;
         }
         let terms = if spec.obs.is_empty() { default_obs() } else { spec.obs.clone() };
-        let obs = CompiledObs::new(&terms, &spec.sensors, action_map.dim(), def.rotors.len())
-            .map_err(|e| fail(e.to_string()))?;
+        let num_rotors = def.as_multirotor().map_or(0, |d| d.rotors.len());
+        let obs =
+            CompiledObs::new(&terms, &spec.sensors, action_map.dim(), num_rotors).map_err(|e| fail(e.to_string()))?;
         let sp = &spec.spawn;
         let spawn_ok = valid_range(sp.agl)
             && sp.agl[0] >= 0.0
@@ -780,7 +833,11 @@ impl CompiledGroup {
             return Err(fail(format!("invalid goals {gl:?}")));
         }
         let colliders = def.sphere_colliders();
-        let bottom = colliders.iter().map(|c| c.radius - c.center.z).fold(0.0, f64::max);
+        // Ground vehicles are placed from the ground point.
+        let bottom = match family {
+            Family::Multirotor => colliders.iter().map(|c| c.radius - c.center.z).fold(0.0, f64::max),
+            Family::Wheeled => 0.0,
+        };
         let radius = colliders.iter().map(|c| c.center.length() + c.radius).fold(0.0, f64::max);
         Ok(Self { spec, def, controller, action_map, obs, bottom, radius, first_agent })
     }

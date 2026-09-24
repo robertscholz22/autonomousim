@@ -101,6 +101,9 @@ pub struct Wheeled {
     pub state: MbState,
     /// Steering angle of the equivalent bicycle (rad).
     steer_angle: f64,
+    /// Specific force and angular acceleration of the chassis frame over the last step.
+    specific_force: DVec3,
+    ang_acc: DVec3,
     // Step buffers.
     ws: AbaWorkspace,
     tau: Vec<f64>,
@@ -213,6 +216,8 @@ impl Wheeled {
             mass,
             corners,
             steer_angle: 0.0,
+            specific_force: DVec3::ZERO,
+            ang_acc: DVec3::ZERO,
             cache: ContactCache::default(),
             scratch: ContactScratch::default(),
             contacts: Vec::new(),
@@ -281,6 +286,8 @@ impl Wheeled {
             c.out = WheelState::default();
         }
         self.steer_angle = 0.0;
+        self.specific_force = rot.inverse() * DVec3::Z * super::def::STANDARD_GRAVITY;
+        self.ang_acc = DVec3::ZERO;
         let spin: Vec<f64> = self.corners.iter().map(|c| self.state.v[c.spin.1]).collect();
         self.powertrain.reset(&spin);
         self.cache.clear();
@@ -418,6 +425,12 @@ impl Wheeled {
             }
         }
         aba_with_kinematics(&self.model, &self.tau, &self.f_ext, gravity, &mut self.ws)?;
+        // Classical acceleration of the chassis origin: spatial acceleration plus ω × v.
+        let qdd = &self.ws.qdd;
+        let (w, v) = (self.ang_vel_body(), self.lin_vel_body());
+        let accel = DVec3::new(qdd[3], qdd[4], qdd[5]) + w.cross(v);
+        self.specific_force = accel - self.orientation().inverse() * gravity;
+        self.ang_acc = DVec3::new(qdd[0], qdd[1], qdd[2]);
         semi_implicit_euler(&self.model, &mut self.state, &self.ws.qdd, dt);
         for (w, c) in self.corners.iter_mut().enumerate() {
             let o = &mut c.out;
@@ -517,6 +530,17 @@ impl Wheeled {
 
     pub fn colliders(&self) -> &[SphereCollider] {
         &self.colliders
+    }
+
+    /// Specific force (accelerometer reading at the chassis frame origin, chassis axes) of the
+    /// last step: acceleration minus gravity.
+    pub fn specific_force_body(&self) -> DVec3 {
+        self.specific_force
+    }
+
+    /// Angular acceleration of the chassis (chassis axes) over the last step.
+    pub fn ang_acc_body(&self) -> DVec3 {
+        self.ang_acc
     }
 }
 

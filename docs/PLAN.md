@@ -837,6 +837,43 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - The skid rover cannot hold κ = 1 at half its top speed: the scrub saturates the outer motor. The controller gives priority to neither speed nor curvature; the RL policy or a planner must stay within the limits.
   - `sim`/scenario support (step 6); scenarios reject wheeled vehicles until then.
 
+**As built in step 5** (agents over vehicle families):
+- **Baseline first**: before the refactor, `sim/tests/golden.rs` fixed hashes (`fixtures/golden_trajectories.toml`) of observations, state rows, events, world state hashes and recorded messages. They come from 120 batched policy steps (with partial and seeded resets) of `hover.toml`, all five multirotor action modes with LiDAR/GPS/IMU, agent contacts, wind and randomisation, and a small wild map pool. A reference recording (`fixtures/recordings/hover.mcap`) must still be read and reproduced message for message. MCAP files are compared by message, not by byte: the writer orders its summary section by hash map. All of these, the procgen golden hashes and every M1 test are unchanged after the refactor.
+- **vehicles**:
+  - `Vehicle { Multirotor, Wheeled }` holds the shared queries: pose, twist, mass, `state()`, colliders, contacts, `is_gear(group)` (landing gear or skids), specific force and angular acceleration. It also holds the shared phases: `begin_step`, `apply_contacts`, `apply_force`, `finish_step`, plus `place(pose, v, ω)` for replays. Family actuation is reached through `as_multirotor()` / `as_wheeled()`.
+  - `SharedDef` is the `Arc`'d definition of either family (name, family, mass, colliders, contact model).
+  - `Family` names the family.
+  - Nothing assumes wheels or rotors, so a `Tracked` variant slots in beside them (M4).
+  - `Wheeled` now reports its specific force (classical acceleration of the chassis origin, from the free joint's q̈ plus ω×v, minus gravity) and angular acceleration, so the IMU works on ground vehicles.
+- **control**: `Controller { Multirotor, Ground }`, `Command { Multirotor(Setpoint), Ground(GroundSetpoint) }` (with `From` impls, so `set_command(agent, setpoint)` takes either), and `ActionMapping { Multirotor(ActionMap), Ground(GroundActionMap) }`. `AgentActionMode` is serialised by name. The names are disjoint, so `"ctbr"` or `"vk"` alone picks the family.
+- **Scenario**:
+  - `action_mode` is optional; the family's default (`ctbr`, `vk`) is filled into the compiled spec. Multirotor scenario JSON stays byte-identical.
+  - New `ground_controller` and `ground_action_limits` fields are only written when set.
+  - Setting the other family's fields is an error that names the field: `controller`, `action_limits` or `randomize` on a wheeled group, or the ground fields on a multirotor group. So is a mode of the wrong family, or `motor_speeds` without rotors.
+  - Ground vehicles always spawn on the ground, at the static rest pose from `Wheeled::rest`, with the heading drawn from `yaw_deg`. Goals are sampled from the ground point.
+  - Terrain-aligned spawning on slopes and reachable ground goals come in step 6.
+- **Agent step**: the controller update and actuation match on (vehicle, controller, command). A multirotor runs the cascade then the rotors. A wheeled vehicle runs `GroundController::update` → `apply_drive` → `apply_tires`. Contacts, agent forces, integration, events, shapes and sensors are shared. Event rules are the same for both families: contact on a non-gear collider, or faster than `crash_speed`, is a crash.
+- **State and recording**:
+  - `STATE_FIELDS` is unchanged and common to both families.
+  - `state_hash` adds a ground vehicle's steering angle, per-wheel steer, drive, brake and tyre force, and gear, engine speed and torque.
+  - `/agent/<id>/state` carries `motors` for multirotors. For ground vehicles it carries `steering`, `wheels` (spin, steer, travel, drive and brake torque, load), `gear` and `engine_speed`; `RecordedState` reads both, with defaults.
+  - `/meta` vehicle definitions stay untagged for multirotors (the old format); other families carry their `type` tag.
+- **Python / viewer**:
+  - `group_info` adds `family`; `num_rotors` is 0 for ground vehicles, and `mass` is the total mass.
+  - The viewer draws ground vehicles as a box with a red nose and wheels posed from the simulated steering, travel and spin (`scene::props::wheeled`). The HUD shows steering, gear and rpm. The keyboard drives them through `Pedal`. Replays place them from the recorded pose.
+- **Tests** (`sim/tests/ground.rs`, 1 kHz):
+  - Two Sedans (default `vk`), a skid rover (`vw`) and a drone share a flat world. At rest the vehicles move < 2 cm in 1 s with no events, and the chassis specific force equals gravity in body axes within 0.05 m/s².
+  - Driving at half the speed limit while turning, speed is within 10 % after 5 s; the drone holds its position meanwhile.
+  - `SpeedCurvature(0, 0)` stops a Sedan to < 5 cm/s.
+  - Four 4×4s driven straight through a dense forest patch raise `CRASH_OBSTACLE` and are disabled.
+  - State hashes are identical at 1 and 4 envs on 1 and 3 threads, and cover the ground state.
+  - Recordings carry and read back the wheel data, and scenarios round-trip.
+  - Mismatched fields and modes give errors that name the field.
+- **Throughput** (criterion against the pre-refactor baseline, same session):
+  - Single-world steps are +2 to +3 % (quad 6.85 → 7.0 µs). Repeated runs scatter by about ±1 %, and one run showed −10 %.
+  - Batched throughput is within noise: 256 quads on 10 threads +1.8 % (p = 0.08); with forest LiDAR +0.6 % (p = 0.6); the 128-agent swarm +1.2 % (p = 0.08).
+  - `#[inline]` on the `Vehicle` wrappers made no measurable difference; the cost is the extra dispatch.
+
 ### Performance targets (i7-1365U, release)
 | Metric | Target |
 |---|---|

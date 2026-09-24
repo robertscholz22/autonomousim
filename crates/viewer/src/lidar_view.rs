@@ -296,7 +296,7 @@ mod tests {
             map: MapSource::Testworld(Testworld::Flat { size: 200.0 }),
             groups: vec![GroupSpec {
                 vehicle: VehicleRef::Name("iris_like".into()),
-                action_mode: ActionMode::Velocity,
+                action_mode: Some(ActionMode::Velocity.into()),
                 sensors: vec![lidar],
                 ..Default::default()
             }],

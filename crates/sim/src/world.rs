@@ -23,10 +23,11 @@ use crate::events::Events;
 use crate::interaction::{AgentContacts, AgentShape, agent_contacts};
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, Goal};
-use autonomousim_control::multirotor::Setpoint;
+use autonomousim_control::Command;
 use autonomousim_core::rng::Seed;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
+use autonomousim_vehicles::Vehicle;
 use autonomousim_world::StaticWorld;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -133,14 +134,17 @@ impl WorldInstance {
             for (k, p) in positions.into_iter().enumerate() {
                 let id = g.first_agent + k;
                 let density = self.env.config.atmosphere.density(self.env.origin_altitude + p.z);
-                let hover = g.def.hover_omega(self.env.config.gravity, density);
+                let hover = g.def.as_multirotor().map_or(0.0, |d| d.hover_omega(self.env.config.gravity, density));
                 let placement = spawn.sample_state(p, hover, &mut spawn_rng);
                 let goals = g.spec.goals.sample(world, &placement.pose, &mut goal_rng);
                 let seed = agent_seed.child_index(id as u64);
-                let scales = g.spec.randomize.sample(g.def.rotors.len(), &mut seed.child("vehicle").rng());
+                let scales = g
+                    .def
+                    .as_multirotor()
+                    .map(|d| g.spec.randomize.sample(d.rotors.len(), &mut seed.child("vehicle").rng()));
                 let agent = &mut self.agents[id];
-                agent.reset(g, &placement, &scales, goals, seed, &self.env, world);
-                let contact = g.def.contact.model(agent.vehicle.mass(), sc.dt());
+                agent.reset(g, &placement, scales.as_ref(), goals, seed, &self.env, world);
+                let contact = g.def.contact_model(agent.vehicle.mass(), sc.dt());
                 self.shapes[id].set_contact(&contact.solid);
                 agent.update_shape(&mut self.shapes[id]);
             }
@@ -165,9 +169,11 @@ impl WorldInstance {
         self.agents[agent].set_action(g, action);
     }
 
-    /// Command one agent's cascade directly.
-    pub fn set_setpoint(&mut self, agent: usize, setpoint: Setpoint) {
-        self.agents[agent].set_setpoint(setpoint);
+    /// Command one agent's controller directly (a multirotor
+    /// [`Setpoint`](autonomousim_control::multirotor::Setpoint) or a
+    /// [`GroundSetpoint`](autonomousim_control::ground::GroundSetpoint)).
+    pub fn set_command(&mut self, agent: usize, command: impl Into<Command>) {
+        self.agents[agent].set_command(command);
     }
 
     /// One policy step (`decimation` physics ticks).
@@ -352,8 +358,9 @@ impl WorldInstance {
         self.clone_from(snapshot);
     }
 
-    /// Hash of the dynamic state: time, and per agent the rigid-body state, rotor speeds,
-    /// events, goal index and latest sensor readings. Equal hashes mean bit-identical states.
+    /// Hash of the dynamic state: time, and per agent the multibody state, rotor speeds (or a
+    /// ground vehicle's steering, tyre and powertrain state), events, goal index and latest
+    /// sensor readings. Equal hashes mean bit-identical states.
     pub fn state_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&self.clock.tick.to_le_bytes());
@@ -361,8 +368,24 @@ impl WorldInstance {
             h.update(&x.to_bits().to_le_bytes());
         };
         for a in &self.agents {
-            let v = &a.vehicle;
-            v.state.q.iter().chain(v.state.v.iter()).chain(v.motor_speeds()).for_each(|x| f(*x));
+            let st = a.vehicle.state();
+            st.q.iter().chain(st.v.iter()).for_each(|x| f(*x));
+            match &a.vehicle {
+                Vehicle::Multirotor(v) => v.motor_speeds().iter().for_each(|x| f(*x)),
+                Vehicle::Wheeled(v) => {
+                    f(v.steering_angle());
+                    for w in v.wheels() {
+                        let t = &w.tire;
+                        for x in [w.steer, w.drive_torque, w.brake_torque, t.force.x, t.force.y, t.force.z] {
+                            f(x);
+                        }
+                    }
+                    let p = v.powertrain();
+                    for x in [f64::from(p.gear), p.engine_speed, p.engine_torque] {
+                        f(x);
+                    }
+                }
+            }
             f(f64::from(a.events.0));
             f(a.goal_index as f64);
             for s in &a.sensors {

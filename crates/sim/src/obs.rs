@@ -192,6 +192,9 @@ impl CompiledObs {
                 (TermKind::Height | TermKind::Agl | TermKind::Clearance | TermKind::BaroAltitude, _) => (1, 0.0),
                 (TermKind::Rot6d | TermKind::Imu, _) => (6, 0.0),
                 (TermKind::Quat, _) => (4, 0.0),
+                (TermKind::MotorSpeeds, _) if num_rotors == 0 => {
+                    return Err("observation motor_speeds needs a vehicle with rotors".into());
+                }
                 (TermKind::MotorSpeeds, _) => (num_rotors, 0.0),
                 (TermKind::LastAction, _) => (act_dim, 0.0),
                 (TermKind::Range, Some(SensorConfig::Rangefinder(c))) => (1, c.max_range),

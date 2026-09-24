@@ -113,7 +113,7 @@ fn status_window(
             ui.label(format!("map {} · seed {} · {} maps in pool", meta.name, meta.seed, world.scenario().maps.len()));
             let (episode, episodes) = sim.episode();
             let of = episodes.map_or(String::new(), |n| format!(" of {n}"));
-            ui.label(format!("agent {} ({}) · episode {episode}{of}", sim.pilot, v.def().name));
+            ui.label(format!("agent {} ({}) · episode {episode}{of}", sim.pilot, v.name()));
             if let Some(a) = &sim.autopilot {
                 ui.label(format!("policy {}", a.name));
                 let who = if sim.manual_agent().is_some() { "you fly · T: hand back" } else { "T: take over" };
@@ -174,13 +174,28 @@ fn status_window(
                     row(ui, "max speed", format!("{:4.1} m/s", sim.max_speed));
                 }
             });
-            let (_, max) = v.speed_range();
-            ui.horizontal(|ui| {
-                ui.label("rotors");
-                for &w in v.motor_speeds() {
-                    ui.add(egui::ProgressBar::new((w / max) as f32).desired_width(40.0));
-                }
-            });
+            if let Some(m) = v.as_multirotor() {
+                let (_, max) = m.speed_range();
+                ui.horizontal(|ui| {
+                    ui.label("rotors");
+                    for &w in m.motor_speeds() {
+                        ui.add(egui::ProgressBar::new((w / max) as f32).desired_width(40.0));
+                    }
+                });
+            }
+            if let Some(w) = v.as_wheeled() {
+                let p = w.powertrain();
+                let gear = match p.gear {
+                    0 => "–".to_owned(),
+                    -1 => "R".to_owned(),
+                    g => g.to_string(),
+                };
+                ui.label(format!(
+                    "steering {:+4.0}° · gear {gear} · {:5.0} rpm",
+                    w.steering_angle().to_degrees(),
+                    p.engine_speed * 30.0 / std::f64::consts::PI
+                ));
+            }
             let latched = sim.latched[sim.pilot];
             let now = agent.events;
             let names: Vec<&str> = latched.names().collect();

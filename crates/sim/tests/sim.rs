@@ -290,7 +290,7 @@ fn events_are_raised() {
 
     // A corrupted state.
     let mut w = WorldInstance::new(compile(flat), Seed::from_u64(0));
-    w.agent_mut(0).vehicle.state.v[0] = f64::NAN;
+    w.agent_mut(0).vehicle.state_mut().v[0] = f64::NAN;
     w.step();
     assert!(w.agent(0).events.contains(Events::NAN | Events::DISABLED));
     let mut obs = vec![0.0; w.scenario().groups[0].obs_dim()];
@@ -371,7 +371,7 @@ fn goals_advance_within_the_radius() {
         let mut reached = Vec::new();
         for step in 0..1000 {
             let goal = w.agent(0).goal();
-            w.set_setpoint(0, Setpoint::Position { position: goal.position, yaw: YawCommand::Rate(0.0) });
+            w.set_command(0, Setpoint::Position { position: goal.position, yaw: YawCommand::Rate(0.0) });
             w.step();
             let e = w.agent(0).events;
             if e.contains(Events::GOAL_REACHED) {
@@ -471,7 +471,7 @@ fn recording_round_trips_through_mcap() {
         // Floats survive the JSON round trip exactly.
         let last = second.states[i].last().unwrap();
         assert_eq!((last.position, last.orientation), (a.vehicle.position(), a.vehicle.orientation()));
-        assert_eq!(last.motors, a.vehicle.motor_speeds());
+        assert_eq!(last.motors, a.vehicle.as_multirotor().unwrap().motor_speeds());
         assert_eq!(second.goals[i], a.goals);
     }
     // The scenario compiles again, with its maps checked against the recorded hashes.

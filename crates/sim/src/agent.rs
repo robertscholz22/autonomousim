@@ -1,8 +1,9 @@
-//! Agents: a vehicle with its controller, held action, sensors, goals and wind state.
+//! Agents: a vehicle of any family with its controller, held action, sensors, goals and wind
+//! state.
 //!
 //! The per-tick work is split into phases so that the world can run them for all agents
-//! (in parallel when there are many): [`pre_step`](Agent::pre_step) (air, controller, rotor,
-//! static and agent contact forces) and [`post_step`](Agent::post_step) (integration, events,
+//! (in parallel when there are many): [`pre_step`](Agent::pre_step) (air, controller,
+//! actuators (rotors, or drive and tyres), static and agent contact forces) and [`post_step`](Agent::post_step) (integration, events,
 //! shape) run back to back per agent; [`sense`](Agent::sense) needs every agent's new shape
 //! and runs after all of them.
 
@@ -10,7 +11,9 @@ use crate::events::Events;
 use crate::interaction::{AgentContacts, AgentShape, SceneRays, Sphere};
 use crate::obs::ObsInput;
 use crate::scenario::{CompiledGroup, EventConfig, Goal, Placement};
-use autonomousim_control::multirotor::{MultirotorController, Setpoint, StateEstimate, YawCommand};
+use autonomousim_control::ground::GroundEstimate;
+use autonomousim_control::multirotor::StateEstimate;
+use autonomousim_control::{Command, Controller};
 use autonomousim_core::contact::StaticScene;
 use autonomousim_core::geometry::HitKind;
 use autonomousim_core::math::Pose;
@@ -19,9 +22,8 @@ use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorEnv};
-use autonomousim_vehicles::multirotor::{
-    AirData, ColliderPart, GroundPlane, InitialState, MAX_ROTORS, Multirotor, MultirotorScales,
-};
+use autonomousim_vehicles::Vehicle;
+use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
 use autonomousim_world::StaticWorld;
 use autonomousim_world::environment::{Dryden, EnvironmentConfig, MagneticField};
 use glam::{DVec2, DVec3};
@@ -60,9 +62,10 @@ pub struct Agent {
     /// Index in the world (agents are numbered group by group).
     pub id: u32,
     pub group: usize,
-    pub vehicle: Multirotor,
-    pub controller: MultirotorController,
-    setpoint: Setpoint,
+    pub vehicle: Vehicle,
+    pub controller: Controller,
+    command: Command,
+    /// Rotor speed commands of a multirotor.
     cmd: [f64; MAX_ROTORS],
     /// Normalised action held since the last policy step (zeros after a reset).
     pub action: SmallVec<[f64; MAX_ROTORS]>,
@@ -94,9 +97,9 @@ impl Agent {
         Self {
             id,
             group: group_index,
-            vehicle: Multirotor::new(group.def.clone(), clock.dt()),
+            vehicle: Vehicle::new(&group.def, clock.dt()),
             controller: group.controller.clone(),
-            setpoint: Setpoint::Ctbr { thrust: 0.0, rates: DVec3::ZERO },
+            command: Command::hold(group.family(), &Pose::IDENTITY),
             cmd: [0.0; MAX_ROTORS],
             action: SmallVec::from_elem(0.0, group.act_dim()),
             sensors,
@@ -114,31 +117,43 @@ impl Agent {
         }
     }
 
-    /// Start an episode. `seed` is this agent's stream of the episode.
+    /// Start an episode. `seed` is this agent's stream of the episode; `scales` perturb a
+    /// multirotor's parameters. A ground vehicle is placed at rest with its wheels on the
+    /// placement's position, facing its heading.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reset(
         &mut self,
         group: &CompiledGroup,
         placement: &Placement,
-        scales: &MultirotorScales,
+        scales: Option<&MultirotorScales>,
         goals: Vec<Goal>,
         seed: Seed,
         env: &EnvState,
         world: &StaticWorld,
     ) {
-        let v = &mut self.vehicle;
-        v.set_scales(scales);
-        v.reset(&InitialState {
-            pose: placement.pose,
-            lin_vel_world: placement.lin_vel,
-            ang_vel_body: placement.ang_vel,
-            motors: placement.motors,
-            soc: 1.0,
-        });
-        self.controller.reset();
-        self.controller.sync_motors(v.motor_speeds());
+        let pose = match &mut self.vehicle {
+            Vehicle::Multirotor(v) => {
+                if let Some(s) = scales {
+                    v.set_scales(s);
+                }
+                v.reset(&InitialState {
+                    pose: placement.pose,
+                    lin_vel_world: placement.lin_vel,
+                    ang_vel_body: placement.ang_vel,
+                    motors: placement.motors,
+                    soc: 1.0,
+                });
+                placement.pose
+            }
+            Vehicle::Wheeled(v) => {
+                let init = v.rest(placement.pose.pos, yaw(placement.pose.rot), 0.0);
+                v.reset(&init);
+                init.pose
+            }
+        };
+        self.controller.reset(&self.vehicle);
         // Hold the spawn pose until the first action arrives.
-        self.setpoint =
-            Setpoint::Position { position: placement.pose.pos, yaw: YawCommand::Angle(yaw(placement.pose.rot)) };
+        self.command = Command::hold(group.family(), &pose);
         self.action.clear();
         self.action.resize(group.act_dim(), 0.0);
         let sensor_seed = seed.child("sensor");
@@ -149,7 +164,7 @@ impl Agent {
         self.goal_index = 0;
         self.events = Events::NONE;
         self.disabled = false;
-        self.spawn = placement.pose;
+        self.spawn = pose;
         self.turbulence_rng = seed.child("turbulence").rng();
         self.turbulence = Dryden::stationary(&mut self.turbulence_rng);
         self.update_air(world, env, 0.0, Some(0.0));
@@ -162,16 +177,23 @@ impl Agent {
             let x = f64::from(x);
             *a = if x.is_finite() { x.clamp(-1.0, 1.0) } else { 0.0 };
         }
-        self.setpoint = group.action_map.setpoint(&self.action, &StateEstimate::of(&self.vehicle));
+        self.command = group.action_map.command(&self.action, &self.vehicle);
     }
 
-    /// Command the cascade directly (scripted agents, the viewer).
-    pub fn set_setpoint(&mut self, setpoint: Setpoint) {
-        self.setpoint = setpoint;
+    /// Command the controller directly (scripted agents, the viewer); the command must be of
+    /// the vehicle's family.
+    pub fn set_command(&mut self, command: impl Into<Command>) {
+        let command = command.into();
+        let fits = matches!(
+            (&command, &self.vehicle),
+            (Command::Multirotor(_), Vehicle::Multirotor(_)) | (Command::Ground(_), Vehicle::Wheeled(_))
+        );
+        assert!(fits, "command {command:?} for a {} vehicle", self.vehicle.family());
+        self.command = command;
     }
 
-    pub fn setpoint(&self) -> &Setpoint {
-        &self.setpoint
+    pub fn command(&self) -> &Command {
+        &self.command
     }
 
     /// The current goal (the last one once all have been reached).
@@ -259,20 +281,30 @@ impl Agent {
             return;
         }
         self.update_air(world, env, time, env_step);
-        let v = &mut self.vehicle;
-        if v.battery().is_some() {
-            let (lo, hi) = v.speed_range();
-            self.controller.set_speed_limits(lo, hi);
+        let scene =
+            StaticScene { terrain: world.terrain(), obstacles: world.obstacles(), materials: world.materials() };
+        match (&mut self.vehicle, &mut self.controller, &self.command) {
+            (Vehicle::Multirotor(v), Controller::Multirotor(c), Command::Multirotor(sp)) => {
+                if v.battery().is_some() {
+                    let (lo, hi) = v.speed_range();
+                    c.set_speed_limits(lo, hi);
+                }
+                let n = v.num_rotors();
+                c.update(sp, &StateEstimate::of(v), &mut self.cmd[..n]);
+                v.begin_step();
+                v.apply_rotors(&self.cmd[..n], &self.air, self.ground.as_ref());
+                v.apply_contacts(&scene);
+            }
+            (Vehicle::Wheeled(v), Controller::Ground(c), Command::Ground(sp)) => {
+                let input = c.update(sp, &GroundEstimate::of(v));
+                v.begin_step();
+                v.apply_drive(&input, &self.air);
+                v.apply_tires(&scene);
+                v.apply_contacts(&scene);
+            }
+            (v, c, sp) => unreachable!("{} vehicle with a {} controller and {sp:?}", v.family(), c.family()),
         }
-        let n = v.num_rotors();
-        self.controller.update(&self.setpoint, &StateEstimate::of(v), &mut self.cmd[..n]);
-        v.begin_step();
-        v.apply_rotors(&self.cmd[..n], &self.air, self.ground.as_ref());
-        v.apply_contacts(&StaticScene {
-            terrain: world.terrain(),
-            obstacles: world.obstacles(),
-            materials: world.materials(),
-        });
+        let v = &mut self.vehicle;
         for &(force, point) in &agents.forces {
             v.apply_force(force, point);
         }
@@ -295,7 +327,8 @@ impl Agent {
             return;
         }
         let ok = self.vehicle.finish_step(env.gravity).is_ok();
-        let finite = ok && self.vehicle.state.q.iter().chain(self.vehicle.state.v.iter()).all(|x| x.is_finite());
+        let state = self.vehicle.state();
+        let finite = ok && state.q.iter().chain(state.v.iter()).all(|x| x.is_finite());
         if !finite {
             self.events |= Events::NAN;
             self.disable();
@@ -351,7 +384,7 @@ impl Agent {
         let colliders = v.colliders();
         let mut crashed = false;
         for c in v.contacts() {
-            let gear = ColliderPart::from_group(colliders[c.collider as usize].group) == Some(ColliderPart::Gear);
+            let gear = v.is_gear(colliders[c.collider as usize].group);
             let crash = !gear || c.normal_velocity < -cfg.crash_speed;
             match c.kind {
                 HitKind::Terrain | HitKind::Solid(_) if crash => {
@@ -428,13 +461,17 @@ impl Agent {
 
     pub(crate) fn observe(&self, group: &CompiledGroup, world: &StaticWorld, out: &mut [f32]) {
         let kin = self.kinematics();
+        let (motors, motor_range) = match &self.vehicle {
+            Vehicle::Multirotor(v) => (v.motor_speeds(), v.speed_range()),
+            _ => (&[][..], (0.0, 1.0)),
+        };
         group.obs.write(
             &ObsInput {
                 kin: &kin,
                 goal: self.goal(),
                 agl: self.agl_now(world),
-                motors: self.vehicle.motor_speeds(),
-                motor_range: self.vehicle.speed_range(),
+                motors,
+                motor_range,
                 last_action: &self.action,
                 sensors: &self.sensors,
                 world,

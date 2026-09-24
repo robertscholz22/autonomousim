@@ -4,11 +4,14 @@
 //! |---|---|---|
 //! | `/meta` | once | scenario, map pool (metadata and content hashes), vehicle definitions, rates, agent list |
 //! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses and goals |
-//! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, rotor speeds, wind, goal, events |
+//! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels and powertrain (ground vehicles) |
 //! | `/agent/<id>/pose` | `state_hz` | the pose as `foxglove.PoseInFrame` (frame `world`) |
 //! | `/agent/<id>/action` | each action | the normalised action |
 //! | `/agent/<id>/lidar` | each scan, if enabled | sensor pose and ranges |
 //! | `/events` | when an agent gets new event bits | agent id and event names |
+//!
+//! Vehicle definitions in `/meta` are a multirotor's fields alone (as in the first recordings),
+//! or other families' definitions with their `type` tag.
 //!
 //! The map is not stored: a reader rebuilds it from the scenario's map source. Log times are
 //! simulated time since the recording started, continuing across episodes.
@@ -20,6 +23,7 @@ use crate::SimError;
 use crate::scenario::{CompiledScenario, Goal, Scenario};
 use crate::world::{STATE_FIELDS, WorldInstance};
 use autonomousim_sensors::Sensor;
+use autonomousim_vehicles::{SharedDef, Vehicle, VehicleDef};
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -249,11 +253,20 @@ impl Recorder {
             .iter()
             .map(|a| {
                 let g = &sc.groups[a.group];
-                json!({"id": a.id, "group": g.spec.name, "index": a.id as usize - g.first_agent, "vehicle": g.def.name})
+                json!({"id": a.id, "group": g.spec.name, "index": a.id as usize - g.first_agent, "vehicle": g.def.name()})
             })
             .collect();
-        let vehicles: BTreeMap<&str, Value> =
-            sc.groups.iter().map(|g| (g.spec.name.as_str(), serde_json::to_value(&*g.def).expect("JSON"))).collect();
+        let vehicles: BTreeMap<&str, Value> = sc
+            .groups
+            .iter()
+            .map(|g| {
+                let def = match &g.def {
+                    SharedDef::Multirotor(m) => serde_json::to_value(&**m),
+                    SharedDef::Wheeled(w) => serde_json::to_value(VehicleDef::Wheeled((**w).clone())),
+                };
+                (g.spec.name.as_str(), def.expect("JSON"))
+            })
+            .collect();
         let maps: Vec<Value> = sc
             .maps
             .iter()
@@ -372,20 +385,43 @@ impl Recorder {
             let v = &a.vehicle;
             let (p, q) = (v.position(), v.orientation());
             let goal = a.goal();
-            let msg = json!({
+            let mut msg = json!({
                 "time": time,
                 "tick": w.clock().tick,
                 "position": p,
                 "orientation": q,
                 "velocity": q * v.lin_vel_body(),
                 "rates": v.ang_vel_body(),
-                "motors": v.motor_speeds(),
                 "wind": a.air().wind,
                 "goal": goal.position,
                 "goal_yaw": goal.yaw,
                 "events": a.events.0,
                 "disabled": a.disabled,
             });
+            let m = msg.as_object_mut().expect("object");
+            match v {
+                Vehicle::Multirotor(v) => {
+                    m.insert("motors".into(), json!(v.motor_speeds()));
+                }
+                Vehicle::Wheeled(v) => {
+                    let wheels: Vec<RecordedWheel> = v
+                        .wheels()
+                        .map(|w| RecordedWheel {
+                            spin: w.spin,
+                            steer: w.steer,
+                            travel: w.travel,
+                            drive_torque: w.drive_torque,
+                            brake_torque: w.brake_torque,
+                            load: w.tire.fz,
+                        })
+                        .collect();
+                    let pt = v.powertrain();
+                    m.insert("steering".into(), json!(v.steering_angle()));
+                    m.insert("wheels".into(), json!(wheels));
+                    m.insert("gear".into(), json!(pt.gear));
+                    m.insert("engine_speed".into(), json!(pt.engine_speed));
+                }
+            }
             self.send(ch.state, &msg);
             let pose = json!({
                 "timestamp": stamp,
@@ -424,14 +460,38 @@ pub struct RecordedState {
     pub velocity: DVec3,
     /// Body frame (rad/s).
     pub rates: DVec3,
-    /// Rotor speeds (rad/s).
+    /// Rotor speeds (rad/s); empty for other families.
+    #[serde(default)]
     pub motors: Vec<f64>,
+    /// Ground vehicles: bicycle steering angle (rad), wheels, gear and engine (or first motor)
+    /// speed (rad/s).
+    #[serde(default)]
+    pub steering: f64,
+    #[serde(default)]
+    pub wheels: Vec<RecordedWheel>,
+    #[serde(default)]
+    pub gear: i32,
+    #[serde(default)]
+    pub engine_speed: f64,
     pub wind: DVec3,
     pub goal: DVec3,
     pub goal_yaw: f64,
     /// Event bits since the last policy step.
     pub events: u32,
     pub disabled: bool,
+}
+
+/// A wheel in a ground vehicle's state message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordedWheel {
+    /// Spin rate (rad/s), steering angle (rad) and suspension travel (m, bump positive).
+    pub spin: f64,
+    pub steer: f64,
+    pub travel: f64,
+    /// Drive and brake torque (N·m) and tyre load (N).
+    pub drive_torque: f64,
+    pub brake_torque: f64,
+    pub load: f64,
 }
 
 /// A `/agent/<id>/action` message: the normalised action held from `time` on.

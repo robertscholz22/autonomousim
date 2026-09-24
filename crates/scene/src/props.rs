@@ -164,6 +164,52 @@ pub fn rotor_disc(radius: f32, color: [f32; 4]) -> MeshData {
     mesh::cylinder(radius, 0.004 * radius.max(0.05), 24, color)
 }
 
+/// Visual of a wheeled vehicle: the body in the chassis frame (FLU) and one mesh per wheel in
+/// its spinning link's frame (spin axis y), to be posed from the simulated wheels.
+pub struct WheeledVisual {
+    pub body: MeshData,
+    pub wheels: Vec<MeshData>,
+    /// Largest distance of a wheel's outer edge from the chassis origin (m), for cameras.
+    pub span: f32,
+}
+
+/// Build the visual of a wheeled vehicle: a box over the wheelbase and track with a red nose,
+/// and dark tyres with a light marker on the rim so that spin is visible.
+pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual {
+    let n = def.num_wheels();
+    let positions: Vec<DVec3> = (0..n).map(|w| def.wheel_position(w)).collect();
+    let tire = |w: usize| def.tire(w / 2);
+    let (mut lo, mut hi) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+    for (w, p) in positions.iter().enumerate() {
+        let r = tire(w).radius();
+        lo = lo.min(*p - DVec3::new(r, 0.0, 0.0));
+        hi = hi.max(*p + DVec3::new(r, 0.0, r));
+    }
+    let width = (0..n).map(|w| tire(w).width()).fold(0.0, f64::max);
+    let radius = (0..n).map(|w| tire(w).radius()).fold(0.0, f64::max);
+    // Between the wheels, from the axle line up to a little above the tyre tops.
+    let half = DVec3::new(0.5 * (hi.x - lo.x), (0.5 * (hi.y - lo.y) - 0.6 * width).max(0.3 * radius), 0.4 * radius);
+    let centre = DVec3::new(0.5 * (hi.x + lo.x), 0.5 * (hi.y + lo.y), lo.z + 0.2 * radius + half.z);
+    let mut body = MeshData::new();
+    let h = |v: DVec3| v.as_vec3();
+    body.append_transformed(&mesh::cuboid(h(half), srgb([70, 110, 150])), DQuat::IDENTITY, centre);
+    let nose = mesh::cuboid(h(DVec3::new(0.08 * half.x, 0.8 * half.y, 0.3 * half.z)), srgb([200, 40, 36]));
+    body.append_transformed(&nose, DQuat::IDENTITY, centre + DVec3::new(half.x, 0.0, 0.5 * half.z));
+    let axis = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
+    let wheels = (0..n)
+        .map(|w| {
+            let (r, b) = (tire(w).radius() as f32, tire(w).width() as f32);
+            let mut m = MeshData::new();
+            m.append_transformed(&mesh::cylinder(r, 0.5 * b, 20, srgb([30, 30, 32])), axis, DVec3::ZERO);
+            let marker = mesh::cuboid(Vec3::new(0.12 * r, 0.52 * b, 0.12 * r), srgb([220, 220, 220]));
+            m.append_transformed(&marker, DQuat::IDENTITY, DVec3::new(0.0, 0.0, 0.7 * r as f64));
+            m
+        })
+        .collect();
+    let span = positions.iter().enumerate().map(|(w, p)| p.length() + tire(w).radius()).fold(0.0, f64::max) as f32;
+    WheeledVisual { body, wheels, span }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +252,24 @@ mod tests {
             // The front arms are red.
             let red = v.body.colors.iter().filter(|c| c[0] > 0.5 && c[1] < 0.1).count();
             assert!(red > 0);
+        }
+    }
+
+    #[test]
+    fn wheeled_visual_covers_its_wheels() {
+        for name in ["sedan_like", "rover_diff", "offroad_4x4"] {
+            let def = presets::wheeled(name).unwrap();
+            let v = wheeled(&def);
+            assert_eq!(v.wheels.len(), def.num_wheels());
+            let (lo, hi) = v.body.bounds().unwrap();
+            let front = def.wheel_position(0).x as f32;
+            assert!(hi.x > front && lo.x < def.wheel_position(def.num_wheels() - 1).x as f32, "{name}");
+            // Wheels are discs about y.
+            let (wlo, whi) = v.wheels[0].bounds().unwrap();
+            let r = def.tire(0).radius() as f32;
+            assert!((whi.z - r).abs() < 1e-3 && (wlo.x + r).abs() < 0.05 * r, "{name}: {wlo} {whi}");
+            assert!(whi.y < 0.6 * def.tire(0).width() as f32);
+            assert!(v.span > front);
         }
     }
 }

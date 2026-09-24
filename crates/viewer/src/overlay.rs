@@ -111,7 +111,10 @@ pub fn draw(keys: Res<ButtonInput<KeyCode>>, sim: Res<Sim>, mut overlay: ResMut<
             let pos = sim.render_pose(i).pos;
             // Goals: the current one solid, the ones after it faint and joined up; as large as
             // the vehicle.
-            let arm = agent.vehicle.def().rotors.iter().map(|r| r.position.length()).fold(0.0, f64::max);
+            let arm = match agent.vehicle.as_multirotor() {
+                Some(m) => m.def().rotors.iter().map(|r| r.position.length()).fold(0.0, f64::max),
+                None => sim.world.scenario().groups[agent.group].radius / 1.5,
+            };
             let radius = (1.5 * arm).max(0.05) as f32;
             let current = agent.goal_index.min(agent.goals.len().saturating_sub(1));
             for (k, g) in agent.goals.iter().enumerate().skip(current) {

@@ -7,6 +7,9 @@
 pub mod ground;
 pub mod multirotor;
 pub mod presets;
+mod vehicle;
+
+pub use vehicle::{Family, SharedDef, Vehicle};
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -49,6 +52,13 @@ impl VehicleDef {
         match self {
             VehicleDef::Multirotor(m) => &m.name,
             VehicleDef::Wheeled(w) => &w.name,
+        }
+    }
+
+    pub fn family(&self) -> Family {
+        match self {
+            VehicleDef::Multirotor(_) => Family::Multirotor,
+            VehicleDef::Wheeled(_) => Family::Wheeled,
         }
     }
 }

@@ -6,9 +6,12 @@
 use crate::autopilot::{self, Autopilot};
 use crate::camera::{CameraMode, CameraRig};
 use crate::replay::Replay;
+use autonomousim_control::Command;
+use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::{Events, WorldInstance};
+use autonomousim_vehicles::Family;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 use glam::{DVec2, DVec3};
@@ -194,6 +197,18 @@ impl Sim {
         }
     }
 
+    /// The pilot's command for the followed vehicle: [`setpoint`](Self::setpoint) for a
+    /// multirotor; for a ground vehicle forward/back as the pedal and left/right as steering.
+    pub fn pilot_command(&self) -> Command {
+        match self.world.agent(self.pilot).vehicle.family() {
+            Family::Multirotor => self.setpoint().into(),
+            Family::Wheeled => {
+                let [forward, left, ..] = self.stick;
+                GroundSetpoint::Pedal { drive: forward, steering: left }.into()
+            }
+        }
+    }
+
     /// Advance by `real_dt` seconds of wall-clock time.
     pub fn advance(&mut self, real_dt: f64) {
         if let Some(r) = &mut self.replay {
@@ -216,8 +231,8 @@ impl Sim {
         self.accumulator += wanted.min(MAX_FRAME_STEP);
         let manual = self.manual_agent();
         if let Some(pilot) = manual {
-            let setpoint = self.setpoint();
-            self.world.set_setpoint(pilot, setpoint);
+            let command = self.pilot_command();
+            self.world.set_command(pilot, command);
         }
         let mut stepped = 0.0;
         while self.accumulator >= dt {
@@ -404,7 +419,7 @@ mod tests {
             map: MapSource::Testworld(Testworld::Flat { size: 200.0 }),
             groups: vec![GroupSpec {
                 vehicle: autonomousim_sim::scenario::VehicleRef::Name("iris_like".into()),
-                action_mode: ActionMode::Velocity,
+                action_mode: Some(ActionMode::Velocity.into()),
                 ..Default::default()
             }],
             ..Default::default()

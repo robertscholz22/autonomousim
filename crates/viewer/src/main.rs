@@ -35,6 +35,7 @@ use autonomousim_sim::policy::PolicyFile;
 use autonomousim_sim::record::Recording;
 use autonomousim_sim::scenario::{MapSource, SpawnSpec, VehicleRef, WildMaps};
 use autonomousim_sim::{CompiledScenario, GroupSpec, Scenario, WorldInstance};
+use autonomousim_vehicles::Vehicle;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
@@ -227,7 +228,7 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
         groups: vec![GroupSpec {
             name: "pilot".into(),
             vehicle: VehicleRef::Name(args.vehicle.clone()),
-            action_mode: ActionMode::Velocity,
+            action_mode: Some(ActionMode::Velocity.into()),
             spawn: SpawnSpec { agl: [2.0, 2.0], clearance: 4.0, margin: 60.0, ..Default::default() },
             disable_on_terminal: false,
             ..Default::default()
@@ -448,7 +449,10 @@ fn main() -> anyhow::Result<()> {
 
 fn spawn_camera(mut commands: Commands, sim: Res<sim::Sim>, view: Res<world_view::MapView>, quality: Res<Quality>) {
     let v = &sim.world.agent(sim.pilot).vehicle;
-    let span = autonomousim_scene::props::multirotor(v.def()).span;
+    let span = match v {
+        Vehicle::Multirotor(m) => autonomousim_scene::props::multirotor(m.def()).span,
+        Vehicle::Wheeled(w) => autonomousim_scene::props::wheeled(w.def()).span,
+    };
     let far = view.view_distance;
     commands.spawn((
         Camera3d::default(),
