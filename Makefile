@@ -55,9 +55,10 @@ MICROMAMBA ?= $(HOME)/.local/bin/micromamba
 MAMBA_ROOT_PREFIX ?= $(HOME)/.local/share/micromamba
 export MAMBA_ROOT_PREFIX
 
-fixtures-chrono:  ## PAC2002 and full-vehicle reference runs from Project Chrono (fixtures/chrono/)
+fixtures-chrono:  ## PAC2002, full-vehicle and handling reference runs from Project Chrono (fixtures/chrono/)
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_fixtures.py
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_vehicle_fixtures.py
+	$(MICROMAMBA) run -n chrono python tools/gen_chrono_handling_fixtures.py
 
 clean:
 	cargo clean

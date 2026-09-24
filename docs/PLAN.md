@@ -942,6 +942,38 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
 
   The multirotor benches are +2 % against the step-5 baseline. `tools/collect_bench.py` now also collects grouped benches (`group/name`).
 
+**As built in step 7** (handling validation, `vehicles/tests/handling.rs`):
+- **Reference runs**: `tools/gen_chrono_handling_fixtures.py` (in `make fixtures-chrono`, about 20 s) drives the Chrono Sedan on flat rigid ground with μ at the tyres' reference value and writes `fixtures/chrono/handling_sedan.json` (0.57 MB):
+  - ISO 4138 constant steering input with speed rising from 5 to 16 m/s (a_y up to 5.9 m/s²). These samples carry per-wheel loads, lateral forces, aligning moments and slip angles.
+  - ISO 7401 step steer at 80 km/h, two amplitudes (a_y ≈ 1 and 4 m/s²).
+  - ISO 3888-1 double lane change at 80 km/h, driven by a pure-pursuit driver along a cosine-blended centreline.
+  - Straight braking from 100 km/h at pedals 0.3, 0.5, 0.7 and 1.0.
+  - The speed PI and the driver are simple enough to re-implement exactly in the test, so both cars are driven by the same laws. Chrono runs are rolled out at x = −400 m on a 1 km patch (`Run` gained `patch`/`start`; the older fixtures are unchanged).
+- **Findings about the Chrono Sedan** that shape the comparison:
+  - Its steering linkage maps input to road-wheel angle nonlinearly (0.573 rad per unit at small inputs, 0.612 at full lock) and lags the input by about 20 ms. Inputs are therefore matched by road-wheel angle: the test fits Chrono's front-wheel angle against roll and takes the zero-roll intercept (both cars have the same roll steer, dδ/dφ ≈ −0.24). Matching a single sample instead left an 8 % yaw-rate deficit.
+  - `ChPac02Tire` never passes the inclination to its formulas, so its tyres have no camber thrust. The test zeroes the 22 camber coefficients of the `.tir` for the comparisons with Chrono. With camber our Sedan understeers a little more (K +0.00004 at low a_y).
+  - Without ABS, Chrono's rear wheels lock from pedal 0.7 and the car spins (1.4–1.75 rad/s yaw rate); at 0.5 it yaws slightly (0.12 rad/s). Ours stays straight, being exactly symmetric. Only pedals 0.3 and 0.5 are compared.
+  - Chrono reports tyre forces at the wheel centres. At a_y 5.3 m/s² its total lateral load transfer is 5 % smaller than ours (5130 vs 5392 N) and its outer-wheel aligning moments are about 35 % larger (Pac02 trail without `LFZO` and with its own offsets). Our front slip angles are about 0.0006 rad smaller at the same a_y. The K offset below was not attributed further, and neither model was changed.
+- **Acceptance criteria as implemented**:
+  - The understeer gradient is compared absolutely. The Chrono Sedan is close to neutral (K = 0.00053 rad/(m/s²), 0.3°/g, below 3 m/s²), so 10 % of it is 0.03°/g, below what the data resolve. The bound is |K − K_Chrono| < 0.0005 rad/(m/s²), 10 % of a typical passenger car's 3°/g, plus path curvature within 5 % at every sample up to 6 m/s².
+  - The linear bicycle model is per wheel: each wheel's lateral force is linear in slip angle and inclination, with the Magic Formula's cornering and camber stiffness at static load, and the road-wheel angle and camber changes as the vehicle model produced them (steer, roll steer, compliance, roll camber). The classical two-stiffness model (K ≈ 0.0001) misses the Sedan's rear roll steer and predicts a 22 % lower yaw rate at 4 m/s².
+- **Results** (ours vs Chrono):
+
+  | Test | Ours | Chrono | Criterion |
+  |---|---|---|---|
+  | K, a_y 0.5–3 m/s² | 0.00015 | 0.00053 | Δ < 0.0005 |
+  | K, a_y 3–5.5 m/s² | 0.00154 | 0.00204 | Δ < 0.0005 |
+  | Path curvature, worst sample | — | — | 3.2 % (< 5 %) |
+  | Step steer, small: steady / peak yaw rate (rad/s), t90 (s) | 0.0450 / 0.0453 / 0.140 | 0.0455 / 0.0462 / 0.140 | 10 %, 10 %, 30 ms |
+  | Step steer, standard (a_y ≈ 4) | 0.1997 / 0.2083 / 0.130 | 0.1927 / 0.2046 / 0.120 | same |
+  | Step steer, small, vs linear model | 0.0450 (0.0447 with camber) | model 0.0481 (0.0479) | 10 % |
+  | Braking, pedal 0.3 / 0.5 | 93.8 / 58.0 m | 95.7 / 60.5 m | 5 % |
+  | Lane change: peak yaw rate, peak a_y | 0.219, 4.86 | 0.218, 4.86 | 10 % |
+  | Lane change: largest lateral difference | 0.15 m | — | < 0.3 m |
+
+  Both cars keep their centre inside every lane. With a 1.8 m body, both would touch the cones of the offset lane by 2–5 cm; the driver is not tuned for clearance.
+- The five tests take 0.3 s.
+
 ### Performance targets (i7-1365U, release)
 | Metric | Target |
 |---|---|

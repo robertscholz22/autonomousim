@@ -42,7 +42,7 @@ def vec(v) -> list[float]:
 
 
 class Run:
-    def __init__(self, files, z0: float, speed: float, g: float = 9.81):
+    def __init__(self, files, z0: float, speed: float, g: float = 9.81, patch=(4000.0, 40.0), start=-1900.0):
         f = veh.GetVehicleDataFile
         self.sys = ch.ChSystemNSC()
         self.sys.SetGravitationalAcceleration(ch.ChVector3d(0, 0, -g))
@@ -50,10 +50,11 @@ class Run:
         self.terrain = veh.RigidTerrain(self.sys)
         mat = ch.ChContactMaterialNSC()
         mat.SetFriction(MU0)
-        self.terrain.AddPatch(mat, ch.ChCoordsysd(ch.ChVector3d(0, 0, 0), ch.QUNIT), 4000, 40)
+        self.terrain.AddPatch(mat, ch.ChCoordsysd(ch.ChVector3d(0, 0, 0), ch.QUNIT), *patch)
         self.terrain.Initialize()
         v = veh.WheeledVehicle(self.sys, f(files[0]))
-        v.Initialize(ch.ChCoordsysd(ch.ChVector3d(-1900, 0, z0), ch.QUNIT), speed)
+        v.Initialize(ch.ChCoordsysd(ch.ChVector3d(start, 0, z0), ch.QUNIT), speed)
+        self.start = start
         v.InitializePowertrain(veh.ChPowertrainAssembly(veh.ReadEngineJSON(f(files[1])),
                                                         veh.ReadTransmissionJSON(f(files[2]))))
         self.tires = []
@@ -79,7 +80,7 @@ class Run:
 
     def sample(self) -> dict:
         tr, eng = self.v.GetTransmission(), self.v.GetEngine()
-        return {"t": round(self.t, 6), "x": self.v.GetPos().x + 1900, "speed": self.v.GetSpeed(),
+        return {"t": round(self.t, 6), "x": self.v.GetPos().x - self.start, "speed": self.v.GetSpeed(),
                 "gear": tr.GetCurrentGear(), "engine_rpm": eng.GetMotorSpeed() * 30 / 3.141592653589793}
 
     def record(self, duration: float, every: float = 0.05) -> list[dict]:
