@@ -3,6 +3,7 @@
 use autonomousim_core::dynamics::*;
 use autonomousim_core::math::{Pose, RigidInertia, SpatialForce};
 use glam::{DQuat, DVec3};
+use std::sync::Arc;
 
 const G: DVec3 = DVec3::new(0.0, 0.0, -9.80665);
 
@@ -248,10 +249,11 @@ fn random_tree(seed: u64, n: usize, floating: bool) -> MultibodyModel {
         let joint = if i == 0 {
             if floating { JointType::Free } else { JointType::revolute(rng.unit_vector()) }
         } else {
-            match rng.below(5) {
+            match rng.below(6) {
                 0 | 1 => JointType::revolute(rng.unit_vector()),
                 2 => JointType::prismatic(rng.unit_vector()),
                 3 => JointType::Spherical,
+                4 => JointType::KcTravel(Arc::new(curved_kc())),
                 _ => JointType::Fixed,
             }
         };
@@ -392,4 +394,95 @@ fn free_fall_proper_acceleration_is_zero() {
     // Generalised acceleration = body-frame gravity.
     let g_body = rot.inverse() * G;
     assert!((DVec3::new(ws.qdd[3], ws.qdd[4], ws.qdd[5]) - g_body).length() < 1e-12);
+}
+
+/// Suspension-like kinematics with every curve non-trivial and large enough (±0.5 m of
+/// travel, toe and camber up to 0.3 rad) that the configuration-dependent terms matter.
+fn curved_kc() -> KcTable {
+    KcTable::new(KcTableSpec {
+        travel: vec![-0.5, -0.2, 0.0, 0.3, 0.5],
+        x: vec![0.05, 0.01, 0.0, -0.03, -0.08],
+        y: vec![-0.1, -0.02, 0.0, 0.01, -0.04],
+        z: vec![-0.45, -0.2, 0.0, 0.28, 0.44],
+        toe: vec![0.2, 0.05, 0.0, -0.1, -0.3],
+        camber: vec![0.25, 0.06, 0.0, -0.12, -0.3],
+    })
+    .unwrap()
+}
+
+/// A straight vertical `KcTravel` table is a prismatic joint along z.
+#[test]
+fn vertical_kc_travel_matches_a_prismatic_joint() {
+    let build = |joint: JointType| {
+        let mut m = MultibodyModel::new();
+        let body = RigidInertia::cuboid(900.0, DVec3::new(4.0, 1.8, 0.6));
+        let b = m.add_link("body", None, JointType::Free, Pose::IDENTITY, body);
+        let frame = Pose::new(DVec3::new(1.3, 0.8, -0.2), DQuat::from_rotation_z(0.1));
+        let c = m.add_link("carrier", Some(b), joint, frame, RigidInertia::sphere(20.0, 0.2));
+        m.add_link(
+            "wheel",
+            Some(c),
+            JointType::revolute(DVec3::Y),
+            Pose::IDENTITY,
+            RigidInertia::cuboid(15.0, DVec3::splat(0.6)),
+        );
+        m
+    };
+    let kc = build(JointType::KcTravel(Arc::new(KcTable::vertical([-0.2, 0.2]))));
+    let pr = build(JointType::prismatic(DVec3::Z));
+    let (mut s, tau) = random_state(&pr, 7);
+    s.q[7] = 0.05;
+    let (mut w1, mut w2) = (AbaWorkspace::new(&kc), AbaWorkspace::new(&pr));
+    aba(&kc, &s.q, &s.v, &tau, &[], G, &mut w1).unwrap();
+    aba(&pr, &s.q, &s.v, &tau, &[], G, &mut w2).unwrap();
+    for (a, b) in w1.qdd.iter().zip(&w2.qdd) {
+        assert!((a - b).abs() < 1e-12 * (1.0 + b.abs()), "{:?} vs {:?}", w1.qdd, w2.qdd);
+    }
+}
+
+/// With gravity and no other forces, a chain of `KcTravel` joints conserves energy (a wrong
+/// bias acceleration `c_J` would show up as drift).
+#[test]
+fn kc_travel_chain_conserves_energy_rk4() {
+    let mut model = MultibodyModel::new();
+    let mut parent = None;
+    for i in 0..3 {
+        let joint = if i == 1 {
+            JointType::revolute(DVec3::new(0.3, 1.0, 0.2))
+        } else {
+            JointType::KcTravel(Arc::new(curved_kc()))
+        };
+        let frame = Pose::new(DVec3::new(0.2, -0.1, 0.3), DQuat::from_rotation_x(0.4 * i as f64));
+        let inertia =
+            RigidInertia::cuboid(1.0 + i as f64, DVec3::new(0.4, 0.2, 0.3)).with_com(DVec3::new(0.05, 0.1, -0.02));
+        parent = Some(model.add_link(format!("l{i}"), parent, joint, frame, inertia));
+    }
+    let mut s = model.neutral_state();
+    s.q.copy_from_slice(&[0.1, 0.4, -0.2]);
+    s.v.copy_from_slice(&[1.5, -2.0, 1.0]);
+    let energy = |s: &MbState| {
+        let mut kin = KinCache::new(&model);
+        forward_kinematics(&model, &s.q, &s.v, &mut kin);
+        kinetic_energy(&model, &kin) + potential_energy(&model, &kin, G)
+    };
+    let e0 = energy(&s);
+    let mut ws = AbaWorkspace::new(&model);
+    let mut rk = Rk4Workspace::new(&model);
+    let tau = vec![0.0; model.nv()];
+    let mut max_drift = 0.0f64;
+    for _ in 0..80_000 {
+        rk4(&model, &mut s, 2.5e-5, &mut rk, |q, v, qdd| {
+            aba(&model, q, v, &tau, &[], G, &mut ws)?;
+            qdd.copy_from_slice(&ws.qdd);
+            Ok::<_, DynamicsError>(())
+        })
+        .unwrap();
+        max_drift = max_drift.max((energy(&s) - e0).abs());
+    }
+    // The motion must actually exercise the curves.
+    assert!(s.q[0].abs() > 0.05 || s.q[2].abs() > 0.05, "{:?}", s.q);
+    // Without c_J this run diverges (singular articulated inertia) well before the end. The
+    // drift left converges slowly with the step, because the splines' second derivatives
+    // (and so c_J) have kinks at the knots and at the ends of the table.
+    assert!(max_drift < 1e-8 * e0.abs(), "energy drift {max_drift} of {e0}");
 }

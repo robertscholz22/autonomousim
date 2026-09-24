@@ -3,12 +3,16 @@
 //! A joint connects a predecessor frame (fixed in the parent body, placed by the tree
 //! transform `X_T`) to the successor frame (the child body frame). `X_J(q)` maps
 //! predecessor to successor coordinates and the motion subspace `S` is expressed in child
-//! coordinates. For all joint types here `S` is constant in child coordinates, so the
-//! joint bias acceleration `c_J = Ṡ q̇` is zero.
+//! coordinates. For all joint types but [`JointType::KcTravel`] `S` is constant in child
+//! coordinates, so the joint bias acceleration `c_J = Ṡ q̇` is zero; for `KcTravel`, forward
+//! kinematics stores `S(q)` and `c_J` in the [`KinCache`](super::KinCache), and the dynamics
+//! algorithms take the subspace from there ([`KinCache::joint_col`](super::KinCache::joint_col)).
 
+use super::kc::KcTable;
 use crate::math::{SpatialMotion, Xform, quat};
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Kinematic joint type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -25,6 +29,9 @@ pub enum JointType {
     Spherical,
     /// Rigid attachment (no DoF).
     Fixed,
+    /// Suspension travel: one DoF moving the child along the tabulated curves of a
+    /// [`KcTable`] (`S` depends on `q`).
+    KcTravel(Arc<KcTable>),
 }
 
 impl JointType {
@@ -41,7 +48,7 @@ impl JointType {
     pub fn nq(&self) -> usize {
         match self {
             JointType::Free => 7,
-            JointType::Revolute { .. } | JointType::Prismatic { .. } => 1,
+            JointType::Revolute { .. } | JointType::Prismatic { .. } | JointType::KcTravel(_) => 1,
             JointType::Spherical => 4,
             JointType::Fixed => 0,
         }
@@ -52,7 +59,7 @@ impl JointType {
     pub fn nv(&self) -> usize {
         match self {
             JointType::Free => 6,
-            JointType::Revolute { .. } | JointType::Prismatic { .. } => 1,
+            JointType::Revolute { .. } | JointType::Prismatic { .. } | JointType::KcTravel(_) => 1,
             JointType::Spherical => 3,
             JointType::Fixed => 0,
         }
@@ -63,7 +70,7 @@ impl JointType {
         match self {
             JointType::Free => q.copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
             JointType::Spherical => q.copy_from_slice(&[0.0, 0.0, 0.0, 1.0]),
-            JointType::Revolute { .. } | JointType::Prismatic { .. } => q[0] = 0.0,
+            JointType::Revolute { .. } | JointType::Prismatic { .. } | JointType::KcTravel(_) => q[0] = 0.0,
             JointType::Fixed => {}
         }
     }
@@ -77,10 +84,21 @@ impl JointType {
             JointType::Prismatic { axis } => Xform::translation(*axis * q[0]),
             JointType::Spherical => Xform::rotation(quat_at(q, 0)),
             JointType::Fixed => Xform::IDENTITY,
+            JointType::KcTravel(t) => t.transform(q[0]),
         }
     }
 
-    /// Column `k` of the motion subspace `S` (child coordinates).
+    /// Whether `S` depends on the configuration (then use [`subspace_at`](Self::subspace_at)).
+    #[inline]
+    pub fn configuration_dependent(&self) -> bool {
+        matches!(self, JointType::KcTravel(_))
+    }
+
+    /// Column `k` of the motion subspace `S` (child coordinates) of a joint whose subspace is
+    /// constant.
+    ///
+    /// # Panics
+    /// For configuration-dependent joints.
     #[inline]
     pub fn s_col(&self, k: usize) -> SpatialMotion {
         match self {
@@ -97,10 +115,27 @@ impl JointType {
                 SpatialMotion::new(a, DVec3::ZERO)
             }
             JointType::Fixed => unreachable!("fixed joints have no motion subspace"),
+            JointType::KcTravel(_) => panic!("the subspace of a KcTravel joint depends on q"),
         }
     }
 
-    /// Joint velocity `S q̇` (child coordinates).
+    /// The single subspace column of a one-DoF joint at `q`, and its derivative with respect to
+    /// `q` (zero for constant subspaces).
+    #[inline]
+    pub fn subspace_at(&self, q: &[f64]) -> (SpatialMotion, SpatialMotion) {
+        match self {
+            JointType::KcTravel(t) => {
+                let p = t.eval(q[0]);
+                (p.s, p.ds)
+            }
+            j => {
+                debug_assert_eq!(j.nv(), 1, "subspace_at is for one-DoF joints");
+                (j.s_col(0), SpatialMotion::ZERO)
+            }
+        }
+    }
+
+    /// Joint velocity `S q̇` (child coordinates) of a joint with a constant subspace.
     #[inline]
     pub fn motion(&self, v: &[f64]) -> SpatialMotion {
         match self {
@@ -109,6 +144,16 @@ impl JointType {
             JointType::Prismatic { axis } => SpatialMotion::new(DVec3::ZERO, *axis * v[0]),
             JointType::Spherical => SpatialMotion::new(DVec3::new(v[0], v[1], v[2]), DVec3::ZERO),
             JointType::Fixed => SpatialMotion::ZERO,
+            JointType::KcTravel(_) => panic!("the subspace of a KcTravel joint depends on q"),
+        }
+    }
+
+    /// Joint velocity `S(q) q̇` for any joint.
+    #[inline]
+    pub fn motion_at(&self, q: &[f64], v: &[f64]) -> SpatialMotion {
+        match self {
+            JointType::KcTravel(t) => t.eval(q[0]).s * v[0],
+            j => j.motion(v),
         }
     }
 
@@ -122,7 +167,7 @@ impl JointType {
                 q[..3].copy_from_slice(&p.to_array());
                 set_quat(q, 3, rot);
             }
-            JointType::Revolute { .. } | JointType::Prismatic { .. } => q[0] += v[0] * dt,
+            JointType::Revolute { .. } | JointType::Prismatic { .. } | JointType::KcTravel(_) => q[0] += v[0] * dt,
             JointType::Spherical => {
                 let rot = quat::integrate_body_rate(quat_at(q, 0), DVec3::new(v[0], v[1], v[2]), dt);
                 set_quat(q, 0, rot);
@@ -141,7 +186,7 @@ impl JointType {
                 let qd = quat_derivative(rot, DVec3::new(v[0], v[1], v[2]));
                 out[3..7].copy_from_slice(&qd);
             }
-            JointType::Revolute { .. } | JointType::Prismatic { .. } => out[0] = v[0],
+            JointType::Revolute { .. } | JointType::Prismatic { .. } | JointType::KcTravel(_) => out[0] = v[0],
             JointType::Spherical => {
                 let qd = quat_derivative(quat_at(q, 0), DVec3::new(v[0], v[1], v[2]));
                 out[..4].copy_from_slice(&qd);
@@ -197,6 +242,7 @@ mod tests {
             JointType::prismatic(DVec3::new(-0.2, 0.1, 0.9)),
             JointType::Spherical,
             JointType::Free,
+            JointType::KcTravel(Arc::new(crate::dynamics::kc::tests::curved())),
         ];
         for j in joints {
             let mut q = vec![0.0; j.nq()];
@@ -215,7 +261,7 @@ mod tests {
             let rot_err = rel.rot.transpose() - glam::DMat3::IDENTITY; // ≈ h [ω]×
             let omega = DVec3::new(rot_err.y_axis.z, rot_err.z_axis.x, rot_err.x_axis.y) / h;
             let lin_succ = rel.pos / h;
-            let sv = j.motion(&v);
+            let sv = j.motion_at(&q, &v);
             assert!((omega - sv.ang).length() < 1e-5, "{j:?}: {omega:?} vs {:?}", sv.ang);
             assert!((lin_succ - sv.lin).length() < 1e-5, "{j:?}: {lin_succ:?} vs {:?}", sv.lin);
         }

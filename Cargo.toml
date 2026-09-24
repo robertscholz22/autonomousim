@@ -50,7 +50,7 @@ libm = "0.2"
 
 # infrastructure
 smallvec = { version = "1", features = ["union", "const_generics", "serde"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }  # exact f64 round trips (recordings)
 toml = "1"
 blake3 = "1.8"

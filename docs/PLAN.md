@@ -633,10 +633,103 @@ Commands: `make check` (fmt + clippy), `make test` (`cargo test` + `uv run pytes
 
 Benchmarking: take the median of 5 runs with the performance governor (the laptop's P/E cores and thermal throttling add noise). Results go to `benchmarks/results/*.json`.
 
+## Milestone 2: Ground vehicles I
+
+Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` joint), Magic Formula tires with transient slip, steering, powertrain, brakes; Ackermann cars, diff-drive and skid-steer robots; ground action modes; a 1 kHz preset. Two things were decided with the user at the start:
+- **Validation oracle**: Project Chrono (PyChrono, conda) in its own environment outside the repo. It is used only to generate committed fixtures, as Pinocchio is for the multibody tests. Analytic checks come on top.
+- **Closing demo**: `CarWaypointOffroad-v0`. A 4×4 drives through waypoints over wild-map terrain between the trees, using LiDAR and `(v, κ)` actions.
+
+### Design
+- **Agents become vehicle-generic**. The vehicles crate gets `enum Vehicle { Multirotor(Multirotor), Wheeled(Wheeled) }` with the shared queries: pose, twist, mass, definition, the step phases, contact colliders, visual state. Controllers become `enum Controller`, and each action mode belongs to a family (`ActionMode::{Motors, Ctbr, …}` for multirotors, `GroundActionMode` for wheeled vehicles). The state row (`STATE_FIELDS`) stays common. Family-specific data goes to recordings and observation terms, never into the row.
+  - **Bit-exactness**: multirotor trajectories, the golden hashes and the M1 recordings must not change. The determinism suite runs before and after the refactor.
+- **Multibody additions** (`core`):
+  - Joints whose motion subspace depends on `q`. The bias `c_J = Ṡ(q)·q̇` enters ABA, RNEA and CRBA.
+  - `JointType::KcTravel(Arc<KcTable>)`: one DoF (wheel travel `s`). Tables over `s` give the wheel-carrier pose relative to the design position: vertical, lateral and longitudinal offsets, toe, camber and caster. Cubic Hermite interpolation gives a smooth `S(s)` and `Ṡ`. A straight vertical table reduces it to a prismatic joint; a test checks this.
+  - **Auxiliary states** in the integrator (motor, engine and tire relaxation states) are stepped together with `(q, v)`, as the M1 plan intended. Stiff aux states use exact exponential or implicit updates.
+- **Wheeled vehicle** (`vehicles::ground`):
+  - **Tree**: chassis (Free) → one `KcTravel` per corner → steering `Revolute` about the kingpin axis (prescribed on steered wheels) → wheel spin `Revolute`. A 4-wheel car has 6 + 4 + 2 + 4 = 16 DoF, which fits `MbState`'s inline storage.
+  - **Force elements**: coil spring (preload, progressive rate) with bump and rebound stops, a damper with bilinear or tabulated force-velocity, an anti-roll bar per axle (torsion over the travel difference), and chassis aerodynamic drag.
+  - **Steering**: the rack position is limited in rate and travel. Each wheel's angle comes from a table over the rack position (Ackermann geometry, a percentage-Ackermann parameter). The angles are prescribed joint trajectories (hybrid dynamics), and the rack force is reported.
+  - **Brakes**: maximum torque per wheel with a front/rear bias. Friction is regularised (`T = −T_max·clamp(ω/ω_ε, ±1)`, with `ω_ε` chosen from `I/dt`), so a braked car holds on slopes without creep. The parking brake uses the same model.
+  - **Powertrain**:
+    - `Combustion`: engine torque over rpm at full and zero throttle, interpolated in throttle; engine inertia and friction; a clutch for launch, or a torque converter table (capacity factor and torque ratio over speed ratio); a gearbox with ratios, efficiency, an automatic shift schedule with hysteresis and a shift time.
+    - `Electric`: torque and power limits and a motor time constant, per axle or per wheel (robots).
+  - **Differentials**: open, limited-slip (preload, torque bias ratio, viscous), or locked. A locked or LSD coupling is a stiff torsional spring-damper between the output shafts, updated implicitly. Its time constant is well under the tick and it adds no stiffness problem for the tree.
+  - **Robots**: diff-drive (two driven wheels plus frictionless caster spheres through the existing penalty contacts) and skid-steer (four wheels, left and right driven sides). Each driven wheel has an electric drive.
+  - **Chassis collisions**: sphere colliders on the body through the existing contact code. A chassis hit on terrain or an obstacle raises the crash events. Full shapes come in M3.
+- **Tires** (`vehicles::ground::tire`):
+  - `enum TireModel { MagicFormula(MfTire), Fiala(FialaTire) }`, read from `.tir` files or TOML.
+  - **MF 6.1/6.2** following Pacejka (2012), ch. 4: pure and combined slip Fx, Fy, Mz, plus Mx and My. Dependence on load, inflation pressure and camber. User scaling factors λ.
+  - **Friction per surface**: the material table scales λ_μ as the material's μ over the reference μ (asphalt). The rolling-resistance column scales My.
+  - **Transient slip**: first-order relaxation lengths σ_κ and σ_α (MF 6.x), with the MF 6.1 low-speed damping below `v_low`. A parked car on a slope therefore holds without drift and without oscillation at 1 kHz.
+  - **Contact**: a single contact point on the local road plane, fitted from 4 terrain samples around the patch (the envelope approach of Chrono and MF). Vertical force comes from the tire's stiffness and damping over the loaded radius (MF vertical stiffness with `Fz ≥ 0`). The effective rolling radius follows MF. In water, the tire gets drag and loses friction.
+  - **Fiala** (brush model) for small robot tires that have no MF data.
+- **Parameter data**: Chrono's data directory (BSD-3) has `.tir` files and complete reference vehicles (Sedan, HMMWV). The M2 presets reuse their published numbers with attribution:
+  - `sedan_like`: front-wheel drive, the on-road reference for the ISO tests.
+  - `offroad_4x4`: HMMWV-like, the demo vehicle.
+  - `rover_diff`: a small diff-drive robot, about 17 kg, Clearpath-Jackal-like.
+  - `rover_skid`: a four-wheel skid-steer robot, about 50 kg, Husky-like.
+- **Ground control and action modes** (`control::ground`), all normalised to [−1, 1]:
+  - `raw`: throttle/brake on one axis, and steering (diff-drive: left/right wheel torque).
+  - `vk` (cars): speed and path curvature. A speed PI drives throttle and brake. Curvature becomes steering through the kinematic bicycle model plus yaw-rate feedback.
+  - `vw` (robots): speed and yaw rate through per-side wheel-speed PI loops.
+  - Gains come from the definition, as for multirotors.
+- **Simulation**:
+  - The 1 kHz physics preset for any world with ground vehicles. The same policy rate options apply.
+  - **Ground spawning and goals**: on the surface, with a maximum slope, clear of obstacles by the vehicle's radius, and on dry land. Goals are checked for reachability: a coarse grid A* over drivable cells (slope, water, trunks) confirms a path exists.
+  - **Events**: `ROLLOVER` (tilt past a limit); crashes from chassis contact; `WATER` when water reaches the chassis; `STUCK` when the vehicle has barely moved for N seconds (not terminal by itself). New observation terms: speed and slip, wheel speeds, steering angle, pitch and roll, gear and rpm.
+  - A `wild` preset `offroad`: gentler relief and sparser forest with clearings. It gets new golden hashes.
+- **Viewer**:
+  - Car and robot visuals: chassis, wheels that spin, steer and travel, and suspension links.
+  - Driving keys: W/S throttle and brake, A/D steering, Space handbrake. A gamepad works as well.
+  - A chase camera suited to cars.
+  - HUD: speed, rpm, gear, steering, per-wheel load and slip. Plots: slip against force, and yaw rate against its reference.
+  - Replay of ground recordings.
+
+### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 0 | Chrono oracle: micromamba env with PyChrono (outside the repo), `tools/gen_chrono_fixtures.py`, `make fixtures-chrono`; pick the `.tir` files and reference vehicle data | A Chrono MF tire test-rig sweep and a Sedan step-steer run write JSON fixtures |
+| 1 | `core`: q-dependent joints, `KcTravel`, aux states in the integrator | ABA ≡ CRBA⁻¹(τ − RNEA) with KcTravel (proptest); finite-difference `S`/`Ṡ`; energy conserved; prismatic equivalence |
+| 2 | Tires: `.tir` parser, MF 6.1/6.2 steady state, transient slip and low-speed damping, road-plane contact, Fiala | Fx/Fy/Mz sweeps (pure and combined, several loads and cambers) match the Chrono fixtures within 1 % of peak; a parked tire on a 20° slope holds; free rolling decays to rolling resistance |
+| 3 | `vehicles::ground`: definitions (TOML), suspension, steering, brakes, powertrain, differentials, the four presets | Static ride heights and wheel loads match the definitions; a braked car holds on a 30 % slope; a straight 0–100 km/h run and a coast-down are plausible against Chrono |
+| 4 | `control::ground` + action modes | Speed steps settle without overshoot beyond 10 %; curvature tracking on a circle; diff-drive `vw` tracking |
+| 5 | Generalise agents (`Vehicle`/`Controller` enums, family-scoped action modes, recording and observation plumbing), done once the wheeled vehicle exists so that both variants are exercised | All M1 tests pass; golden hashes, trajectory hashes and old recordings unchanged; no throughput loss beyond 3 % |
+| 6 | `sim` integration: ground groups, 1 kHz, spawning and reachable goals, events, observation terms, `offroad` preset, BatchSim, recording | Determinism suite with cars; a batch of 64 cars drives on a wild map; benchmarks recorded |
+| 7 | Validation suite: ISO 4138 constant radius, ISO 7401 step steer, straight braking, ISO 3888-1 double lane change (path-following driver) | Understeer gradient and yaw-rate response within 10 % of Chrono (Sedan) and of the linear bicycle model at low lateral acceleration; braking distance within 5 % of Chrono |
+| 8 | Viewer: ground visuals, driving, HUD, plots, replay | Drive the 4×4 through a wild map at ≥ 60 fps medium; replay a recorded drive |
+| 9 | Python: ground tasks and throughput; `CarWaypointOffroad-v0`; training | > 80 % success on unseen maps; exported policy drives in the viewer |
+
+**As built in step 0 (Chrono environment)**:
+- micromamba 2.9 in `~/.local/bin`, environment `chrono` (`MAMBA_ROOT_PREFIX=~/.local/share/micromamba`) with Python 3.12 and PyChrono **10.0.0** from the `projectchrono` channel. It takes 5.7 GB after `micromamba clean -a`.
+- Chrono 10 has no MF 6.x tire. Its Magic Formula tire is `ChPac02Tire` (MF 5.2 equations, `.tir` input), next to TMeasy, Fiala and Pac89. All 15 `.tir` files in its data directory are MF 5.x. Among them: `hmmwv/tire/HMMWV_Pac02Tire.tir` (the demo 4×4), `sedan/tire/Sedan_Pac02Tire.tir`, and a Goodyear 335/65R22.5 fitted at four pressures.
+- Consequence for step 2: the tire code implements MF 5.2 and MF 6.1 behind the `.tir` version, as MFeval does. MF 5.2 is checked against `ChPac02Tire`. The 6.1-only terms (pressure, some camber and turn-slip terms) are checked analytically and by reduction to 5.2.
+- The fixture generator (`tools/gen_chrono_fixtures.py`) comes with steps 2 and 7.
+
+**As built in step 1** (`core`):
+- `math::spline::CubicSpline`: a natural cubic spline, continued linearly past the end knots, returning the value and both derivatives.
+- `dynamics::KcTable` + `JointType::KcTravel(Arc<KcTable>)`:
+  - The carrier sits at `p(s)` with `R(s) = R_z(toe) R_x(camber)`. Curves are given on travel knots; an empty `z` means `z = s`.
+  - `S(s)` and `dS/ds` are analytic (formulas in `kc.rs`) and checked against central differences of the transform.
+  - Forward kinematics stores the column in `KinCache::s` and adds `c_J = dS/ds·ṡ²` to `c`. ABA, RNEA and CRBA take subspace columns through `KinCache::joint_col` and `joint_motion`. Joints with a constant subspace use exactly the code paths they used before, so the M1 hashes are unchanged.
+- **Tests**:
+  - The random-tree ABA ≡ CRBA⁻¹(τ − RNEA) and RNEA∘ABA = id checks now include `KcTravel`.
+  - A vertical table equals a prismatic joint (to 1e-12).
+  - A chain of two `KcTravel` joints and a revolute conserves energy under gravity to 3.5e-9 relative with RK4 at 25 µs. Without `c_J` the same run diverges.
+- **Auxiliary states** (motor, engine, rack, tire relaxation) stay in the vehicle models, which step them after the multibody update, as the multirotor does with its motors. A generic aux vector in the core integrator was not needed.
+
+### Performance targets (i7-1365U, release)
+| Metric | Target |
+|---|---|
+| One car tick (ABA with 16 DoF, 4 MF tires, powertrain, controller) | ≤ 4 µs |
+| `BatchSim`, N = 256 cars, 10 threads, 1 kHz physics, 20 Hz policy | ≥ 15k env-steps/s raw (≥ 300k physics ticks/s) |
+| Tire force evaluation (combined MF 6.1) | ≤ 150 ns |
+
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
-| M2 | Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
+| M2 | (Detailed above.) Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
 | M3 | Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations, live viewer attach over zenoh | pettingzoo API tests; 256 drones at ≥ 20× real time |
 | M4 | Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering) | Offtracking vs analytic results; trailer reversing task |
 | M5 | Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |

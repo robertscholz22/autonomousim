@@ -27,7 +27,7 @@ pub fn rnea(
             Some(p) => kin.x_up[i].apply_motion(acc[p]),
             None => kin.x_up[i].apply_motion(a0),
         };
-        acc[i] = a_parent + link.joint.motion(model.v_slice(i, qdd)) + kin.c[i];
+        acc[i] = a_parent + kin.joint_motion(link, i, model.v_slice(i, qdd)) + kin.c[i];
         let inertia = &link.inertia;
         f[i] = inertia.mul_motion(acc[i]) + kin.vel[i].cross_force(inertia.mul_motion(kin.vel[i]));
         if !f_ext.is_empty() {
@@ -39,7 +39,7 @@ pub fn rnea(
         let link = &links[i];
         let vo = model.v_offset(i);
         for r in 0..link.joint.nv() {
-            tau[vo + r] = link.joint.s_col(r).dot(f[i]);
+            tau[vo + r] = kin.joint_col(link, i, r).dot(f[i]);
         }
         if let Some(p) = link.parent {
             let fp = kin.x_up[i].inv_apply_force(f[i]);
@@ -66,9 +66,9 @@ pub fn crba(model: &MultibodyModel, kin: &KinCache) -> DenseMatrix {
         let vi = model.v_offset(i);
         for a in 0..ki {
             // F = I^c_i S_i[:, a], carried up the tree.
-            let mut fcol = ic[i].mul_motion(links[i].joint.s_col(a));
+            let mut fcol = ic[i].mul_motion(kin.joint_col(&links[i], i, a));
             for b in 0..ki {
-                m[(vi + a, vi + b)] = links[i].joint.s_col(b).dot(fcol);
+                m[(vi + a, vi + b)] = kin.joint_col(&links[i], i, b).dot(fcol);
             }
             let mut j = i;
             while let Some(p) = links[j].parent {
@@ -77,7 +77,7 @@ pub fn crba(model: &MultibodyModel, kin: &KinCache) -> DenseMatrix {
                 let kj = links[j].joint.nv();
                 let vj = model.v_offset(j);
                 for b in 0..kj {
-                    let val = links[j].joint.s_col(b).dot(fcol);
+                    let val = kin.joint_col(&links[j], j, b).dot(fcol);
                     m[(vi + a, vj + b)] = val;
                     m[(vj + b, vi + a)] = val;
                 }

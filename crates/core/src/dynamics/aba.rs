@@ -113,15 +113,15 @@ pub fn aba_with_kinematics(
         let (ia_up, pa_up) = if k == 0 {
             (ia, ws.pa[i] + ia.mul_motion(c))
         } else if link.prescribed {
-            let sq = link.joint.motion(&ws.qdd[vo..vo + k]);
+            let sq = ws.kin.joint_motion(link, i, &ws.qdd[vo..vo + k]);
             (ia, ws.pa[i] + ia.mul_motion(c + sq))
         } else {
             let mut d = [[0.0; 6]; 6];
             for col in 0..k {
-                ws.u_cols[i][col] = ia.mul_motion(link.joint.s_col(col));
+                ws.u_cols[i][col] = ia.mul_motion(ws.kin.joint_col(link, i, col));
             }
             for r in 0..k {
-                let s_r = link.joint.s_col(r);
+                let s_r = ws.kin.joint_col(link, i, r);
                 for col in 0..k {
                     d[r][col] = s_r.dot(ws.u_cols[i][col]);
                 }
@@ -195,11 +195,11 @@ pub fn aba_with_kinematics(
         } else if k == 0 {
             a_prime
         } else if link.prescribed {
-            let a = a_prime + link.joint.motion(&ws.qdd[vo..vo + k]);
+            let a = a_prime + ws.kin.joint_motion(link, i, &ws.qdd[vo..vo + k]);
             // Required joint force: τ = Sᵀ (I^A a + p^A).
             let f = ws.ia[i].mul_motion(a) + ws.pa[i];
             for r in 0..k {
-                ws.tau_prescribed[vo + r] = link.joint.s_col(r).dot(f);
+                ws.tau_prescribed[vo + r] = ws.kin.joint_col(link, i, r).dot(f);
             }
             a
         } else {
@@ -212,7 +212,7 @@ pub fn aba_with_kinematics(
                 qdd[r] = (0..k).map(|col| ws.d_inv[i][r][col] * rhs[col]).sum();
             }
             ws.qdd[vo..vo + k].copy_from_slice(&qdd[..k]);
-            a_prime + link.joint.motion(&qdd[..k])
+            a_prime + ws.kin.joint_motion(link, i, &qdd[..k])
         };
         ws.acc[i] = acc;
     }

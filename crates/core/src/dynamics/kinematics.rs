@@ -1,6 +1,6 @@
 //! Forward kinematics (positions and velocities of all links).
 
-use super::MultibodyModel;
+use super::{JointType, Link, MultibodyModel};
 use crate::math::{Pose, SpatialMotion, Xform};
 
 /// Per-link kinematic quantities for one configuration, reused across steps (no allocation
@@ -19,6 +19,8 @@ pub struct KinCache {
     pub vj: Vec<SpatialMotion>,
     /// Velocity-product acceleration `c_i = c_J + v_i × S q̇`.
     pub c: Vec<SpatialMotion>,
+    /// Subspace column of configuration-dependent joints at the current `q` (zero for others).
+    pub s: Vec<SpatialMotion>,
 }
 
 impl KinCache {
@@ -31,6 +33,25 @@ impl KinCache {
             vel: vec![SpatialMotion::ZERO; n],
             vj: vec![SpatialMotion::ZERO; n],
             c: vec![SpatialMotion::ZERO; n],
+            s: vec![SpatialMotion::ZERO; n],
+        }
+    }
+
+    /// Column `k` of the motion subspace of `link` (index `i`) at the current configuration.
+    #[inline]
+    pub fn joint_col(&self, link: &Link, i: usize, k: usize) -> SpatialMotion {
+        match link.joint {
+            JointType::KcTravel(_) => self.s[i],
+            ref j => j.s_col(k),
+        }
+    }
+
+    /// `S x` for joint coordinates `x` of `link` (index `i`) at the current configuration.
+    #[inline]
+    pub fn joint_motion(&self, link: &Link, i: usize, x: &[f64]) -> SpatialMotion {
+        match link.joint {
+            JointType::KcTravel(_) => self.s[i] * x[0],
+            ref j => j.motion(x),
         }
     }
 
@@ -53,9 +74,16 @@ pub fn forward_kinematics(model: &MultibodyModel, q: &[f64], v: &[f64], kin: &mu
     debug_assert_eq!(q.len(), model.nq());
     debug_assert_eq!(v.len(), model.nv());
     for (i, link) in model.links().iter().enumerate() {
-        let xj = link.joint.transform(model.q_slice(i, q));
+        let (qi, vi) = (model.q_slice(i, q), model.v_slice(i, v));
+        let (xj, vj, cj) = match &link.joint {
+            JointType::KcTravel(t) => {
+                let p = t.eval(qi[0]);
+                kin.s[i] = p.s;
+                (Xform::from_pose(p.position, p.rotation), p.s * vi[0], Some(p.ds * (vi[0] * vi[0])))
+            }
+            j => (j.transform(qi), j.motion(vi), None),
+        };
         let x_up = xj * link.x_tree;
-        let vj = link.joint.motion(model.v_slice(i, v));
         let (x_world, vel) = match link.parent {
             Some(p) => (x_up * kin.x_world[p], x_up.apply_motion(kin.vel[p]) + vj),
             None => (x_up, vj),
@@ -66,6 +94,9 @@ pub fn forward_kinematics(model: &MultibodyModel, q: &[f64], v: &[f64], kin: &mu
         kin.pose[i] = Pose::new(pos, rot);
         kin.vel[i] = vel;
         kin.vj[i] = vj;
-        kin.c[i] = vel.cross_motion(vj);
+        kin.c[i] = match cj {
+            Some(cj) => vel.cross_motion(vj) + cj,
+            None => vel.cross_motion(vj),
+        };
     }
 }

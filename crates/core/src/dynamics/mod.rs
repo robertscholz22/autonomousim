@@ -2,6 +2,7 @@
 //!
 //! * [`MultibodyModel`]: immutable kinematic tree (shared between instances).
 //! * [`MbState`]: generalised coordinates `(q, v)` of one instance.
+//! * [`KcTable`]: suspension kinematics for [`JointType::KcTravel`].
 //! * [`aba`]: forward dynamics O(n); [`rnea`]: inverse dynamics; [`crba`]: mass matrix.
 //! * Gravity enters as a fictitious upward base acceleration, so link accelerations in
 //!   [`AbaWorkspace::acc`] are *proper* accelerations (what an accelerometer measures, up to
@@ -11,6 +12,7 @@ mod aba;
 mod energy;
 mod integrator;
 mod joint;
+mod kc;
 mod kinematics;
 mod model;
 mod rnea;
@@ -22,6 +24,7 @@ pub use integrator::{
     semi_implicit_euler_with_momentum,
 };
 pub use joint::JointType;
+pub use kc::{KcPoint, KcTable, KcTableSpec};
 pub use kinematics::{KinCache, forward_kinematics};
 pub use model::{Link, MbState, MultibodyModel};
 pub use rnea::{crba, rnea};
