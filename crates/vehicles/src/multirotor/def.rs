@@ -274,10 +274,7 @@ impl MultirotorDef {
 
     /// Sphere colliders attached to the body link.
     pub fn sphere_colliders(&self) -> Vec<SphereCollider> {
-        self.colliders
-            .iter()
-            .map(|c| SphereCollider { link: 0, center: c.center, radius: c.radius, group: c.part as u8 })
-            .collect()
+        self.colliders.iter().map(|c| SphereCollider::new(0, c.center, c.radius, c.part as u8)).collect()
     }
 
     /// Uniform rotor speed that balances `gravity` (m/s²) at air density `density`, ignoring

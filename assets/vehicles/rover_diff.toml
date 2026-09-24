@@ -1,0 +1,74 @@
+# 17 kg differential-drive indoor/outdoor robot: two driven wheels and two caster balls.
+type = "wheeled"
+name = "rover_diff"
+source = """
+Generic differential-drive research platform in the size class of the Clearpath Jackal and \
+Pioneer 3-DX (17 kg, 0.37 m track, 0.196 m wheels, ~1.5 m/s). All values are estimates; the \
+casters are frictionless spheres on the chassis. The chassis frame origin is at the wheel axis."""
+
+[chassis]
+mass = 15.0
+com = [0.0, 0.0, 0.05]
+inertia = [0.28, 0.39, 0.51]
+drag_area = [0.1, 0.1, 0.2]
+
+[[axles]]
+name = "drive"
+position = [0.0, 0.185, 0.0]
+wheel = { mass = 1.0, inertia = [0.0025, 0.0048, 0.0025] }
+brake = { max_torque = 10.0, parking_torque = 10.0 }
+
+[axles.tire.fiala]
+radius = 0.098
+width = 0.05
+vertical_stiffness = 2.0e4
+vertical_damping = 50.0
+slip_stiffness = 500.0
+cornering_stiffness = 400.0
+mu = 0.9
+nominal_load = 83.0
+relaxation_x = 0.03
+relaxation_y = 0.04
+
+[powertrain]
+type = "electric"
+
+[[powertrain.motors]]
+wheels = [0]
+side = "left"
+max_torque = 0.5                        # stall
+max_power = 100.0
+ratio = 0.05
+no_load_speed = 367.0                   # 1.8 m/s unloaded
+time_constant = 0.01
+
+[[powertrain.motors]]
+wheels = [1]
+side = "right"
+max_torque = 0.5
+max_power = 100.0
+ratio = 0.05
+no_load_speed = 367.0
+time_constant = 0.01
+
+# Caster balls, 3 mm clear of the ground when the tyres carry the whole weight.
+[[colliders]]
+center = [0.2, 0.0, -0.061]
+radius = 0.03
+friction = 0.0
+part = "skid"
+
+[[colliders]]
+center = [-0.2, 0.0, -0.061]
+radius = 0.03
+friction = 0.0
+part = "skid"
+
+# Body.
+[[colliders]]
+center = [0.12, 0.0, 0.08]
+radius = 0.12
+
+[[colliders]]
+center = [-0.12, 0.0, 0.08]
+radius = 0.12

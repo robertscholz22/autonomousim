@@ -32,7 +32,7 @@ impl Ball {
             ws: AbaWorkspace::new(&model),
             model,
             state,
-            collider: [SphereCollider { link: 0, center: DVec3::ZERO, radius, group: 0 }],
+            collider: [SphereCollider::new(0, DVec3::ZERO, radius, 0)],
             contact: ContactModel::for_mass(mass, DT),
             cache: ContactCache::default(),
             scratch: ContactScratch::default(),

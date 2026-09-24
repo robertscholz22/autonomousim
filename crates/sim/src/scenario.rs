@@ -732,6 +732,12 @@ impl CompiledGroup {
     fn new(spec: GroupSpec, clock: &Clock, first_agent: usize) -> Result<Self, SimError> {
         let def = match spec.vehicle.resolve()? {
             VehicleDef::Multirotor(m) => Arc::new(m),
+            VehicleDef::Wheeled(w) => {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: wheeled vehicle {:?} is not supported in scenarios yet",
+                    spec.name, w.name
+                )));
+            }
         };
         let name = spec.name.clone();
         let fail = move |what: String| SimError::Scenario(format!("group {name:?}: {what}"));

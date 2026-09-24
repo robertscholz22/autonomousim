@@ -1,7 +1,8 @@
-//! Vehicle definitions and models (multirotor now; ground, fixed-wing and rotorcraft later).
+//! Vehicle definitions and models (multirotors and wheeled ground vehicles; fixed-wing and
+//! rotorcraft later).
 //!
-//! A [`VehicleDef`] is immutable, loaded from TOML (`type = "multirotor"`, …) and shared
-//! between instances by `Arc`; instances hold the per-agent state.
+//! A [`VehicleDef`] is immutable, loaded from TOML (`type = "multirotor"`, `"wheeled"`, …) and
+//! shared between instances by `Arc`; instances hold the per-agent state.
 
 pub mod ground;
 pub mod multirotor;
@@ -27,6 +28,7 @@ pub enum VehicleError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VehicleDef {
     Multirotor(multirotor::MultirotorDef),
+    Wheeled(ground::WheeledDef),
 }
 
 impl VehicleDef {
@@ -34,6 +36,7 @@ impl VehicleDef {
         let mut def: Self = toml::from_str(s)?;
         match &mut def {
             VehicleDef::Multirotor(m) => m.finish()?,
+            VehicleDef::Wheeled(w) => w.finish()?,
         }
         Ok(def)
     }
@@ -45,6 +48,7 @@ impl VehicleDef {
     pub fn name(&self) -> &str {
         match self {
             VehicleDef::Multirotor(m) => &m.name,
+            VehicleDef::Wheeled(w) => &w.name,
         }
     }
 }

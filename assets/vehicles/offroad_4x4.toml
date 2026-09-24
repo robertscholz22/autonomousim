@@ -1,0 +1,120 @@
+# Four-wheel-drive off-road utility vehicle after the Chrono::Vehicle HMMWV (double wishbones
+# with progressive springs, SimpleMap diesel and 6-speed automatic, open differentials,
+# Pacejka 2002 tyres).
+type = "wheeled"
+name = "offroad_4x4"
+source = """
+Masses, inertias, suspension kinematics (spindle path, toe and camber over travel), spring \
+force over travel, dampers, brakes, steering lock, engine maps, gear ratios and shift points \
+derived from Project Chrono's data/vehicle/hmmwv, HMMWV_Vehicle_4WD (BSD-3-Clause, Copyright \
+(c) 2014 projectchrono.org) by settling the Chrono model under scaled gravity \
+(tools/gen_chrono_vehicle_fixtures.py). The wheel positions are Chrono's static spindle \
+positions in its chassis frame. Aerodynamic drag, steering rate, parking brake, end stops and \
+colliders are estimates (Chrono models none of them)."""
+
+[chassis]
+mass = 2151.362
+com = [0.0576, 0.0, 0.2066]
+inertia = [1102.54, 3143.88, 3775.67]
+drag_area = [1.9, 5.0, 6.0]             # estimate: C_d ≈ 0.55 at 3.4 m²
+
+[steering]
+max_angle = 0.477                       # inner 30.6°, outer 24.1°
+rate = 1.0
+ackermann = 1.0
+
+[[axles]]
+name = "front"
+position = [1.65685, 0.87488, -0.12831]
+steer = 1.0
+wheel = { mass = 56.4, inertia = [4.34, 7.79, 4.34] }
+tire = { tir = { file = "HMMWV_Pac02Tire" } }
+brake = { max_torque = 4000.0 }
+
+[axles.suspension]
+carrier_mass = 49.04
+carrier_inertia = [0.5, 0.5, 0.5]
+damper = { bump = 4581.0, rebound = 4581.0 }
+bump_stop = { travel = 0.10, stiffness = 1.0e6 }
+rebound_stop = { travel = -0.10, stiffness = 1.0e6 }
+
+[axles.suspension.spring]
+travel = [-0.04298, -0.03173, -0.01833, 0.0, 0.01733, 0.03295, 0.04304, 0.05243]
+force = [1364.6, 2727.8, 4093.2, 5458.9, 6826.8, 8196.5, 9568.3, 10939.5]
+
+[axles.suspension.kinematics]
+travel = [-0.04298, -0.03173, -0.01833, 0.0, 0.01733, 0.03295, 0.04304, 0.05243]
+x = [0.00544, 0.00367, 0.00195, 0.0, -0.00159, -0.00288, -0.00368, -0.00438]
+y = [-0.02751, -0.01913, -0.01036, 0.0, 0.00839, 0.01498, 0.01879, 0.02204]
+toe = [-0.04852, -0.03871, -0.03005, -0.02144, -0.01544, -0.01122, -0.00893, -0.00706]
+camber = [0.00371, -0.00471, -0.01137, -0.01639, -0.01806, -0.01761, -0.01653, -0.01499]
+
+[[axles]]
+name = "rear"
+position = [-1.65352, 0.87453, -0.13692]
+wheel = { mass = 56.4, inertia = [4.34, 7.79, 4.34] }
+tire = { tir = { file = "HMMWV_Pac02Tire" } }
+brake = { max_torque = 4000.0, parking_torque = 3000.0 }
+
+[axles.suspension]
+carrier_mass = 49.04
+carrier_inertia = [0.5, 0.5, 0.5]
+damper = { bump = 8447.0, rebound = 8447.0 }
+bump_stop = { travel = 0.10, stiffness = 1.0e6 }
+rebound_stop = { travel = -0.10, stiffness = 1.0e6 }
+
+[axles.suspension.spring]
+travel = [-0.02847, -0.01958, -0.0122, 0.0, 0.0129, 0.02518, 0.03384, 0.04105]
+force = [1279.6, 2551.7, 3824.1, 5096.2, 6365.3, 7632.3, 8900.5, 10169.1]
+
+[axles.suspension.kinematics]
+travel = [-0.02847, -0.01958, -0.0122, 0.0, 0.0129, 0.02518, 0.03384, 0.04105]
+x = [-0.00088, -0.00052, -0.00029, 0.0, 0.00021, 0.00035, 0.00042, 0.00045]
+y = [-0.01589, -0.01052, -0.00635, 0.0, 0.00607, 0.0113, 0.01468, 0.01732]
+toe = [0.0138, 0.01103, 0.00918, 0.00682, 0.00499, 0.00369, 0.00297, 0.00248]
+camber = [-0.04046, -0.04185, -0.04232, -0.04195, -0.04029, -0.03771, -0.03537, -0.03309]
+
+[powertrain]
+type = "combustion"
+driven = [0, 1]
+final_drive = 0.2
+driveline_inertia = 39.3
+axle_differential = "open"
+center_differential = "open"
+
+[powertrain.engine]
+max_rpm = 2600.0
+full_throttle = [[-100, 300], [800, 382], [900, 490], [1000, 579], [1100, 650], [1200, 706],
+    [1300, 746], [1400, 774], [1500, 789], [1600, 793], [1700, 788], [1800, 774], [1900, 754],
+    [2000, 728], [2100, 697], [2200, 664], [2300, 628], [2400, 593], [2500, 558], [2700, -400]]
+zero_throttle = [[-100, 0], [0, 0], [100, 0], [1000, -50], [2000, -70], [3000, -90]]
+
+[powertrain.gearbox]
+forward = [0.1708, 0.2791, 0.4218, 0.6223, 1.0173, 1.5361]
+reverse = -0.151
+shift = [[1000, 2226], [1000, 2225], [1000, 2210], [1000, 2226], [1000, 2225], [1000, 2700]]
+
+# Belly, bumpers and roof (ground at z ≈ −0.59).
+[[colliders]]
+center = [0.8, 0.0, 0.12]
+radius = 0.3
+
+[[colliders]]
+center = [-0.8, 0.0, 0.12]
+radius = 0.3
+
+[[colliders]]
+center = [2.25, 0.0, 0.36]
+radius = 0.35
+
+[[colliders]]
+center = [-2.25, 0.0, 0.36]
+radius = 0.35
+
+[[colliders]]
+center = [-0.3, 0.5, 0.79]
+radius = 0.45
+
+[[colliders]]
+center = [-0.3, -0.5, 0.79]
+radius = 0.45

@@ -47,7 +47,7 @@ impl Body {
     }
 
     fn sphere(mass: f64, radius: f64, contact: ContactModel, pos: DVec3) -> Self {
-        let c = SphereCollider { link: 0, center: DVec3::ZERO, radius, group: 0 };
+        let c = SphereCollider::new(0, DVec3::ZERO, radius, 0);
         Self::new(RigidInertia::sphere(mass, radius), vec![c], contact, Pose::from_translation(pos))
     }
 
@@ -159,12 +159,8 @@ fn restitution_matches_damping_ratio() {
 fn box_on_incline(theta: f64) -> (Body, PlaneTerrain, DVec3) {
     let m = 2.0;
     let ground = PlaneTerrain::incline(theta, MaterialId::GRASS);
-    let feet = [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)].map(|(x, y)| SphereCollider {
-        link: 0,
-        center: DVec3::new(0.18 * x, 0.18 * y, -0.05),
-        radius: 0.02,
-        group: 0,
-    });
+    let feet = [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
+        .map(|(x, y)| SphereCollider::new(0, DVec3::new(0.18 * x, 0.18 * y, -0.05), 0.02, 0));
     let rot = DQuat::from_rotation_y(-theta);
     let n = rot * DVec3::Z;
     let body = Body::new(

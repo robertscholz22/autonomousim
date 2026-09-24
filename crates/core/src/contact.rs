@@ -30,6 +30,20 @@ pub struct SphereCollider {
     /// Free-form group for event classification (e.g. landing gear vs. airframe).
     #[serde(default)]
     pub group: u8,
+    /// Multiplies the friction coefficient (0 for a frictionless skid or caster ball).
+    #[serde(default = "one")]
+    pub friction: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+impl SphereCollider {
+    /// A collider with full friction.
+    pub fn new(link: usize, center: DVec3, radius: f64, group: u8) -> Self {
+        Self { link, center, radius, group, friction: 1.0 }
+    }
 }
 
 /// Spring–damper constants of one contact class (before material scaling).
@@ -222,7 +236,7 @@ pub fn compute_contacts(
                 let base = if matches!(sp.kind, HitKind::Foliage(_)) { &model.foliage } else { &model.solid };
                 let material = scene.materials.get(sp.material);
                 let params = base.scaled(material.stiffness_scale);
-                let mu = material.friction * params.friction_scale;
+                let mu = material.friction * params.friction_scale * c.friction;
 
                 let n = sp.normal;
                 let p_link = pose.inverse_transform_point(sp.point);

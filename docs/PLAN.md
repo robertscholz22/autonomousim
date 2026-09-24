@@ -665,7 +665,7 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - **Contact**: a single contact point on the local road plane, fitted from 4 terrain samples around the patch (the envelope approach of Chrono and MF). Vertical force comes from the tire's stiffness and damping over the loaded radius (MF vertical stiffness with `Fz ≥ 0`). The effective rolling radius follows MF. In water, the tire gets drag and loses friction.
   - **Fiala** (brush model) for small robot tires that have no MF data.
 - **Parameter data**: Chrono's data directory (BSD-3) has `.tir` files and complete reference vehicles (Sedan, HMMWV). The M2 presets reuse their published numbers with attribution:
-  - `sedan_like`: front-wheel drive, the on-road reference for the ISO tests.
+  - `sedan_like`: the on-road reference for the ISO tests (Chrono's Sedan turned out to be rear-wheel drive; see step 3).
   - `offroad_4x4`: HMMWV-like, the demo vehicle.
   - `rover_diff`: a small diff-drive robot, about 17 kg, Clearpath-Jackal-like.
   - `rover_skid`: a four-wheel skid-steer robot, about 50 kg, Husky-like.
@@ -741,6 +741,57 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
 - **Performance** (`benches/tire.rs`):
   - MF eval: 148 ns for the Sedan file, 232 ns for the HMMWV file. The HMMWV file uses every term group (curvature E, RVY, REX/REY), which costs about 31 libm calls. Exact shortcuts for zero coefficients (E = 0, SV_yκ = 0, Mx groups) and `cos∘atan`, `sin(2 atan)` identities brought these down from 245 and 300 ns. Cheaper approximations would give up the exact oracle match, so they were not used.
   - Full tyre step on a height grid (road-plane fit, load, transient slip, MF, wrench): 336 and 425 ns.
+
+**As built in step 3** (`vehicles::ground::{def, powertrain, wheeled}`, `assets/vehicles/*.toml`):
+- **Definition** (`type = "wheeled"`, `WheeledDef`):
+  - The sprung chassis (mass, COM, inertia, drag area per axis).
+  - 1–4 axles, each listing its left wheel; the right wheel mirrors y, toe and camber. Wheels are numbered `2·axle + side`.
+  - Optional steering (bicycle angle at full lock, rate limit, Ackermann fraction); a powertrain; sphere colliders (`body` or frictionless `skid` casters).
+  - Suspension per axle, or none (rigid robots):
+    - a `KcTravel` table (spindle x/y offsets, toe, camber over travel) and a carrier mass;
+    - a spring as a rate plus preload or as a force table;
+    - bilinear damper, linear bump and rebound stops, an anti-roll rate.
+  - Tyres are a `.tir` file (built-in names or a path) or Fiala parameters.
+- **Automatic preload**: when a rate spring has no preload, `finish()` solves the two-axle statics and preloads each spring so it carries its static load at zero travel. The design positions are then the static ride height.
+- **Static solver**: `static_state(g)` solves the statics; it iterates the attitude against the loads by levers, the tyre deflections, the travels and a Gauss–Newton fit of height, pitch and roll.
+- **Tree**: chassis (Free) → carrier (`KcTravel`, if sprung) → massless knuckle (Revolute z, prescribed, if steered) → wheel (Revolute y). The Sedan has 16 DoF: 6 + 4 + 2 + 4, with the 2 knuckle joints prescribed.
+- **Steering**: the rate-limited bicycle angle becomes per-wheel angles by Ackermann blending about the mean unsteered axle. The knuckle joints follow as prescribed trajectories with `q̈ = ((target − q)/dt − q̇)/dt`, and their torques are reported.
+- **Brakes, locked and limited-slip differentials, chain drives**: all are one torsional "bristle" coupling. It is a spring–damper on the integrated relative rotation (stiffness and damping from the coupled inertia and dt: ω = 0.3/dt, ζ = 0.7), with its torque capped at the capacity. A braked wheel therefore holds without creep and a slipping one feels exactly its capacity. This replaces the planned regularised friction.
+- **Combustion powertrain**: Chrono's SimpleMap model.
+  - Engine speed follows the driveline algebraically.
+  - Torque blends the zero- and full-throttle maps in throttle, with a fuel cut above `max_rpm`.
+  - Automatic up- and downshift at fixed engine speeds per gear, with an optional torque gap.
+  - Fixed-share open differentials, the axle split as the centre differential, and driveline inertia lumped onto the driven wheels.
+  - The clutch, torque converter and engine inertia were deferred.
+- **Electric powertrain**: motors per axle, side or wheel, with a torque and power limit and a first-order lag. With `no_load_speed`, a motor is a voltage-commanded DC motor: stall torque falls linearly to zero at the commanded fraction of the no-load speed, and back-EMF brakes it. `DriveInput::yaw` mixes into left and right motors.
+- **Presets**:
+  - `sedan_like` and `offroad_4x4` come from Chrono's Sedan and HMMWV_Vehicle_4WD (BSD-3, attributed in `source`). `tools/gen_chrono_vehicle_fixtures.py` settles each Chrono model under gravity scaled 0.25–2×. From that sweep we take:
+    - the spindle paths, toe and camber over travel;
+    - the wheel rates (Sedan) and the spring force tables (HMMWV);
+    - the masses, damper rates at the wheel, engine maps, gears and shift points.
+  - The wheel positions are Chrono's static spindles in its chassis frame, so the Sedan rests pitched 2.6° nose-down as Chrono's does.
+  - Chrono's Sedan is **rear**-wheel drive, not front-wheel drive as planned.
+  - `rover_skid` (Husky A200 dimensions) and `rover_diff` (Jackal-sized) use Fiala tyres and DC motors; the diff-drive robot has frictionless casters.
+  - Aero drag, steering rate, parking brakes, end stops and colliders are estimates.
+- **Tests** (`tests/ground_vehicle.rs`, fixtures `fixtures/chrono/vehicle_{sedan,hmmwv}.json`, regenerated by `make fixtures-chrono`):
+  - **Settled state**: the simulation settles on the definition's static state (loads 0.5 %, height 0.5 mm, pitch 2e-4, travel 0.2 mm; zero travel with automatic preload).
+  - **Statics vs Chrono**: ride height within 2 mm, pitch within 1e-3, axle loads within 0.5 %. Actual agreement: Sedan 0.2309 m and 0.0456 rad, the same as Chrono.
+  - **30 % slope**: braked (the Husky on its parking brake), facing uphill and downhill, the Sedan, 4×4 and Husky creep < 0.1 mm in 5 s. Released, they roll away.
+  - **0–100 km/h vs Chrono**: Sedan 6.4 s (Chrono 6.05 s), 4×4 9.4 s (Chrono 8.9 s). Speeds at 5, 10 and 15 s are within 8 %.
+    - The deficit comes entirely from the launch. With no clutch in either model, the engine's rising torque curve drives the transient tyre's lightly damped wheel mode, so the rear wheels spin up more than Chrono's quasi-steady tyres do. Afterwards the accelerations agree.
+    - Beyond about 15 s Chrono keeps its map torque at the engine speed limit, while we cut fuel.
+  - **Coast-down vs Chrono**: 30 s in gear from Chrono's speed and gear. Sedan 16.42 m/s against Chrono's 16.42 m/s; 4×4 12.92 against 13.13 m/s; distances within 1 %. Both runs use zero rolling resistance, because Chrono's Pac02 has none without QSY coefficients.
+  - **Braking**: the Sedan's stopping distance is within 5 % of Chrono's. The 4×4 needs 34 m against Chrono's 24 m: its wheels lock, and our Pac02 (exact against MFeval) falls to μ ≈ 0.55 at locked wheels, while Chrono's keeps about 0.9. So the step-7 braking criterion applies to the Sedan only.
+  - **Robots**: the robots drive straight at their top speed (diff 1.77 m/s, skid 1.18 m/s), turn on the spot counter-clockwise, and stop on back-EMF.
+  - **Steering**: HMMWV full-lock angles 30.6°/24.1° as in Chrono.
+- **Fix found by the tests**: `rest()` gave the initial velocity along the pitched chassis x axis, which dropped the Sedan onto its bump stops at speed. It now follows the heading.
+- **Cost**: one car tick (4 MF tyres, 16 DoF, powertrain, no controller) takes 3.6–4.0 µs (release); a Husky tick 1.5 µs.
+- **Follow-ups**:
+  - Clutch and torque-converter launch; this also cures the launch wheel-hop.
+  - Engine inertia.
+  - Caster and upright pitch in the kinematics tables, for anti-dive and anti-squat.
+  - Stiff Chrono Sedan springs (3 Hz ride) lift the rear wheels briefly under full braking.
+  - `sim`/scenario support (step 6); scenarios reject wheeled vehicles until then.
 
 ### Performance targets (i7-1365U, release)
 | Metric | Target |

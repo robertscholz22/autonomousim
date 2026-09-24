@@ -1,0 +1,91 @@
+# 50 kg four-wheel skid-steer field robot after the Clearpath Husky A200.
+type = "wheeled"
+name = "rover_skid"
+source = """
+Mass, wheel size, track, wheelbase, ground clearance and top speed (1.0 m/s) from Clearpath's \
+published Husky A200 specifications; the chassis frame origin is midway between the wheel \
+centres. Inertias, tyre (Fiala) parameters and motor constants are estimates chosen to match \
+the top speed and to let the robot turn on the spot on asphalt."""
+
+[chassis]
+mass = 42.0
+com = [0.0, 0.0, 0.06]
+inertia = [2.1, 3.96, 5.0]
+drag_area = [0.2, 0.2, 0.4]
+
+[[axles]]
+name = "front"
+position = [0.256, 0.2775, 0.0]
+wheel = { mass = 2.0, inertia = [0.016, 0.03, 0.016] }
+brake = { max_torque = 60.0, parking_torque = 60.0 }
+
+[axles.tire.fiala]
+radius = 0.165
+width = 0.1
+vertical_stiffness = 2.0e4
+vertical_damping = 100.0
+slip_stiffness = 1200.0
+cornering_stiffness = 800.0
+mu = 0.9
+nominal_load = 125.0
+relaxation_x = 0.05
+relaxation_y = 0.08
+
+[[axles]]
+name = "rear"
+position = [-0.256, 0.2775, 0.0]
+wheel = { mass = 2.0, inertia = [0.016, 0.03, 0.016] }
+brake = { max_torque = 60.0, parking_torque = 60.0 }
+
+[axles.tire.fiala]
+radius = 0.165
+width = 0.1
+vertical_stiffness = 2.0e4
+vertical_damping = 100.0
+slip_stiffness = 1200.0
+cornering_stiffness = 800.0
+mu = 0.9
+nominal_load = 125.0
+relaxation_x = 0.05
+relaxation_y = 0.08
+
+# One DC motor per side, chained to both wheels of that side.
+[powertrain]
+type = "electric"
+
+[[powertrain.motors]]
+wheels = [0, 2]
+side = "left"
+max_torque = 1.5                        # stall
+max_power = 400.0
+ratio = 0.02
+no_load_speed = 364.0                   # 1.2 m/s unloaded
+time_constant = 0.02
+coupling = "locked"
+
+[[powertrain.motors]]
+wheels = [1, 3]
+side = "right"
+max_torque = 1.5
+max_power = 400.0
+ratio = 0.02
+no_load_speed = 364.0
+time_constant = 0.02
+coupling = "locked"
+
+# Belly and bumpers (ground at z ≈ −0.16; 0.13 m clearance).
+[[colliders]]
+center = [0.2, 0.0, 0.07]
+radius = 0.1
+
+[[colliders]]
+center = [-0.2, 0.0, 0.07]
+radius = 0.1
+
+[[colliders]]
+center = [0.42, 0.0, 0.08]
+radius = 0.1
+
+[[colliders]]
+center = [-0.42, 0.0, 0.08]
+radius = 0.1

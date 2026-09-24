@@ -72,14 +72,12 @@ fn queries(c: &mut Criterion) {
     let mut model = MultibodyModel::new();
     model.add_link("body", None, JointType::Free, Pose::IDENTITY, RigidInertia::cuboid(1.5, DVec3::new(0.3, 0.3, 0.1)));
     let mut colliders: Vec<SphereCollider> = [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
-        .map(|(x, y)| SphereCollider { link: 0, center: DVec3::new(0.1 * x, 0.1 * y, -0.1), radius: 0.02, group: 0 })
+        .map(|(x, y)| SphereCollider::new(0, DVec3::new(0.1 * x, 0.1 * y, -0.1), 0.02, 0))
         .to_vec();
-    colliders.extend([(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)].map(|(x, y)| SphereCollider {
-        link: 0,
-        center: DVec3::new(0.25 * x, 0.25 * y, 0.0),
-        radius: 0.08,
-        group: 1,
-    }));
+    colliders.extend(
+        [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+            .map(|(x, y)| SphereCollider::new(0, DVec3::new(0.25 * x, 0.25 * y, 0.0), 0.08, 1)),
+    );
     let contact = ContactModel::for_mass(1.5 / 4.0, 0.002);
     let scene = StaticScene { terrain: world.terrain(), obstacles: world.obstacles(), materials: world.materials() };
     let (mut cache, mut scratch, mut out) =

@@ -1,0 +1,114 @@
+# Mid-size rear-wheel-drive sedan after the Chrono::Vehicle "Sedan" model (double wishbones,
+# SimpleMap engine and 6-speed automatic, Pacejka 2002 tyres).
+type = "wheeled"
+name = "sedan_like"
+source = """
+Masses, inertias, suspension kinematics (spindle path, toe and camber over travel), wheel \
+rates, dampers, brakes, steering lock, engine maps, gear ratios and shift points derived from \
+Project Chrono's data/vehicle/sedan (BSD-3-Clause, Copyright (c) 2014 projectchrono.org) by \
+settling the Chrono model under scaled gravity (tools/gen_chrono_vehicle_fixtures.py). The \
+chassis frame is Chrono's: the wheel positions are its static spindle positions, so the \
+chassis sits pitched ~2.6° nose-down at rest, as in Chrono. Aerodynamic drag, steering rate, \
+parking brake, end stops and colliders are estimates (Chrono models none of them)."""
+
+[chassis]
+mass = 1557.175
+com = [0.0013, 0.0, 0.6971]
+inertia = [227.91, 960.06, 1068.51]
+drag_area = [0.65, 2.5, 3.0]            # estimate: C_d ≈ 0.30 at 2.2 m²
+
+[steering]
+max_angle = 0.61                        # ≈ 35° at the wheels, parallel steer
+rate = 1.2
+ackermann = 0.0
+
+[[axles]]
+name = "front"
+position = [1.38758, 0.79905, 0.16164]
+steer = 1.0
+wheel = { mass = 24.7, inertia = [0.396, 1.499, 0.396] }
+tire = { tir = { file = "Sedan_Pac02Tire" } }
+brake = { max_torque = 2000.0 }
+
+[axles.suspension]
+carrier_mass = 3.8215
+carrier_inertia = [0.02, 0.02, 0.02]
+spring = { rate = 136336.0 }            # preload: carries the static load at zero travel
+damper = { bump = 2722.0, rebound = 2722.0 }
+bump_stop = { travel = 0.08, stiffness = 5.0e5 }
+rebound_stop = { travel = -0.08, stiffness = 5.0e5 }
+
+[axles.suspension.kinematics]
+travel = [-0.02156, -0.01429, -0.00722, 0.0, 0.00722, 0.01447, 0.02163, 0.02886]
+x = [0.00032, 0.00023, 0.00012, 0.0, -0.00014, -0.0003, -0.00048, -0.00067]
+y = [-0.00039, -9e-05, 4e-05, 0.0, -0.00023, -0.00064, -0.00121, -0.00199]
+toe = [0.00596, 0.00991, 0.01346, 0.0168, 0.01984, 0.0226, 0.02505, 0.02722]
+camber = [0.00344, 0.00617, 0.00889, 0.01179, 0.0148, 0.01797, 0.02115, 0.02459]
+
+[[axles]]
+name = "rear"
+position = [-1.3884, 0.79908, 0.03548]
+wheel = { mass = 24.7, inertia = [0.396, 1.499, 0.396] }
+tire = { tir = { file = "Sedan_Pac02Tire" } }
+brake = { max_torque = 2000.0, parking_torque = 1500.0 }
+
+[axles.suspension]
+carrier_mass = 3.8215
+carrier_inertia = [0.02, 0.02, 0.02]
+spring = { rate = 136307.0 }
+damper = { bump = 2721.0, rebound = 2721.0 }
+bump_stop = { travel = 0.08, stiffness = 5.0e5 }
+rebound_stop = { travel = -0.08, stiffness = 5.0e5 }
+
+[axles.suspension.kinematics]
+travel = [-0.0207, -0.01372, -0.00693, 0.0, 0.00693, 0.01389, 0.02077, 0.02768]
+x = [0.0003, 0.00022, 0.00012, 0.0, -0.00013, -0.00028, -0.00045, -0.00062]
+y = [-0.00045, -0.00014, 2e-05, 0.0, -0.00019, -0.00054, -0.00106, -0.00175]
+toe = [0.00579, 0.0096, 0.01306, 0.0163, 0.01927, 0.02198, 0.02439, 0.02656]
+camber = [0.00333, 0.00596, 0.00848, 0.01124, 0.01411, 0.01712, 0.02021, 0.02346]
+
+[powertrain]
+type = "combustion"
+driven = [1]
+final_drive = 0.2
+driveline_inertia = 13.1                # driveshaft and differential, referred to the wheels
+axle_differential = "open"
+
+[powertrain.engine]
+max_rpm = 6500.0
+full_throttle = [[-10, 104.64], [1000, 236.8], [1200, 296], [1400, 338.3], [1500, 355.2],
+    [1600, 370], [2000, 370], [2500, 370], [3000, 370], [3500, 370], [4000, 370], [4500, 370],
+    [4600, 369.3], [4800, 364], [5000, 353.3], [5200, 339.7], [5500, 321.2], [5700, 309.9],
+    [6000, 294.4], [6200, 280.4], [6500, 244.6]]
+zero_throttle = [[-10, 0], [10, 0], [1000, -10], [1500, -10], [2000, -15], [2500, -15],
+    [3000, -15], [3500, -20], [4000, -20], [4500, -30], [5000, -50], [6000, -70], [6500, -100]]
+
+[powertrain.gearbox]
+forward = [0.265, 0.489, 0.784, 1.063, 1.276, 1.499]
+reverse = -0.333
+shift = [[1000, 4000], [1200, 4500], [1400, 4500], [1600, 4500], [1800, 4500], [2000, 4500]]
+
+# Belly, bumpers and roof (the chassis frame is pitched: the ground is at z ≈ −0.231 + 0.046·x).
+[[colliders]]
+center = [0.7, 0.0, 0.13]
+radius = 0.2
+
+[[colliders]]
+center = [-0.7, 0.0, 0.07]
+radius = 0.2
+
+[[colliders]]
+center = [2.05, 0.0, 0.30]
+radius = 0.25
+
+[[colliders]]
+center = [-2.05, 0.0, 0.13]
+radius = 0.25
+
+[[colliders]]
+center = [-0.2, 0.4, 0.81]
+radius = 0.4
+
+[[colliders]]
+center = [-0.2, -0.4, 0.81]
+radius = 0.4

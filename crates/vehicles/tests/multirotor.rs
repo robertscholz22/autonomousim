@@ -31,7 +31,10 @@ fn hover_at(q: &mut Multirotor, z: f64, density: f64) -> f64 {
 
 #[test]
 fn presets_load_with_documented_numbers() {
-    assert_eq!(presets::names().collect::<Vec<_>>(), ["cf2x", "iris_like"]);
+    assert_eq!(
+        presets::names().collect::<Vec<_>>(),
+        ["cf2x", "iris_like", "sedan_like", "offroad_4x4", "rover_diff", "rover_skid"]
+    );
     let cf = presets::multirotor("cf2x").unwrap();
     assert!((cf.hover_omega(G, 1.225) - 1515.64).abs() < 0.1);
     assert!((cf.thrust_to_weight(G) - 2.25).abs() < 1e-3);
@@ -54,7 +57,7 @@ fn definitions_are_validated() {
     assert!(matches!(VehicleDef::from_toml(&src.replace("tau_up", "tau_upp")), Err(VehicleError::Parse(_))));
     assert!(VehicleDef::from_toml(&src.replace("omega_max = 2273.5", "omega_max = 0.0")).is_err());
     let tilted = src.replacen("spin = \"ccw\"", "spin = \"ccw\"\naxis = [0.0, 0.2, 2.0]", 1);
-    let VehicleDef::Multirotor(m) = VehicleDef::from_toml(&tilted).unwrap();
+    let VehicleDef::Multirotor(m) = VehicleDef::from_toml(&tilted).unwrap() else { panic!("not a multirotor") };
     assert!((m.rotors[0].axis.length() - 1.0).abs() < 1e-15);
 }
 
