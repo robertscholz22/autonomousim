@@ -256,18 +256,35 @@ fn sgn(x: f64) -> f64 {
     if x >= 0.0 { 1.0 } else { -1.0 }
 }
 
+/// `B x − E (B x − atan(B x))`, skipping the inner `atan` when `E = 0` (common in files).
+#[inline]
+fn shape(b: f64, e: f64, x: f64) -> f64 {
+    let bx = b * x;
+    if e == 0.0 { bx } else { bx - e * (bx - bx.atan()) }
+}
+
 /// `D sin(C atan(B x − E (B x − atan(B x))))`.
 #[inline]
 fn magic(b: f64, c: f64, d: f64, e: f64, x: f64) -> f64 {
-    let bx = b * x;
-    d * (c * (bx - e * (bx - bx.atan())).atan()).sin()
+    d * (c * shape(b, e, x).atan()).sin()
 }
 
 /// `cos(C atan(B x − E (B x − atan(B x))))` (the combined-slip weighting shape).
 #[inline]
 fn weight(b: f64, c: f64, e: f64, x: f64) -> f64 {
-    let bx = b * x;
-    (c * (bx - e * (bx - bx.atan())).atan()).cos()
+    (c * shape(b, e, x).atan()).cos()
+}
+
+/// `cos(atan(x))`.
+#[inline]
+fn cos_atan(x: f64) -> f64 {
+    1.0 / (1.0 + x * x).sqrt()
+}
+
+/// `sin(2 atan(x))`.
+#[inline]
+fn sin_2atan(x: f64) -> f64 {
+    2.0 * x / (1.0 + x * x)
 }
 
 /// Pure lateral-force curve (4.E19–4.E30).
@@ -303,12 +320,9 @@ impl MfParams {
 
     fn lateral(&self, fz: f64, dfz: f64, dpi: f64, gs: f64, lmuy: f64) -> LateralCurve {
         let fz0p = self.lfzo * self.fnomin;
-        let kya = self.pky1
-            * fz0p
-            * (1.0 + self.ppy1 * dpi)
-            * (1.0 - self.pky3 * gs.abs())
-            * (self.pky4 * ((fz / fz0p) / ((self.pky2 + self.pky5 * gs * gs) * (1.0 + self.ppy2 * dpi))).atan()).sin()
-            * self.lky;
+        let x = (fz / fz0p) / ((self.pky2 + self.pky5 * gs * gs) * (1.0 + self.ppy2 * dpi));
+        let shape = if self.pky4 == 2.0 { sin_2atan(x) } else { (self.pky4 * x.atan()).sin() };
+        let kya = self.pky1 * fz0p * (1.0 + self.ppy1 * dpi) * (1.0 - self.pky3 * gs.abs()) * shape * self.lky;
         let svyg = fz * (self.pvy3 + self.pvy4 * dfz) * gs * self.lkyc * lmuy;
         let shy = match self.version {
             MfVersion::V52 => (self.phy1 + self.phy2 * dfz) * self.lhy + self.phy3 * gs * self.lkyc,
@@ -365,7 +379,7 @@ impl MfParams {
         let dx = mux * fz;
         let kxk = fz
             * (self.pkx1 + self.pkx2 * dfz)
-            * (self.pkx3 * dfz).exp()
+            * if self.pkx3 == 0.0 { 1.0 } else { (self.pkx3 * dfz).exp() }
             * (1.0 + self.ppx1 * dpi + self.ppx2 * dpi * dpi)
             * self.lkx;
         let bx = kxk / (cx * dx + EPS * sgn(dx));
@@ -382,15 +396,15 @@ impl MfParams {
 
         // Combined slip (4.E50–4.E67).
         let exa = (self.rex1 + self.rex2 * dfz).min(1.0);
-        let bxa = (self.rbx1 + self.rbx3 * gs * gs) * (self.rbx2 * kappa).atan().cos() * self.lxal;
+        let bxa = (self.rbx1 + self.rbx3 * gs * gs) * cos_atan(self.rbx2 * kappa) * self.lxal;
         let gxa = weight(bxa, self.rcx1, exa, a + self.rhx1) / weight(bxa, self.rcx1, exa, self.rhx1);
         let fx = gxa * fx0;
 
-        let dvyk = lat.muy * fz * (self.rvy1 + self.rvy2 * dfz + self.rvy3 * gs) * (self.rvy4 * a).atan().cos();
-        let svyk = dvyk * (self.rvy5 * (self.rvy6 * kappa).atan()).sin() * self.lvyka;
+        let dvyk = lat.muy * fz * (self.rvy1 + self.rvy2 * dfz + self.rvy3 * gs) * cos_atan(self.rvy4 * a);
+        let svyk = if dvyk == 0.0 { 0.0 } else { dvyk * (self.rvy5 * (self.rvy6 * kappa).atan()).sin() * self.lvyka };
         let shyk = self.rhy1 + self.rhy2 * dfz;
         let eyk = (self.rey1 + self.rey2 * dfz).min(1.0);
-        let byk = (self.rby1 + self.rby4 * gs * gs) * (self.rby2 * (a - self.rby3)).atan().cos() * self.lyka;
+        let byk = (self.rby1 + self.rby4 * gs * gs) * cos_atan(self.rby2 * (a - self.rby3)) * self.lyka;
         let gyk = weight(byk, self.rcy1, eyk, kappa + shyk) / weight(byk, self.rcy1, eyk, shyk);
         let fy = gyk * fy0 + svyk;
 
@@ -426,7 +440,7 @@ impl MfParams {
         let equivalent = |x: f64| (x.tan().powi(2) + k2).sqrt().atan() * sgn(x);
         let (ar_eq, at_eq) = (equivalent(alpha_r), equivalent(alpha_t));
         let s = r0 * (self.ssz1 + self.ssz2 * (fy / fz0) + (self.ssz3 + self.ssz4 * dfz) * g) * self.ls;
-        let mzr = dr * (br * ar_eq).atan().cos();
+        let mzr = dr * cos_atan(br * ar_eq);
         let trail = dt * weight(bt, ct, et, at_eq) * inp.cos_alpha * self.lfzo;
         let mz = match self.version {
             MfVersion::V52 => -trail * (fy - svyk) + mzr + s * fx,
@@ -445,10 +459,14 @@ impl MfParams {
             * self.lmx
             * (self.qsx1 * self.lvmx - self.qsx2 * g * (1.0 + self.ppmx1 * dpi)
                 + self.qsx3 * (fy / fz0)
-                + self.qsx4
-                    * (self.qsx5 * (self.qsx6 * fz_mx / fz0).powi(2).atan()).cos()
-                    * (self.qsx7 * g + self.qsx8 * (self.qsx9 * fy / fz0).atan()).sin()
-                + self.qsx10 * (self.qsx11 * fz_mx / fz0).atan() * g)
+                + if self.qsx4 == 0.0 {
+                    0.0
+                } else {
+                    self.qsx4
+                        * (self.qsx5 * (self.qsx6 * fz_mx / fz0).powi(2).atan()).cos()
+                        * (self.qsx7 * g + self.qsx8 * (self.qsx9 * fy / fz0).atan()).sin()
+                }
+                + if self.qsx10 == 0.0 { 0.0 } else { self.qsx10 * (self.qsx11 * fz_mx / fz0).atan() * g })
             + r0 * self.lmx * (fy * (self.qsx13 + self.qsx14 * g.abs()) - fz_mx * self.qsx12 * g * g.abs());
         let fz_my = if fz < fzmin { fz * (fz / fzmin) } else { fz };
         let v = inp.vx.abs() / self.longvl;
@@ -476,7 +494,7 @@ impl MfParams {
             MfVersion::V52 => (
                 (self.ptx1 + self.ptx2 * dfz) * (-self.ptx3 * dfz).exp() * self.lsgkp * r0 * fz / self.fnomin,
                 self.pty1
-                    * (2.0 * (fz / (self.pty2 * fz0p)).atan()).sin()
+                    * sin_2atan(fz / (self.pty2 * fz0p))
                     * (1.0 - self.pky3 * gamma.abs())
                     * r0
                     * self.lfzo

@@ -704,7 +704,7 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
 - micromamba 2.9 in `~/.local/bin`, environment `chrono` (`MAMBA_ROOT_PREFIX=~/.local/share/micromamba`) with Python 3.12 and PyChrono **10.0.0** from the `projectchrono` channel. It takes 5.7 GB after `micromamba clean -a`.
 - Chrono 10 has no MF 6.x tire. Its Magic Formula tire is `ChPac02Tire` (MF 5.2 equations, `.tir` input), next to TMeasy, Fiala and Pac89. All 15 `.tir` files in its data directory are MF 5.x. Among them: `hmmwv/tire/HMMWV_Pac02Tire.tir` (the demo 4×4), `sedan/tire/Sedan_Pac02Tire.tir`, and a Goodyear 335/65R22.5 fitted at four pressures.
 - Consequence for step 2: the tire code implements MF 5.2 and MF 6.1 behind the `.tir` version, as MFeval does. MF 5.2 is checked against `ChPac02Tire`. The 6.1-only terms (pressure, some camber and turn-slip terms) are checked analytically and by reduction to 5.2.
-- The fixture generator (`tools/gen_chrono_fixtures.py`) comes with steps 2 and 7.
+- The fixture generator `tools/gen_chrono_fixtures.py` (`make fixtures-chrono`) came with step 2 (tyre sweeps); the Sedan step-steer run follows in step 7.
 
 **As built in step 1** (`core`):
 - `math::spline::CubicSpline`: a natural cubic spline, continued linearly past the end knots, returning the value and both derivatives.
@@ -717,6 +717,30 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - A vertical table equals a prismatic joint (to 1e-12).
   - A chain of two `KcTravel` joints and a revolute conserves energy under gravity to 3.5e-9 relative with RK4 at 25 µs. Without `c_J` the same run diverges.
 - **Auxiliary states** (motor, engine, rack, tire relaxation) stay in the vehicle models, which step them after the multibody update, as the multirotor does with its motors. A generic aux vector in the core integrator was not needed.
+
+
+**As built in step 2** (`vehicles::ground::tire`):
+- **`.tir` reader** (`tir.rs`): sections, `$`/`!` comments, quoted strings, Fortran exponents; SI units only (anything else is rejected, not converted).
+- **Magic Formula** (`mf.rs`): MF 5.2/PAC2002 (FITTYP 5, 6, 21) and MF 6.1/6.2 (61, 62) behind `MfVersion`, following MFeval's equations and corrections: pure and combined Fx, Fy, Mz, plus Mx, My, relaxation lengths, effective rolling radius, vertical force and contact length. Turn slip and MFeval's input limits are left out. The MF 5.2 camber scalings LGAX/LGAY/LGAZ/LKG must be 1.
+- **Oracles** (outside the repo, fixtures committed):
+  - **MFeval.jl** (MIT; `~/.local/share/autonomousim-oracles/MFeval_julia` with the official Julia 1.13 tarball, about 1.1 GB plus 130 MB in `~/.julia`; `make fixtures-mfeval`). useMode 221, 682 points per tyre (random load, slip, angle, camber, pressure, plus sweeps), on the MF 5.2 and 6.1 sample tyres and the two presets. The oracle reads canonical `.tir` files written by our parser (`examples/tir_canonical.rs`), so its defaults for missing keys play no part. All outputs agree to about 1e-15 of peak (trail and Mz to 1e-7, from MFeval's ε in cos α′). Re and contact length are skipped for files with LCZ ≠ 1, which MFeval ignores.
+  - **Chrono `ChPac02Tire`** (`make fixtures-chrono`): pure κ, pure α and combined sweeps at 0.5, 1 and 1.5 × F_z0 on the HMMWV and Sedan files, evaluated at Chrono's own slip quantities. Agreement is 1e-6 to 1e-5 of peak (the test bounds it at 1e-4; the plan asked for 1 %) wherever Chrono's pure-slip curves are not clamped. Chrono's deviations from MF 5.2, documented in the generator: γ is never passed on; B·x is clamped to ±(π/2 − 0.01); the trail lacks the LFZO factor; +0.1 in the stiffness denominators; its combined mode takes the equivalent trail angle's sign from κ. The sweeps therefore use USE_MODE 3 and USE_MODE 4 with FE_METHOD 'NO'.
+- **Fiala** (`fiala.rs`, TOML): an isotropic brush with a parabolic pressure distribution under combined slip, `F = μF_z(3z − 3z² + z³)` along the slip demand, with trail `(a/3)(1 − z)³/(1 − z + z²/3)`. Unit tests check the slip and cornering stiffness, saturation, the friction circle and the brush aligning moment.
+- **Road contact** (`road.rs`): terrain samples ahead, behind and to both sides (±0.3 R, ± half width) define the road plane; the contact point is where the wheel plane meets it; the loaded radius is measured in the wheel plane.
+- **Force element** (`model.rs`, `Tire::step`):
+  - F_z comes from MF vertical stiffness (plus MF 6.x bottoming) or linear stiffness, with damping, and F_z ≥ 0.
+  - Transient slip uses carcass deflections `u` and `v` (Pacejka §7.2). Their decay term is implicit, and the relaxation lengths lag by one tick.
+  - The MF 6.1 low-speed damping `k_Vlow` acts below VXLOW. By default `k_Vlow0` gives damping ratio 0.25 for the nominal corner mass on the standstill carcass spring, which keeps the wheel-spin mode stable at 1 ms explicit steps.
+  - Surface friction scales λ_μ as material μ / 0.8 (asphalt). Rolling resistance scales My by the material coefficient / 0.013. Files without QSY coefficients (the Sedan) use 0.013 · F_z · R0.
+  - My changes sign with the wheel's rolling direction, smoothed over ±0.05 m/s.
+- **Dynamic tests** (`tests/tire_dynamics.rs`, one corner mass with a wheel; Sedan, HMMWV and a robot Fiala tyre):
+  - Transient slip settles on the steady state (1e-9).
+  - Side-slip relaxation is first order in distance, independent of speed (3 and 25 m/s).
+  - A braked wheel on a 20° slope, facing uphill or across it, creeps 0.3–1.2 µm over 8 s at speeds below 1.1e-4 m/s.
+  - Free rolling decelerates exactly at the rolling-resistance rate.
+- **Performance** (`benches/tire.rs`):
+  - MF eval: 148 ns for the Sedan file, 232 ns for the HMMWV file. The HMMWV file uses every term group (curvature E, RVY, REX/REY), which costs about 31 libm calls. Exact shortcuts for zero coefficients (E = 0, SV_yκ = 0, Mx groups) and `cos∘atan`, `sin(2 atan)` identities brought these down from 245 and 300 ns. Cheaper approximations would give up the exact oracle match, so they were not used.
+  - Full tyre step on a height grid (road-plane fit, load, transient slip, MF, wrench): 336 and 425 ns.
 
 ### Performance targets (i7-1365U, release)
 | Metric | Target |

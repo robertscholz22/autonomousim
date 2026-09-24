@@ -23,5 +23,9 @@ criterion.workspace = true
 name = "multirotor"
 harness = false
 
+[[bench]]
+name = "tire"
+harness = false
+
 [lints]
 workspace = true
