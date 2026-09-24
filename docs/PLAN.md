@@ -15,7 +15,7 @@ end) and summarizes M2–M9.
 | Stack | Rust Cargo workspace (headless core) + Python bindings (PyO3/maturin, `uv`) |
 | Physics | Custom reduced-coordinate multibody (Featherstone ABA) + parry3d-f64 collision queries + penalty contacts; deterministic; f64 |
 | Ground fidelity | Vehicle-dynamics grade: Pacejka MF tires with relaxation length, suspension K&C, steering, powertrain, brakes, load transfer. Tire contact goes through a `Terrain` query trait, not the collision engine |
-| Ground scope | Diff-drive/skid-steer robots, Ackermann cars, multi-axle trucks + trailers, motorcycles/bicycles |
+| Ground scope | Diff-drive/skid-steer robots, Ackermann cars, multi-axle trucks + trailers, tracked vehicles (added 2026-09-24, M4), motorcycles/bicycles |
 | Aerial scope | Multirotors, fixed-wing, helicopters, VTOL/tiltrotor |
 | World | Seeded procedural generation, **separate map per character** (wild / rural / urban) |
 | Agents | Multiple learning agents, mixed air+ground teams, scripted NPC traffic/pedestrians, swarms (100+) |
@@ -640,7 +640,7 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
 - **Closing demo**: `CarWaypointOffroad-v0`. A 4×4 drives through waypoints over wild-map terrain between the trees, using LiDAR and `(v, κ)` actions.
 
 ### Design
-- **Agents become vehicle-generic**. The vehicles crate gets `enum Vehicle { Multirotor(Multirotor), Wheeled(Wheeled) }` with the shared queries: pose, twist, mass, definition, the step phases, contact colliders, visual state. Controllers become `enum Controller`, and each action mode belongs to a family (`ActionMode::{Motors, Ctbr, …}` for multirotors, `GroundActionMode` for wheeled vehicles). The state row (`STATE_FIELDS`) stays common. Family-specific data goes to recordings and observation terms, never into the row.
+- **Agents become vehicle-generic**. The vehicles crate gets `enum Vehicle { Multirotor(Multirotor), Wheeled(Wheeled) }` (a `Tracked` variant follows in M4, so nothing ground-generic may assume wheels) with the shared queries: pose, twist, mass, definition, the step phases, contact colliders, visual state. Controllers become `enum Controller`, and each action mode belongs to a family (`ActionMode::{Motors, Ctbr, …}` for multirotors, `GroundActionMode` for wheeled vehicles). The state row (`STATE_FIELDS`) stays common. Family-specific data goes to recordings and observation terms, never into the row.
   - **Bit-exactness**: multirotor trajectories, the golden hashes and the M1 recordings must not change. The determinism suite runs before and after the refactor.
 - **Multibody additions** (`core`):
   - Joints whose motion subspace depends on `q`. The bias `c_J = Ṡ(q)·q̇` enters ABA, RNEA and CRBA.
@@ -673,6 +673,13 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - `raw`: throttle/brake on one axis, and steering (diff-drive: left/right wheel torque).
   - `vk` (cars): speed and path curvature. A speed PI drives throttle and brake. Curvature becomes steering through the kinematic bicycle model plus yaw-rate feedback.
   - `vw` (robots): speed and yaw rate through per-side wheel-speed PI loops.
+  - `per_wheel` (added 2026-09-24): every wheel commanded separately, for torque vectoring, brake-based yaw control, crab and independent four-wheel steering, and swerve-like robots.
+    - `DriveInput` gets optional per-wheel channels that replace the mixed commands when present:
+      - `wheel_drive[w]`: the command of the motor driving wheel `w`, for electric drives. A motor that drives several wheels takes the mean of their commands. Combustion drives keep the single throttle.
+      - `wheel_brake[w]`: pedal fraction per wheel.
+      - `wheel_steer[w]`: angle as a fraction of the axle's lock.
+    - **Independent steering**: a new axle option `steer_mode = "independent"` (default `"ackermann"`) with its own `max_angle`. It gives the axle's wheels knuckles that follow their own commands (rate-limited, prescribed as now) instead of the Ackermann blend.
+    - **Action vector**: only the channels the vehicle has (motors, brakes, independently steered wheels), in wheel order, normalised to [−1, 1]. `action_space` names each channel.
   - Gains come from the definition, as for multirotors.
 - **Simulation**:
   - The 1 kHz physics preset for any world with ground vehicles. The same policy rate options apply.
@@ -693,7 +700,7 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
 | 1 | `core`: q-dependent joints, `KcTravel`, aux states in the integrator | ABA ≡ CRBA⁻¹(τ − RNEA) with KcTravel (proptest); finite-difference `S`/`Ṡ`; energy conserved; prismatic equivalence |
 | 2 | Tires: `.tir` parser, MF 6.1/6.2 steady state, transient slip and low-speed damping, road-plane contact, Fiala | Fx/Fy/Mz sweeps (pure and combined, several loads and cambers) match the Chrono fixtures within 1 % of peak; a parked tire on a 20° slope holds; free rolling decays to rolling resistance |
 | 3 | `vehicles::ground`: definitions (TOML), suspension, steering, brakes, powertrain, differentials, the four presets | Static ride heights and wheel loads match the definitions; a braked car holds on a 30 % slope; a straight 0–100 km/h run and a coast-down are plausible against Chrono |
-| 4 | `control::ground` + action modes | Speed steps settle without overshoot beyond 10 %; curvature tracking on a circle; diff-drive `vw` tracking |
+| 4 | `control::ground` + action modes, including `per_wheel` | Speed steps settle without overshoot beyond 10 %; curvature tracking on a circle; diff-drive `vw` tracking. `per_wheel`: on a four-motor car, a left/right torque difference gives the yaw moment and sign that statics predict; braking one wheel yaws toward it; independent four-wheel steering at 30° crabs with yaw rate < 0.01 rad/s, and counter-phase steering beats the front-steer turn radius as the bicycle model predicts; unused channels are absent from the action space |
 | 5 | Generalise agents (`Vehicle`/`Controller` enums, family-scoped action modes, recording and observation plumbing), done once the wheeled vehicle exists so that both variants are exercised | All M1 tests pass; golden hashes, trajectory hashes and old recordings unchanged; no throughput loss beyond 3 % |
 | 6 | `sim` integration: ground groups, 1 kHz, spawning and reachable goals, events, observation terms, `offroad` preset, BatchSim, recording | Determinism suite with cars; a batch of 64 cars drives on a wild map; benchmarks recorded |
 | 7 | Validation suite: ISO 4138 constant radius, ISO 7401 step steer, straight braking, ISO 3888-1 double lane change (path-following driver) | Understeer gradient and yaw-rate response within 10 % of Chrono (Sedan) and of the linear bicycle model at low lateral acceleration; braking distance within 5 % of Chrono |
@@ -806,12 +813,37 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
 |---|---|---|
 | M2 | (Detailed above.) Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
 | M3 | Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations, live viewer attach over zenoh | pettingzoo API tests; 256 drones at ≥ 20× real time |
-| M4 | Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering) | Offtracking vs analytic results; trailer reversing task |
+| M4 | Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
 | M5 | Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
 | M6 | Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
 | M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export | Round trip with `ros2 topic echo` |
+
+### Tracked vehicles (M4; added 2026-09-24)
+- **Scope and presets**:
+  - `tracked_apc`: an M113-like armoured carrier from Chrono's `data/vehicle/M113` (BSD-3; Chrono also has the Marder).
+  - `rover_tracked`: a rubber-tracked UGV of about 60 kg.
+- **Model** (`vehicles::tracked`), built for RL throughput rather than individual track shoes (Chrono's shoe-by-shoe contact is far too slow):
+  - **Tree**: chassis (Free) plus, per side, road wheels on trailing-arm suspension. The arms reuse `KcTravel` tables or a revolute arm with a torsion bar, together with the step-3 springs, dampers and stops.
+  - **Sprocket and idler**: the driven sprocket and the idler (with a tensioner spring) are fixed to the hull.
+  - **Track as a continuous band**: one speed DoF per side carries the inertia of the band, sprocket, idler and road-wheel spin. Road wheels turn kinematically with it.
+  - **Internal resistance**: speed-dependent rolling resistance, after Wong. Tension is pretension plus the tensioner deflection, and it feeds the internal resistance.
+- **Track–ground force element**:
+  - **Patches**: the lower run is sampled as contact patches under and between the road wheels. Each patch takes its normal pressure from the road-wheel loads, spread over the patch length, and follows the terrain.
+  - **Shear**: tangential force comes from shear displacement accumulated per patch, an aux state like the tyre's carcass deflection. It follows Janosi–Hanamoto: `τ = (c + p·tan φ)(1 − e^(−j/K))`.
+  - **Slip and steering**: longitudinal slip comes from band speed against ground speed, and lateral slip from side-slip and yaw. Skid steering therefore produces its turning-resistance moment on its own (Wong, *Theory of Ground Vehicles*, ch. 7).
+- **Obstacles**: the sprocket and idler get colliders, and the front run gets a swept capsule, so steps and logs are climbed through the existing contacts.
+- **Soft soil**:
+  - Materials gain Bekker–Wong parameters (k_c, k_φ, n, c, φ, K). Sinkage comes from the pressure–sinkage law, plus compaction and bulldozing resistance.
+  - Tracks mainly pay off on soft ground, so this comes with them. The same terms can be added to tyres later (Chrono's SCM is the reference).
+- **Steering and powertrain**: skid steering by a clutch-brake, a controlled differential, or dual electric or hydrostatic drives, one per side. These reuse the combustion engine and gearbox, the side-coupled electric motors and the bristle couplings. Action modes: `raw` (throttle, brake, steering as the side difference), `vw` and `per_side`.
+- **Validation**:
+  - **Analytic, drawbar pull**: drawbar pull against slip on soft soil, from the Janosi–Hanamoto integral.
+  - **Analytic, turning**: the steady skid-steer turning radius and the sprocket torques against sprocket speed ratio (Wong's turning-resistance model).
+  - **Analytic, grades**: gradeability on rigid ground.
+  - **Chrono M113**: static loads per road wheel; straight acceleration; the steady turn at a fixed sprocket speed ratio (turn radius and yaw rate within 15 %, given the different track models); a braked hold on a 30 % slope.
+- **Performance target**: ≤ 10 µs per tick for an APC with 5 road wheels per side (about 20 patches).
 
 ## Key risks and mitigations
 - **Penalty contact stability**: stiffness from ω_c·dt, bristle friction, a sub-stepping option. M2 tires don't use this path.
