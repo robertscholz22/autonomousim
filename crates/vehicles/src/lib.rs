@@ -3,6 +3,7 @@
 //! A [`VehicleDef`] is immutable, loaded from TOML (`type = "multirotor"`, …) and shared
 //! between instances by `Arc`; instances hold the per-agent state.
 
+pub mod ground;
 pub mod multirotor;
 pub mod presets;
 

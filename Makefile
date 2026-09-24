@@ -1,7 +1,7 @@
 # Development tasks for autonomousim. Cargo lives in ~/.cargo/bin, which is not always on PATH.
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
-.PHONY: check fmt test test-rust test-py test-viewer bench dev-py train-deps viewer clean
+.PHONY: check fmt test test-rust test-py test-viewer bench dev-py train-deps viewer clean fixtures-mfeval fixtures-chrono
 
 check:            ## rustfmt + clippy (whole workspace, incl. viewer and bindings)
 	cargo fmt --all --check
@@ -34,6 +34,29 @@ train-deps:       ## CPU torch + tensorboard for examples/
 
 viewer:
 	cargo run -p autonomousim-viewer --release
+
+# Oracles outside the repo (see docs/PLAN.md, M2 step 0): Julia + MFeval.jl.
+ORACLES ?= $(HOME)/.local/share/autonomousim-oracles
+JULIA ?= $(ORACLES)/julia-1.13.0/bin/julia
+MFEVAL_JL ?= $(ORACLES)/MFeval_julia
+MFEVAL_TYRES := fixtures/tir/MagicFormula52_Parameters.tir fixtures/tir/MagicFormula61_Parameters.tir \
+	assets/tires/HMMWV_Pac02Tire.tir assets/tires/Sedan_Pac02Tire.tir
+
+fixtures-mfeval:  ## Magic Formula reference values from MFeval.jl (fixtures/mfeval/)
+	mkdir -p fixtures/mfeval
+	cargo build -p autonomousim-vehicles --example tir_canonical
+	for t in $(MFEVAL_TYRES); do \
+		n=$$(basename $$t .tir); \
+		target/debug/examples/tir_canonical $$t fixtures/mfeval/$$n.tir && \
+		$(JULIA) --project=$(MFEVAL_JL) tools/gen_mfeval_fixtures.jl fixtures/mfeval/$$n.tir $$n fixtures/mfeval/$$n.json || exit 1; \
+	done
+
+MICROMAMBA ?= $(HOME)/.local/bin/micromamba
+MAMBA_ROOT_PREFIX ?= $(HOME)/.local/share/micromamba
+export MAMBA_ROOT_PREFIX
+
+fixtures-chrono:  ## PAC2002 cross-check values from Project Chrono (fixtures/chrono/)
+	$(MICROMAMBA) run -n chrono python tools/gen_chrono_fixtures.py
 
 clean:
 	cargo clean
