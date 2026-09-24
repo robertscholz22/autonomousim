@@ -9,10 +9,10 @@ from autonomousim._native import EVENTS, TERMINAL_EVENTS
 Event = enum.IntFlag("Event", {name.upper(): bit for name, bit in EVENTS})
 Event.__doc__ = (
     "Event bits: crashes, water, out of bounds, NaN (terminal), foliage, ground contact, landed, disabled,"
-    " goal reached, finished (last goal reached)."
+    " goal reached, finished (last goal reached), rollover (terminal) and stuck (ground vehicles)."
 )
 
-#: Bits that end an episode: crashes, water, out of bounds and NaN.
+#: Bits that end an episode: crashes, water, out of bounds, NaN and rollover.
 TERMINAL = Event(TERMINAL_EVENTS)
 
 

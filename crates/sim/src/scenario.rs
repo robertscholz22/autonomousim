@@ -38,10 +38,12 @@
 //! Angles in scenario files are in degrees (`*_deg`); everything else is SI.
 
 use crate::SimError;
+use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
 use autonomousim_control::{ActionMapping, AgentActionMode, Controller};
+use autonomousim_core::geometry::{HitMask, StaticGeometry};
 use autonomousim_core::material::MaterialId;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::from_yaw;
@@ -51,6 +53,7 @@ use autonomousim_core::time::Clock;
 use autonomousim_procgen::MapCache;
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
 use autonomousim_sensors::{Sensor, SensorSpec};
+use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_vehicles::multirotor::{MotorInit, MultirotorScales};
 use autonomousim_vehicles::presets;
 use autonomousim_vehicles::{Family, SharedDef, VehicleDef};
@@ -63,6 +66,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Default physics rates of worlds with and without ground vehicles (Hz).
+pub const GROUND_PHYSICS_HZ: u32 = 1000;
+pub const AERIAL_PHYSICS_HZ: u32 = 500;
+
 /// Candidate positions tried before falling back to the best one seen.
 const MAX_ATTEMPTS: usize = 200;
 
@@ -70,6 +77,8 @@ const MAX_ATTEMPTS: usize = 200;
 #[serde(default, deny_unknown_fields)]
 pub struct Scenario {
     pub name: String,
+    /// Physics rate; 0 (the default) picks 1000 Hz when any group drives a ground vehicle
+    /// (tyre relaxation and stiff suspensions) and 500 Hz otherwise.
     pub physics_hz: u32,
     /// Rate at which actions are applied and observations produced.
     pub policy_hz: u32,
@@ -88,7 +97,7 @@ impl Default for Scenario {
     fn default() -> Self {
         Self {
             name: "default".into(),
-            physics_hz: 500,
+            physics_hz: 0,
             policy_hz: 50,
             environment_hz: 100,
             map: MapSource::default(),
@@ -398,11 +407,39 @@ pub struct EventConfig {
     pub max_agl: Option<f64>,
     /// Out of bounds above this altitude (map z, m).
     pub ceiling: Option<f64>,
+    /// Thresholds that only apply to ground vehicles.
+    #[serde(skip_serializing_if = "is_default")]
+    pub ground: GroundEventConfig,
 }
 
 impl Default for EventConfig {
     fn default() -> Self {
-        Self { crash_speed: 2.0, landed_speed: 0.1, landed_rate: 0.3, bounds_margin: 0.0, max_agl: None, ceiling: None }
+        Self {
+            crash_speed: 2.0,
+            landed_speed: 0.1,
+            landed_rate: 0.3,
+            bounds_margin: 0.0,
+            max_agl: None,
+            ceiling: None,
+            ground: GroundEventConfig::default(),
+        }
+    }
+}
+
+/// Event thresholds of ground vehicles (`[events.ground]`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GroundEventConfig {
+    /// Rollover when the chassis up axis tilts more than this from the vertical (degrees).
+    pub rollover_deg: f64,
+    /// Stuck after moving less than `stuck_distance` (m) for `stuck_time` seconds (0: never).
+    pub stuck_time: f64,
+    pub stuck_distance: f64,
+}
+
+impl Default for GroundEventConfig {
+    fn default() -> Self {
+        Self { rollover_deg: 60.0, stuck_time: 5.0, stuck_distance: 0.5 }
     }
 }
 
@@ -435,8 +472,8 @@ impl VehicleRef {
 /// Agents that share a vehicle type, action mode and observation layout. Python sees each
 /// group as arrays of shape `[num_envs, count, dim]`.
 ///
-/// `controller`, `action_limits` and `randomize` configure multirotors; `ground_controller`
-/// and `ground_action_limits` wheeled vehicles. Setting those of the other family is an error.
+/// `controller`, `action_limits` and `randomize` configure multirotors; `ground_controller`,
+/// `ground_action_limits` and `drivable` wheeled vehicles. Setting those of the other family is an error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -453,6 +490,10 @@ pub struct GroupSpec {
     pub ground_controller: GroundConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub ground_action_limits: GroundActionLimits,
+    /// Terrain that ground vehicles can drive over: spawns and goals only use drivable cells,
+    /// and goals must be reachable from the spawn.
+    #[serde(skip_serializing_if = "is_default")]
+    pub drivable: DrivableSpec,
     pub sensors: Vec<SensorSpec>,
     /// Observation terms in order; empty: the default hover observation.
     pub obs: Vec<ObsTerm>,
@@ -475,6 +516,7 @@ impl Default for GroupSpec {
             action_limits: ActionLimits::default(),
             ground_controller: GroundConfig::default(),
             ground_action_limits: GroundActionLimits::default(),
+            drivable: DrivableSpec::default(),
             sensors: Vec::new(),
             obs: Vec::new(),
             spawn: SpawnSpec::default(),
@@ -686,6 +728,11 @@ pub struct CompiledGroup {
     pub radius: f64,
     /// Id of the group's first agent (agents are numbered group by group).
     pub first_agent: usize,
+    /// Ground vehicles: the rest pose on flat ground at the origin (heading +x), half the
+    /// vehicle's width (m), and where it can drive on each map of the pool.
+    pub rest: Pose,
+    pub half_width: f64,
+    pub drive: Vec<Arc<DriveGrid>>,
 }
 
 impl CompiledGroup {
@@ -708,35 +755,55 @@ impl CompiledGroup {
 
 impl CompiledScenario {
     fn new(mut spec: Scenario) -> Result<Self, SimError> {
-        let clock = Clock::new(spec.physics_hz.max(1));
-        if spec.physics_hz == 0 {
-            return Err(SimError::Scenario("physics_hz must be positive".into()));
+        if spec.groups.is_empty() {
+            return Err(SimError::Scenario("a scenario needs at least one agent group".into()));
         }
+        let defs = spec
+            .groups
+            .iter()
+            .map(|g| {
+                g.vehicle
+                    .resolve()
+                    .map(SharedDef::from)
+                    .map_err(|e| SimError::Scenario(format!("group {:?}: {e}", g.name)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if spec.physics_hz == 0 {
+            let ground = defs.iter().any(|d| d.family() != Family::Multirotor);
+            spec.physics_hz = if ground { GROUND_PHYSICS_HZ } else { AERIAL_PHYSICS_HZ };
+        }
+        let clock = Clock::new(spec.physics_hz);
         let decimation = clock.divider("policy", spec.policy_hz)?;
         let environment_divider = clock.divider("environment", spec.environment_hz)?;
         if let Some(r) = &spec.randomize_environment {
             r.validate()?;
         }
         let e = &spec.events;
-        if !(e.crash_speed > 0.0 && e.landed_speed >= 0.0 && e.landed_rate >= 0.0 && e.bounds_margin >= 0.0) {
+        if !(e.crash_speed > 0.0
+            && e.landed_speed >= 0.0
+            && e.landed_rate >= 0.0
+            && e.bounds_margin >= 0.0
+            && e.ground.rollover_deg > 0.0
+            && e.ground.rollover_deg <= 180.0
+            && e.ground.stuck_time >= 0.0
+            && e.ground.stuck_distance >= 0.0)
+        {
             return Err(SimError::Scenario(format!("invalid event thresholds {e:?}")));
         }
-        if spec.groups.is_empty() {
-            return Err(SimError::Scenario("a scenario needs at least one agent group".into()));
-        }
-        let (maps, map_hashes) = spec.map.build()?.into_iter().map(|(w, h)| (Arc::new(w), h)).unzip();
+        let (maps, map_hashes): (Vec<_>, Vec<_>) = spec.map.build()?.into_iter().map(|(w, h)| (Arc::new(w), h)).unzip();
         let mut groups = Vec::with_capacity(spec.groups.len());
         let mut first_agent = 0;
-        for (gi, g) in spec.groups.iter().enumerate() {
+        for (gi, (g, def)) in spec.groups.iter().zip(defs).enumerate() {
             if g.count == 0 {
                 return Err(SimError::Scenario(format!("group {:?} has no agents", g.name)));
             }
             if spec.groups[..gi].iter().any(|o| o.name == g.name) {
                 return Err(SimError::Scenario(format!("duplicate group name {:?}", g.name)));
             }
-            groups.push(CompiledGroup::new(g.clone(), &clock, first_agent)?);
+            groups.push(CompiledGroup::new(g.clone(), def, &clock, first_agent)?);
             first_agent += g.count;
         }
+        build_drive_grids(&mut groups, &maps);
         // Defaults that depend on the vehicle, filled in.
         for (s, g) in spec.groups.iter_mut().zip(&groups) {
             s.clone_from(&g.spec);
@@ -768,8 +835,7 @@ impl CompiledScenario {
 }
 
 impl CompiledGroup {
-    fn new(mut spec: GroupSpec, clock: &Clock, first_agent: usize) -> Result<Self, SimError> {
-        let def = SharedDef::from(spec.vehicle.resolve()?);
+    fn new(mut spec: GroupSpec, def: SharedDef, clock: &Clock, first_agent: usize) -> Result<Self, SimError> {
         let family = def.family();
         let name = spec.name.clone();
         let fail = move |what: String| SimError::Scenario(format!("group {name:?}: {what}"));
@@ -777,7 +843,7 @@ impl CompiledGroup {
             Family::Multirotor => [
                 ("ground_controller", !is_default(&spec.ground_controller)),
                 ("ground_action_limits", !is_default(&spec.ground_action_limits)),
-                ("", false),
+                ("drivable", !is_default(&spec.drivable)),
             ],
             Family::Wheeled => [
                 ("controller", !is_default(&spec.controller)),
@@ -804,8 +870,9 @@ impl CompiledGroup {
         }
         let terms = if spec.obs.is_empty() { default_obs() } else { spec.obs.clone() };
         let num_rotors = def.as_multirotor().map_or(0, |d| d.rotors.len());
-        let obs =
-            CompiledObs::new(&terms, &spec.sensors, action_map.dim(), num_rotors).map_err(|e| fail(e.to_string()))?;
+        let num_wheels = def.as_wheeled().map_or(0, |d| d.num_wheels());
+        let obs = CompiledObs::new(&terms, &spec.sensors, action_map.dim(), num_rotors, num_wheels)
+            .map_err(|e| fail(e.to_string()))?;
         let sp = &spec.spawn;
         let spawn_ok = valid_range(sp.agl)
             && sp.agl[0] >= 0.0
@@ -839,8 +906,63 @@ impl CompiledGroup {
             Family::Wheeled => 0.0,
         };
         let radius = colliders.iter().map(|c| c.center.length() + c.radius).fold(0.0, f64::max);
-        Ok(Self { spec, def, controller, action_map, obs, bottom, radius, first_agent })
+        spec.drivable.validate().map_err(fail)?;
+        let (rest, half_width) = match def.as_wheeled() {
+            Some(d) => (Wheeled::new(d.clone(), clock.dt()).rest(DVec3::ZERO, 0.0, 0.0).pose, drive::half_width(d)),
+            None => (Pose::IDENTITY, 0.0),
+        };
+        Ok(Self {
+            spec,
+            def,
+            controller,
+            action_map,
+            obs,
+            bottom,
+            radius,
+            first_agent,
+            rest,
+            half_width,
+            drive: Vec::new(),
+        })
     }
+
+    /// Where this group's vehicles stand on the map, for spawning and goals (ground vehicles).
+    pub(crate) fn ground<'a>(&'a self, map: usize) -> Option<GroundSampling<'a>> {
+        self.drive.get(map).map(|grid| GroundSampling {
+            grid,
+            ride: self.rest.pos.z,
+            radius: self.radius,
+            max_slope: self.spec.drivable.spawn_slope_deg.to_radians(),
+        })
+    }
+}
+
+/// Drive grids of the ground groups on every map; groups with the same drivable spec and
+/// width share them.
+fn build_drive_grids(groups: &mut [CompiledGroup], maps: &[Arc<StaticWorld>]) {
+    for i in 0..groups.len() {
+        if groups[i].family() != Family::Wheeled {
+            continue;
+        }
+        let (spec, hw) = (&groups[i].spec.drivable, groups[i].half_width);
+        let shared = groups[..i].iter().find(|o| !o.drive.is_empty() && o.spec.drivable == *spec && o.half_width == hw);
+        groups[i].drive = match shared {
+            Some(o) => o.drive.clone(),
+            None => maps.par_iter().map(|m| Arc::new(DriveGrid::new(m, spec, hw))).collect(),
+        };
+    }
+}
+
+/// What spawn and goal sampling of ground vehicles needs.
+#[derive(Clone, Copy)]
+pub(crate) struct GroundSampling<'a> {
+    pub grid: &'a DriveGrid,
+    /// Height of the chassis frame above the ground at rest (m).
+    pub ride: f64,
+    /// Radius kept clear of solid obstacles at the spawn (m).
+    pub radius: f64,
+    /// Steepest spawn (rad).
+    pub max_slope: f64,
 }
 
 // ------------------------------------------------------------------------------- sampling
@@ -875,19 +997,24 @@ pub(crate) struct Placement {
 
 impl SpawnSpec {
     /// Positions of `count` agents; `placed` holds positions of agents placed before (other
-    /// groups) and receives these.
+    /// groups) and receives these. Ground vehicles (`ground`) get the position of their chassis
+    /// frame at rest, in drivable cells of the largest component, clear of obstacles by their
+    /// radius.
     pub(crate) fn sample_positions(
         &self,
         world: &StaticWorld,
         count: usize,
         bottom: f64,
+        ground: Option<GroundSampling>,
         placed: &mut Vec<DVec3>,
         rng: &mut SimRng,
     ) -> Vec<DVec3> {
         let [lo, hi] = region(world, self.region, self.margin);
         let height = |xy: DVec2, rng: &mut SimRng| {
             let surface = world.surface_height(xy.x, xy.y);
-            if self.on_ground {
+            if let Some(g) = ground {
+                world.terrain().height(xy.x, xy.y) + g.ride
+            } else if self.on_ground {
                 world.terrain().height(xy.x, xy.y) + bottom + 1e-3
             } else {
                 surface + sample(rng, self.agl)
@@ -906,7 +1033,11 @@ impl SpawnSpec {
                         (i / cols) as f64 - 0.5 * (rows - 1) as f64,
                     );
                     let xy = centre + offset * spacing;
-                    let z = if self.on_ground { height(xy, rng) } else { world.surface_height(xy.x, xy.y) + mid };
+                    let z = if self.on_ground || ground.is_some() {
+                        height(xy, rng)
+                    } else {
+                        world.surface_height(xy.x, xy.y) + mid
+                    };
                     out.push(xy.extend(z));
                 }
             }
@@ -916,7 +1047,7 @@ impl SpawnSpec {
                     for _ in 0..MAX_ATTEMPTS {
                         let xy = DVec2::new(sample(rng, [lo.x, hi.x]), sample(rng, [lo.y, hi.y]));
                         let p = xy.extend(height(xy, rng));
-                        let score = self.score(world, p, placed.iter().chain(&out));
+                        let score = self.score(world, p, ground, placed.iter().chain(&out));
                         if score > best.0 {
                             best = (score, p);
                         }
@@ -933,7 +1064,13 @@ impl SpawnSpec {
     }
 
     /// 1 or more if `p` is acceptable; otherwise how close it comes (for the fallback).
-    fn score<'a>(&self, world: &StaticWorld, p: DVec3, others: impl Iterator<Item = &'a DVec3>) -> f64 {
+    fn score<'a>(
+        &self,
+        world: &StaticWorld,
+        p: DVec3,
+        ground: Option<GroundSampling>,
+        others: impl Iterator<Item = &'a DVec3>,
+    ) -> f64 {
         if self.avoid_water
             && world.terrain().water_level(p.x, p.y).is_some_and(|w| w > world.terrain().height(p.x, p.y))
         {
@@ -941,7 +1078,17 @@ impl SpawnSpec {
         }
         // On the ground, check the space just above it instead.
         let probe = if self.on_ground { DVec3::new(p.x, p.y, p.z + self.clearance) } else { p };
-        let free = if self.clearance > 0.0 {
+        let free = if let Some(g) = ground {
+            let xy = p.truncate();
+            let r = g.radius.max(self.clearance);
+            match g.grid.component(xy) {
+                None => return -1.0,
+                // Off the largest component, few goals can be reached.
+                Some(c) if c != g.grid.largest() => 0.3,
+                Some(_) if drive::slope(world, xy, 1.5) > g.max_slope => 0.5,
+                Some(_) => world.obstacles().nearest_distance(p, r, HitMask::SOLID).map_or(1.0, |d| d / r),
+            }
+        } else if self.clearance > 0.0 {
             let c = world.clearance(probe, self.clearance) / self.clearance;
             let foliage = world.is_free(probe, self.clearance, true, false);
             if foliage { c } else { c.min(0.5) }
@@ -976,7 +1123,16 @@ impl SpawnSpec {
 }
 
 impl GoalSpec {
-    pub(crate) fn sample(&self, world: &StaticWorld, spawn: &Pose, rng: &mut SimRng) -> Vec<Goal> {
+    /// Goals from `spawn`. Ground vehicles' goals (`ground`) are where their chassis frame would
+    /// rest on the terrain, in drivable cells reachable from the spawn; the height range is
+    /// ignored.
+    pub(crate) fn sample(
+        &self,
+        world: &StaticWorld,
+        spawn: &Pose,
+        ground: Option<GroundSampling>,
+        rng: &mut SimRng,
+    ) -> Vec<Goal> {
         use autonomousim_core::math::quat::yaw;
         match self.kind {
             GoalKind::Spawn => vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }],
@@ -990,12 +1146,17 @@ impl GoalSpec {
                         let dir = DVec2::from_angle(rng.range(-std::f64::consts::PI, std::f64::consts::PI));
                         let raw = prev + dir * sample(rng, self.distance);
                         let xy = raw.clamp(lo, hi);
-                        let p = xy.extend(world.surface_height(xy.x, xy.y) + sample(rng, self.agl));
-                        let free = if self.clearance > 0.0 {
-                            let c = world.clearance(p, self.clearance) / self.clearance;
-                            if world.is_free(p, self.clearance, true, false) { c } else { c.min(0.5) }
-                        } else {
-                            1.0
+                        let agl = sample(rng, self.agl);
+                        let (p, free) = match ground {
+                            Some(g) => {
+                                let p = xy.extend(world.terrain().height(xy.x, xy.y) + g.ride);
+                                // Unreachable goals rank below any reachable one.
+                                (p, if g.grid.reachable(spawn.pos.truncate(), xy) { 1.0 } else { -3.0 })
+                            }
+                            None => {
+                                let p = xy.extend(world.surface_height(xy.x, xy.y) + agl);
+                                (p, self.free(world, p))
+                            }
                         };
                         // A point moved onto the region's edge is off the distance range: only
                         // used when no draw lands inside.
@@ -1013,6 +1174,16 @@ impl GoalSpec {
                 }
                 goals
             }
+        }
+    }
+
+    /// 1 when a goal at `p` is free; otherwise how close it comes.
+    fn free(&self, world: &StaticWorld, p: DVec3) -> f64 {
+        if self.clearance > 0.0 {
+            let c = world.clearance(p, self.clearance) / self.clearance;
+            if world.is_free(p, self.clearance, true, false) { c } else { c.min(0.5) }
+        } else {
+            1.0
         }
     }
 }
@@ -1073,7 +1244,7 @@ mod tests {
         let spec = SpawnSpec { min_separation: 3.0, clearance: 1.5, ..SpawnSpec::default() };
         let mut rng = Seed::from_u64(1).rng();
         let mut placed = Vec::new();
-        let ps = spec.sample_positions(&world, 30, 0.05, &mut placed, &mut rng);
+        let ps = spec.sample_positions(&world, 30, 0.05, None, &mut placed, &mut rng);
         for (i, p) in ps.iter().enumerate() {
             assert!(world.is_free(*p, 1.5, true, true), "{p}");
             let agl = p.z - world.surface_height(p.x, p.y);
@@ -1084,7 +1255,7 @@ mod tests {
         }
         // Goals chain from the spawn and stay free.
         let goals = GoalSpec { kind: GoalKind::Random, count: 5, distance: [4.0, 8.0], ..GoalSpec::default() };
-        let g = goals.sample(&world, &Pose::from_translation(ps[0]), &mut rng);
+        let g = goals.sample(&world, &Pose::from_translation(ps[0]), None, &mut rng);
         assert_eq!(g.len(), 5);
         let mut prev = ps[0];
         for goal in &g {

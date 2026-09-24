@@ -36,6 +36,11 @@ impl Events {
     pub const GOAL_REACHED: Self = Self(1 << 10);
     /// Reached the last goal (set together with `GOAL_REACHED`).
     pub const FINISHED: Self = Self(1 << 11);
+    /// A ground vehicle tilted past the rollover angle (`EventConfig::rollover_deg`).
+    pub const ROLLOVER: Self = Self(1 << 12);
+    /// A ground vehicle has moved less than `EventConfig::stuck_distance` for
+    /// `EventConfig::stuck_time` seconds (set on every step until it moves; not terminal).
+    pub const STUCK: Self = Self(1 << 13);
 
     /// Events after which the vehicle cannot continue.
     pub const TERMINAL: Self = Self(
@@ -44,10 +49,11 @@ impl Events {
             | Self::CRASH_AGENT.0
             | Self::WATER.0
             | Self::OUT_OF_BOUNDS.0
-            | Self::NAN.0,
+            | Self::NAN.0
+            | Self::ROLLOVER.0,
     );
 
-    pub const NAMES: [(&'static str, Events); 12] = [
+    pub const NAMES: [(&'static str, Events); 14] = [
         ("crash_terrain", Self::CRASH_TERRAIN),
         ("crash_obstacle", Self::CRASH_OBSTACLE),
         ("crash_agent", Self::CRASH_AGENT),
@@ -60,6 +66,8 @@ impl Events {
         ("disabled", Self::DISABLED),
         ("goal_reached", Self::GOAL_REACHED),
         ("finished", Self::FINISHED),
+        ("rollover", Self::ROLLOVER),
+        ("stuck", Self::STUCK),
     ];
 
     #[inline]

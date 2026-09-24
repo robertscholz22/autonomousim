@@ -350,7 +350,7 @@ impl Wheeled {
         self.powertrain.step(&input, &self.spin, dt, &mut self.drive);
         for (w, c) in self.corners.iter_mut().enumerate() {
             let b = &self.def.axles[w / 2].brake;
-            let pedal = input.wheels.map_or(input.brake, |wc| wc.brake[w]);
+            let pedal = (input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w]).min(1.0);
             let limit = pedal * b.max_torque + if input.parking { b.parking_torque } else { 0.0 };
             c.brake.step(limit, &self.spin, dt, &mut self.brake);
             self.tau[c.spin.1] += self.drive[w] + self.brake[w];

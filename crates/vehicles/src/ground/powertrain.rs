@@ -64,6 +64,14 @@ pub struct DriveInput {
     pub yaw: f64,
     /// Per-wheel commands, replacing the mixed ones where given.
     pub wheels: Option<WheelCommands>,
+    /// Extra service brake per wheel, `[0, 1]`, added to the pedal (traction control and
+    /// other brake interventions).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub wheel_brake: [f64; MAX_WHEELS],
+}
+
+fn is_zero(x: &[f64; MAX_WHEELS]) -> bool {
+    x.iter().all(|&v| v == 0.0)
 }
 
 impl DriveInput {
@@ -82,6 +90,7 @@ impl DriveInput {
                 brake: w.brake.map(|x| c(x, 0.0)),
                 steer: w.steer.map(|x| c(x, -1.0)),
             }),
+            wheel_brake: self.wheel_brake.map(|x| c(x, 0.0)),
         }
     }
 }

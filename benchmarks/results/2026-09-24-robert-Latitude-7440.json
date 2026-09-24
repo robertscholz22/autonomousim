@@ -1,0 +1,192 @@
+{
+  "date": "2026-09-24",
+  "host": "robert-Latitude-7440",
+  "cpu": "13th Gen Intel(R) Core(TM) i7-1365U",
+  "governor": "powersave",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "results": {
+    "aba/chain20": {
+      "median_ns": 2809.18760760403
+    },
+    "aba/chain6": {
+      "median_ns": 814.184866226769
+    },
+    "aba/free_body": {
+      "median_ns": 122.59923719212547
+    },
+    "atmosphere/at_altitude": {
+      "median_ns": 13.61676136677794
+    },
+    "batch_10t/car_x256": {
+      "median_ns": 7248729.3478506785
+    },
+    "batch_10t/quad_forest_lidar_x256": {
+      "median_ns": 1710011.3526077098
+    },
+    "batch_10t/quad_x256": {
+      "median_ns": 645829.1122661124
+    },
+    "batch_12t/quad_x256": {
+      "median_ns": 617064.9381538462
+    },
+    "batch_1t/quad_x256": {
+      "median_ns": 1625977.9962962964
+    },
+    "batch_2t/quad_x256": {
+      "median_ns": 931890.6305216165
+    },
+    "batch_4t/quad_x256": {
+      "median_ns": 955497.7362500001
+    },
+    "batch_8t/quad_x256": {
+      "median_ns": 667588.8554347826
+    },
+    "contact/quad_above_canopy": {
+      "median_ns": 55.839521546451905
+    },
+    "contact/quad_airborne": {
+      "median_ns": 1518.26127228955
+    },
+    "contact/quad_between_trees": {
+      "median_ns": 191.77849841903077
+    },
+    "contact/quad_in_canopy": {
+      "median_ns": 925.6759859620963
+    },
+    "contact/quad_landed": {
+      "median_ns": 824.7381797373289
+    },
+    "contact/quad_low_in_forest": {
+      "median_ns": 949.2880625552923
+    },
+    "controller/attitude": {
+      "median_ns": 193.40541725046236
+    },
+    "controller/ctbr": {
+      "median_ns": 138.4354725745819
+    },
+    "controller/motors": {
+      "median_ns": 8.29048288930333
+    },
+    "controller/position": {
+      "median_ns": 258.0313319709777
+    },
+    "controller/velocity": {
+      "median_ns": 262.11653392335666
+    },
+    "controller/velocity_plus_physics_step": {
+      "median_ns": 450.8635911352329
+    },
+    "crba/chain20": {
+      "median_ns": 2020.3742639093794
+    },
+    "crba/chain6": {
+      "median_ns": 390.14261931690913
+    },
+    "ground_controller/rover_skid/vw": {
+      "median_ns": 25.94550564344168
+    },
+    "ground_controller/sedan_like/vk": {
+      "median_ns": 46.547640774154914
+    },
+    "multirotor/cf2x_step_airborne": {
+      "median_ns": 335.5820934326765
+    },
+    "multirotor/iris_like_step_airborne": {
+      "median_ns": 336.8841588024191
+    },
+    "obstacles/sphere_contacts": {
+      "median_ns": 114.16294016985302
+    },
+    "rnea/chain20": {
+      "median_ns": 1248.1874207858048
+    },
+    "rnea/chain6": {
+      "median_ns": 371.79812167039006
+    },
+    "sensor/baro": {
+      "median_ns": 328.0287893268129
+    },
+    "sensor/gps": {
+      "median_ns": 333.0117492765696
+    },
+    "sensor/ground_truth": {
+      "median_ns": 553.9414368701008
+    },
+    "sensor/imu_adis16448": {
+      "median_ns": 69.35346026923065
+    },
+    "sensor/imu_ideal": {
+      "median_ns": 24.646385064240555
+    },
+    "sensor/lidar_rl64_forest": {
+      "median_ns": 28003.35321280027
+    },
+    "sensor/mag": {
+      "median_ns": 22.240007092052615
+    },
+    "sensor/rangefinder": {
+      "median_ns": 202.08468216068079
+    },
+    "slow/sensor/lidar_vlp16_forest": {
+      "median_ns": 15578875.089285715
+    },
+    "step/free_body_semi_implicit": {
+      "median_ns": 231.99497040619963
+    },
+    "swarm/128_agents": {
+      "median_ns": 623173.1292735043
+    },
+    "swarm/128_agents_in_pool": {
+      "median_ns": 603924.0752586594
+    },
+    "swarm/64_cars": {
+      "median_ns": 2445669.9695833335
+    },
+    "terrain/closest_point": {
+      "median_ns": 107.42983686426862
+    },
+    "terrain/height": {
+      "median_ns": 8.834877968715407
+    },
+    "terrain/height_normal": {
+      "median_ns": 11.976267907329571
+    },
+    "terrain/raycast_down": {
+      "median_ns": 60.338333824429554
+    },
+    "tire/HMMWV_Pac02Tire_mf_eval": {
+      "median_ns": 231.7326160766968
+    },
+    "tire/HMMWV_Pac02Tire_step_on_heightgrid": {
+      "median_ns": 423.98962018182397
+    },
+    "tire/Sedan_Pac02Tire_mf_eval": {
+      "median_ns": 147.17267189226345
+    },
+    "tire/Sedan_Pac02Tire_step_on_heightgrid": {
+      "median_ns": 319.4048138323714
+    },
+    "wind/dryden_step": {
+      "median_ns": 135.9210531420863
+    },
+    "world/raycast_lidar_100m": {
+      "median_ns": 1002.9265728616388
+    },
+    "world_step/car": {
+      "median_ns": 82534.7336877828
+    },
+    "world_step/quad": {
+      "median_ns": 5963.350793380936
+    },
+    "world_step/quad_forest_lidar": {
+      "median_ns": 15274.94145085961
+    },
+    "world_step/quad_sensors_wind": {
+      "median_ns": 9758.320271857694
+    },
+    "world_step/truck_offroad_lidar": {
+      "median_ns": 99292.58789855073
+    }
+  }
+}

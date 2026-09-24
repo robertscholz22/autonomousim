@@ -132,7 +132,7 @@ fn wild_map_invariants() {
 
 #[test]
 fn config_round_trips_and_is_validated() {
-    for c in [WildConfig::training(), WildConfig::showcase()] {
+    for c in [WildConfig::training(), WildConfig::showcase(), WildConfig::offroad()] {
         let text = toml::to_string(&c).unwrap();
         assert_eq!(toml::from_str::<WildConfig>(&text).unwrap(), c);
     }

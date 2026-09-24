@@ -874,6 +874,74 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - Batched throughput is within noise: 256 quads on 10 threads +1.8 % (p = 0.08); with forest LiDAR +0.6 % (p = 0.6); the 128-agent swarm +1.2 % (p = 0.08).
   - `#[inline]` on the `Vehicle` wrappers made no measurable difference; the cost is the extra dispatch.
 
+**As built in step 6** (`sim` integration of ground vehicles):
+- **Physics rate**:
+  - `physics_hz = 0`, the new default, means auto: 1 kHz when any group is a ground vehicle, else 500 Hz.
+  - The resolved rate is filled into the compiled spec, so `/meta` and the multirotor goldens are unchanged.
+  - Python tasks pass `physics_hz = None` as 0. `hover.toml` and `forest.toml` no longer pin 500.
+- **Drivable ground** (`sim::drive`):
+  - A group's `drivable = { cell = 2, max_slope_deg = 25, spawn_slope_deg = 15, margin = 1, obstacle_height = 0.25, max_water_depth = 0 }` builds a `DriveGrid` per map.
+  - Grids are built in parallel over maps and shared by groups with the same spec and vehicle half-width.
+  - A cell is blocked when:
+    - its normal, or its gradient over the cell, is steeper than `max_slope_deg`;
+    - water is deeper than `max_water_depth`;
+    - a solid obstacle's AABB (from `obstacle_height` above the ground up to 2 m above the terrain) comes within its radius + half-width + `margin`. Foliage does not block.
+  - Connected components (4-connected, found in scan order) answer reachability, instead of an A* per goal.
+  - `DriveGrid::path` (8-connected A* without corner cutting, deterministic) serves scripted drivers and tests.
+  - A `drivable` table on a multirotor group is an error.
+- **Spawning**:
+  - Ground vehicles spawn in drivable cells of the largest component, clear of solids by their radius and at most `spawn_slope_deg` steep. The slope is `drive::slope`: the steeper of the normal and the gradient over ±1.5 m.
+  - The spawn slope limit is what stops creep on rough terrain. On planar inclines both cars hold within 2 cm up to 25°. On 19–23° rough wild slopes, uneven wheel loads let them creep 0.2–0.6 m.
+  - Spawns are posed by `drive::ground_pose`: a least-squares plane through the wheel contacts and the centre, lifted by the largest residual, with the vehicle's rest pose on top. Grid layouts are placed the same way.
+  - Goals sit at chassis height over the terrain and are scored by reachability from the spawn. The RNG draw order is unchanged, so multirotor goals are identical.
+- **Events**:
+  - `ROLLOVER` (bit 12, terminal): up-axis tilt beyond `events.ground.rollover_deg` (60°).
+  - `STUCK` (bit 13, not terminal): the vehicle stays within `stuck_distance` (0.5 m) of an anchor for `stuck_time` (5 s; 0 disables it).
+  - Water uses the existing `WATER` event.
+  - The `events.ground` table is written only when set.
+- **Observation terms**: all need a ground vehicle, else error.
+
+  | Term | Dim | Content |
+  |---|---|---|
+  | `speed` | 1 | Body forward speed |
+  | `sideslip` | 1 | `atan2(v_y, max(\|v_x\|, 1))` |
+  | `pitch_roll` | 2 | Pitch and roll angles |
+  | `wheel_speeds` | n | Spin × radius per wheel |
+  | `wheel_slip` | n | Longitudinal slip κ per wheel |
+  | `steering` | 1 | Steering angle |
+  | `gear_rpm` | 2 | Gear and engine speed in krpm |
+- **Traction control** (`control::ground`): open differentials could not launch with crossed axles. Traction control scaled the drive force on the *mean* driven-wheel slip, so two unloaded, spinning wheels shut the throttle off on a 5° hill.
+  - Now any driven wheel slipping past the allowance gets a brake, in proportion to its excess slip, up to its share of the drive torque. This goes through the new `DriveInput::wheel_brake` (per wheel, added to the pedal, and not serialised when zero).
+  - The throttle fade uses the *least* slipping wheel.
+  - The Chrono validation and controller tests are unchanged.
+- **`offroad` wild preset** (512 m, gentle):
+  - Relief 40 m with broad hills. Slope p50 ≈ 3°, p99 ≈ 16°.
+  - Forest patches with clearings: about 1100 trees per 512 m map, and few rocks.
+  - Its golden map hash is committed.
+- **Tests** (`sim/tests/offroad.rs`, plus a `cars` golden in `golden.rs`):
+  - Spawns and goals:
+    - Spawns are in the largest component, below 15°, clear of trunks, and aligned within 8° with the finite-difference terrain normal.
+    - Goals are reachable, with a path.
+    - Creep is < 10 cm in 1 s.
+    - The drivable share is > 50 %.
+  - The new observation terms are checked against the vehicle state while 8 trucks drive.
+  - Rollover, stuck and water events.
+  - Batch independence of the thread count.
+  - **Batch of 64 4×4s** (8 worlds × 8) on offroad maps: they follow grid paths with pure pursuit for 20 s.
+    - 59/64 move more than 20 m, 51 reach at least one goal, and 71 goals are reached in total.
+    - 4 end on another terminal event (trees, terrain or bounds). 6 collide with other cars, because the follower ignores the other agents.
+  - The `cars` golden covers all four ground action modes and all four vehicle presets, with LiDAR, goals and events. The other golden hashes are unchanged.
+- **Throughput** (criterion, powersave governor):
+
+  | Benchmark | Result |
+  |---|---|
+  | `world_step/car` (sedan circling, 20 ticks) | 83 µs, ≈ 4 µs per car-tick |
+  | `world_step/truck_offroad_lidar` | 99 µs |
+  | `swarm/64_cars` | 2.47 ms, ≈ 8× real time on one thread |
+  | `batch_10t/car_x256` | ≈ 35k env-steps/s |
+
+  The multirotor benches are +2 % against the step-5 baseline. `tools/collect_bench.py` now also collects grouped benches (`group/name`).
+
 ### Performance targets (i7-1365U, release)
 | Metric | Target |
 |---|---|

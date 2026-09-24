@@ -87,12 +87,10 @@ fn ground_vehicles_rest_then_drive() {
     let start: Vec<_> = w.agents().iter().map(|a| a.vehicle.pose()).collect();
     for a in &w.agents()[..3] {
         assert!(matches!(a.vehicle, Vehicle::Wheeled(_)));
-        // At rest on its wheels: the chassis is above the ground, its goal on the ground
-        // where it stands.
+        // At rest on its wheels: the chassis is above the ground, its goal where it stands.
         let p = a.vehicle.position();
         assert!(p.z > 0.1 && p.z < 1.0, "{p}");
-        assert_eq!(a.goal().position.truncate(), p.truncate());
-        assert!(a.goal().position.z.abs() < 0.01);
+        assert_eq!(a.goal().position, p);
     }
     // One second of standing still (zero speed): nothing moves, nothing happens.
     for _ in 0..50 {

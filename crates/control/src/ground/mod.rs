@@ -108,9 +108,10 @@ pub struct GroundConfig {
     pub max_decel: f64,
     /// Below this speed (m/s) a zero speed request holds the vehicle on its brakes.
     pub hold_speed: f64,
-    /// Traction control: the drive force fades out as the driven wheels' slip speed grows
-    /// from this fraction of the travel speed (with `traction_slip_floor`, m/s, at least) to
-    /// twice that.
+    /// Traction control: a driven wheel whose slip speed exceeds this fraction of the travel
+    /// speed (with `traction_slip_floor`, m/s, at least) is braked, so that its differential
+    /// passes the torque on to the others; when even the least slipping wheel exceeds it, the
+    /// drive force also fades out, reaching zero at twice that slip.
     pub traction_slip: f64,
     pub traction_slip_floor: f64,
     /// Integral gain on the curvature error (1/s), and the largest steering correction it may
@@ -178,6 +179,9 @@ pub struct GroundController {
     driven: Vec<usize>,
     /// Total service brake torque (N·m).
     brake_torque: f64,
+    /// Per wheel: tyre radius (m) and service brake torque (N·m).
+    wheel_radius: Vec<f64>,
+    wheel_brake: Vec<f64>,
     /// Bicycle model of the Ackermann-steered axle: wheelbase (m), steering share, and the
     /// steering lock (rad).
     steering: Option<(f64, f64, f64)>,
@@ -248,7 +252,9 @@ impl GroundController {
             }
         };
         let radius = driven.iter().map(|&w| radius_of(w)).sum::<f64>() / driven.len() as f64;
-        let brake_torque = (0..n).map(|w| def.axles[w / 2].brake.max_torque).sum();
+        let wheel_radius: Vec<f64> = (0..n).map(radius_of).collect();
+        let wheel_brake: Vec<f64> = (0..n).map(|w| def.axles[w / 2].brake.max_torque).collect();
+        let brake_torque = wheel_brake.iter().sum();
         let steering = def.steering.and_then(|s| {
             let reference: Vec<f64> = def.axles.iter().filter(|a| a.steer == 0.0).map(|a| a.position.x).collect();
             let reference = if reference.is_empty() {
@@ -280,6 +286,8 @@ impl GroundController {
             radius,
             driven,
             brake_torque,
+            wheel_radius,
+            wheel_brake,
             steering,
             track,
             speed_i: 0.0,
@@ -381,15 +389,29 @@ impl GroundController {
         let (lo, hi) = self.accel_bounds(est);
         let integral = self.speed_i;
         let mut accel = self.speed_loop(v_ref, v, lo, hi);
-        // Traction control, with the integrator held while it acts.
-        let slip =
-            self.driven.iter().map(|&w| est.wheel_spin[w]).sum::<f64>() / self.driven.len() as f64 * self.radius - v;
+        // Traction control on the least slipping driven wheel (slip speed along the demand),
+        // with the integrator held while it acts.
+        let sign = accel.signum();
+        let slip = |w: usize| sign * (est.wheel_spin[w] * self.wheel_radius[w] - v);
         let allowed = (self.config.traction_slip * v.abs()).max(self.config.traction_slip_floor);
-        if accel * slip > 0.0 && slip.abs() > allowed {
-            accel *= (2.0 - slip.abs() / allowed).clamp(0.0, 1.0);
+        let least = self.driven.iter().map(|&w| slip(w)).fold(f64::INFINITY, f64::min);
+        if accel != 0.0 && least > allowed {
+            accel *= (2.0 - least / allowed).clamp(0.0, 1.0);
             self.speed_i = integral;
         }
         let force = self.mass * accel;
+        // Spinning wheels under drive (not under braking) are braked in proportion to their
+        // excess slip, up to their share of the drive torque, as an open differential would
+        // otherwise waste that torque on them.
+        if (self.reverse && accel < 0.0) || (!self.reverse && accel > 0.0) {
+            let share = force.abs() * self.radius / self.driven.len() as f64;
+            for &w in &self.driven {
+                let excess = (slip(w) - allowed) / allowed;
+                if excess > 0.0 {
+                    input.wheel_brake[w] = (excess.min(1.0) * share / self.wheel_brake[w]).min(1.0);
+                }
+            }
+        }
         let r = self.radius;
         match &self.drive {
             Drive::Combustion(c) => {

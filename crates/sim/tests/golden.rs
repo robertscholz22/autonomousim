@@ -70,12 +70,42 @@ const FOREST: &str = r#"
     spawn = { agl = [1.0, 2.0], clearance = 1.5 }
 "#;
 
+/// Ground vehicles of every drive type and action mode on a small off-road map, with the
+/// ground observation terms, LiDAR, goals on drivable ground and the ground events.
+const CARS: &str = r#"
+    name = "cars"
+    map = { type = "wild", preset = "offroad", seed = 5, count = 2, cache = false, config = { size = 128.0 } }
+    events = { ground = { stuck_time = 1.0 } }
+    [[groups]]
+    name = "trucks"
+    count = 2
+    vehicle = "offroad_4x4"
+    action_mode = "vk"
+    spawn = { min_separation = 6.0 }
+    goals = { kind = "random", count = 2, distance = [15.0, 30.0], radius = 3.0 }
+    sensors = [ { name = "lidar", type = "lidar" }, { name = "imu", type = "imu" } ]
+    obs = [ { term = "goal_rel_heading" }, { term = "speed" }, { term = "sideslip" }, { term = "pitch_roll" }, { term = "wheel_speeds" }, { term = "wheel_slip" }, { term = "steering" }, { term = "gear_rpm" }, { term = "lidar_log", sensor = "lidar" } ]
+    [[groups]]
+    name = "sedan"
+    vehicle = "sedan_like"
+    action_mode = "raw"
+    [[groups]]
+    name = "skid"
+    vehicle = "rover_skid"
+    action_mode = "vw"
+    [[groups]]
+    name = "diff"
+    vehicle = "rover_diff"
+    action_mode = "per_wheel"
+"#;
+
 fn scenarios() -> Vec<(&'static str, String)> {
     let hover = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/scenarios/hover.toml");
     vec![
         ("hover", std::fs::read_to_string(hover).unwrap()),
         ("modes", MODES.to_string()),
         ("forest", FOREST.to_string()),
+        ("cars", CARS.to_string()),
     ]
 }
 

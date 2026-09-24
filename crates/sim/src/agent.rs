@@ -10,20 +10,20 @@
 use crate::events::Events;
 use crate::interaction::{AgentContacts, AgentShape, SceneRays, Sphere};
 use crate::obs::ObsInput;
-use crate::scenario::{CompiledGroup, EventConfig, Goal, Placement};
+use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, Placement};
 use autonomousim_control::ground::GroundEstimate;
 use autonomousim_control::multirotor::StateEstimate;
 use autonomousim_control::{Command, Controller};
 use autonomousim_core::contact::StaticScene;
 use autonomousim_core::geometry::HitKind;
 use autonomousim_core::math::Pose;
-use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorEnv};
-use autonomousim_vehicles::Vehicle;
+use autonomousim_vehicles::ground::WheeledInit;
 use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
+use autonomousim_vehicles::{Family, Vehicle};
 use autonomousim_world::StaticWorld;
 use autonomousim_world::environment::{Dryden, EnvironmentConfig, MagneticField};
 use glam::{DVec2, DVec3};
@@ -82,6 +82,9 @@ pub struct Agent {
     air: AirData,
     ground: Option<GroundPlane>,
     agl: f64,
+    /// Where a ground vehicle last moved away from, and for how long it has not (s).
+    anchor: DVec3,
+    still_time: f64,
     turbulence: Dryden,
     turbulence_rng: SimRng,
 }
@@ -112,14 +115,16 @@ impl Agent {
             air: AirData::default(),
             ground: None,
             agl: 0.0,
+            anchor: DVec3::ZERO,
+            still_time: 0.0,
             turbulence: Dryden::default(),
             turbulence_rng: Seed::from_u64(0).rng(),
         }
     }
 
     /// Start an episode. `seed` is this agent's stream of the episode; `scales` perturb a
-    /// multirotor's parameters. A ground vehicle is placed at rest with its wheels on the
-    /// placement's position, facing its heading.
+    /// multirotor's parameters. A ground vehicle's placement is its chassis pose (at rest on
+    /// the terrain, see [`ground_pose`](crate::drive::ground_pose)).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reset(
         &mut self,
@@ -146,9 +151,12 @@ impl Agent {
                 placement.pose
             }
             Vehicle::Wheeled(v) => {
-                let init = v.rest(placement.pose.pos, yaw(placement.pose.rot), 0.0);
-                v.reset(&init);
-                init.pose
+                v.reset(&WheeledInit {
+                    pose: placement.pose,
+                    lin_vel_world: placement.lin_vel,
+                    ang_vel_body: placement.ang_vel,
+                });
+                placement.pose
             }
         };
         self.controller.reset(&self.vehicle);
@@ -165,6 +173,8 @@ impl Agent {
         self.events = Events::NONE;
         self.disabled = false;
         self.spawn = pose;
+        self.anchor = pose.pos;
+        self.still_time = 0.0;
         self.turbulence_rng = seed.child("turbulence").rng();
         self.turbulence = Dryden::stationary(&mut self.turbulence_rng);
         self.update_air(world, env, 0.0, Some(0.0));
@@ -314,10 +324,12 @@ impl Agent {
     }
 
     /// Phase 2: integrate, then derive the events of the step and the new shape.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn post_step(
         &mut self,
         world: &StaticWorld,
         env: &EnvState,
+        dt: f64,
         events: &EventConfig,
         disable_on_terminal: bool,
         shape: &mut AgentShape,
@@ -337,6 +349,10 @@ impl Agent {
         }
         self.update_shape(shape);
         self.events |= self.detect_events(world, events, shape);
+        if self.vehicle.family() == Family::Wheeled {
+            let e = self.ground_events(dt, &events.ground);
+            self.events |= e;
+        }
         if self.events.is_terminal() {
             if disable_on_terminal {
                 self.disable();
@@ -425,6 +441,26 @@ impl Agent {
         e
     }
 
+    /// Rollover and stuck (ground vehicles).
+    fn ground_events(&mut self, dt: f64, cfg: &GroundEventConfig) -> Events {
+        let mut e = Events::NONE;
+        let up = self.vehicle.orientation() * DVec3::Z;
+        if up.z < cfg.rollover_deg.to_radians().cos() {
+            e |= Events::ROLLOVER;
+        }
+        let p = self.vehicle.position();
+        if p.distance_squared(self.anchor) > cfg.stuck_distance * cfg.stuck_distance {
+            self.anchor = p;
+            self.still_time = 0.0;
+        } else {
+            self.still_time += dt;
+            if cfg.stuck_time > 0.0 && self.still_time >= cfg.stuck_time {
+                e |= Events::STUCK;
+            }
+        }
+        e
+    }
+
     /// Phase 3: sensors at the new tick.
     pub(crate) fn sense(
         &mut self,
@@ -473,6 +509,7 @@ impl Agent {
                 motors,
                 motor_range,
                 last_action: &self.action,
+                wheeled: self.vehicle.as_wheeled(),
                 sensors: &self.sensors,
                 world,
             },

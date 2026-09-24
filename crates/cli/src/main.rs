@@ -34,7 +34,7 @@ enum Command {
 
 #[derive(Args)]
 struct MapgenArgs {
-    /// Starting configuration: training (512 m) or showcase (2 km).
+    /// Starting configuration: training (512 m), showcase (2 km) or offroad (512 m, gentle).
     #[arg(long, default_value = "training")]
     preset: WildPreset,
     /// TOML file whose values override the preset (same layout as `--print-config`).

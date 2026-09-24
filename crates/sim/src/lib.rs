@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod batch;
+pub mod drive;
 pub mod events;
 pub mod interaction;
 pub mod obs;

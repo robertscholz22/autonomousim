@@ -11,6 +11,11 @@
 //! | `rot6d` / `quat` / `gravity_body` / `yaw` | 6 / 4 / 3 / 2 | attitude: first two rotation-matrix columns; quaternion (x, y, z, w with w ≥ 0); world down in the body frame; sin, cos of heading |
 //! | `lin_vel_world` / `lin_vel_body` / `lin_vel_heading` | 3 | velocity (m/s) |
 //! | `ang_vel_body` | 3 | body rates (rad/s) |
+//! | `speed` / `sideslip` | 1 | forward speed (body x, m/s) / sideslip angle atan2(v_y, max(\|v_x\|, 1 m/s)) (rad) |
+//! | `pitch_roll` | 2 | pitch and roll (rad; Z-Y-X Euler angles) |
+//! | `wheel_speeds` / `wheel_slip` | wheels | ground vehicles: wheel spin × tyre radius (m/s) / longitudinal slip κ |
+//! | `steering` | 1 | ground vehicles: steering angle of the equivalent bicycle (rad) |
+//! | `gear_rpm` | 2 | ground vehicles: gear (1… forward, −1 reverse, 0 electric) and engine (first motor) speed (1000 rpm) |
 //! | `motor_speeds` | rotors | rotor speeds mapped to [−1, 1] over their range |
 //! | `last_action` | action | the action held during the last step |
 //! | `clearance` | 1 | distance to the nearest terrain or solid obstacle, up to 20 m (costs ~0.6 µs) |
@@ -27,8 +32,9 @@
 use crate::scenario::Goal;
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
+use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_world::StaticWorld;
-use glam::{DQuat, DVec3};
+use glam::{DQuat, DVec3, EulerRot};
 use serde::{Deserialize, Serialize};
 
 /// Largest distance the `clearance` term looks (m).
@@ -52,6 +58,13 @@ pub enum TermKind {
     LinVelBody,
     LinVelHeading,
     AngVelBody,
+    Speed,
+    Sideslip,
+    PitchRoll,
+    WheelSpeeds,
+    WheelSlip,
+    Steering,
+    GearRpm,
     MotorSpeeds,
     LastAction,
     Clearance,
@@ -81,6 +94,12 @@ impl TermKind {
             Lidar | LidarLog => Some("lidar"),
             _ => None,
         }
+    }
+
+    /// Whether the term reads a ground vehicle's wheels, steering or powertrain.
+    fn needs_wheels(self) -> bool {
+        use TermKind::*;
+        matches!(self, WheelSpeeds | WheelSlip | Steering | GearRpm)
     }
 }
 
@@ -160,12 +179,20 @@ pub struct ObsInput<'a> {
     pub motors: &'a [f64],
     pub motor_range: (f64, f64),
     pub last_action: &'a [f64],
+    /// The vehicle, when it is a ground vehicle.
+    pub wheeled: Option<&'a Wheeled>,
     pub sensors: &'a [Sensor],
     pub world: &'a StaticWorld,
 }
 
 impl CompiledObs {
-    pub fn new(terms: &[ObsTerm], sensors: &[SensorSpec], act_dim: usize, num_rotors: usize) -> Result<Self, String> {
+    pub fn new(
+        terms: &[ObsTerm],
+        sensors: &[SensorSpec],
+        act_dim: usize,
+        num_rotors: usize,
+        num_wheels: usize,
+    ) -> Result<Self, String> {
         let mut out = Vec::with_capacity(terms.len());
         let mut dim = 0;
         for t in terms {
@@ -187,9 +214,22 @@ impl CompiledObs {
                 (None, Some(_)) => return Err(format!("observation {:?} does not read a sensor", t.term)),
                 (None, None) => (usize::MAX, None),
             };
+            if t.term.needs_wheels() && num_wheels == 0 {
+                return Err(format!("observation {:?} needs a ground vehicle", t.term));
+            }
             let (d, max_range) = match (t.term, spec) {
-                (TermKind::GoalYaw | TermKind::Yaw, _) => (2, 0.0),
-                (TermKind::Height | TermKind::Agl | TermKind::Clearance | TermKind::BaroAltitude, _) => (1, 0.0),
+                (TermKind::GoalYaw | TermKind::Yaw | TermKind::PitchRoll | TermKind::GearRpm, _) => (2, 0.0),
+                (
+                    TermKind::Height
+                    | TermKind::Agl
+                    | TermKind::Clearance
+                    | TermKind::BaroAltitude
+                    | TermKind::Speed
+                    | TermKind::Sideslip
+                    | TermKind::Steering,
+                    _,
+                ) => (1, 0.0),
+                (TermKind::WheelSpeeds | TermKind::WheelSlip, _) => (num_wheels, 0.0),
                 (TermKind::Rot6d | TermKind::Imu, _) => (6, 0.0),
                 (TermKind::Quat, _) => (4, 0.0),
                 (TermKind::MotorSpeeds, _) if num_rotors == 0 => {
@@ -271,6 +311,36 @@ impl CompiledObs {
                 TermKind::LinVelBody => put3(dst, q.inverse() * k.velocity),
                 TermKind::LinVelHeading => put3(dst, heading.inverse() * k.velocity),
                 TermKind::AngVelBody => put3(dst, k.rates),
+                TermKind::Speed => put(dst, &[(q.inverse() * k.velocity).x], t),
+                TermKind::Sideslip => {
+                    let v = q.inverse() * k.velocity;
+                    put(dst, &[v.y.atan2(v.x.abs().max(1.0))], t)
+                }
+                TermKind::PitchRoll => {
+                    let (_, pitch, roll) = q.to_euler(EulerRot::ZYX);
+                    put(dst, &[pitch, roll], t)
+                }
+                TermKind::WheelSpeeds | TermKind::WheelSlip | TermKind::Steering | TermKind::GearRpm => {
+                    let v = inp.wheeled.expect("ground terms are checked when the spec is compiled");
+                    match t.kind {
+                        TermKind::WheelSpeeds => {
+                            for (w, (d, s)) in dst.iter_mut().zip(v.wheels()).enumerate() {
+                                *d = value(s.spin * v.def().tire(w / 2).radius(), t);
+                            }
+                        }
+                        TermKind::WheelSlip => {
+                            for (d, s) in dst.iter_mut().zip(v.wheels()) {
+                                *d = value(s.tire.kappa, t);
+                            }
+                        }
+                        TermKind::Steering => put(dst, &[v.steering_angle()], t),
+                        _ => {
+                            let p = v.powertrain();
+                            let krpm = p.engine_speed * 60.0 / std::f64::consts::TAU / 1000.0;
+                            put(dst, &[f64::from(p.gear), krpm], t)
+                        }
+                    }
+                }
                 TermKind::MotorSpeeds => {
                     let (lo, hi) = inp.motor_range;
                     for (d, &w) in dst.iter_mut().zip(inp.motors) {
@@ -372,7 +442,7 @@ mod tests {
             ObsTerm::new(TermKind::ImuAccel, 1.0).sensor("imu"),
             ObsTerm::new(TermKind::LidarLog, 1.0).sensor("lidar"),
         ];
-        let obs = CompiledObs::new(&terms, &sensors, 4, 4).unwrap();
+        let obs = CompiledObs::new(&terms, &sensors, 4, 4, 0).unwrap();
         assert_eq!(obs.dim(), 3 + 2 + 4 + 3 + 4 + 4 + 3 + 64);
         let layout = obs.layout();
         assert_eq!(layout[1], ("goal_yaw".to_string(), 3, 2));
@@ -406,6 +476,7 @@ mod tests {
             motors: &motors,
             motor_range: (100.0, 300.0),
             last_action: &[0.1, -0.2, 0.3, 2.0],
+            wheeled: None,
             sensors: &built,
             world: &world,
         };
@@ -429,8 +500,10 @@ mod tests {
             ObsTerm::new(TermKind::Mag, 1.0),
             ObsTerm::new(TermKind::Agl, 1.0).sensor("imu"),
             ObsTerm::new(TermKind::Agl, 1.0).clip(0.0),
+            ObsTerm::new(TermKind::WheelSpeeds, 1.0),
+            ObsTerm::new(TermKind::GearRpm, 1.0),
         ] {
-            assert!(CompiledObs::new(&[bad], &sensors, 4, 4).is_err());
+            assert!(CompiledObs::new(&[bad], &sensors, 4, 4, 0).is_err());
         }
     }
 }

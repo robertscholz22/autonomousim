@@ -18,3 +18,9 @@ preset = "showcase"
 size = 512.0
 seed = 2
 hash = "48bd465896900ab8274022c7ab114f2572db33b5e728b5eb31c3c671b7abf072"
+
+[[wild]]
+preset = "offroad"
+size = 512.0
+seed = 4
+hash = "24adc74118b99347af4453ea5954fcb38b42710505bb45c73f94d217e783b7f2"

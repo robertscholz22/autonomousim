@@ -19,11 +19,13 @@
 //! the count, so `reset(Some(s))` always reproduces the same episode.
 
 use crate::agent::{Agent, EnvState};
+use crate::drive::ground_pose;
 use crate::events::Events;
 use crate::interaction::{AgentContacts, AgentShape, agent_contacts};
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, Goal};
 use autonomousim_control::Command;
+use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::Seed;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
@@ -130,13 +132,17 @@ impl WorldInstance {
         let mut placed = Vec::with_capacity(self.agents.len());
         for g in &sc.groups {
             let spawn = &g.spec.spawn;
-            let positions = spawn.sample_positions(world, g.spec.count, g.bottom, &mut placed, &mut spawn_rng);
+            let ground = g.ground(pick);
+            let positions = spawn.sample_positions(world, g.spec.count, g.bottom, ground, &mut placed, &mut spawn_rng);
             for (k, p) in positions.into_iter().enumerate() {
                 let id = g.first_agent + k;
                 let density = self.env.config.atmosphere.density(self.env.origin_altitude + p.z);
                 let hover = g.def.as_multirotor().map_or(0.0, |d| d.hover_omega(self.env.config.gravity, density));
-                let placement = spawn.sample_state(p, hover, &mut spawn_rng);
-                let goals = g.spec.goals.sample(world, &placement.pose, &mut goal_rng);
+                let mut placement = spawn.sample_state(p, hover, &mut spawn_rng);
+                if let Some(d) = g.def.as_wheeled() {
+                    placement.pose = ground_pose(world, d, &g.rest, p.truncate(), yaw(placement.pose.rot));
+                }
+                let goals = g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng);
                 let seed = agent_seed.child_index(id as u64);
                 let scales = g
                     .def
@@ -209,7 +215,7 @@ impl WorldInstance {
         let step = |((a, s), c): ((&mut Agent, &mut AgentShape), &AgentContacts)| {
             let g = &sc.groups[a.group];
             a.pre_step(world, env, time, env_step, c);
-            a.post_step(world, env, &sc.spec.events, g.spec.disable_on_terminal, s);
+            a.post_step(world, env, sc.dt(), &sc.spec.events, g.spec.disable_on_terminal, s);
         };
         if parallel {
             agents.par_iter_mut().zip(shapes.par_iter_mut()).zip(contacts.par_iter()).for_each(step);

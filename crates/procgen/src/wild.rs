@@ -149,6 +149,9 @@ pub enum WildPreset {
     Training,
     /// 2 km with 300 m relief: mountains, valleys, lakes and about 60k trees.
     Showcase,
+    /// 512 m of gentle hills (40 m relief) with sparse forest, clearings and few rocks, for
+    /// ground vehicles.
+    Offroad,
 }
 
 impl WildPreset {
@@ -156,6 +159,7 @@ impl WildPreset {
         match self {
             Self::Training => WildConfig::training(),
             Self::Showcase => WildConfig::showcase(),
+            Self::Offroad => WildConfig::offroad(),
         }
     }
 }
@@ -166,7 +170,8 @@ impl std::str::FromStr for WildPreset {
         match s {
             "training" => Ok(Self::Training),
             "showcase" => Ok(Self::Showcase),
-            _ => Err(format!("unknown preset {s:?} (training, showcase)")),
+            "offroad" => Ok(Self::Offroad),
+            _ => Err(format!("unknown preset {s:?} (training, showcase, offroad)")),
         }
     }
 }
@@ -198,6 +203,42 @@ impl WildConfig {
                 warp_strength: 40.0,
                 ..TerrainConfig::default()
             },
+            ..Self::showcase()
+        }
+    }
+
+    /// Drivable terrain: low relief with few mountains and little fine detail, open forest
+    /// with wide clearings, no snow and few (smaller) rocks.
+    pub fn offroad() -> Self {
+        Self {
+            size: 512.0,
+            terrain: TerrainConfig {
+                relief: 40.0,
+                hills_wavelength: 500.0,
+                hills_amplitude: 0.35,
+                mountains_wavelength: 900.0,
+                mountains_amplitude: 0.6,
+                mask_wavelength: 900.0,
+                mask_threshold: 0.35,
+                warp_wavelength: 400.0,
+                warp_strength: 40.0,
+                detail_amplitude: 0.1,
+                ..TerrainConfig::default()
+            },
+            materials: MaterialsConfig {
+                treeline: 0.9,
+                snowline: 2.0,
+                forest_wavelength: 200.0,
+                forest_threshold: 0.15,
+                ..MaterialsConfig::default()
+            },
+            trees: TreesConfig {
+                forest_density: 140.0,
+                meadow_density: 2.0,
+                min_spacing: 4.0,
+                ..TreesConfig::default()
+            },
+            rocks: RocksConfig { rocky_density: 40.0, other_density: 0.5, max_size: 2.5, ..RocksConfig::default() },
             ..Self::showcase()
         }
     }

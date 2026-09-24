@@ -23,7 +23,7 @@ def cpu_model() -> str:
 def main() -> None:
     crit = ROOT / "target" / "criterion"
     results = {}
-    for est in sorted(crit.glob("*/new/estimates.json")):
+    for est in sorted(crit.rglob("new/estimates.json")):
         bench_json = est.parent / "benchmark.json"
         name = json.loads(bench_json.read_text())["full_id"] if bench_json.exists() else est.parent.parent.name
         results[name] = {"median_ns": json.loads(est.read_text())["median"]["point_estimate"]}

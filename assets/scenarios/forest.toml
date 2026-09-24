@@ -2,7 +2,6 @@
 # viewer (`--scenario assets/scenarios/forest.toml`; it flies the first agent in `velocity`
 # mode) and a starting point for navigation tasks.
 name = "forest"
-physics_hz = 500
 policy_hz = 50
 
 map = { type = "wild", seed = 0, count = 4, preset = "training" }

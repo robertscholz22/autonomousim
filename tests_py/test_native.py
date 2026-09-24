@@ -146,7 +146,8 @@ def test_invalid_scenarios_raise_value_error():
 
 def test_scenario_helpers(tmp_path):
     d = default_scenario()
-    assert d["physics_hz"] == 500 and d["groups"][0]["vehicle"] == "cf2x"
+    # physics_hz 0: chosen by the vehicles when compiled (500 Hz for drones, 1 kHz with ground vehicles).
+    assert d["physics_hz"] == 0 and d["groups"][0]["vehicle"] == "cf2x"
     full = json.loads(normalize_scenario('policy_hz = 100\n[[groups]]\nvehicle = "iris_like"\n', toml=True))
     assert full["policy_hz"] == 100 and full["groups"][0]["spawn"]["clearance"] == 1.0
     path = tmp_path / "s.toml"
@@ -168,8 +169,9 @@ def test_example_scenarios_build(path, tmp_path, monkeypatch):
 
 def test_events():
     assert Event.CRASH_TERRAIN == 1 and Event.DISABLED == 1 << 9 and Event.FINISHED == 1 << 11
+    assert Event.ROLLOVER == 1 << 12 and Event.STUCK == 1 << 13
     assert TERMINAL == Event.CRASH_TERRAIN | Event.CRASH_OBSTACLE | Event.CRASH_AGENT | Event.WATER | (
-        Event.OUT_OF_BOUNDS | Event.NAN
+        Event.OUT_OF_BOUNDS | Event.NAN | Event.ROLLOVER
     )
     assert autonomousim.events.names(int(Event.WATER | Event.LANDED)) == ["water", "landed"]
     # Falling from 2–3 m with the rotors off is a crash.

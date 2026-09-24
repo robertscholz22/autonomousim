@@ -52,7 +52,8 @@ class Task:
               (±5, ±5, ±2 m), heading change (±π).
         map, map_seed, map_count: see ``map_source``.
         physics_hz, policy_hz: simulation and action rates (the policy rate must divide the
-            physics rate).
+            physics rate); ``physics_hz=None`` lets the scenario choose (500 Hz for aerial
+            vehicles, 1 kHz with ground vehicles).
         episode_time: seconds until truncation.
         wind: ``[min, max]`` mean wind speed per episode (m/s, uniform direction), or None.
         randomize: relative spreads of the vehicle parameters, e.g. ``{"mass": 0.1}``.
@@ -73,7 +74,7 @@ class Task:
         map: str | dict[str, Any] = "flat",
         map_seed: int = 0,
         map_count: int = 16,
-        physics_hz: int = 500,
+        physics_hz: int | None = None,
         policy_hz: int = 50,
         episode_time: float | None = None,
         wind: tuple[float, float] | None = None,
@@ -120,7 +121,7 @@ class Task:
             group["obs"] = self.obs
         sc: dict[str, Any] = {
             "name": self.name,
-            "physics_hz": self.physics_hz,
+            "physics_hz": self.physics_hz or 0,
             "policy_hz": self.policy_hz,
             "map": map_source(self.map, self.map_seed, self.map_count),
             "groups": [group],
