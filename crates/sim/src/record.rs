@@ -408,11 +408,16 @@ impl Recorder {
                         .wheels()
                         .map(|w| RecordedWheel {
                             spin: w.spin,
+                            spin_angle: w.spin_angle,
                             steer: w.steer,
                             travel: w.travel,
                             drive_torque: w.drive_torque,
                             brake_torque: w.brake_torque,
                             load: w.tire.fz,
+                            kappa: w.tire.kappa,
+                            tan_alpha: w.tire.tan_alpha,
+                            fx: w.tire.fx,
+                            fy: w.tire.fy,
                         })
                         .collect();
                     let pt = v.powertrain();
@@ -483,15 +488,24 @@ pub struct RecordedState {
 
 /// A wheel in a ground vehicle's state message.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RecordedWheel {
-    /// Spin rate (rad/s), steering angle (rad) and suspension travel (m, bump positive).
+    /// Spin rate (rad/s) and angle (rad), steering angle (rad) and suspension travel (m, bump
+    /// positive).
     pub spin: f64,
+    pub spin_angle: f64,
     pub steer: f64,
     pub travel: f64,
     /// Drive and brake torque (N·m) and tyre load (N).
     pub drive_torque: f64,
     pub brake_torque: f64,
     pub load: f64,
+    /// Tyre slip (longitudinal κ, tan of the slip angle) and the longitudinal and lateral
+    /// forces in the contact frame (N).
+    pub kappa: f64,
+    pub tan_alpha: f64,
+    pub fx: f64,
+    pub fy: f64,
 }
 
 /// A `/agent/<id>/action` message: the normalised action held from `time` on.

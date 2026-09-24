@@ -247,7 +247,7 @@ impl GroundActionMap {
         let speed = |x: f64| if x >= 0.0 { x * self.speed } else { x * self.reverse };
         match self.mode {
             GroundActionMode::Raw if self.side_drive => GroundSetpoint::Sides { left: a(0), right: a(1) },
-            GroundActionMode::Raw => GroundSetpoint::Pedal { drive: a(0), steering: a(1) },
+            GroundActionMode::Raw => GroundSetpoint::Pedal { drive: a(0), steering: a(1), handbrake: false },
             GroundActionMode::Vk => {
                 GroundSetpoint::SpeedCurvature { speed: speed(a(0)), curvature: a(1) * self.curvature }
             }

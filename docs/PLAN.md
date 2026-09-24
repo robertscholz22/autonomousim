@@ -974,6 +974,36 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   Both cars keep their centre inside every lane. With a 1.8 m body, both would touch the cones of the offset lane by 2–5 cm; the driver is not tuned for clearance.
 - The five tests take 0.3 s.
 
+**As built in step 8** (viewer for ground vehicles):
+- **Driving**: `--vehicle offroad_4x4` (or any wheeled preset) gives the first agent a "driver" group in `raw` mode that is not disabled on terminal events.
+  - Keys: W/S pedal (S brakes, then reverses), A/D steering, Space handbrake.
+  - Gamepad: right trigger minus left trigger is the pedal, the left stick steers, South is the handbrake.
+  - Skid-steer and diff-drive robots get `Sides { left: forward − steer, right: forward + steer }`, so they turn on the spot.
+  - The steering follows the keys at 2.5 per second (rate-limited, so a tap is not full lock). At speed its range fades as 1/(1 + (v/12 m/s)²).
+  - `GroundSetpoint::Pedal` gained `handbrake`, which maps to `DriveInput::parking`; the action map's raw mode never sets it. The parking brake acts on the rear axle only, so at speed it slows the car at about 1.6 m/s² and swings its tail out, as a real handbrake does.
+  - `GroundController` keeps the last `DriveInput` it produced (`last_input`), for the HUD.
+- **Demo driver** (`--demo`): picks a random reachable point more than 80 m away and follows a `DriveGrid::path` to it by pure pursuit (8 m lookahead). It drives at 8 m/s, slowing to 4 m/s in turns, and picks a new route on terminal or `STUCK` events. It is used for the frame-rate runs and screenshots.
+- **Visuals**: the procedural `WheeledVisual` gained a cabin for cars (tyre radius > 0.2 m), the driver's eye point, and suspension links (a strut and an arm per suspended wheel, from their chassis mounts to the wheel centre). Wheels spin, steer and travel from the vehicle's wheel poses.
+- **Cameras**: the chase camera for ground vehicles sits lower and closer (pitch 0.2 rad, distance 2.6 spans, zoom limit 1.2 spans) and aims above the chassis. First person sits at the driver's eye, tilted 5° down.
+- **HUD and plots**:
+  - The HUD shows speed in km/h, the driver's pedal, steering and handbrake, and gear, rpm, steering angle and throttle and brake bars.
+  - A per-wheel table shows load, travel, κ, α, Fx, Fy and drive and brake torque.
+  - The plots show sideslip in place of AGL, yaw rate and speed against their references, and two tyre scatter plots per wheel (Fy/Fz against α, Fx/Fz against κ). The yaw-rate reference is the commanded one in the speed modes and the kinematic v·tanδ/L otherwise.
+  - Wheels carrying less than a fifth of the mean load are left out of the scatter plots: their force ratios exploded on bumps.
+- **Recording and replay**:
+  - `--record <file>` (live and `policy`) writes MCAP with LiDAR through the sim `Recorder` and closes it on exit.
+  - `RecordedWheel` gained `spin_angle`, `kappa`, `tan_alpha`, `fx` and `fy` (serde defaults, so older files still read). This changed only the `cars` golden hash; it was re-blessed after checking that the old recorder still reproduced the old hash.
+  - Replay interpolates the wheels and poses the vehicle through the new `Wheeled::show`, which sets the joint coordinates, wheel outputs and powertrain status (`Powertrain::set_status`) and runs forward kinematics.
+- **Frame rates** (i7-1365U, Iris Xe, 1920×1080, medium, plots and recording on):
+  - Demo drive on the showcase map: 74 fps.
+  - Offroad preset: 84 fps (87 over the last frames).
+  - Replay of that drive: 98 fps.
+- **Finding**: on the showcase map the 4×4 bounces hard. The detail noise (0.25 m at 6 m wavelength) leaves at least one wheel unloaded in 63 % of samples, with peak loads of 23 kN. On the `offroad` preset that falls to 6 % (never three or more wheels), with peaks of 18 kN. The model was not changed; `offroad` is the map for driving.
+- **Tests**:
+  - Viewer: keys drive, steer, brake and hold a car; a skid-steer turns on the spot; the demo command overrides the keys; a ground replay reproduces spin, steer, travel, tyre forces and wheel poses; tracking references and tyre samples; `--record` writes a drive with wheel data.
+  - Vehicles: a shown state matches the simulated one.
+  - Scene: links only on suspended wheels, and an eye point inside the body.
+
 ### Performance targets (i7-1365U, release)
 | Metric | Target |
 |---|---|

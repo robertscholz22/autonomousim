@@ -1,7 +1,8 @@
 //! What the viewer shows: either a live [`WorldInstance`] stepped at its physics rate from the
-//! frame clock (fixed-step accumulator) with keyboard flight of one agent, or the playback of
-//! a recording ([`Replay`]) that places the agents of the same kind of world. Live, a trained
-//! policy ([`Autopilot`]) can fly the agents instead.
+//! frame clock (fixed-step accumulator) with keyboard flight or driving of one agent, or the
+//! playback of a recording ([`Replay`]) that places the agents of the same kind of world.
+//! Live, a trained policy ([`Autopilot`]) can fly the agents instead, and the session can be
+//! recorded.
 
 use crate::autopilot::{self, Autopilot};
 use crate::camera::{CameraMode, CameraRig};
@@ -10,14 +11,22 @@ use autonomousim_control::Command;
 use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::math::Pose;
+use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::Family;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 use glam::{DVec2, DVec3};
+use std::sync::Mutex;
 
 /// Simulated time advanced per frame at most (s); slower frames run the simulation slower.
 const MAX_FRAME_STEP: f64 = 0.1;
+
+/// Keyboard steering of ground vehicles: the rate at which the steering follows the keys
+/// (full lock per second), and the speed (m/s) at which the reachable lock is halved (it falls
+/// as `1/(1 + (v/v₀)²)`, so that a tap of the key does not spin the car at speed).
+const STEER_RATE: f64 = 2.5;
+const STEER_FADE_SPEED: f64 = 12.0;
 
 /// How the keys fly the pilot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,8 +67,15 @@ pub struct Sim {
     /// Simulated (or recorded) seconds per real second.
     pub time_scale: f64,
     pub pilot_mode: PilotMode,
-    /// Pilot input: forward, left, up and yaw, each in [−1, 1].
+    /// Pilot input: forward, left, up and yaw, each in [−1, 1]. Ground vehicles use forward
+    /// (pedal) and left (steering).
     pub stick: [f64; 4],
+    /// Ground vehicles: parking brake held, and the steering command after the rate limit and
+    /// the fade with speed.
+    pub handbrake: bool,
+    pub steer: f64,
+    /// Drives the followed ground vehicle instead of the keys (`--demo`).
+    pub drive_command: Option<GroundSetpoint>,
     /// Horizontal and vertical speed at full stick (m/s), yaw rate (rad/s).
     pub max_speed: f64,
     pub max_climb: f64,
@@ -81,6 +97,8 @@ pub struct Sim {
     pub replay: Option<Replay>,
     /// A trained policy flying the agents of its group (live only).
     pub autopilot: Option<Autopilot>,
+    /// Recording of the live session (`--record`; in a mutex since the recorder is not `Sync`).
+    recorder: Option<Mutex<Recorder>>,
 }
 
 impl Sim {
@@ -93,6 +111,9 @@ impl Sim {
             time_scale: 1.0,
             pilot_mode: PilotMode::Velocity,
             stick: [0.0; 4],
+            handbrake: false,
+            steer: 0.0,
+            drive_command: None,
             max_speed: 8.0,
             max_climb: 3.0,
             max_yaw_rate: 1.5,
@@ -105,6 +126,7 @@ impl Sim {
             episodes: 1,
             replay: None,
             autopilot: None,
+            recorder: None,
         };
         s.snapshot_poses();
         s
@@ -118,8 +140,31 @@ impl Sim {
         s
     }
 
-    /// Go on in `world` (e.g. on a regenerated map) with a new episode.
+    /// Record the live session from now on: the current state starts an episode, and every
+    /// reset starts the next.
+    pub fn record(&mut self, mut recorder: Recorder) {
+        recorder.on_reset(&self.world);
+        self.recorder = Some(Mutex::new(recorder));
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// Write the rest of the recording and close it.
+    pub fn finish_recording(&mut self) -> anyhow::Result<()> {
+        match self.recorder.take() {
+            Some(r) => Ok(r.into_inner().map_err(|_| anyhow::anyhow!("recorder poisoned"))?.finish()?),
+            None => Ok(()),
+        }
+    }
+
+    /// Go on in `world` (e.g. on a regenerated map) with a new episode. A recording ends here,
+    /// since it holds one scenario.
     pub fn set_world(&mut self, world: WorldInstance) {
+        if let Err(e) = self.finish_recording() {
+            warn!("finishing the recording: {e:#}");
+        }
         self.world = world;
         self.pilot = self.pilot.min(self.world.agents().len() - 1);
         self.latched = vec![Events::NONE; self.world.agents().len()];
@@ -143,6 +188,9 @@ impl Sim {
             return;
         }
         self.world.reset(None);
+        if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
+            r.on_reset(&self.world);
+        }
         self.accumulator = 0.0;
         self.latched.iter_mut().for_each(|e| *e = Events::NONE);
         self.episodes += 1;
@@ -198,15 +246,36 @@ impl Sim {
     }
 
     /// The pilot's command for the followed vehicle: [`setpoint`](Self::setpoint) for a
-    /// multirotor; for a ground vehicle forward/back as the pedal and left/right as steering.
+    /// multirotor. For a ground vehicle, forward/back is the pedal (brake, then reverse) and
+    /// the steering follows left/right; side drives turn by driving their sides apart.
     pub fn pilot_command(&self) -> Command {
-        match self.world.agent(self.pilot).vehicle.family() {
+        let agent = self.world.agent(self.pilot);
+        match agent.vehicle.family() {
             Family::Multirotor => self.setpoint().into(),
             Family::Wheeled => {
-                let [forward, left, ..] = self.stick;
-                GroundSetpoint::Pedal { drive: forward, steering: left }.into()
+                if let Some(sp) = self.drive_command {
+                    return sp.into();
+                }
+                let forward = self.stick[0];
+                if agent.controller.as_ground().is_some_and(|c| c.is_side_drive()) {
+                    let (left, right) =
+                        ((forward - self.steer).clamp(-1.0, 1.0), (forward + self.steer).clamp(-1.0, 1.0));
+                    GroundSetpoint::Sides { left, right }.into()
+                } else {
+                    GroundSetpoint::Pedal { drive: forward, steering: self.steer, handbrake: self.handbrake }.into()
+                }
             }
         }
+    }
+
+    /// Move the steering command toward the keys by `dt` of simulated time.
+    fn update_steering(&mut self, dt: f64) {
+        let agent = self.world.agent(self.pilot);
+        let steered = agent.controller.as_ground().is_some_and(|c| c.has_steering());
+        let fade =
+            if steered { 1.0 / (1.0 + (agent.vehicle.lin_vel_body().x / STEER_FADE_SPEED).powi(2)) } else { 1.0 };
+        let step = STEER_RATE * dt;
+        self.steer += (self.stick[1] * fade - self.steer).clamp(-step, step);
     }
 
     /// Advance by `real_dt` seconds of wall-clock time.
@@ -231,6 +300,7 @@ impl Sim {
         self.accumulator += wanted.min(MAX_FRAME_STEP);
         let manual = self.manual_agent();
         if let Some(pilot) = manual {
+            self.update_steering(wanted.min(MAX_FRAME_STEP));
             let command = self.pilot_command();
             self.world.set_command(pilot, command);
         }
@@ -246,6 +316,9 @@ impl Sim {
                 self.world.agent_mut(a).events = Events::NONE;
             }
             self.world.tick();
+            if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
+                r.on_tick(&self.world);
+            }
             for (l, a) in self.latched.iter_mut().zip(self.world.agents()) {
                 *l |= a.events;
             }
@@ -297,11 +370,14 @@ impl Sim {
 
 /// Keys common to both modes: P pause, `[`/`]` time scale, R reset (live) or restart
 /// (replay), Tab next agent. Live only: W/S forward/back, A/D left/right, Space/Shift up/down,
-/// Q/E yaw, M pilot mode, `-`/`=` speed, T take over from the autopilot. The free camera takes
-/// the flight keys.
+/// Q/E yaw, M pilot mode, `-`/`=` speed, T take over from the autopilot. Ground vehicles:
+/// W/S pedal (brake, then reverse), A/D steering, Space handbrake. The free camera takes the
+/// flight keys.
 ///
 /// A gamepad flies as a mode-2 transmitter: left stick climb and yaw, right stick forward and
-/// sideways; Start pauses, Select changes the pilot mode, East (B) resets.
+/// sideways; Start pauses, Select changes the pilot mode, East (B) resets. It drives with the
+/// right trigger (throttle), the left trigger (brake, then reverse), the left stick
+/// (steering) and South (A, handbrake).
 pub fn pilot_input(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
@@ -311,19 +387,30 @@ pub fn pilot_input(
 ) {
     if egui.ctx_mut().is_ok_and(|c| c.egui_wants_keyboard_input()) {
         sim.stick = [0.0; 4];
+        sim.handbrake = false;
         return;
     }
+    let ground = sim.world.agent(sim.pilot).vehicle.family() == Family::Wheeled;
     let axis = |pos: KeyCode, neg: KeyCode| f64::from(keys.pressed(pos) as u8) - f64::from(keys.pressed(neg) as u8);
-    let mut stick = [
-        axis(KeyCode::KeyW, KeyCode::KeyS),
-        axis(KeyCode::KeyA, KeyCode::KeyD),
-        axis(KeyCode::Space, KeyCode::ShiftLeft),
-        axis(KeyCode::KeyQ, KeyCode::KeyE),
-    ];
+    let mut stick = [axis(KeyCode::KeyW, KeyCode::KeyS), axis(KeyCode::KeyA, KeyCode::KeyD), 0.0, 0.0];
+    let mut handbrake = false;
+    if ground {
+        handbrake = keys.pressed(KeyCode::Space);
+    } else {
+        stick[2] = axis(KeyCode::Space, KeyCode::ShiftLeft);
+        stick[3] = axis(KeyCode::KeyQ, KeyCode::KeyE);
+    }
     let (mut pause, mut mode, mut reset) = (false, false, false);
     for pad in &gamepads {
         let (l, r) = (pad.left_stick().as_dvec2(), pad.right_stick().as_dvec2());
-        for (s, p) in stick.iter_mut().zip([r.y, -r.x, l.y, -l.x]) {
+        let pads = if ground {
+            let trigger = |b: GamepadButton| f64::from(pad.get(b).unwrap_or(0.0));
+            handbrake |= pad.pressed(GamepadButton::South);
+            [trigger(GamepadButton::RightTrigger2) - trigger(GamepadButton::LeftTrigger2), -l.x, 0.0, 0.0]
+        } else {
+            [r.y, -r.x, l.y, -l.x]
+        };
+        for (s, p) in stick.iter_mut().zip(pads) {
             *s = (*s + p).clamp(-1.0, 1.0);
         }
         pause |= pad.just_pressed(GamepadButton::Start);
@@ -331,12 +418,14 @@ pub fn pilot_input(
         reset |= pad.just_pressed(GamepadButton::East);
     }
     let horizontal = DVec2::new(stick[0], stick[1]);
-    if horizontal.length() > 1.0 {
+    if !ground && horizontal.length() > 1.0 {
         let h = horizontal.normalize();
         (stick[0], stick[1]) = (h.x, h.y);
     }
     let free = camera.single().is_ok_and(|c| c.mode == CameraMode::Free);
-    sim.stick = if free || sim.replay.is_some() { [0.0; 4] } else { stick };
+    let idle = free || sim.replay.is_some();
+    sim.stick = if idle { [0.0; 4] } else { stick };
+    sim.handbrake = handbrake && !idle;
 
     if keys.just_pressed(KeyCode::KeyR) || reset {
         sim.reset();
@@ -358,7 +447,7 @@ pub fn pilot_input(
     {
         a.flies_pilot = !a.flies_pilot;
     }
-    if sim.replay.is_none() {
+    if sim.replay.is_none() && !ground {
         if keys.just_pressed(KeyCode::KeyM) || mode {
             sim.pilot_mode = sim.pilot_mode.next();
         }
@@ -407,6 +496,7 @@ pub fn step(time: Res<Time>, mut sim: ResMut<Sim>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autonomousim_control::ground::GroundActionMode;
     use autonomousim_control::multirotor::ActionMode;
     use autonomousim_core::math::quat::yaw;
     use autonomousim_core::rng::Seed;
@@ -425,6 +515,96 @@ mod tests {
             ..Default::default()
         };
         Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1)))
+    }
+
+    /// A ground vehicle driven by the pedal, as the viewer's driver group.
+    fn ground_sim(vehicle: &str) -> Sim {
+        let sc = Scenario {
+            map: MapSource::Testworld(Testworld::Flat { size: 2000.0 }),
+            groups: vec![GroupSpec {
+                vehicle: autonomousim_sim::scenario::VehicleRef::Name(vehicle.into()),
+                action_mode: Some(GroundActionMode::Raw.into()),
+                disable_on_terminal: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1)))
+    }
+
+    /// Run `seconds` of 60 Hz frames with the given stick; returns the displacement along the
+    /// initial heading and the heading change.
+    fn drive(s: &mut Sim, stick: [f64; 4], seconds: f64) -> (f64, f64) {
+        let start = s.world.agent(0).vehicle.position();
+        let heading = yaw(s.world.agent(0).vehicle.orientation());
+        s.stick = stick;
+        for _ in 0..(seconds * 60.0).round() as usize {
+            s.advance(1.0 / 60.0);
+        }
+        let v = &s.world.agent(0).vehicle;
+        let d = (v.position() - start).truncate();
+        let turn = (yaw(v.orientation()) - heading + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
+        (d.dot(glam::DVec2::from_angle(heading)), turn)
+    }
+
+    #[test]
+    fn keys_drive_and_steer_a_car() {
+        let mut s = ground_sim("offroad_4x4");
+        // Settle on the suspension, then the pedal drives forward.
+        drive(&mut s, [0.0; 4], 0.5);
+        assert!(!s.world.agent(0).controller.as_ground().unwrap().last_input().parking);
+        let (forward, turn) = drive(&mut s, [1.0, 0.0, 0.0, 0.0], 3.0);
+        assert!(forward > 5.0 && turn.abs() < 0.05, "forward {forward}, turn {turn}");
+        // The steering follows the keys at the rate limit, less at speed.
+        let speed = s.world.agent(0).vehicle.lin_vel_body().x;
+        drive(&mut s, [0.5, 1.0, 0.0, 0.0], 0.1);
+        assert!((s.steer - STEER_RATE * 0.1).abs() < 0.02, "steer {}", s.steer);
+        let (_, turn) = drive(&mut s, [0.5, 1.0, 0.0, 0.0], 2.0);
+        let fade = 1.0 / (1.0 + (speed / STEER_FADE_SPEED).powi(2));
+        assert!(turn > 0.3 && s.steer < 1.0 && s.steer > 0.5 * fade, "turn {turn}, steer {}", s.steer);
+        // Released, the steering centres. The handbrake locks the rear wheels and slows the car
+        // (and swings its tail out); the brake pedal stops it, and the handbrake then holds it.
+        drive(&mut s, [0.0; 4], 1.0);
+        assert_eq!(s.steer, 0.0);
+        let speed = s.world.agent(0).vehicle.lin_vel_body().x;
+        s.handbrake = true;
+        drive(&mut s, [0.0; 4], 1.0);
+        assert!(s.world.agent(0).controller.as_ground().unwrap().last_input().parking);
+        assert!(s.world.agent(0).vehicle.lin_vel_body().x < speed - 1.0);
+        s.handbrake = false;
+        for _ in 0..600 {
+            if s.world.agent(0).vehicle.lin_vel_body().length() < 0.3 {
+                break;
+            }
+            drive(&mut s, [-1.0, 0.0, 0.0, 0.0], 1.0 / 60.0);
+        }
+        s.handbrake = true;
+        drive(&mut s, [0.0; 4], 1.0);
+        let (moved, _) = drive(&mut s, [0.0; 4], 2.0);
+        assert!(moved.abs() < 0.01, "moved {moved}");
+        assert!(!s.latched[0].intersects(Events::TERMINAL), "{:?}", s.latched[0]);
+    }
+
+    #[test]
+    fn side_drives_turn_on_the_spot() {
+        let mut s = ground_sim("rover_skid");
+        drive(&mut s, [0.0; 4], 0.5);
+        let (forward, turn) = drive(&mut s, [0.0, 1.0, 0.0, 0.0], 0.5);
+        assert!(turn > 0.3 && forward.abs() < 0.5, "forward {forward}, turn {turn}");
+        let (forward, _) = drive(&mut s, [1.0, 0.0, 0.0, 0.0], 2.0);
+        assert!(forward.abs() > 1.0, "forward {forward}");
+    }
+
+    #[test]
+    fn drive_command_overrides_the_keys() {
+        let mut s = ground_sim("offroad_4x4");
+        s.stick = [1.0, 1.0, 0.0, 0.0];
+        s.drive_command = Some(GroundSetpoint::Pedal { drive: -0.5, steering: 0.0, handbrake: true });
+        assert!(matches!(
+            s.pilot_command(),
+            Command::Ground(GroundSetpoint::Pedal { drive, handbrake: true, .. }) if drive == -0.5
+        ));
     }
 
     #[test]

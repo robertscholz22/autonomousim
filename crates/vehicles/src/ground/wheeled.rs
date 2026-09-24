@@ -296,6 +296,27 @@ impl Wheeled {
         forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut self.ws.kin);
     }
 
+    /// Show a recorded state instead of simulating: place the vehicle (as [`reset`](Self::reset))
+    /// with the bicycle steering angle `steering`, the wheels' travel, steering and spin angles
+    /// and outputs from `wheels` (one per wheel; fewer leave the rest as placed), and the
+    /// powertrain status `powertrain`.
+    pub fn show(&mut self, init: &WheeledInit, steering: f64, wheels: &[WheelState], powertrain: PowertrainStatus) {
+        self.reset(init);
+        for (c, w) in self.corners.iter_mut().zip(wheels) {
+            if let Some((q, v)) = c.travel {
+                (self.state.q[q], self.state.v[v]) = (w.travel, w.travel_rate);
+            }
+            if let Some((q, _)) = c.steer {
+                self.state.q[q] = w.steer;
+            }
+            (self.state.q[c.spin.0], self.state.v[c.spin.1]) = (w.spin_angle, w.spin);
+            c.out = *w;
+        }
+        self.steer_angle = steering;
+        self.powertrain.set_status(powertrain);
+        forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut self.ws.kin);
+    }
+
     // ---------------------------------------------------------------- step phases
 
     /// Forward kinematics and cleared force accumulators.

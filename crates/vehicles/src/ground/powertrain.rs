@@ -562,6 +562,11 @@ impl Powertrain {
         self.status
     }
 
+    /// Show `status` (playback of a recording) until the next step.
+    pub fn set_status(&mut self, status: PowertrainStatus) {
+        self.status = status;
+    }
+
     /// Engage forward gear `gear` (1…) or reverse (−1) of a combustion drive; the automatic
     /// shifting takes over from the next step.
     pub fn set_gear(&mut self, gear: i32) {

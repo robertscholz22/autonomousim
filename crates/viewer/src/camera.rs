@@ -1,6 +1,7 @@
 //! Cameras following the piloted vehicle: chase (behind it, turning with its heading), orbit
-//! (mouse-controlled around it) and first-person (fixed to the airframe), and a free-flying
-//! camera (W/A/S/D, Space/Shift, mouse drag to look, wheel for speed, Ctrl for 4×).
+//! (mouse-controlled around it) and first-person (fixed to the airframe, or from the driver's
+//! seat), and a free-flying camera (W/A/S/D, Space/Shift, mouse drag to look, wheel for speed,
+//! Ctrl for 4×). Ground vehicles are chased from lower and closer, relative to their size.
 //!
 //! Angles and positions are computed in ENU and converted once.
 
@@ -54,6 +55,12 @@ pub struct CameraRig {
     pub distance: f64,
     /// Size of the vehicle (m), which sets distance limits.
     pub span: f64,
+    /// Closest chase distance (m), and the height of the chased point above the vehicle
+    /// origin (m).
+    pub min_distance: f64,
+    pub focus_height: f64,
+    /// First-person eye point in the vehicle frame (m); `None`: ahead of the centre.
+    pub eye_offset: Option<DVec3>,
     /// Where the camera is (ENU), and the speed of the free camera (m/s).
     pub eye: DVec3,
     pub speed: f64,
@@ -67,8 +74,23 @@ impl CameraRig {
             pitch: 0.3,
             distance: (6.0 * span).max(1.2),
             span,
+            min_distance: 2.0 * span,
+            focus_height: 0.5 * span,
+            eye_offset: None,
             eye: DVec3::ZERO,
             speed: 10.0,
+        }
+    }
+
+    /// For a ground vehicle of size `span` with the driver's eye at `eye` (vehicle frame).
+    pub fn ground(span: f64, heading: f64, eye: DVec3) -> Self {
+        Self {
+            pitch: 0.2,
+            distance: (2.6 * span).max(1.5),
+            min_distance: (1.2 * span).max(0.6),
+            focus_height: eye.z.max(0.3 * span),
+            eye_offset: Some(eye),
+            ..Self::new(span, heading)
         }
     }
 
@@ -108,7 +130,7 @@ pub fn update_camera(
             if rig.mode == CameraMode::Free {
                 rig.speed = (rig.speed / factor).clamp(1.0, 200.0);
             } else {
-                rig.distance = (rig.distance * factor).clamp(2.0 * rig.span, 300.0);
+                rig.distance = (rig.distance * factor).clamp(rig.min_distance, 300.0);
             }
         }
         if buttons.pressed(MouseButton::Left) || buttons.pressed(MouseButton::Right) {
@@ -129,13 +151,13 @@ pub fn update_camera(
                 rig.heading += err * (1.0 - (-dt / 0.5).exp());
             }
             let dir = rig.look();
-            let focus = target + DVec3::Z * (0.5 * rig.span);
+            let focus = target + DVec3::Z * rig.focus_height;
             // Move in front of terrain, trunks and crowns between the vehicle and the camera.
             let mask = HitMask(HitMask::TERRAIN.0 | HitMask::SOLID.0 | HitMask::FOLIAGE.0);
             let distance = view
                 .world
                 .raycast(&Ray::new(focus, -dir), rig.distance, mask)
-                .map_or(rig.distance, |hit| (hit.toi - 0.15).max(1.5 * rig.span));
+                .map_or(rig.distance, |hit| (hit.toi - 0.15).max(0.75 * rig.min_distance));
             let mut eye = focus - dir * distance;
             // Stay above the ground and water.
             let floor = view.world.surface_height(eye.x, eye.y) + (0.3 * rig.span).max(0.15);
@@ -143,9 +165,14 @@ pub fn update_camera(
             (eye, focus, DVec3::Z)
         }
         CameraMode::Fpv => {
-            // Slightly ahead of and above the centre, tilted up by 10°.
-            let camera_rot = pose.rot * DQuat::from_rotation_y(-10f64.to_radians());
-            let eye = target + pose.rot * DVec3::new(0.4 * rig.span, 0.0, 0.15 * rig.span);
+            // From the driver's seat, looking 5° down; for aircraft slightly ahead of and above
+            // the centre, tilted up by 10°.
+            let (offset, tilt) = match rig.eye_offset {
+                Some(eye) => (eye, 5f64),
+                None => (DVec3::new(0.4 * rig.span, 0.0, 0.15 * rig.span), -10f64),
+            };
+            let camera_rot = pose.rot * DQuat::from_rotation_y(tilt.to_radians());
+            let eye = target + pose.rot * offset;
             (eye, eye + camera_rot * DVec3::X, camera_rot * DVec3::Z)
         }
         CameraMode::Free => {

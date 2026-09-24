@@ -1,6 +1,7 @@
-//! Head-up display: flight data, events, rotor speeds, simulation controls and key help; a
-//! map seed control (live), a timeline (replay), and plots of the followed agent. The LiDAR
-//! view is in `lidar_view`.
+//! Head-up display: flight data, events, rotor speeds (or a ground vehicle's powertrain,
+//! pedals and per-wheel load, slip and force), simulation controls and key help; a map seed
+//! control (live), a timeline (replay), and plots of the followed agent. The LiDAR view is in
+//! `lidar_view`.
 
 use crate::Regenerate;
 use crate::camera::CameraRig;
@@ -12,7 +13,7 @@ use autonomousim_sim::Events;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
-use egui_plot::{Legend, Line, LineStyle, Plot, PlotPoints, VLine};
+use egui_plot::{Legend, Line, LineStyle, Plot, PlotPoints, Points, VLine};
 
 #[derive(Resource)]
 pub struct Hud {
@@ -30,6 +31,15 @@ const HELP: &str = "W/S  forward/back     A/D  left/right\n\
                     O  goals/trails       G  plots\n\
                     L  LiDAR hits         V  LiDAR view\n\
                     H  hide HUD   F1  help   Esc  quit";
+
+const GROUND_HELP: &str = "W/S  throttle / brake, reverse   A/D  steer\n\
+                           Space  handbrake      R  reset episode\n\
+                           Tab  next agent       P  pause   [/]  time scale\n\
+                           C  camera             mouse drag  look   wheel  zoom\n\
+                           O  goals/trails       G  plots\n\
+                           L  LiDAR hits         V  LiDAR view\n\
+                           H  hide HUD   F1  help   Esc  quit\n\
+                           gamepad: RT/LT pedals, left stick steers, A handbrake";
 
 /// Shown above [`HELP`] while a policy flies.
 const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
@@ -138,7 +148,11 @@ fn status_window(
                     if regen.pending.is_some() {
                         ui.spinner();
                         ui.label("generating…");
-                    } else if ui.add_enabled(seed != current, egui::Button::new("generate")).clicked() {
+                    } else if ui
+                        .add_enabled(seed != current && !sim.is_recording(), egui::Button::new("generate"))
+                        .on_disabled_hover_text("the recording holds this map")
+                        .clicked()
+                    {
                         regen.start(seed);
                     }
                 });
@@ -155,8 +169,13 @@ fn status_window(
                 };
                 row(ui, "time", format!("{:8.2} s", sim.time()));
                 row(ui, "position", format!("{:7.1} {:7.1} {:6.1} m", pos.x, pos.y, pos.z));
-                row(ui, "height", format!("{:6.1} m AGL", agent.agl_now(world.map())));
-                row(ui, "speed", format!("{:5.1} m/s  climb {:+5.1}", vel.truncate().length(), vel.z));
+                if let Some(w) = v.as_wheeled() {
+                    let forward = w.lin_vel_body().x;
+                    row(ui, "speed", format!("{:5.1} km/h  ({forward:+5.1} m/s)", 3.6 * vel.length()));
+                } else {
+                    row(ui, "height", format!("{:6.1} m AGL", agent.agl_now(world.map())));
+                    row(ui, "speed", format!("{:5.1} m/s  climb {:+5.1}", vel.truncate().length(), vel.z));
+                }
                 row(ui, "heading", format!("{:5.0}°", yaw(v.orientation()).to_degrees()));
                 if !agent.goals.is_empty() {
                     let g = agent.goal();
@@ -168,6 +187,10 @@ fn status_window(
                 if sim.replay.is_none() && sim.manual_agent().is_none() {
                     let a: Vec<String> = agent.action.iter().map(|x| format!("{x:+.2}")).collect();
                     row(ui, "policy", a.join(" "));
+                } else if sim.replay.is_none() && v.as_wheeled().is_some() {
+                    let hb = if sim.handbrake { "  handbrake" } else { "" };
+                    let who = if sim.drive_command.is_some() { "demo" } else { "keys" };
+                    row(ui, "driver", format!("{who}  pedal {:+.1}  steer {:+.2}{hb}", sim.stick[0], sim.steer));
                 } else if sim.replay.is_none() {
                     let [f, l, u, y] = sim.stick;
                     row(ui, "pilot", format!("{}  {f:+.1} {l:+.1} {u:+.1} {y:+.1}", sim.pilot_mode.name()));
@@ -184,17 +207,7 @@ fn status_window(
                 });
             }
             if let Some(w) = v.as_wheeled() {
-                let p = w.powertrain();
-                let gear = match p.gear {
-                    0 => "–".to_owned(),
-                    -1 => "R".to_owned(),
-                    g => g.to_string(),
-                };
-                ui.label(format!(
-                    "steering {:+4.0}° · gear {gear} · {:5.0} rpm",
-                    w.steering_angle().to_degrees(),
-                    p.engine_speed * 30.0 / std::f64::consts::PI
-                ));
+                ground_status(ui, sim, w);
             }
             let latched = sim.latched[sim.pilot];
             let now = agent.events;
@@ -221,14 +234,82 @@ fn status_window(
                 "{state} · ×{} · real time ×{:.2} · {fps:.0} fps · camera {camera_mode}",
                 sim.time_scale, sim.real_time_factor
             ));
+            if sim.is_recording() {
+                ui.colored_label(egui::Color32::from_rgb(230, 80, 60), "● recording");
+            }
             if hud.help {
                 ui.separator();
                 if sim.autopilot.is_some() {
                     ui.monospace(POLICY_HELP);
                 }
-                ui.monospace(if sim.replay.is_some() { REPLAY_HELP } else { HELP });
+                let help = match (sim.replay.is_some(), v.as_wheeled().is_some()) {
+                    (true, _) => REPLAY_HELP,
+                    (false, true) => GROUND_HELP,
+                    (false, false) => HELP,
+                };
+                ui.monospace(help);
             }
         });
+}
+
+/// Wheel names: FL, FR, RL, RR for two axles, else axle number and side.
+fn wheel_name(w: usize, axles: usize) -> String {
+    let side = if w.is_multiple_of(2) { "L" } else { "R" };
+    match (axles, w / 2) {
+        (2, 0) => format!("F{side}"),
+        (2, _) => format!("R{side}"),
+        (_, a) => format!("{}{side}", a + 1),
+    }
+}
+
+/// Gear, engine speed, steering and the driver's pedals, and a table of the wheels: tyre load,
+/// suspension travel, slip, forces and torques.
+fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground::Wheeled) {
+    let agent = sim.world.agent(sim.pilot);
+    let p = w.powertrain();
+    let gear = match p.gear {
+        0 => "–".to_owned(),
+        -1 => "R".to_owned(),
+        g => g.to_string(),
+    };
+    ui.label(format!(
+        "steering {:+5.1}° · gear {gear} · {:5.0} rpm",
+        w.steering_angle().to_degrees(),
+        p.engine_speed * 30.0 / std::f64::consts::PI
+    ));
+    if sim.replay.is_none()
+        && let Some(c) = agent.controller.as_ground()
+    {
+        let input = c.last_input();
+        ui.horizontal(|ui| {
+            ui.label("throttle");
+            ui.add(egui::ProgressBar::new(input.throttle.abs() as f32).desired_width(60.0));
+            ui.label("brake");
+            ui.add(egui::ProgressBar::new(input.brake as f32).desired_width(60.0));
+            if input.parking {
+                ui.label("P");
+            }
+        });
+    }
+    let axles = w.def().axles.len();
+    egui::Grid::new("wheels").num_columns(8).striped(true).show(ui, |ui| {
+        for h in ["", "load kN", "travel mm", "κ", "α °", "Fx kN", "Fy kN", "drive/brake N·m"] {
+            ui.label(egui::RichText::new(h).small());
+        }
+        ui.end_row();
+        for (k, s) in w.wheels().enumerate() {
+            let t = &s.tire;
+            ui.label(wheel_name(k, axles));
+            ui.monospace(format!("{:5.2}", t.fz / 1e3));
+            ui.monospace(format!("{:+5.0}", s.travel * 1e3));
+            ui.monospace(format!("{:+5.2}", t.kappa));
+            ui.monospace(format!("{:+5.1}", t.tan_alpha.atan().to_degrees()));
+            ui.monospace(format!("{:+5.2}", t.fx / 1e3));
+            ui.monospace(format!("{:+5.2}", t.fy / 1e3));
+            ui.monospace(format!("{:+5.0}/{:4.0}", s.drive_torque, s.brake_torque.abs()));
+            ui.end_row();
+        }
+    });
 }
 
 /// Replay controls at the bottom: play/pause, episode, time slider and speed.
@@ -293,7 +374,21 @@ fn line<'a>(name: &str, points: Vec<[f64; 2]>, color: egui::Color32) -> Line<'a>
     Line::new(name, PlotPoints::from(points)).color(color)
 }
 
-/// Height and goal distance, and setpoint against the measured value, over time.
+/// Colours of the wheels in the tyre plots.
+const WHEELS: [egui::Color32; 8] = [
+    egui::Color32::from_rgb(230, 90, 80),
+    egui::Color32::from_rgb(240, 170, 60),
+    egui::Color32::from_rgb(90, 150, 240),
+    egui::Color32::from_rgb(110, 200, 90),
+    egui::Color32::from_rgb(190, 110, 220),
+    egui::Color32::from_rgb(80, 200, 200),
+    egui::Color32::from_rgb(200, 200, 90),
+    egui::Color32::from_rgb(200, 200, 200),
+];
+
+/// Height (sideslip for ground vehicles) and goal distance, and setpoint against the
+/// measured value, over time; for ground vehicles also every tyre's force over its load
+/// against its slip.
 fn plots(ctx: &egui::Context, sim: &Sim, history: &History) {
     let samples = &history.samples;
     let now = sim.time();
@@ -306,8 +401,13 @@ fn plots(ctx: &egui::Context, sim: &Sim, history: &History) {
         .default_width(420.0)
         .collapsible(true)
         .show(ctx, |ui| {
+            let ground = history.tracking == crate::history::Tracking::Ground;
             Plot::new("height").height(150.0).legend(Legend::default()).link_axis("t", [true, false]).show(ui, |p| {
-                p.line(line("height AGL (m)", series(&|s| s.agl), AXES[2]));
+                if ground {
+                    p.line(line("sideslip (°)", series(&|s| s.sideslip), AXES[2]));
+                } else {
+                    p.line(line("height AGL (m)", series(&|s| s.agl), AXES[2]));
+                }
                 p.line(line("goal distance (m)", series(&|s| s.goal_distance), egui::Color32::from_rgb(240, 200, 40)));
                 if cursor {
                     p.vline(VLine::new("now", now).color(egui::Color32::GRAY));
@@ -330,5 +430,35 @@ fn plots(ctx: &egui::Context, sim: &Sim, history: &History) {
                     p.vline(VLine::new("now", now).color(egui::Color32::GRAY));
                 }
             });
+            if ground {
+                tyre_plots(ui, sim, history);
+            }
         });
+}
+
+/// Force over load against slip for every tyre: lateral against the slip angle, longitudinal
+/// against κ. Live: the history window; replay: the episode up to the playback time.
+fn tyre_plots(ui: &mut egui::Ui, sim: &Sim, history: &History) {
+    let now = sim.time();
+    let upto: Vec<&crate::history::Sample> = history.samples.iter().filter(|s| s.time <= now + 1e-9).collect();
+    let n = upto.iter().map(|s| s.wheels.len()).max().unwrap_or(0);
+    let axles = n / 2;
+    let scatter = |x: fn(&crate::history::WheelSample) -> f64, y: fn(&crate::history::WheelSample) -> f64| {
+        let upto = &upto;
+        move |p: &mut egui_plot::PlotUi| {
+            for k in 0..n {
+                let pts: Vec<[f64; 2]> = upto
+                    .iter()
+                    .filter_map(|s| s.wheels.get(k))
+                    .map(|w| [x(w), y(w)])
+                    .filter(|q| q[0].is_finite() && q[1].is_finite())
+                    .collect();
+                p.points(Points::new(wheel_name(k, axles), pts).radius(1.5).color(WHEELS[k % WHEELS.len()]));
+            }
+        }
+    };
+    ui.label("tyres: lateral force / load against slip angle (°)");
+    Plot::new("fy_alpha").height(140.0).legend(Legend::default()).show(ui, scatter(|w| w.alpha, |w| w.fy));
+    ui.label("tyres: longitudinal force / load against slip ratio κ");
+    Plot::new("fx_kappa").height(140.0).legend(Legend::default()).show(ui, scatter(|w| w.kappa, |w| w.fx));
 }

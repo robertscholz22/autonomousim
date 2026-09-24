@@ -82,8 +82,9 @@ pub enum GroundSetpoint {
     /// Driver input, passed through.
     Direct(DriveInput),
     /// One pedal axis (`[−1, 1]`: accelerate forward, or brake and then reverse) and steering
-    /// (`[−1, 1]`), with automatic reverse engagement near standstill.
-    Pedal { drive: f64, steering: f64 },
+    /// (`[−1, 1]`), with automatic reverse engagement near standstill; `handbrake` applies the
+    /// parking brake.
+    Pedal { drive: f64, steering: f64, handbrake: bool },
     /// Left and right motor commands (`[−1, 1]`), for side drives.
     Sides { left: f64, right: f64 },
     /// Forward speed (m/s, negative reverses) and path curvature (1/m, positive turns left).
@@ -196,6 +197,8 @@ pub struct GroundController {
     saturated: bool,
     motor_i: Vec<f64>,
     reverse: bool,
+    /// Driver input of the last update.
+    last: DriveInput,
 }
 
 impl GroundController {
@@ -297,6 +300,7 @@ impl GroundController {
             saturated: false,
             motor_i: vec![0.0; motors],
             reverse: false,
+            last: DriveInput::default(),
         })
     }
 
@@ -307,6 +311,16 @@ impl GroundController {
     /// Whether the vehicle has Ackermann steering (curvature control by steering).
     pub fn has_steering(&self) -> bool {
         self.steering.is_some()
+    }
+
+    /// Wheelbase of the bicycle model of the steered axle (m); `None` without steering.
+    pub fn wheelbase(&self) -> Option<f64> {
+        self.steering.map(|(l, _, _)| l)
+    }
+
+    /// Driver input of the last [`update`](Self::update).
+    pub fn last_input(&self) -> &DriveInput {
+        &self.last
     }
 
     /// Whether the vehicle is driven by left and right electric motors (skid-steer or
@@ -324,17 +338,25 @@ impl GroundController {
         self.saturated = false;
         self.motor_i.fill(0.0);
         self.reverse = false;
+        self.last = DriveInput::default();
     }
 
     /// Driver input for setpoint `sp`.
     pub fn update(&mut self, sp: &GroundSetpoint, est: &GroundEstimate) -> DriveInput {
+        self.last = self.input(sp, est);
+        self.last
+    }
+
+    fn input(&mut self, sp: &GroundSetpoint, est: &GroundEstimate) -> DriveInput {
         let v = est.speed();
         match *sp {
             GroundSetpoint::Direct(input) => input,
             GroundSetpoint::Sides { left, right } => {
                 DriveInput { throttle: 0.5 * (left + right), yaw: 0.5 * (right - left), ..Default::default() }
             }
-            GroundSetpoint::Pedal { drive, steering } => self.pedal(drive, steering, v),
+            GroundSetpoint::Pedal { drive, steering, handbrake } => {
+                DriveInput { parking: handbrake, ..self.pedal(drive, steering, v) }
+            }
             GroundSetpoint::SpeedCurvature { speed, curvature } => match self.steering {
                 Some(_) => {
                     let mut input = self.longitudinal(speed, est);

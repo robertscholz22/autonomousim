@@ -166,15 +166,24 @@ pub fn rotor_disc(radius: f32, color: [f32; 4]) -> MeshData {
 
 /// Visual of a wheeled vehicle: the body in the chassis frame (FLU) and one mesh per wheel in
 /// its spinning link's frame (spin axis y), to be posed from the simulated wheels.
+#[derive(Clone, Debug)]
 pub struct WheeledVisual {
     pub body: MeshData,
     pub wheels: Vec<MeshData>,
     /// Largest distance of a wheel's outer edge from the chassis origin (m), for cameras.
     pub span: f32,
+    /// Driver's eye point in the chassis frame (m), for the first-person camera.
+    pub eye: DVec3,
+    /// Per wheel with suspension: chassis-side ends of the strut and of the lower arm, in the
+    /// chassis frame (m). The other ends follow the wheel centre.
+    pub links: Vec<Option<[DVec3; 2]>>,
+    /// Link (unit cylinder along z, from −0.5 to 0.5) scaled to the links' thickness.
+    pub link: MeshData,
 }
 
-/// Build the visual of a wheeled vehicle: a box over the wheelbase and track with a red nose,
-/// and dark tyres with a light marker on the rim so that spin is visible.
+/// Build the visual of a wheeled vehicle: a box over the wheelbase and track with a red nose
+/// (and a cabin on cars), dark tyres with a light marker on the rim so that spin is visible,
+/// and a strut and lower arm per suspended wheel.
 pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual {
     let n = def.num_wheels();
     let positions: Vec<DVec3> = (0..n).map(|w| def.wheel_position(w)).collect();
@@ -195,6 +204,17 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     body.append_transformed(&mesh::cuboid(h(half), srgb([70, 110, 150])), DQuat::IDENTITY, centre);
     let nose = mesh::cuboid(h(DVec3::new(0.08 * half.x, 0.8 * half.y, 0.3 * half.z)), srgb([200, 40, 36]));
     body.append_transformed(&nose, DQuat::IDENTITY, centre + DVec3::new(half.x, 0.0, 0.5 * half.z));
+    let top = centre.z + half.z;
+    // Cars (wheels larger than a robot's): a cabin over the middle, a little behind centre.
+    let car = radius > 0.2;
+    let eye = if car {
+        let cabin = DVec3::new(0.3 * half.x, 0.85 * half.y, 0.55 * radius.max(0.35));
+        let at = DVec3::new(centre.x - 0.1 * half.x, centre.y, top + cabin.z);
+        body.append_transformed(&mesh::cuboid(h(cabin), srgb([150, 185, 210])), DQuat::IDENTITY, at);
+        DVec3::new(at.x + 0.2 * cabin.x, centre.y + 0.4 * cabin.y, top + 1.2 * cabin.z)
+    } else {
+        DVec3::new(centre.x + 0.8 * half.x, centre.y, top + 0.3 * half.z)
+    };
     let axis = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
     let wheels = (0..n)
         .map(|w| {
@@ -206,8 +226,20 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
             m
         })
         .collect();
+    // Strut from above the wheel, inboard, and lower arm to the body's side, below the axle line.
+    let links = (0..n)
+        .map(|w| {
+            def.axles[w / 2].suspension.as_ref()?;
+            let (p, r) = (positions[w], tire(w).radius());
+            let inboard = p.y.signum() * (0.5 * width + 0.25 * r);
+            let strut = DVec3::new(p.x, p.y - inboard, p.z + 0.9 * r);
+            let arm = DVec3::new(p.x, (p.y - 2.0 * inboard).abs().min(half.y).copysign(p.y), p.z - 0.2 * r);
+            Some([strut, arm])
+        })
+        .collect();
+    let link = mesh::cylinder((0.06 * radius) as f32, 0.5, 8, srgb([90, 90, 95]));
     let span = positions.iter().enumerate().map(|(w, p)| p.length() + tire(w).radius()).fold(0.0, f64::max) as f32;
-    WheeledVisual { body, wheels, span }
+    WheeledVisual { body, wheels, span, eye, links, link }
 }
 
 #[cfg(test)]
@@ -270,6 +302,12 @@ mod tests {
             assert!((whi.z - r).abs() < 1e-3 && (wlo.x + r).abs() < 0.05 * r, "{name}: {wlo} {whi}");
             assert!(whi.y < 0.6 * def.tire(0).width() as f32);
             assert!(v.span > front);
+            // Links on suspended wheels only; the eye is over the body.
+            for (w, l) in v.links.iter().enumerate() {
+                assert_eq!(l.is_some(), def.axles[w / 2].suspension.is_some(), "{name}");
+            }
+            assert!((v.eye.x as f32) < hi.x && v.eye.z > def.wheel_position(0).z, "{name}: {}", v.eye);
         }
+        assert!(wheeled(&presets::wheeled("sedan_like").unwrap()).links.iter().all(Option::is_some));
     }
 }

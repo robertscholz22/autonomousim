@@ -3,13 +3,15 @@
 //!
 //! ```text
 //! cargo run -p autonomousim-viewer --release -- --preset showcase --seed 0 --vehicle iris_like
+//! cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4 --record drive.mcap
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
 //! cargo run -p autonomousim-viewer --release -- policy runs/run/policy.json --agents 4
 //! ```
 //!
 //! Live, the simulation runs in-process at its physics rate from a fixed-step accumulator and
-//! the first agent is flown from the keyboard (or a gamepad); a replay rebuilds the recorded
+//! the first agent is flown or driven from the keyboard (or a gamepad), optionally recorded to
+//! MCAP; a replay rebuilds the recorded
 //! maps, checks their hashes and puts the agents where the recording has them; `policy` flies
 //! the agents with a trained policy (from `examples/export_policy.py`) in its task's scenario
 //! on a new map. F1 shows the keys.
@@ -27,15 +29,16 @@ mod vehicle_view;
 mod world_view;
 
 use anyhow::{Context, bail};
+use autonomousim_control::ground::{GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::ActionMode;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::Seed;
 use autonomousim_procgen::WildPreset;
 use autonomousim_sim::policy::PolicyFile;
-use autonomousim_sim::record::Recording;
+use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
 use autonomousim_sim::scenario::{MapSource, SpawnSpec, VehicleRef, WildMaps};
-use autonomousim_sim::{CompiledScenario, GroupSpec, Scenario, WorldInstance};
-use autonomousim_vehicles::Vehicle;
+use autonomousim_sim::{CompiledScenario, Events, GroupSpec, Scenario, WorldInstance};
+use autonomousim_vehicles::{Vehicle, VehicleDef};
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
@@ -96,6 +99,9 @@ enum Command {
         /// Generate the map without the map cache.
         #[arg(long)]
         no_cache: bool,
+        /// Record the session to this MCAP file.
+        #[arg(long)]
+        record: Option<PathBuf>,
         #[command(flatten)]
         display: DisplayArgs,
     },
@@ -127,9 +133,13 @@ struct LiveArgs {
     /// Generate the map without the map cache.
     #[arg(long)]
     no_cache: bool,
-    /// Fly forward on your own (for demos and performance checks).
+    /// Fly forward on your own, or drive from place to place along drivable paths (for demos
+    /// and performance checks).
     #[arg(long)]
     demo: bool,
+    /// Record the session to this MCAP file (replay it with `replay`).
+    #[arg(long)]
+    record: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -216,6 +226,27 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
         return Scenario::load(path).with_context(|| format!("loading {}", path.display()));
     }
     let config = args.size.map(|s| serde_json::json!({ "size": s }));
+    let vehicle = VehicleRef::Name(args.vehicle.clone());
+    let ground = matches!(vehicle.resolve()?, VehicleDef::Wheeled(_));
+    let group = if ground {
+        GroupSpec {
+            name: "driver".into(),
+            vehicle,
+            action_mode: Some(GroundActionMode::Raw.into()),
+            spawn: SpawnSpec { margin: 60.0, ..Default::default() },
+            disable_on_terminal: false,
+            ..Default::default()
+        }
+    } else {
+        GroupSpec {
+            name: "pilot".into(),
+            vehicle,
+            action_mode: Some(ActionMode::Velocity.into()),
+            spawn: SpawnSpec { agl: [2.0, 2.0], clearance: 4.0, margin: 60.0, ..Default::default() },
+            disable_on_terminal: false,
+            ..Default::default()
+        }
+    };
     let mut sc = Scenario {
         name: "viewer".into(),
         map: MapSource::Wild(WildMaps {
@@ -225,14 +256,7 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
             config,
             cache: !args.no_cache,
         }),
-        groups: vec![GroupSpec {
-            name: "pilot".into(),
-            vehicle: VehicleRef::Name(args.vehicle.clone()),
-            action_mode: Some(ActionMode::Velocity.into()),
-            spawn: SpawnSpec { agl: [2.0, 2.0], clearance: 4.0, margin: 60.0, ..Default::default() },
-            disable_on_terminal: false,
-            ..Default::default()
-        }],
+        groups: vec![group],
         ..Default::default()
     };
     sc.environment.wind.mean = glam::DVec2::new(args.wind, 0.0);
@@ -341,7 +365,7 @@ fn main() -> anyhow::Result<()> {
             let title = format!("autonomousim · replay {}", file.file_name().unwrap_or_default().to_string_lossy());
             (sim::Sim::replay(world, replay), display, None, false, title)
         }
-        Some(Command::Policy { file, map_seed, agents, episode_seed, no_cache, display }) => {
+        Some(Command::Policy { file, map_seed, agents, episode_seed, no_cache, record, display }) => {
             let policy = PolicyFile::read(&file)?;
             let sc = policy_scenario(&policy, map_seed, agents, !no_cache)?;
             let compiled = Arc::new(sc.clone().compile().context("building the policy's scenario")?);
@@ -356,6 +380,7 @@ fn main() -> anyhow::Result<()> {
             );
             let mut sim = sim::Sim::new(world);
             sim.autopilot = Some(autopilot);
+            start_recording(&mut sim, record.as_ref())?;
             let regen = Regenerate { seed: map_seed, scenario: sc, pending: None, error: None };
             let title = format!("autonomousim · policy {}", policy.name);
             (sim, display, Some(regen), false, title)
@@ -369,7 +394,9 @@ fn main() -> anyhow::Result<()> {
             let compiled = Arc::new(sc.clone().compile().context("building the scenario")?);
             let world = WorldInstance::new(compiled, Seed::from_u64(live.episode_seed));
             let regen = Regenerate { seed: live.seed, scenario: sc, pending: None, error: None };
-            (sim::Sim::new(world), display, Some(regen), live.demo, "autonomousim".to_owned())
+            let mut sim = sim::Sim::new(world);
+            start_recording(&mut sim, live.record.as_ref())?;
+            (sim, display, Some(regen), live.demo, "autonomousim".to_owned())
         }
     };
     let map = sim.world.map().clone();
@@ -390,6 +417,7 @@ fn main() -> anyhow::Result<()> {
         .insert_resource(history::History::default())
         .insert_resource(overlay::Overlay::default())
         .insert_resource(sim)
+        .insert_resource(DemoRoute::default())
         .insert_resource(hud::Hud { visible: true, help: display.screenshot.is_none(), plots: display.plots })
         .insert_resource(lidar_view::LidarView { visible: display.lidar_view })
         .insert_resource(Capture {
@@ -439,7 +467,8 @@ fn main() -> anyhow::Result<()> {
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, (hud::hud, lidar_view::lidar_view).chain());
+        .add_systems(EguiPrimaryContextPass, (hud::hud, lidar_view::lidar_view).chain())
+        .add_systems(Last, finish_recording);
     if let Some(regen) = regen {
         app.insert_resource(regen).add_systems(Update, finish_regenerate.before(sim::step));
     }
@@ -449,9 +478,16 @@ fn main() -> anyhow::Result<()> {
 
 fn spawn_camera(mut commands: Commands, sim: Res<sim::Sim>, view: Res<world_view::MapView>, quality: Res<Quality>) {
     let v = &sim.world.agent(sim.pilot).vehicle;
-    let span = match v {
-        Vehicle::Multirotor(m) => autonomousim_scene::props::multirotor(m.def()).span,
-        Vehicle::Wheeled(w) => autonomousim_scene::props::wheeled(w.def()).span,
+    let heading = yaw(v.orientation());
+    let (span, rig) = match v {
+        Vehicle::Multirotor(m) => {
+            let span = autonomousim_scene::props::multirotor(m.def()).span;
+            (span, CameraRig::new(f64::from(span), heading))
+        }
+        Vehicle::Wheeled(w) => {
+            let visual = autonomousim_scene::props::wheeled(w.def());
+            (visual.span, CameraRig::ground(f64::from(visual.span), heading, visual.eye))
+        }
     };
     let far = view.view_distance;
     commands.spawn((
@@ -469,21 +505,101 @@ fn spawn_camera(mut commands: Commands, sim: Res<sim::Sim>, view: Res<world_view
             falloff: FogFalloff::Linear { start: 0.3 * far, end: far },
         },
         quality.msaa(),
-        CameraRig::new(f64::from(span), yaw(v.orientation())),
+        rig,
         Transform::default(),
     ));
 }
 
+/// Record the session to `path`, if given.
+fn start_recording(sim: &mut sim::Sim, path: Option<&PathBuf>) -> anyhow::Result<()> {
+    if let Some(path) = path {
+        let config = RecorderConfig { lidar: true, ..Default::default() };
+        let recorder = Recorder::create(path, config).with_context(|| format!("creating {}", path.display()))?;
+        sim.record(recorder);
+        println!("recording to {}", path.display());
+    }
+    Ok(())
+}
+
+/// Close the recording when the viewer exits.
+fn finish_recording(mut exits: MessageReader<AppExit>, mut sim: ResMut<sim::Sim>) {
+    if exits.read().next().is_some()
+        && sim.is_recording()
+        && let Err(e) = sim.finish_recording()
+    {
+        error!("finishing the recording: {e:#}");
+    }
+}
+
 /// With `--demo`: fly forward at 8 m/s, turning slowly, 40 m above the ground (above the
-/// tallest trees).
-fn demo_pilot(capture: Res<Capture>, mut sim: ResMut<sim::Sim>) {
+/// tallest trees); ground vehicles drive to random reachable places along drivable paths.
+fn demo_pilot(capture: Res<Capture>, mut sim: ResMut<sim::Sim>, mut route: ResMut<DemoRoute>) {
     if !capture.demo {
+        return;
+    }
+    if sim.world.agent(sim.pilot).vehicle.family() == autonomousim_vehicles::Family::Wheeled {
+        drive_demo(&mut sim, &mut route);
         return;
     }
     let agl = sim.world.agent(sim.pilot).agl_now(sim.world.map());
     let climb = (40.0 - agl).clamp(-2.0, 3.0);
     sim.pilot_mode = sim::PilotMode::Velocity;
     sim.stick = [8.0 / sim.max_speed, 0.0, climb / sim.max_climb, 0.1 / sim.max_yaw_rate];
+}
+
+/// The demo driver's route: grid path points still ahead, and its random state.
+#[derive(Resource, Default)]
+struct DemoRoute {
+    path: Vec<glam::DVec2>,
+    rng: u64,
+}
+
+impl DemoRoute {
+    /// Uniform in [0, 1) (xorshift).
+    fn uniform(&mut self) -> f64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Pure pursuit of a point 8 m ahead along a drivable grid path to a random place 80 m or more
+/// away, at 8 m/s (4 m/s while turning); a new episode after a terminal event or getting
+/// stuck.
+fn drive_demo(sim: &mut sim::Sim, route: &mut DemoRoute) {
+    const LOOKAHEAD: f64 = 8.0;
+    let i = sim.pilot;
+    if sim.latched[i].intersects(Events(Events::TERMINAL.0 | Events::STUCK.0)) {
+        sim.reset();
+        route.path.clear();
+    }
+    let agent = sim.world.agent(i);
+    let p = agent.vehicle.position().truncate();
+    let grid = sim.world.scenario().groups[agent.group].drive[sim.world.map_index()].clone();
+    if route.path.len() <= 1 && route.path.first().is_none_or(|q| q.distance(p) < LOOKAHEAD) {
+        if route.rng == 0 {
+            route.rng = 0x9e37_79b9_7f4a_7c15;
+        }
+        let (lo, hi) = sim.world.map().extent();
+        route.path = (0..200)
+            .find_map(|_| {
+                let q = lo + (hi - lo) * glam::DVec2::new(route.uniform(), route.uniform());
+                (q.distance(p) > 80.0 && grid.reachable(p, q)).then(|| grid.path(p, q)).flatten()
+            })
+            .unwrap_or_default();
+    }
+    while route.path.len() > 1 && route.path[0].distance(p) < LOOKAHEAD {
+        route.path.remove(0);
+    }
+    let Some(&target) = route.path.first() else {
+        sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 });
+        return;
+    };
+    let rel = glam::DVec2::from_angle(-yaw(agent.vehicle.orientation())).rotate(target - p);
+    let curvature = 2.0 * rel.y / rel.length_squared().max(1.0);
+    let speed = if rel.x > rel.y.abs() { 8.0 } else { 4.0 };
+    sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed, curvature });
 }
 
 fn capture(
@@ -580,5 +696,33 @@ mod tests {
         assert!(Arc::ptr_eq(&view.world, app.resource::<sim::Sim>().world.map()));
         let after: Vec<Entity> = app.query_filtered::<Entity, With<MapEntity>>().iter(&app).collect();
         assert!(!after.is_empty() && before.iter().all(|e| app.get_entity(*e).is_err()));
+    }
+
+    /// A wheeled vehicle gets a driver group; `--record` writes the drive, wheels included.
+    #[test]
+    fn a_recorded_drive_plays_back() {
+        let path = std::env::temp_dir().join(format!("autonomousim-viewer-drive-{}.mcap", std::process::id()));
+        let path_arg = path.to_str().unwrap();
+        let args = ["viewer", "--preset", "offroad", "--size", "128", "--no-cache", "--vehicle", "offroad_4x4"];
+        let cli = Cli::try_parse_from(args.into_iter().chain(["--record", path_arg])).unwrap();
+        assert_eq!(cli.live.record.as_deref(), Some(path.as_path()));
+        let sc = scenario(&cli.live).unwrap();
+        assert_eq!(sc.groups[0].name, "driver");
+        let mut sim = sim::Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(0)));
+        start_recording(&mut sim, cli.live.record.as_ref()).unwrap();
+        assert!(sim.is_recording());
+        sim.stick = [1.0, 0.5, 0.0, 0.0];
+        for _ in 0..60 {
+            sim.advance(1.0 / 60.0);
+        }
+        sim.finish_recording().unwrap();
+        assert!(!sim.is_recording());
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let states = &recording.episodes[0].states[0];
+        assert!(states.len() >= 45, "{}", states.len());
+        let last = states.last().unwrap();
+        assert_eq!(last.wheels.len(), 4);
+        assert!(last.wheels.iter().all(|w| w.spin_angle > 0.1 && w.load > 0.0), "{:?}", last.wheels);
     }
 }

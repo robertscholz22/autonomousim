@@ -336,3 +336,27 @@ fn steering_follows_the_rate_limit_and_ackermann() {
     assert!((outer - 24.1f64.to_radians()).abs() < 0.02, "outer {}", outer.to_degrees());
     assert_eq!(v.wheel(2).steer, 0.0);
 }
+
+/// A recorded state shown on another instance poses the wheels and reports the outputs as the
+/// simulated vehicle did.
+#[test]
+fn shown_state_matches_the_simulated_one() {
+    let world = World::flat();
+    let mut v = vehicle("sedan_like");
+    let init = v.rest(DVec3::ZERO, 0.3, 10.0);
+    v.reset(&init);
+    world.run(&mut v, &DriveInput { steering: 0.3, throttle: 0.2, ..Default::default() }, 2.0);
+    let wheels: Vec<WheelState> = v.wheels().copied().collect();
+    let mut shown = vehicle("sedan_like");
+    let state = WheeledInit { pose: v.pose(), lin_vel_world: v.lin_vel_world(), ang_vel_body: v.ang_vel_body() };
+    shown.show(&state, v.steering_angle(), &wheels, v.powertrain());
+    // Kinematics of the current state (a step computes them at its start).
+    v.begin_step();
+    for w in 0..v.num_wheels() {
+        let (a, b) = (v.wheel_pose(w), shown.wheel_pose(w));
+        assert!((a.pos - b.pos).length() < 1e-9 && a.rot.angle_between(b.rot) < 1e-9, "wheel {w}");
+        assert_eq!(shown.wheel(w), v.wheel(w));
+    }
+    assert!(v.wheel(0).steer.abs() > 0.05 && v.wheel(0).travel != v.wheel(1).travel);
+    assert_eq!((shown.steering_angle(), shown.powertrain()), (v.steering_angle(), v.powertrain()));
+}

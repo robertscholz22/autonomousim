@@ -1,5 +1,6 @@
 //! Vehicle visuals: a multirotor's body and rotor discs whose opacity follows the rotor speed;
-//! a wheeled vehicle's body and wheels posed from the simulated steering, travel and spin.
+//! a wheeled vehicle's body, wheels posed from the simulated steering, travel and spin, and a
+//! strut and lower arm per suspended wheel that follow the wheel.
 
 use crate::convert;
 use crate::sim::Sim;
@@ -22,6 +23,26 @@ pub struct RotorDisc {
 pub struct WheelVisual {
     agent: usize,
     wheel: usize,
+}
+
+/// A suspension link from a chassis point (chassis frame) to the centre of a wheel.
+#[derive(Component)]
+pub struct LinkVisual {
+    agent: usize,
+    wheel: usize,
+    mount: glam::DVec3,
+}
+
+/// Transform (in the chassis frame) of a unit link (a cylinder along z from −0.5 to 0.5)
+/// stretched from `a` to `b`.
+fn link_transform(a: glam::DVec3, b: glam::DVec3) -> Transform {
+    let d = b - a;
+    let rot = glam::DQuat::from_rotation_arc(glam::DVec3::Z, d.normalize_or(glam::DVec3::Z));
+    Transform::from_translation(convert::vec(0.5 * (a + b))).with_rotation(convert::quat(rot)).with_scale(Vec3::new(
+        1.0,
+        d.length().max(1e-3) as f32,
+        1.0,
+    ))
 }
 
 pub fn spawn_vehicles(
@@ -48,8 +69,20 @@ pub fn spawn_vehicles(
             Vehicle::Wheeled(w) => {
                 let v = props::wheeled(w.def());
                 let chassis = w.pose();
+                let link = meshes.add(convert::mesh(&v.link));
                 commands.spawn(root).with_children(|parent| {
                     parent.spawn((Mesh3d(meshes.add(convert::mesh(&v.body))), MeshMaterial3d(body_material.clone())));
+                    for (k, mounts) in v.links.iter().enumerate() {
+                        let centre = (chassis.inverse() * w.wheel_pose(k)).pos;
+                        for &mount in mounts.iter().flatten() {
+                            parent.spawn((
+                                Mesh3d(link.clone()),
+                                MeshMaterial3d(body_material.clone()),
+                                link_transform(mount, centre),
+                                LinkVisual { agent: i, wheel: k, mount },
+                            ));
+                        }
+                    }
                     for (k, mesh) in v.wheels.iter().enumerate() {
                         let local = chassis.inverse() * w.wheel_pose(k);
                         parent.spawn((
@@ -94,10 +127,12 @@ pub fn spawn_vehicles(
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn sync_vehicles(
     sim: Res<Sim>,
-    mut roots: Query<(&VehicleVisual, &mut Transform), Without<WheelVisual>>,
-    mut wheels: Query<(&WheelVisual, &mut Transform), Without<VehicleVisual>>,
+    mut roots: Query<(&VehicleVisual, &mut Transform), (Without<WheelVisual>, Without<LinkVisual>)>,
+    mut wheels: Query<(&WheelVisual, &mut Transform), (Without<VehicleVisual>, Without<LinkVisual>)>,
+    mut links: Query<(&LinkVisual, &mut Transform), (Without<VehicleVisual>, Without<WheelVisual>)>,
     discs: Query<(&RotorDisc, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -111,6 +146,10 @@ pub fn sync_vehicles(
         let local = w.pose().inverse() * w.wheel_pose(wv.wheel);
         t.translation = convert::vec(local.pos);
         t.rotation = convert::quat(local.rot);
+    }
+    for (l, mut t) in &mut links {
+        let Some(w) = sim.world.agent(l.agent).vehicle.as_wheeled() else { continue };
+        *t = link_transform(l.mount, (w.pose().inverse() * w.wheel_pose(l.wheel)).pos);
     }
     for (d, m) in &discs {
         let Some(vehicle) = sim.world.agent(d.agent).vehicle.as_multirotor() else { continue };

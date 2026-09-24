@@ -3,8 +3,10 @@
 //! draws a replay exactly like a live simulation.
 
 use autonomousim_core::math::Pose;
-use autonomousim_sim::record::{RecordedEpisode, RecordedState, Recording};
+use autonomousim_sim::record::{RecordedEpisode, RecordedState, RecordedWheel, Recording};
 use autonomousim_sim::{Events, WorldInstance};
+use autonomousim_vehicles::ground::tire::TireForces;
+use autonomousim_vehicles::ground::{PowertrainStatus, WheelState, WheeledInit};
 use glam::DVec3;
 
 pub struct Replay {
@@ -24,6 +26,9 @@ pub struct Sample {
     pub velocity: DVec3,
     pub rates: DVec3,
     pub motors: Vec<f64>,
+    /// Ground vehicles: bicycle steering angle (rad) and wheels.
+    pub steering: f64,
+    pub wheels: Vec<RecordedWheel>,
     pub goal: DVec3,
     /// The sample at or before the playback time (events, flags).
     pub last: RecordedState,
@@ -89,6 +94,8 @@ impl Replay {
             velocity: a.velocity.lerp(b.velocity, alpha),
             rates: a.rates.lerp(b.rates, alpha),
             motors: a.motors.iter().zip(&b.motors).map(|(x, y)| x + (y - x) * alpha).collect(),
+            steering: a.steering + (b.steering - a.steering) * alpha,
+            wheels: a.wheels.iter().zip(&b.wheels).map(|(x, y)| lerp_wheel(x, y, alpha)).collect(),
             goal: a.goal,
             last: a.clone(),
         })
@@ -125,7 +132,15 @@ impl Replay {
         for i in 0..world.agents().len() {
             let Some(s) = self.sample(i) else { continue };
             let agent = world.agent_mut(i);
-            agent.vehicle.place(s.pose, s.velocity, s.rates);
+            if let Some(v) = agent.vehicle.as_wheeled_mut() {
+                let init = WheeledInit { pose: s.pose, lin_vel_world: s.velocity, ang_vel_body: s.rates };
+                let wheels: Vec<WheelState> = s.wheels.iter().map(wheel_state).collect();
+                let powertrain =
+                    PowertrainStatus { gear: s.last.gear, engine_speed: s.last.engine_speed, engine_torque: f64::NAN };
+                v.show(&init, s.steering, &wheels, powertrain);
+            } else {
+                agent.vehicle.place(s.pose, s.velocity, s.rates);
+            }
             if let Some(v) = agent.vehicle.as_multirotor_mut()
                 && s.motors.len() == v.motor_speeds().len()
             {
@@ -143,9 +158,48 @@ impl Replay {
     }
 }
 
+fn lerp_wheel(a: &RecordedWheel, b: &RecordedWheel, alpha: f64) -> RecordedWheel {
+    let l = |x: f64, y: f64| x + (y - x) * alpha;
+    RecordedWheel {
+        spin: l(a.spin, b.spin),
+        spin_angle: l(a.spin_angle, b.spin_angle),
+        steer: l(a.steer, b.steer),
+        travel: l(a.travel, b.travel),
+        drive_torque: l(a.drive_torque, b.drive_torque),
+        brake_torque: l(a.brake_torque, b.brake_torque),
+        load: l(a.load, b.load),
+        kappa: l(a.kappa, b.kappa),
+        tan_alpha: l(a.tan_alpha, b.tan_alpha),
+        fx: l(a.fx, b.fx),
+        fy: l(a.fy, b.fy),
+    }
+}
+
+/// A recorded wheel as the vehicle's wheel output.
+pub fn wheel_state(w: &RecordedWheel) -> WheelState {
+    WheelState {
+        travel: w.travel,
+        steer: w.steer,
+        spin_angle: w.spin_angle,
+        spin: w.spin,
+        drive_torque: w.drive_torque,
+        brake_torque: w.brake_torque,
+        tire: TireForces {
+            fz: w.load,
+            fx: w.fx,
+            fy: w.fy,
+            kappa: w.kappa,
+            tan_alpha: w.tan_alpha,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autonomousim_control::ground::GroundActionMode;
     use autonomousim_control::multirotor::ActionMode;
     use autonomousim_core::rng::Seed;
     use autonomousim_sim::record::{Recorder, RecorderConfig};
@@ -213,5 +267,49 @@ mod tests {
         r.set_episode(1);
         r.advance(2.0);
         assert_eq!((r.episode, r.time), (1, 0.5));
+    }
+
+    #[test]
+    fn replayed_ground_vehicles_show_their_wheels() {
+        let sc = Scenario {
+            map: MapSource::Testworld(Testworld::Flat { size: 400.0 }),
+            groups: vec![GroupSpec {
+                vehicle: autonomousim_sim::scenario::VehicleRef::Name("offroad_4x4".into()),
+                action_mode: Some(GroundActionMode::Raw.into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sc = Arc::new(sc.compile().unwrap());
+        let path = std::env::temp_dir().join(format!("autonomousim-replay-ground-{}.mcap", std::process::id()));
+        let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+        let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+        rec.on_reset(&w);
+        for k in 0..100 {
+            w.set_actions(0, &[0.6, if k < 50 { 0.0 } else { 0.5 }]);
+            rec.on_actions(&w);
+            w.step_with(&mut |w| rec.on_tick(w));
+        }
+        rec.finish().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut r = Replay::new(recording, 0);
+        r.seek(r.duration());
+        r.apply(&mut world);
+        let (live, shown) = (w.agent(0).vehicle.as_wheeled().unwrap(), world.agent(0).vehicle.as_wheeled().unwrap());
+        assert!(live.lin_vel_body().x > 3.0);
+        // The wheels turn, steer and travel as they did; the drawn wheel poses agree (the live
+        // ones lag a tick).
+        for (i, (a, b)) in live.wheels().zip(shown.wheels()).enumerate() {
+            assert!((a.spin_angle - b.spin_angle).abs() < 1e-5, "wheel {i}");
+            assert!((a.steer - b.steer).abs() < 1e-5 && (a.travel - b.travel).abs() < 1e-5, "wheel {i}");
+            assert!((a.tire.fy - b.tire.fy).abs() < 1.0 && (a.tire.kappa - b.tire.kappa).abs() < 1e-5, "wheel {i}");
+            let (pa, pb) = (live.wheel_pose(i), shown.wheel_pose(i));
+            assert!((pa.pos - pb.pos).length() < 0.02, "wheel {i}: {} {}", pa.pos, pb.pos);
+            assert!(pa.rot.angle_between(pb.rot) < 0.05, "wheel {i}");
+        }
+        assert!(shown.wheels().next().unwrap().steer > 0.05);
+        assert_eq!(shown.powertrain().gear, live.powertrain().gear);
     }
 }
