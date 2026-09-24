@@ -1,0 +1,20 @@
+# Content hashes of generated maps (see crates/procgen/tests/wild.rs).
+# Regenerate: AUTONOMOUSIM_BLESS=1 cargo test -p autonomousim-procgen --test wild
+
+[[wild]]
+preset = "training"
+size = 256.0
+seed = 0
+hash = "93f82a100a5371bacdbb58e41f0e308269bfa71447acc1ce758b964ef70490e0"
+
+[[wild]]
+preset = "training"
+size = 512.0
+seed = 1
+hash = "a4b5e409802776bcdfa9648462131975c529bf748b5629a3403bd5fd60956df5"
+
+[[wild]]
+preset = "showcase"
+size = 512.0
+seed = 2
+hash = "48bd465896900ab8274022c7ab114f2572db33b5e728b5eb31c3c671b7abf072"

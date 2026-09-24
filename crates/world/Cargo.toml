@@ -1,0 +1,30 @@
+[package]
+name = "autonomousim-world"
+description = "Runtime static-world data (terrain, obstacles, materials) and environment models."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+autonomousim-core.workspace = true
+glam.workspace = true
+parry3d-f64.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+postcard.workspace = true
+zstd.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+serde_json.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "queries"
+harness = false

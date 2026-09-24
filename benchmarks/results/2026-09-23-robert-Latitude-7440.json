@@ -1,0 +1,57 @@
+{
+  "date": "2026-09-23",
+  "host": "robert-Latitude-7440",
+  "cpu": "13th Gen Intel(R) Core(TM) i7-1365U",
+  "governor": "powersave",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "results": {
+    "aba/chain20": {
+      "median_ns": 2954.711330608818
+    },
+    "aba/chain6": {
+      "median_ns": 837.9644497998385
+    },
+    "aba/free_body": {
+      "median_ns": 121.67476577898177
+    },
+    "atmosphere/at_altitude": {
+      "median_ns": 13.61676136677794
+    },
+    "crba/chain20": {
+      "median_ns": 2111.186918579932
+    },
+    "crba/chain6": {
+      "median_ns": 384.05140014308085
+    },
+    "obstacles/sphere_contacts": {
+      "median_ns": 121.28077602162969
+    },
+    "rnea/chain20": {
+      "median_ns": 1269.6798132564736
+    },
+    "rnea/chain6": {
+      "median_ns": 368.69215960099064
+    },
+    "step/free_body_semi_implicit": {
+      "median_ns": 461.0856584986826
+    },
+    "terrain/closest_point": {
+      "median_ns": 107.42983686426862
+    },
+    "terrain/height": {
+      "median_ns": 8.834877968715407
+    },
+    "terrain/height_normal": {
+      "median_ns": 11.976267907329571
+    },
+    "terrain/raycast_down": {
+      "median_ns": 60.338333824429554
+    },
+    "wind/dryden_step": {
+      "median_ns": 135.9210531420863
+    },
+    "world/raycast_lidar_100m": {
+      "median_ns": 1002.9265728616388
+    }
+  }
+}

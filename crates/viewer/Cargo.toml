@@ -1,0 +1,61 @@
+[package]
+name = "autonomousim-viewer"
+description = "Native Bevy viewer for autonomousim (live simulation and MCAP replay)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+autonomousim-core.workspace = true
+autonomousim-world.workspace = true
+autonomousim-procgen.workspace = true
+autonomousim-vehicles.workspace = true
+autonomousim-control.workspace = true
+autonomousim-sim.workspace = true
+autonomousim-sensors.workspace = true
+autonomousim-scene.workspace = true
+glam.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+bevy = { workspace = true, features = [
+    "std",
+    "async_executor",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_winit",
+    "x11",
+    "bevy_window",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_light",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_mesh",
+    "bevy_image",
+    "bevy_shader",
+    "bevy_material",
+    "bevy_gizmos",
+    "bevy_gizmos_render",
+    "keyboard",
+    "mouse",
+    "gamepad",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
+    "png",
+] }
+bevy_egui = { workspace = true, default-features = false, features = ["render", "default_fonts"] }
+egui_plot.workspace = true
+
+[features]
+# Gamepad support through gilrs; needs libudev-dev and pkg-config to build.
+gamepad = ["bevy/bevy_gilrs"]
+
+[lints]
+workspace = true

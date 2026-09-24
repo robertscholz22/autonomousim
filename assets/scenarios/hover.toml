@@ -1,0 +1,13 @@
+# The QuadHover-v0 scenario as a file (what `autonomousim.tasks.QuadHover().scenario()`
+# builds with the defaults): a Crazyflie in `ctbr` mode flies to a goal up to 2 m away.
+name = "hover"
+physics_hz = 500
+policy_hz = 50
+map = { type = "testworld", kind = "flat", size = 200.0 }
+
+[[groups]]
+name = "agent"
+vehicle = "cf2x"
+action_mode = "ctbr"
+spawn = { agl = [1.5, 3.5], tilt_deg = 30.0, speed = 1.0, rates = 1.0, clearance = 1.0, margin = 20.0 }
+goals = { kind = "random", count = 1, distance = [0.0, 2.0], agl = [1.5, 3.5], clearance = 1.0, margin = 20.0 }

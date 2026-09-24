@@ -1,0 +1,27 @@
+[package]
+name = "autonomousim-vehicles"
+description = "Vehicle definitions and models (multirotor, ground, fixed-wing, rotorcraft)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+autonomousim-core.workspace = true
+autonomousim-world.workspace = true
+glam.workspace = true
+smallvec.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "multirotor"
+harness = false
+
+[lints]
+workspace = true

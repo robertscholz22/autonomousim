@@ -1,0 +1,43 @@
+# Two drones in a pool of four generated wild maps, with wind and gusts: a scenario for the
+# viewer (`--scenario assets/scenarios/forest.toml`; it flies the first agent in `velocity`
+# mode) and a starting point for navigation tasks.
+name = "forest"
+physics_hz = 500
+policy_hz = 50
+
+map = { type = "wild", seed = 0, count = 4, preset = "training" }
+
+[randomize_environment]
+wind_speed = [0.0, 4.0]
+turbulence_w20 = [0.0, 7.7]
+gust_rate = 2.0
+
+[events]
+crash_speed = 2.0
+bounds_margin = 5.0
+
+[[groups]]
+name = "iris"
+vehicle = "iris_like"
+action_mode = "velocity"
+spawn = { agl = [2.0, 4.0], clearance = 3.0, margin = 40.0 }
+goals = { kind = "random", count = 5, distance = [20.0, 60.0], agl = [3.0, 6.0], clearance = 3.0, margin = 40.0, radius = 2.0 }
+disable_on_terminal = false
+sensors = [
+    { name = "lidar", type = "lidar" },  # the default layout: rl64 (4 × 16 beams, 40 m)
+    { name = "imu", type = "imu" },
+]
+obs = [
+    { term = "goal_rel_body", scale = 0.05, clip = 3.0 },
+    { term = "lin_vel_body", scale = 0.2 },
+    { term = "ang_vel_body", scale = 0.2 },
+    { term = "rot6d" },
+    { term = "agl", scale = 0.1, clip = 3.0 },
+    { term = "lidar_log", sensor = "lidar" },
+]
+
+[[groups]]
+name = "crazyflie"
+vehicle = "cf2x"
+action_mode = "ctbr"
+spawn = { agl = [1.0, 2.0], clearance = 1.5, margin = 40.0 }

@@ -1,0 +1,23 @@
+[package]
+name = "autonomousim-py"
+description = "Python bindings (autonomousim._native) for the autonomousim simulator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+autonomousim-core.workspace = true
+autonomousim-sim.workspace = true
+autonomousim-vehicles.workspace = true
+pyo3.workspace = true
+numpy.workspace = true
+
+# PyO3's macros expand to unsafe FFI code, so this crate does not inherit the workspace `unsafe_code = "deny"`.
+[lints.clippy]
+dbg_macro = "warn"

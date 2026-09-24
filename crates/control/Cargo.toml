@@ -1,0 +1,27 @@
+[package]
+name = "autonomousim-control"
+description = "Reference controllers, control allocation and action modes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+autonomousim-core.workspace = true
+autonomousim-vehicles.workspace = true
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+autonomousim-world.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "control"
+harness = false
+
+[lints]
+workspace = true

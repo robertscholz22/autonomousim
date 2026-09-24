@@ -1,0 +1,84 @@
+# Bitcraze Crazyflie 2.x in X configuration (27 g).
+type = "multirotor"
+name = "cf2x"
+source = """
+Mass, inertia, arm, kf, km, thrust-to-weight, prop radius and rotor drag from gym-pybullet-drones \
+assets/cf2x.urdf (kf, km converted from RPM² to (rad/s)²; rotor drag = drag_coeff_xy). Motor time \
+constant from Crazyflie system identification (≈ 0.07 s; arXiv:2404.07837). Rotor inertia, body \
+drag and colliders are estimates."""
+
+[body]
+mass = 0.027
+inertia = [1.4e-5, 1.4e-5, 2.17e-5]
+drag_area = [0.002, 0.002, 0.004]      # estimate (rotor drag dominates)
+
+[rotor]
+radius = 0.0231348
+k_thrust = 2.8815745e-8                # 3.16e-10 N/RPM²
+k_torque = 7.2404118e-10               # 7.94e-12 N·m/RPM²
+inertia = 4.0e-8                       # estimate: 46 mm prop + coreless motor rotor
+drag = 9.1785e-7
+omega_min = 0.0
+omega_max = 2273.5                     # thrust-to-weight 2.25
+tau_up = 0.07
+tau_down = 0.07
+
+# Arm 0.0397 m at 45°, gym-pybullet-drones order and yaw signs (body yaw torque
+# −τ₀ + τ₁ − τ₂ + τ₃): props 0 and 2 spin counter-clockwise seen from above, 1 and 3 clockwise.
+[[rotors]]
+position = [0.028, -0.028, 0.0]
+spin = "ccw"
+
+[[rotors]]
+position = [-0.028, -0.028, 0.0]
+spin = "cw"
+
+[[rotors]]
+position = [-0.028, 0.028, 0.0]
+spin = "ccw"
+
+[[rotors]]
+position = [0.028, 0.028, 0.0]
+spin = "cw"
+
+# Motor pods as landing feet, prop discs, and the board.
+[[colliders]]
+center = [0.028, -0.028, -0.02]
+radius = 0.005
+
+[[colliders]]
+center = [-0.028, -0.028, -0.02]
+radius = 0.005
+
+[[colliders]]
+center = [-0.028, 0.028, -0.02]
+radius = 0.005
+
+[[colliders]]
+center = [0.028, 0.028, -0.02]
+radius = 0.005
+
+[[colliders]]
+center = [0.028, -0.028, 0.003]
+radius = 0.02
+part = "rotor"
+
+[[colliders]]
+center = [-0.028, -0.028, 0.003]
+radius = 0.02
+part = "rotor"
+
+[[colliders]]
+center = [-0.028, 0.028, 0.003]
+radius = 0.02
+part = "rotor"
+
+[[colliders]]
+center = [0.028, 0.028, 0.003]
+radius = 0.02
+part = "rotor"
+
+[[colliders]]
+center = [0.0, 0.0, 0.0]
+radius = 0.02
+part = "frame"

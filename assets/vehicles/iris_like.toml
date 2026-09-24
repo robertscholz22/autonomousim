@@ -1,0 +1,90 @@
+# 1.5 kg quadrotor after the PX4 Gazebo-classic "iris" model (3DR Iris, 10" props).
+type = "multirotor"
+name = "iris_like"
+source = """
+Mass, inertia, rotor positions and spin directions, motor constants, time constants, maximum \
+speed, rotor drag and rolling-moment coefficients from PX4-SITL_gazebo-classic models/iris \
+(k_torque = momentConstant · motorConstant; rotor inertia = rotor izz / rotorVelocitySlowdownSim). \
+Body drag and colliders are estimates."""
+
+[body]
+mass = 1.5
+inertia = [0.029125, 0.029125, 0.055225]
+drag_area = [0.02, 0.02, 0.05]          # estimate
+
+[rotor]
+radius = 0.128
+k_thrust = 5.84e-6
+k_torque = 3.504e-7
+inertia = 2.74e-5
+drag = 1.75e-4
+rolling_moment = 1.0e-6
+omega_min = 0.0
+omega_max = 1100.0
+tau_up = 0.0125
+tau_down = 0.025
+
+# PX4 quad-x order: front-right and back-left spin counter-clockwise.
+[[rotors]]
+position = [0.13, -0.22, 0.023]
+spin = "ccw"
+
+[[rotors]]
+position = [-0.13, 0.20, 0.023]
+spin = "ccw"
+
+[[rotors]]
+position = [0.13, 0.22, 0.023]
+spin = "cw"
+
+[[rotors]]
+position = [-0.13, -0.20, 0.023]
+spin = "cw"
+
+# Landing gear, prop discs and the central body.
+[[colliders]]
+center = [0.12, -0.12, -0.10]
+radius = 0.02
+
+[[colliders]]
+center = [-0.12, 0.12, -0.10]
+radius = 0.02
+
+[[colliders]]
+center = [0.12, 0.12, -0.10]
+radius = 0.02
+
+[[colliders]]
+center = [-0.12, -0.12, -0.10]
+radius = 0.02
+
+[[colliders]]
+center = [0.13, -0.22, 0.023]
+radius = 0.1
+part = "rotor"
+
+[[colliders]]
+center = [-0.13, 0.20, 0.023]
+radius = 0.1
+part = "rotor"
+
+[[colliders]]
+center = [0.13, 0.22, 0.023]
+radius = 0.1
+part = "rotor"
+
+[[colliders]]
+center = [-0.13, -0.20, 0.023]
+radius = 0.1
+part = "rotor"
+
+[[colliders]]
+center = [0.0, 0.0, 0.0]
+radius = 0.08
+part = "frame"
+
+# Optional battery sag (disabled by default):
+# [battery]
+# cells = 3
+# capacity = 5.1
+# internal_resistance = 0.03

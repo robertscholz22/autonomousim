@@ -1,0 +1,105 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/world",
+    "crates/procgen",
+    "crates/vehicles",
+    "crates/sensors",
+    "crates/control",
+    "crates/sim",
+    "crates/scene",
+    "crates/py",
+    "crates/viewer",
+    "crates/cli",
+]
+# The Bevy viewer is excluded so that `cargo test` / `cargo check` never compile Bevy.
+default-members = [
+    "crates/core",
+    "crates/world",
+    "crates/procgen",
+    "crates/vehicles",
+    "crates/sensors",
+    "crates/control",
+    "crates/sim",
+    "crates/scene",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+[workspace.dependencies]
+# internal
+autonomousim-core = { path = "crates/core" }
+autonomousim-world = { path = "crates/world" }
+autonomousim-procgen = { path = "crates/procgen" }
+autonomousim-vehicles = { path = "crates/vehicles" }
+autonomousim-sensors = { path = "crates/sensors" }
+autonomousim-control = { path = "crates/control" }
+autonomousim-sim = { path = "crates/sim" }
+autonomousim-scene = { path = "crates/scene" }
+
+# math / geometry (glam must unify with parry3d-f64's glam via glamx)
+glam = { version = "0.33", features = ["serde"] }
+parry3d-f64 = { version = "0.31", features = ["serde-serialize"] }
+libm = "0.2"
+
+# infrastructure
+smallvec = { version = "1", features = ["union", "const_generics", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }  # exact f64 round trips (recordings)
+toml = "1"
+blake3 = "1.8"
+rand_core = "0.10"
+rand_chacha = "0.10"
+postcard = { version = "1.1", features = ["use-std"] }
+zstd = "0.14"
+mcap = { version = "0.25", default-features = false, features = ["zstd"] }
+rayon = "1.12"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+
+# python
+pyo3 = "0.29"
+numpy = "0.29"
+
+# viewer
+bevy = { version = "0.19", default-features = false }
+bevy_egui = { version = "0.42", default-features = false }
+egui_plot = "0.37"
+
+# testing / benchmarking
+approx = "0.5"
+proptest = "1.11"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "rayon"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+# Physics code uses short math names (x, q, v, w, m) and many-argument kernels on purpose.
+many_single_char_names = "allow"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+codegen-units = 1

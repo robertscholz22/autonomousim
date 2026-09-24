@@ -1,0 +1,31 @@
+[package]
+name = "autonomousim-core"
+description = "Core math, multibody dynamics, contact and world interfaces for autonomousim."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+parry3d-f64.workspace = true
+smallvec.workspace = true
+serde.workspace = true
+blake3.workspace = true
+rand_core.workspace = true
+rand_chacha.workspace = true
+thiserror.workspace = true
+libm.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+approx.workspace = true
+serde_json.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "dynamics"
+harness = false

@@ -1,0 +1,26 @@
+# Build output
+/target
+/dist
+*.so
+*.egg-info/
+
+# Python
+/.venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Training runs, recordings and profiles (large, machine-specific)
+/runs
+/recordings
+*.mcap
+perf.data*
+benchmarks/results/*.tmp.json
+
+# Editors and local tool state
+.claude/
+.idea/
+.vscode/
+*.swp
+.DS_Store

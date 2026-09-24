@@ -1,0 +1,16 @@
+[package]
+name = "autonomousim-scene"
+description = "Renderer-independent scene meshes for the viewer and headless cameras."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+autonomousim-core.workspace = true
+autonomousim-world.workspace = true
+autonomousim-vehicles.workspace = true
+glam.workspace = true
+
+[lints]
+workspace = true

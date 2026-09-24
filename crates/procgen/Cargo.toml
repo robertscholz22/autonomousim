@@ -1,0 +1,24 @@
+[package]
+name = "autonomousim-procgen"
+description = "Procedural map generators (wild, rural, urban)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+autonomousim-core.workspace = true
+autonomousim-world.workspace = true
+blake3.workspace = true
+glam.workspace = true
+libm.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true
