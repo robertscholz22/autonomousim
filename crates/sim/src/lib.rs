@@ -6,13 +6,15 @@
 //!   steps, writes observations, state rows and events;
 //! - [`BatchSim`]: many worlds stepped in parallel on a dedicated thread pool, with flat
 //!   output arrays per agent group (the layout Python sees);
-//! - [`record`]: MCAP recording through a [`TelemetrySink`](record::TelemetrySink).
+//! - [`record`]: MCAP recording through a [`TelemetrySink`](record::TelemetrySink);
+//! - [`policy`]: trained policies exported from Python, run without Python.
 
 pub mod agent;
 pub mod batch;
 pub mod events;
 pub mod interaction;
 pub mod obs;
+pub mod policy;
 pub mod record;
 pub mod scenario;
 pub mod world;
@@ -30,6 +32,8 @@ use thiserror::Error;
 pub enum SimError {
     #[error("invalid scenario: {0}")]
     Scenario(String),
+    #[error("invalid policy: {0}")]
+    Policy(String),
     #[error(transparent)]
     Vehicle(#[from] autonomousim_vehicles::VehicleError),
     #[error(transparent)]

@@ -31,6 +31,9 @@ const HELP: &str = "W/S  forward/back     A/D  left/right\n\
                     L  LiDAR hits         V  LiDAR view\n\
                     H  hide HUD   F1  help   Esc  quit";
 
+/// Shown above [`HELP`] while a policy flies.
+const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
+
 const REPLAY_HELP: &str = "P  play/pause         [/]  speed\n\
                            ←/→  ∓1 s   Shift+←/→  one sample\n\
                            N/B  next/previous episode\n\
@@ -111,6 +114,19 @@ fn status_window(
             let (episode, episodes) = sim.episode();
             let of = episodes.map_or(String::new(), |n| format!(" of {n}"));
             ui.label(format!("agent {} ({}) · episode {episode}{of}", sim.pilot, v.def().name));
+            if let Some(a) = &sim.autopilot {
+                ui.label(format!("policy {}", a.name));
+                let who = if sim.manual_agent().is_some() { "you fly · T: hand back" } else { "T: take over" };
+                ui.label(who);
+                if a.flown > 0 {
+                    ui.label(format!(
+                        "{} of {} episodes reached the last goal ({:.0} %)",
+                        a.finished,
+                        a.flown,
+                        100.0 * a.finished as f64 / a.flown as f64
+                    ));
+                }
+            }
             if let Some(mut regen) = regen
                 && let Some(current) = regen.map_seed()
             {
@@ -149,7 +165,10 @@ fn status_window(
                         if n > 1 { format!("  ({} of {n})", agent.goal_index.min(n - 1) + 1) } else { String::new() };
                     row(ui, "goal", format!("{:6.2} m{which}", (pos - g.position).length()));
                 }
-                if sim.replay.is_none() {
+                if sim.replay.is_none() && sim.manual_agent().is_none() {
+                    let a: Vec<String> = agent.action.iter().map(|x| format!("{x:+.2}")).collect();
+                    row(ui, "policy", a.join(" "));
+                } else if sim.replay.is_none() {
                     let [f, l, u, y] = sim.stick;
                     row(ui, "pilot", format!("{}  {f:+.1} {l:+.1} {u:+.1} {y:+.1}", sim.pilot_mode.name()));
                     row(ui, "max speed", format!("{:4.1} m/s", sim.max_speed));
@@ -189,6 +208,9 @@ fn status_window(
             ));
             if hud.help {
                 ui.separator();
+                if sim.autopilot.is_some() {
+                    ui.monospace(POLICY_HELP);
+                }
                 ui.monospace(if sim.replay.is_some() { REPLAY_HELP } else { HELP });
             }
         });

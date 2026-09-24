@@ -1,5 +1,6 @@
 """Training helpers (``autonomousim.rl``) and short runs of the example scripts."""
 
+import json
 import pathlib
 import sys
 
@@ -53,13 +54,33 @@ def examples(monkeypatch):
     pytest.importorskip("torch")
     monkeypatch.syspath_prepend(str(ROOT / "examples"))
     yield
-    for name in ("ppo_continuous", "sac_continuous", "eval_record"):
+    for name in ("ppo_continuous", "sac_continuous", "eval_record", "export_policy"):
         sys.modules.pop(name, None)
 
 
 def _run_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     (run,) = (tmp_path / "runs").iterdir()
     return run
+
+
+def _check_export(policy: pathlib.Path, output: str) -> None:
+    """Export ``policy`` and run the exported network (as the Rust loader reads it) in numpy."""
+    import export_policy
+
+    export_policy.main([str(policy)])
+    data = json.loads(policy.with_suffix(".json").read_text())
+    assert data["format"] == "autonomousim-policy" and data["output"] == output
+    assert data["scenario"]["groups"][0]["name"] == data["group"]
+    n = data["obs_norm"]
+    x = np.asarray(data["check"]["obs"], np.float64)
+    x = np.clip((x - n["mean"]) / np.sqrt(np.asarray(n["var"]) + n["eps"]), -n["clip"], n["clip"])
+    act = {"tanh": np.tanh, "relu": lambda z: np.maximum(z, 0.0), "identity": lambda z: z}
+    for layer in data["layers"]:
+        w = np.asarray(layer["weight"]).reshape(layer["shape"])
+        x = act[layer["activation"]](x @ w.T + layer["bias"])
+    x = np.clip(x, -1.0, 1.0) if output == "clip" else np.tanh(x)
+    assert len(x) >= 16
+    np.testing.assert_allclose(x, data["check"]["action"], atol=1e-4)
 
 
 def test_ppo_and_eval_record(examples, tmp_path, capsys):
@@ -77,6 +98,7 @@ def test_ppo_and_eval_record(examples, tmp_path, capsys):
     eval_record.main([str(policy), "--episodes", "3", "--out", str(out)])
     text = capsys.readouterr().out
     assert "read-back:" in text and "replay: 3 episodes" in text
+    _check_export(policy, "clip")
 
 
 def test_sac_and_eval_record(examples, tmp_path, capsys):
@@ -90,3 +112,4 @@ def test_sac_and_eval_record(examples, tmp_path, capsys):
     )  # fmt: skip
     eval_record.main([str(_run_dir(tmp_path) / "policy.pt"), "--episodes", "2", "--out", str(tmp_path / "s.mcap")])
     assert "replay: 2 episodes" in capsys.readouterr().out
+    _check_export(_run_dir(tmp_path) / "policy.pt", "tanh")

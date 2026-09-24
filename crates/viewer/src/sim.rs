@@ -1,7 +1,9 @@
 //! What the viewer shows: either a live [`WorldInstance`] stepped at its physics rate from the
 //! frame clock (fixed-step accumulator) with keyboard flight of one agent, or the playback of
-//! a recording ([`Replay`]) that places the agents of the same kind of world.
+//! a recording ([`Replay`]) that places the agents of the same kind of world. Live, a trained
+//! policy ([`Autopilot`]) can fly the agents instead.
 
+use crate::autopilot::{self, Autopilot};
 use crate::camera::{CameraMode, CameraRig};
 use crate::replay::Replay;
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
@@ -74,6 +76,8 @@ pub struct Sim {
     pub episodes: u64,
     /// Playing back a recording instead of simulating.
     pub replay: Option<Replay>,
+    /// A trained policy flying the agents of its group (live only).
+    pub autopilot: Option<Autopilot>,
 }
 
 impl Sim {
@@ -97,6 +101,7 @@ impl Sim {
             real_time_factor: 1.0,
             episodes: 1,
             replay: None,
+            autopilot: None,
         };
         s.snapshot_poses();
         s
@@ -117,6 +122,9 @@ impl Sim {
         self.latched = vec![Events::NONE; self.world.agents().len()];
         self.accumulator = 0.0;
         self.episodes += 1;
+        if let Some(a) = &mut self.autopilot {
+            a.ended = None;
+        }
         self.snapshot_poses();
     }
 
@@ -135,6 +143,9 @@ impl Sim {
         self.accumulator = 0.0;
         self.latched.iter_mut().for_each(|e| *e = Events::NONE);
         self.episodes += 1;
+        if let Some(a) = &mut self.autopilot {
+            a.ended = None;
+        }
         self.snapshot_poses();
     }
 
@@ -148,6 +159,14 @@ impl Sim {
         match &self.replay {
             Some(r) => (r.episode as u64 + 1, Some(r.recording.episodes.len())),
             None => (self.episodes, None),
+        }
+    }
+
+    /// The agent flown from the keyboard: the followed one, unless the autopilot flies it.
+    pub fn manual_agent(&self) -> Option<usize> {
+        match &self.autopilot {
+            Some(a) if a.flies_pilot => None,
+            _ => Some(self.pilot),
         }
     }
 
@@ -195,12 +214,18 @@ impl Sim {
         let dt = self.world.clock().dt();
         let wanted = real_dt * self.time_scale;
         self.accumulator += wanted.min(MAX_FRAME_STEP);
-        let setpoint = self.setpoint();
-        self.world.set_setpoint(self.pilot, setpoint);
+        let manual = self.manual_agent();
+        if let Some(pilot) = manual {
+            let setpoint = self.setpoint();
+            self.world.set_setpoint(pilot, setpoint);
+        }
         let mut stepped = 0.0;
         while self.accumulator >= dt {
             if self.accumulator < 2.0 * dt {
                 self.snapshot_poses();
+            }
+            if let Some(a) = &mut self.autopilot {
+                a.before_tick(&mut self.world, manual);
             }
             for a in 0..self.world.agents().len() {
                 self.world.agent_mut(a).events = Events::NONE;
@@ -215,10 +240,30 @@ impl Sim {
         if real_dt > 0.0 {
             self.real_time_factor = 0.9 * self.real_time_factor + 0.1 * stepped / real_dt;
         }
+        self.autoreset(manual);
         // A diverged state cannot be drawn; start over.
         if self.world.agents().iter().any(|a| !a.vehicle.position().is_finite()) {
             warn!("non-finite vehicle state, resetting");
             self.reset();
+        }
+    }
+
+    /// While the autopilot flies every agent of its group: start the next episode shortly after
+    /// all of them ended theirs (or the task's time ran out).
+    fn autoreset(&mut self, manual: Option<usize>) {
+        let Some(a) = &mut self.autopilot else { return };
+        if manual.is_some() {
+            a.ended = None;
+            return;
+        }
+        let now = self.world.time();
+        match a.ended {
+            None if a.episode_over(&self.world, &self.latched) => a.ended = Some(now),
+            Some(t) if now >= t + autopilot::RESET_DELAY => {
+                a.count_episode(&self.world, &self.latched, manual);
+                self.reset();
+            }
+            _ => {}
         }
     }
 
@@ -237,7 +282,8 @@ impl Sim {
 
 /// Keys common to both modes: P pause, `[`/`]` time scale, R reset (live) or restart
 /// (replay), Tab next agent. Live only: W/S forward/back, A/D left/right, Space/Shift up/down,
-/// Q/E yaw, M pilot mode, `-`/`=` speed. The free camera takes the flight keys.
+/// Q/E yaw, M pilot mode, `-`/`=` speed, T take over from the autopilot. The free camera takes
+/// the flight keys.
 ///
 /// A gamepad flies as a mode-2 transmitter: left stick climb and yaw, right stick forward and
 /// sideways; Start pauses, Select changes the pilot mode, East (B) resets.
@@ -291,6 +337,11 @@ pub fn pilot_input(
     }
     if keys.just_pressed(KeyCode::Tab) {
         sim.pilot = (sim.pilot + 1) % sim.world.agents().len();
+    }
+    if let Some(a) = &mut sim.autopilot
+        && keys.just_pressed(KeyCode::KeyT)
+    {
+        a.flies_pilot = !a.flies_pilot;
     }
     if sim.replay.is_none() {
         if keys.just_pressed(KeyCode::KeyM) || mode {

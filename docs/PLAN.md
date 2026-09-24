@@ -340,7 +340,7 @@ crates/viewer/src/{main (live/replay commands, app, map seed regeneration, demo,
 crates/py/src/lib.rs  (BatchSim, module constants)
 python/autonomousim/{__init__ (registration),_native.pyi,events,scenario,vector_env,env,bench,rl}.py, tasks/{base,hover,recover}.py; later recording.py, tasks/{waypoint_forest,landing}.py
 assets/scenarios/{hover,forest}.toml
-examples/{ppo_continuous,sac_continuous,eval_record}.py; later export_policy.py
+examples/{ppo_continuous,sac_continuous,eval_record,export_policy}.py
 tests_py/  assets/{vehicles,maps,scenarios}/  fixtures/{pinocchio/,golden_hashes.toml}  tools/gen_pinocchio_fixtures.py
 ```
 **pyproject**:
@@ -370,7 +370,7 @@ tests_py/  assets/{vehicles,maps,scenarios}/  fixtures/{pinocchio/,golden_hashes
 | 11 | `py` bindings + package, `QuadHover`/`QuadRecover` tasks, `bench.py` | `check_env` and vector-semantics tests pass; throughput targets met |
 | 12 | `ppo_continuous.py`, `sac_continuous.py`, `eval_record.py` (writes MCAP) | Hover policy converges; recording plays back |
 | 10b | Full viewer: LOD, merged per-chunk vegetation, water, fog, cameras, egui HUD with plots, gamepad, MCAP replay with scrubbing, quality presets | ≥ 60 fps at 1080p "medium" on the Iris Xe |
-| 13 | `QuadWaypointForest` (LiDAR). Stretch: `QuadLanding`, Rust MLP policy playback in the viewer | > 80 % success on unseen maps; end-to-end demo |
+| 13 | `QuadWaypointForest` (LiDAR). Stretch: `QuadLanding`, Rust MLP policy playback in the viewer (done, see the viewer notes) | > 80 % success on unseen maps; end-to-end demo |
 
 ### Tasks and training
 | Task | Obs | Action | Reward / end conditions | Budget (laptop) |
@@ -581,6 +581,21 @@ tests_py/  assets/{vehicles,maps,scenarios}/  fixtures/{pinocchio/,golden_hashes
 - **Far obstacle LOD**: each chunk has a second obstacle mesh with `PropDetail::far()`. It uses 4 segments for cones and cylinders, 3 for trunks and a bare icosahedron for crowns, and leaves out obstacles smaller than 1.5 m. It replaces the detailed mesh beyond 400 m (250 m on low, 700 m on high). On the showcase map this is 0.87M triangles against 2.7M. Billboards were not needed.
 - **HUD**: time and AGL are correct in both modes (`agl_now`), plus the goal distance and index, and the pilot mode with its stick values. The status line reads playing, running or paused. The key help changes with the mode.
 - **Tests** (`make test-viewer`, headless): playback interpolation, episodes and puppet state; the pilot modes; the tracking quantities; command-line parsing; and a regenerated map that is swapped in and rebuilt as entities (the scene rebuild is run as a system in a bare ECS world).
+
+**As built after M1: policy playback** (M1 stretch item; `sim::policy`, `examples/export_policy.py`, the viewer's `policy` command):
+- **Export**: `uv run python examples/export_policy.py runs/<run>/policy.pt` writes `policy.json` next to the checkpoint (2.3 MB for the 2×256 forest policy). It holds:
+  - the task's scenario (`task.scenario()`), the agent group and the episode time;
+  - the observation normalisation (mean, variance, clip, eps);
+  - the actor as dense layers (row-major f32 weights, bias, activation) and the output: PPO's action mean clipped to [−1, 1], or SAC's tanh of the mean;
+  - 40 observations from the first second of 8 episodes, with the deterministic actions PyTorch computed for them.
+- **`sim::policy`**: `PolicyFile` reads and checks the format. `PolicyFile::policy()` builds a `Policy` and runs it on the stored observations; a difference above 1e-4 from PyTorch rejects the file, so a misread layout fails at load time instead of flying badly. `Policy::act` normalises in f64 like `ObsNormalizer`, then runs the f32 layers without allocating.
+- **Viewer**: `autonomousim-viewer policy FILE [--map-seed N (1000)] [--agents N] [--episode-seed N] [--no-cache]`, plus the display options. The command runs the policy's scenario on one map of the given seed; the HUD seed control generates others.
+  - An `Autopilot` in `Sim` observes the group and sets every agent's action at each policy-step boundary (`tick % decimation == 0`), so the timing matches `WorldInstance::step`.
+  - T takes over the followed agent, which the keys then fly in the usual pilot modes; the policy keeps flying the others.
+  - While the policy flies every agent, the next episode starts 1.5 s after all of them ended theirs (terminal, disabled or finished) or the task's time ran out. The HUD counts the episodes that reached the last goal and shows the followed agent's action.
+- **Check against Python**: the ignored test `exported_policy_success_rate` flies 64 episodes on each of 4 unseen maps (1000–1003) with the policy in Rust. The forest policy reached 220 of 256 (86 %) with one drone per world, against 88 % in the Python evaluation on other unseen maps. With 8 drones per world it reached 209 of 256 (82 %), because they now meet each other (they trained alone).
+- **Performance**: 4 drones with their LiDAR and the LiDAR view run at 123–149 fps at 1440×810 (medium).
+- **Tests**: the numpy forward pass of an exported PPO and SAC network matches the stored actions (Python). In Rust: a hand-computed forward pass, rejected files and shapes, the take-over, and the automatic restart.
 
 **Still to do**: `attach` (M3).
 

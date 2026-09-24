@@ -5,12 +5,16 @@
 //! cargo run -p autonomousim-viewer --release -- --preset showcase --seed 0 --vehicle iris_like
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
+//! cargo run -p autonomousim-viewer --release -- policy runs/run/policy.json --agents 4
 //! ```
 //!
 //! Live, the simulation runs in-process at its physics rate from a fixed-step accumulator and
 //! the first agent is flown from the keyboard (or a gamepad); a replay rebuilds the recorded
-//! maps, checks their hashes and puts the agents where the recording has them. F1 shows the keys.
+//! maps, checks their hashes and puts the agents where the recording has them; `policy` flies
+//! the agents with a trained policy (from `examples/export_policy.py`) in its task's scenario
+//! on a new map. F1 shows the keys.
 
+mod autopilot;
 mod camera;
 mod convert;
 mod history;
@@ -27,6 +31,7 @@ use autonomousim_control::multirotor::ActionMode;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::Seed;
 use autonomousim_procgen::WildPreset;
+use autonomousim_sim::policy::PolicyFile;
 use autonomousim_sim::record::Recording;
 use autonomousim_sim::scenario::{MapSource, SpawnSpec, VehicleRef, WildMaps};
 use autonomousim_sim::{CompiledScenario, GroupSpec, Scenario, WorldInstance};
@@ -72,6 +77,24 @@ enum Command {
         /// Stop at the end of the last episode instead of starting over.
         #[arg(long)]
         once: bool,
+        #[command(flatten)]
+        display: DisplayArgs,
+    },
+    /// Fly a trained policy (exported by `examples/export_policy.py`) in its task's scenario.
+    Policy {
+        file: PathBuf,
+        /// Map seed (the training maps are generated from the scenario's seed, 0 by default).
+        #[arg(long, default_value_t = 1000)]
+        map_seed: u64,
+        /// Agents flown by the policy (default: as trained).
+        #[arg(long)]
+        agents: Option<usize>,
+        /// Episode seed (spawn positions and goals).
+        #[arg(long, default_value_t = 0)]
+        episode_seed: u64,
+        /// Generate the map without the map cache.
+        #[arg(long)]
+        no_cache: bool,
         #[command(flatten)]
         display: DisplayArgs,
     },
@@ -215,6 +238,21 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
     Ok(sc)
 }
 
+/// The scenario of a policy file: its task's scenario on one map of `map_seed`, with `agents`
+/// in the policy's group.
+fn policy_scenario(file: &PolicyFile, map_seed: u64, agents: Option<usize>, cache: bool) -> anyhow::Result<Scenario> {
+    let mut sc = file.scenario.clone();
+    if let MapSource::Wild(w) = &mut sc.map {
+        (w.seed, w.count, w.cache) = (map_seed, 1, cache);
+    }
+    let group = sc.groups.iter_mut().find(|g| g.name == file.group);
+    let group = group.with_context(|| format!("the scenario has no agent group {:?}", file.group))?;
+    if let Some(n) = agents {
+        group.count = n.max(1);
+    }
+    Ok(sc)
+}
+
 #[derive(Resource)]
 struct Capture {
     path: Option<PathBuf>,
@@ -301,6 +339,25 @@ fn main() -> anyhow::Result<()> {
             replay.looping = !once;
             let title = format!("autonomousim · replay {}", file.file_name().unwrap_or_default().to_string_lossy());
             (sim::Sim::replay(world, replay), display, None, false, title)
+        }
+        Some(Command::Policy { file, map_seed, agents, episode_seed, no_cache, display }) => {
+            let policy = PolicyFile::read(&file)?;
+            let sc = policy_scenario(&policy, map_seed, agents, !no_cache)?;
+            let compiled = Arc::new(sc.clone().compile().context("building the policy's scenario")?);
+            let world = WorldInstance::new(compiled, Seed::from_u64(episode_seed));
+            let autopilot = autopilot::Autopilot::new(&policy, &world).context("loading the policy")?;
+            println!(
+                "{}: {} policy for {} ({} layers, checked against PyTorch)",
+                file.display(),
+                policy.algo,
+                policy.env_id,
+                policy.layers.len()
+            );
+            let mut sim = sim::Sim::new(world);
+            sim.autopilot = Some(autopilot);
+            let regen = Regenerate { seed: map_seed, scenario: sc, pending: None, error: None };
+            let title = format!("autonomousim · policy {}", policy.name);
+            (sim, display, Some(regen), false, title)
         }
         command => {
             let (live, display) = match command {
@@ -479,6 +536,9 @@ mod tests {
         // Live options do not apply to a replay.
         assert!(Cli::try_parse_from(["viewer", "--seed", "3", "replay", "a.mcap"]).is_err());
         assert!(Cli::try_parse_from(["viewer", "replay", "a.mcap", "--seed", "3"]).is_err());
+        let cli = Cli::try_parse_from(["viewer", "policy", "p.json", "--agents", "3", "--lidar-view"]).unwrap();
+        let Some(Command::Policy { file, map_seed, agents, display, .. }) = cli.command else { panic!() };
+        assert_eq!((file, map_seed, agents, display.lidar_view), ("p.json".into(), 1000, Some(3), true));
     }
 
     /// A new map seed is generated in the background, swapped into the simulation, and the

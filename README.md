@@ -34,8 +34,10 @@ policy replayed in the viewer:
   It has plots, a LiDAR view, cameras, and quality presets that reach ≥ 60 fps on an Intel
   Iris Xe.
 
-Next up: running trained policies inside the viewer, then ground vehicles (Milestone 2: tires,
-suspension, powertrain). The full plan, the design decisions and as-built notes for every
+Trained policies also fly inside the viewer, without Python: an exported network runs in Rust,
+and you can take over any drone from the keyboard.
+
+Next up: ground vehicles (Milestone 2: tires, suspension, powertrain). The full plan, the design decisions and as-built notes for every
 step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
@@ -84,6 +86,10 @@ uv run python examples/ppo_continuous.py --env-id autonomousim/QuadWaypointFores
 uv run python examples/eval_record.py runs/<run>/policy.pt --episodes 6 --lidar \
     --env-kwargs '{"map_seed": 1000}'
 cargo run -p autonomousim-viewer --release -- replay recordings/<run>.mcap --lidar-view
+
+# Fly the policy live in the viewer on new maps (T takes over the followed drone).
+uv run python examples/export_policy.py runs/<run>/policy.pt
+cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json --agents 4 --lidar-view
 ```
 
 `eval_record.py` checks that the recording reproduces every recorded state bit for bit when
@@ -99,13 +105,13 @@ re-simulated from the file. The viewer relies on this for replay.
 | `crates/vehicles` | Vehicle definitions (TOML) and multirotor models |
 | `crates/control` | Multirotor cascade, allocation, action modes |
 | `crates/sensors` | IMU, GPS, baro, mag, rangefinder, LiDAR |
-| `crates/sim` | Worlds, agents, scenarios, observations, batched simulation, MCAP recording |
+| `crates/sim` | Worlds, agents, scenarios, observations, batched simulation, MCAP recording, policy playback |
 | `crates/scene` | Renderer-independent meshes (terrain chunks, vegetation, vehicles) |
 | `crates/py` | Python bindings (`autonomousim._native`, PyO3) |
-| `crates/viewer` | The Bevy viewer (live and replay) |
+| `crates/viewer` | The Bevy viewer (live, replay and trained policies) |
 | `crates/cli` | `autonomousim mapgen / map-hash / map-info / version` |
 | `python/autonomousim` | Gymnasium environments, tasks, RL helpers, benchmarks |
-| `examples/` | PPO, SAC, evaluation and recording |
+| `examples/` | PPO, SAC, evaluation and recording, policy export |
 | `assets/` | Vehicle presets and scenarios |
 | `docs/PLAN.md` | Architecture, roadmap and as-built notes |
 
