@@ -798,6 +798,43 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - Engine inertia.
   - Caster and upright pitch in the kinematics tables, for anti-dive and anti-squat.
   - Stiff Chrono Sedan springs (3 Hz ride) lift the rear wheels briefly under full braking.
+
+**As built in step 4** (`control::ground`, `vehicles::ground` per-wheel input):
+- **Vehicle side**:
+  - `DriveInput::wheels: Option<WheelCommands>` carries per-wheel `drive` / `brake` / `steer` arrays (8 wheels). When present they replace the mixed commands. A motor driving several wheels takes their mean; a combustion drive keeps `throttle`.
+  - `SteerMode::Independent { max_angle, rate }` per axle adds a rate-limited knuckle per wheel. Without per-wheel commands it follows the Ackermann angle of its `steer` share, so a four-wheel-steered car still drives with plain steering.
+- **Controller** (`GroundController::update(setpoint, estimate) → DriveInput`, `GroundEstimate::of(&Wheeled)`). Setpoints: `Direct`, `Pedal`, `Sides`, `SpeedCurvature`, `SpeedYawRate`.
+  - **Speed loop**: PI giving an acceleration (τ = 0.5 s).
+    - The demand is clamped to [−6, 3] m/s² and to what the engine in its current gear, the motors (including back-EMF) and the brakes can give right now.
+    - The integrator runs only within ±1 m/s of the target (integral separation). It trims resistances and grades and does not wind up during large steps. Plain conditional integration left a 13 % overshoot, the PI zero on an integrator plant.
+    - Hold on the brakes below 0.3 m/s when the target is 0.
+    - Reverse engages only below 0.5 m/s; otherwise a negative request brakes first.
+  - **Inverse powertrain**:
+    - Engine: the throttle is interpolated between the zero- and full-throttle maps at the current rpm and gear. Brakes add whatever engine braking cannot provide.
+    - Electric: the motor torque, plus the back-EMF term for DC motors.
+  - **Traction control**: the drive force fades from 1 to 0 as the driven-wheel slip goes from max(10 %·|v|, 0.3 m/s) to twice that, and the integrator is held meanwhile. It was needed: a reverse launch of the Sedan spun the rear wheels to 2.5× the body speed and rang the step-3 wheel-hop mode for 1.5 s (0.46 m/s overshoot on a 3 m/s step, against 0.10 m/s with it).
+  - **Curvature**: bicycle feed-forward `δ = atan(Lκ)/share`, plus an integral on κ − r/v above 2 m/s, limited to ±0.15 rad. It takes out understeer.
+  - **Side drives** (skid and diff): wheel-speed targets from (v, ω), a per-motor PI on wheel speed through the inverse motor model, and outer integrals on body speed and yaw rate for skid slip. The outer integrals are held while a motor saturates. `vk` maps to ω = v·κ.
+  - Cost per update: 47 ns (Sedan, vk), 26 ns (Husky, vw).
+- **Action modes** (`GroundActionMap`, components in [−1, 1], named):
+  - `raw`: pedal and steering, or left and right for side drives.
+  - `vk`: speed and curvature. Positive speed scales to `speed`, negative to `reverse`.
+  - `vw`: speed and yaw rate; side drives only.
+  - `per_wheel`: only the channels the vehicle has, in order `throttle` (combustion), `steering` (axles steered through the Ackermann linkage), `drive_<wheels>` (one per electric motor), `brake_<w>`, `steer_<w>` (independent axles). One-sided channels read negative values as 0.
+  - Default limits come from the vehicle: speed = top speed capped at 20 m/s (Husky 1.18, Jackal 1.80); reverse = 0.3·speed for engines, speed for electric; curvature = 95 % of full lock by the bicycle model, or 2/track; yaw rate = 0.8·speed/track for side drives.
+- **Tests** (`control/tests/ground_loop.rs`, flat asphalt, 1 kHz):
+  - **Speed steps** 0 → 10 → 20 → 5 → 0 → −3 → 0 m/s on the Sedan, the 4×4 and an electric four-motor Sedan: overshoot ≤ 0.14 m/s (the limit is 10 % of the step), settled error ≤ 0.015 m/s, then held.
+  - **Circle**: 30 m radius at 10 m/s both ways, and 15 m in reverse at 3 m/s; curvature within 0.1 % for all three cars.
+  - **Robots** (vw): v and ω within 2 % on the Jackal and Husky, including turning on the spot and reversing; vk curvature within 5 %.
+  - **per_wheel**, on the electric Sedan with independent steering on both axles:
+    - A ±81 N·m left/right torque split at 10 m/s gives a tyre yaw moment of 819 N·m, against 786 N·m from statics (Σ −y·T/r); the car turns left.
+    - Braking one wheel yaws the Sedan toward that side (±0.06 rad in 1.5 s).
+    - All wheels at 30° crab along 29.7° with |r| ≤ 0.0013 rad/s.
+    - Counter-phase steering at 3 m/s gives κ 0.1072 against 0.1089 predicted; front steer alone gives 0.0538 against 0.0544 (a ratio of 1.99).
+    - Channel lists are exact: the Sedan has throttle, steering and 4 brakes; the Jackal has 2 drives and 2 brakes; the Husky's drives are `drive_0_2` and `drive_1_3`.
+- **Findings**:
+  - Crabbing needs zero toe. With the Sedan's static toe-in of about 1°, the toe forces of each wheel pair, turned 30°, form a yaw couple that curves the crab path (κ ≈ 0.004 1/m). The test car's corner modules therefore have no toe.
+  - The skid rover cannot hold κ = 1 at half its top speed: the scrub saturates the outer motor. The controller gives priority to neither speed nor curvature; the RL policy or a planner must stay within the limits.
   - `sim`/scenario support (step 6); scenarios reject wheeled vehicles until then.
 
 ### Performance targets (i7-1365U, release)

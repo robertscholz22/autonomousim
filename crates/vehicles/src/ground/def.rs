@@ -87,6 +87,11 @@ pub struct AxleDef {
     /// counter-steering rear axles).
     #[serde(default)]
     pub steer: f64,
+    /// How the axle's wheels steer: from the steering command through the Ackermann geometry
+    /// (with share `steer`), or each wheel independently from its per-wheel command (falling
+    /// back to the Ackermann angle without one).
+    #[serde(default)]
+    pub steer_mode: SteerMode,
     pub brake: BrakeDef,
 }
 
@@ -167,6 +172,22 @@ pub struct DamperDef {
 pub struct StopDef {
     pub travel: f64,
     pub stiffness: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerMode {
+    #[default]
+    Ackermann,
+    /// Per-wheel angle commands up to `max_angle` (rad), rate-limited to `rate` (rad/s).
+    Independent { max_angle: f64, rate: f64 },
+}
+
+impl AxleDef {
+    /// Whether the axle's wheels have a steering joint.
+    pub fn is_steered(&self) -> bool {
+        self.steer != 0.0 || matches!(self.steer_mode, SteerMode::Independent { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -356,6 +377,11 @@ impl WheeledDef {
             }
             if !a.steer.is_finite() || (a.steer != 0.0 && self.steering.is_none()) {
                 return fail("a steered axle needs [steering]");
+            }
+            if let SteerMode::Independent { max_angle, rate } = a.steer_mode
+                && !(pos(max_angle) && max_angle <= std::f64::consts::FRAC_PI_2 && pos(rate))
+            {
+                return fail("independent steering needs 0 < max_angle ≤ π/2 and a positive rate");
             }
             if !nonneg(a.brake.max_torque) || !nonneg(a.brake.parking_torque) {
                 return fail("brake torques must be non-negative");

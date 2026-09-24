@@ -1,10 +1,15 @@
-//! Cost of one controller update per action mode, and of controller + physics step.
+//! Cost of one controller update per action mode, and of controller + physics step, for the
+//! multirotor cascade and the ground controller.
 
+use autonomousim_control::ground::{
+    GroundActionLimits, GroundActionMap, GroundActionMode, GroundConfig, GroundController, GroundEstimate,
+};
 use autonomousim_control::multirotor::{
     ActionLimits, ActionMap, ActionMode, ControllerConfig, MultirotorController, StateEstimate,
 };
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::frames::GRAVITY_ENU;
+use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_vehicles::multirotor::{AirData, InitialState, MotorInit, Multirotor, StepEnv};
 use autonomousim_vehicles::presets;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -45,5 +50,20 @@ fn bench(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench);
+fn bench_ground(c: &mut Criterion) {
+    for (name, mode) in [("sedan_like", GroundActionMode::Vk), ("rover_skid", GroundActionMode::Vw)] {
+        let def = Arc::new(presets::wheeled(name).unwrap());
+        let mut v = Wheeled::new(def.clone(), 1e-3);
+        v.reset(&v.rest(DVec3::ZERO, 0.0, 1.0));
+        let est = GroundEstimate::of(&v);
+        let mut ctrl = GroundController::new(&def, 1e-3, &GroundConfig::default()).unwrap();
+        let map = GroundActionMap::new(mode, &GroundActionLimits::default(), &def).unwrap();
+        let sp = map.setpoint(&[0.3, 0.2]);
+        c.bench_function(&format!("ground_controller/{name}/{mode}"), |b| {
+            b.iter(|| ctrl.update(black_box(&sp), black_box(&est)))
+        });
+    }
+}
+
+criterion_group!(benches, bench, bench_ground);
 criterion_main!(benches);

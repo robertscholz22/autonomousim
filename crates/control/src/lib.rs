@@ -4,6 +4,7 @@
 //! allocation) whose gains are derived from the vehicle definition, and the normalised action
 //! modes that learning agents use to drive it.
 
+pub mod ground;
 pub mod multirotor;
 
 use thiserror::Error;

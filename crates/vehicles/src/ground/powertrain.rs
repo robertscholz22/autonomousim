@@ -25,6 +25,25 @@ use smallvec::SmallVec;
 
 const RPM: f64 = std::f64::consts::PI / 30.0;
 
+/// Most wheels a vehicle can have (four axles).
+pub const MAX_WHEELS: usize = 8;
+
+/// Per-wheel commands, indexed by wheel (`2·axle + side`). When given in
+/// [`DriveInput::wheels`], they replace the mixed commands: `drive` those of the electric
+/// motors (a motor driving several wheels takes their mean; combustion drives keep the
+/// throttle), `brake` the service brake, and `steer` the steering of independently steered
+/// axles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WheelCommands {
+    /// Motor command, `[−1, 1]`.
+    pub drive: [f64; MAX_WHEELS],
+    /// Service brake, `[0, 1]`.
+    pub brake: [f64; MAX_WHEELS],
+    /// Steering angle as a fraction of the axle's lock, `[−1, 1]`, positive turns left.
+    pub steer: [f64; MAX_WHEELS],
+}
+
 /// Driver commands, all normalised.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -43,6 +62,8 @@ pub struct DriveInput {
     /// Differential drive command, `[−1, 1]`, positive turns left: added to right-side and
     /// subtracted from left-side electric motors.
     pub yaw: f64,
+    /// Per-wheel commands, replacing the mixed ones where given.
+    pub wheels: Option<WheelCommands>,
 }
 
 impl DriveInput {
@@ -56,6 +77,11 @@ impl DriveInput {
             parking: self.parking,
             reverse: self.reverse,
             yaw: c(self.yaw, -1.0),
+            wheels: self.wheels.map(|w| WheelCommands {
+                drive: w.drive.map(|x| c(x, -1.0)),
+                brake: w.brake.map(|x| c(x, 0.0)),
+                steer: w.steer.map(|x| c(x, -1.0)),
+            }),
         }
     }
 }
@@ -585,7 +611,10 @@ impl Powertrain {
                 for (k, m) in self.motors.iter_mut().enumerate() {
                     let n = m.wheels.len() as f64;
                     let speed = m.wheels.iter().map(|&w| spin[w]).sum::<f64>() / n / m.ratio;
-                    let command = (input.throttle + m.sign * input.yaw).clamp(-1.0, 1.0);
+                    let command = match &input.wheels {
+                        Some(wc) => m.wheels.iter().map(|&w| wc.drive[w]).sum::<f64>() / n,
+                        None => (input.throttle + m.sign * input.yaw).clamp(-1.0, 1.0),
+                    };
                     let mut demand = match m.no_load_speed {
                         Some(w0) => (m.max_torque * (command - speed / w0)).clamp(-m.max_torque, m.max_torque),
                         None => command * m.max_torque,
