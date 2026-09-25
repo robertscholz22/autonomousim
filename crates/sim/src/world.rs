@@ -23,7 +23,7 @@ use crate::drive::ground_pose;
 use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::obs::CLEARANCE_RANGE;
-use crate::scenario::{CompiledScenario, Goal};
+use crate::scenario::{CompiledScenario, Goal, GoalKind};
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::yaw;
@@ -144,6 +144,11 @@ impl WorldInstance {
             let spawn = &g.spec.spawn;
             let ground = g.ground(pick);
             let positions = spawn.sample_positions(world, g.spec.count, g.bottom, ground, &mut placed, &mut spawn_rng);
+            let mut formation = match g.spec.goals.kind {
+                GoalKind::Formation => g.spec.goals.formation(world, &positions, ground, &mut goal_rng),
+                _ => Vec::new(),
+            }
+            .into_iter();
             for (k, p) in positions.into_iter().enumerate() {
                 let id = g.first_agent + k;
                 let density = self.env.config.atmosphere.density(self.env.origin_altitude + p.z);
@@ -152,7 +157,10 @@ impl WorldInstance {
                 if let Some(d) = g.def.as_wheeled() {
                     placement.pose = ground_pose(world, d, &g.rest, p.truncate(), yaw(placement.pose.rot));
                 }
-                let goals = g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng);
+                let goals = match formation.next() {
+                    Some(slot) => vec![slot],
+                    None => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),
+                };
                 let seed = agent_seed.child_index(id as u64);
                 let scales = g
                     .def

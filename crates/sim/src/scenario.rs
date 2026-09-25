@@ -558,6 +558,9 @@ pub struct SpawnSpec {
     /// Horizontal region `[min, max]` (m); default: the map shrunk by `margin`.
     pub region: Option<[DVec2; 2]>,
     pub margin: f64,
+    /// Side of a square (m), placed at random inside the region each episode, that the
+    /// group spawns in (a cluster); default: the whole region.
+    pub cluster: Option<f64>,
     /// Height of the centre of mass above the ground or water surface (m).
     pub agl: [f64; 2],
     /// Start resting on the ground (motors idle unless set otherwise); ignores `agl`. Ground
@@ -586,6 +589,7 @@ impl Default for SpawnSpec {
             layout: SpawnLayout::Random,
             region: None,
             margin: 10.0,
+            cluster: None,
             agl: [1.0, 3.0],
             on_ground: false,
             clearance: 1.0,
@@ -608,6 +612,21 @@ pub enum GoalKind {
     Spawn,
     /// `count` waypoints, each sampled from the previous one (the first from the spawn).
     Random,
+    /// One goal per agent: slot `k` (the agent's index in its group) of a formation of the
+    /// whole group, centred on the centroid of the group's spawns and turned by a heading
+    /// from `yaw_deg` (also every slot's goal heading); `agl` above the surface at each slot.
+    Formation,
+}
+
+/// Slot layout of `GoalKind::Formation`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormationShape {
+    /// Rows of `ceil(sqrt(count))` slots, `spacing` apart.
+    #[default]
+    Grid,
+    /// A ring with neighbouring slots `spacing` apart.
+    Circle,
 }
 
 /// Goals (waypoints) of each agent.
@@ -629,6 +648,10 @@ pub struct GoalSpec {
     /// to the next one and reports `GOAL_REACHED` (`FINISHED` after the last). 0: goals are
     /// only advanced explicitly (`WorldInstance::advance_goal`).
     pub radius: f64,
+    /// Layout of `GoalKind::Formation`.
+    pub formation: FormationShape,
+    /// Distance between neighbouring formation slots (m).
+    pub spacing: f64,
 }
 
 impl Default for GoalSpec {
@@ -642,6 +665,8 @@ impl Default for GoalSpec {
             yaw_deg: [-180.0, 180.0],
             margin: 10.0,
             radius: 0.0,
+            formation: FormationShape::Grid,
+            spacing: 2.0,
         }
     }
 }
@@ -884,6 +909,7 @@ impl CompiledGroup {
             && (0.0..=180.0).contains(&sp.tilt_deg)
             && valid_range(sp.yaw_deg)
             && sp.region.is_none_or(|[lo, hi]| lo.cmple(hi).all())
+            && sp.cluster.is_none_or(|c| c > 0.0)
             && !matches!(sp.layout, SpawnLayout::Grid { spacing } if spacing.is_nan() || spacing <= 0.0);
         if !spawn_ok {
             return Err(fail(format!("invalid spawn {sp:?}")));
@@ -895,6 +921,7 @@ impl CompiledGroup {
             && valid_range(gl.yaw_deg)
             && gl.clearance >= 0.0
             && gl.radius >= 0.0
+            && gl.spacing > 0.0
             && gl.count >= 1)
         {
             return Err(fail(format!("invalid goals {gl:?}")));
@@ -975,6 +1002,22 @@ fn sample(rng: &mut SimRng, r: [f64; 2]) -> f64 {
     r[0] + (r[1] - r[0]) * rng.uniform()
 }
 
+/// Offset of slot `k` of an `n`-slot formation with unit spacing, centred on the origin.
+fn formation_slot(shape: FormationShape, n: usize, k: usize) -> DVec2 {
+    match shape {
+        FormationShape::Grid => {
+            let cols = (n as f64).sqrt().ceil() as usize;
+            let rows = n.div_ceil(cols);
+            DVec2::new((k % cols) as f64 - 0.5 * (cols - 1) as f64, (k / cols) as f64 - 0.5 * (rows - 1) as f64)
+        }
+        FormationShape::Circle if n < 2 => DVec2::ZERO,
+        FormationShape::Circle => {
+            let step = std::f64::consts::TAU / n as f64;
+            DVec2::from_angle(step * k as f64) * (0.5 / (0.5 * step).sin())
+        }
+    }
+}
+
 /// Region `[min, max]` inside the map, shrunk by `margin` (never inverted).
 fn region(world: &StaticWorld, region: Option<[DVec2; 2]>, margin: f64) -> [DVec2; 2] {
     let (lo, hi) = world.extent();
@@ -1010,6 +1053,17 @@ impl SpawnSpec {
         rng: &mut SimRng,
     ) -> Vec<DVec3> {
         let [lo, hi] = region(world, self.region, self.margin);
+        let [lo, hi] = match self.cluster {
+            Some(side) => {
+                let half = DVec2::splat(0.5 * side).min(0.5 * (hi - lo));
+                let centre = DVec2::new(
+                    sample(rng, [lo.x + half.x, hi.x - half.x]),
+                    sample(rng, [lo.y + half.y, hi.y - half.y]),
+                );
+                [centre - half, centre + half]
+            }
+            None => [lo, hi],
+        };
         let height = |xy: DVec2, rng: &mut SimRng| {
             let surface = world.surface_height(xy.x, xy.y);
             if let Some(g) = ground {
@@ -1135,7 +1189,7 @@ impl GoalSpec {
     ) -> Vec<Goal> {
         use autonomousim_core::math::quat::yaw;
         match self.kind {
-            GoalKind::Spawn => vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }],
+            GoalKind::Spawn | GoalKind::Formation => vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }],
             GoalKind::Random => {
                 let [lo, hi] = region(world, None, self.margin);
                 let mut prev = spawn.pos.truncate();
@@ -1175,6 +1229,34 @@ impl GoalSpec {
                 goals
             }
         }
+    }
+
+    /// Formation slots of a group from its spawn positions, one goal per agent (for
+    /// `GoalKind::Formation`). Ground vehicles' slots (`ground`) rest on the terrain.
+    pub(crate) fn formation(
+        &self,
+        world: &StaticWorld,
+        spawns: &[DVec3],
+        ground: Option<GroundSampling>,
+        rng: &mut SimRng,
+    ) -> Vec<Goal> {
+        let n = spawns.len();
+        let centre = spawns.iter().map(|p| p.truncate()).sum::<DVec2>() / n.max(1) as f64;
+        let heading = sample(rng, self.yaw_deg).to_radians();
+        let agl = sample(rng, self.agl);
+        let turn = DVec2::from_angle(heading);
+        let [lo, hi] = region(world, None, self.margin);
+        (0..n)
+            .map(|k| {
+                let offset = formation_slot(self.formation, n, k) * self.spacing;
+                let xy = (centre + turn.rotate(offset)).clamp(lo, hi);
+                let z = match ground {
+                    Some(g) => world.terrain().height(xy.x, xy.y) + g.ride,
+                    None => world.surface_height(xy.x, xy.y) + agl,
+                };
+                Goal { position: xy.extend(z), yaw: heading }
+            })
+            .collect()
     }
 
     /// 1 when a goal at `p` is free; otherwise how close it comes.
@@ -1263,6 +1345,52 @@ mod tests {
             assert!((4.0 - 1e-9..=8.0 + 1e-9).contains(&d), "{d}");
             assert!(world.is_free(goal.position, 1.0, true, false));
             prev = goal.position;
+        }
+    }
+
+    #[test]
+    fn cluster_spawns_and_formation_slots() {
+        let world = testworlds::flat(200.0);
+        let spawn = SpawnSpec { cluster: Some(8.0), min_separation: 1.5, ..SpawnSpec::default() };
+        let mut rng = Seed::from_u64(4).rng();
+        for shape in [FormationShape::Grid, FormationShape::Circle] {
+            let ps = spawn.sample_positions(&world, 7, 0.05, None, &mut Vec::new(), &mut rng);
+            for p in &ps {
+                for q in &ps {
+                    assert!((p - q).truncate().abs().max_element() <= 8.0 + 1e-9);
+                }
+            }
+            let goals = GoalSpec {
+                kind: GoalKind::Formation,
+                formation: shape,
+                spacing: 3.0,
+                agl: [2.0, 2.0],
+                ..GoalSpec::default()
+            };
+            let slots = goals.formation(&world, &ps, None, &mut rng);
+            assert_eq!(slots.len(), 7);
+            let centre = |v: Vec<DVec2>| v.iter().sum::<DVec2>() / v.len() as f64;
+            let c = centre(ps.iter().map(|p| p.truncate()).collect());
+            let nearest = |i: usize| {
+                (0..7)
+                    .filter(|&j| j != i)
+                    .map(|j| slots[i].position.distance(slots[j].position))
+                    .fold(f64::INFINITY, f64::min)
+            };
+            for (i, s) in slots.iter().enumerate() {
+                assert!((s.position.z - 2.0).abs() < 1e-9);
+                assert!((nearest(i) - 3.0).abs() < 1e-9, "{shape:?} {}", nearest(i));
+                assert_eq!(s.yaw, slots[0].yaw);
+            }
+            match shape {
+                // A 3×3 grid with 7 slots is not centred; the ring is.
+                FormationShape::Grid => {
+                    assert!(centre(slots.iter().map(|g| g.position.truncate()).collect()).distance(c) < 3.0)
+                }
+                FormationShape::Circle => {
+                    assert!(centre(slots.iter().map(|g| g.position.truncate()).collect()).distance(c) < 1e-9)
+                }
+            }
         }
     }
 

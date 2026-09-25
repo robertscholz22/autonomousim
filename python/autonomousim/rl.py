@@ -21,6 +21,8 @@ class RunningMeanStd:
 
     def update(self, x: np.ndarray) -> None:
         n = x.shape[0]
+        if n == 0:
+            return
         mean, var = x.mean(axis=0), x.var(axis=0)
         delta = mean - self.mean
         total = self.count + n
@@ -57,16 +59,17 @@ class ObsNormalizer:
 
 class RewardScaler:
     """Divides rewards by the running standard deviation of the discounted return (as
-    Gymnasium's ``NormalizeReward``)."""
+    Gymnasium's ``NormalizeReward``). With ``mask``, only those returns update the statistics
+    (e.g. the active agents of a multi-agent environment)."""
 
     def __init__(self, num_envs: int, gamma: float):
         self.rms = RunningMeanStd()
         self.ret = np.zeros(num_envs)
         self.gamma = gamma
 
-    def __call__(self, reward: np.ndarray, done: np.ndarray) -> np.ndarray:
+    def __call__(self, reward: np.ndarray, done: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         self.ret = self.ret * self.gamma + reward
-        self.rms.update(self.ret)
+        self.rms.update(self.ret if mask is None else self.ret[mask])
         self.ret[done] = 0.0
         return reward / np.sqrt(self.rms.var + 1e-8)
 
