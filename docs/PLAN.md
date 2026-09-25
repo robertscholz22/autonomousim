@@ -1333,15 +1333,57 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
   - Rust: state rows against `road_state`; routes survive a recording; yard-less maps route to road points; the new map invariants.
   - Python: the scripted driver reaches every yard; a full-lock car fails off the road; spaces and `check_env` for the new id.
 
-### M4b: Trucks and trailers (outline, detailed when it starts)
-- **Articulated vehicles**: a wheeled vehicle becomes a chain of units (tractor, then trailers), each a body in the same tree. A fifth wheel is a Spherical joint with roll stiffness and pitch stops; a drawbar is two revolute joints (a dolly). Axles, colliders and forces attach to their unit's link instead of link 0.
-- **Lifting the 4-axle limit**: per-wheel commands and arrays become `Vec`s, the per-wheel action mask grows beyond 8 bits, and the static equilibrium solves any number of axles (a linear system in the axle loads).
-- **Multi-axle steering**: several steered axles with Ackermann about a virtual rear axle; passive and command-steered trailer axles; air-brake lag.
-- **Agents with several bodies**: collider spheres carry their link; agent contacts and shapes follow each body.
-- **Presets**: a 6×4 tractor with a 3-axle semitrailer, an 8×8 rigid truck, and a farm tractor with a 2-axle drawbar trailer.
-- **Validation**: low-speed offtracking against the analytic steady-state formula; high-speed offtracking and rearward amplification against published values or Chrono's semitrailer.
-- **Viewer**: trailer bodies and articulation, and a reversing camera.
-- **Demo**: `TrailerReverse-v0`, reversing into a farm-yard bay.
+### M4b: Trucks and trailers
+
+Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open to change):
+- **Trailers are their own definitions**, coupled in the scenario (`vehicle = "truck_6x4"`, `trailers = ["semitrailer_3axle"]`), so any towing unit pulls any trailer with a matching coupling.
+- **Truck tyres**: the 315/80 R22.5 truck example of Pacejka's book in PAC2002 form (Chrono's `CityBus_Pac02Tire.tir`, BSD-3), as `Truck_Pac02Tire`. With the same tyre in both, high-speed runs compare like for like with Chrono.
+- **Demo**, `TrailerReverse-v0`: the 6×4 tractor and 3-axle semitrailer start in a farm yard facing the exit and back the trailer into a bay at the far side of the yard, in front of the buildings.
+
+#### Design
+- **Units**: a wheeled vehicle is a chain of units: the towing unit (today's chassis and axles) and up to three trailer units. Each unit is one body of the multibody tree, so articulation needs no loop constraints. Axles, wheels, colliders, drag and contacts attach to their unit's link. Wheels and axles are numbered over all units in order, towing unit first.
+- **Couplings** (on the trailer, with the coupling point on the towing unit given by the towing unit's `fifth_wheel` or `hitch`):
+  - `fifth_wheel`: a Spherical joint at the kingpin. Roll against a torsional spring and damper (the plate); pitch and yaw free up to end stops (±15° pitch, ±90° yaw), which are stiff torsional springs.
+  - `drawbar`: a two-unit trailer. A dolly (drawbar and front axle) hangs on the pintle hitch (Spherical, stops in pitch and yaw, a light roll spring), and the body sits on the dolly's turntable (Revolute about z). A centre-axle trailer is a drawbar trailer without a turntable (the drawbar is part of the body).
+  - Articulation angles (yaw of each unit relative to the one ahead) are reported per coupling.
+- **Limits lifted**: up to 8 axles over all units (`MAX_WHEELS` 16). Per-wheel arrays stay fixed-size (`Copy`, no allocation per tick); per-wheel masks become `u32`.
+- **Static equilibrium for any layout**: for chains or more than two axles, minimise the potential energy (tyre and spring energies, gravity, coupling springs) over the towing unit's height, pitch and roll, each trailer's pitch and roll about its coupling, and the suspension travels (Newton with finite differences; at most about 30 unknowns). Automatic preloads fix the travels at zero and read the preloads from the tyre loads, as today. Single-unit two-axle vehicles keep the current solver (so their goldens stay), and a test checks that both solvers agree.
+- **Steering**:
+  - Several steered axles: each steered axle turns about the virtual rear axle (the mean of the unsteered axles), `tan δ_i = (x_i − x_r) tan δ / (x_1 − x_r)`, with the Ackermann fraction applied per wheel. `steer` stays the share for a hand-set layout; `steer = "geometric"` computes it.
+  - Trailer axles: `steer_mode = { articulation = k }` steers the axle by `−k` × the unit's articulation angle (forced steering, as on long semitrailers). Passive self-steering axles are deferred.
+- **Brakes**: air brakes with a delay and a first-order lag (`brake = { max_torque, delay, time_constant }`, default instant), trailer axles braked from the same pedal.
+- **Presets** (Chrono data where available, extracted by `tools/gen_chrono_truck_fixtures.py` like the sedan):
+  - `truck_6x4`: the Kraz 64431 tractor: steered front axle, driven rear tandem, fifth wheel.
+  - `semitrailer_3axle`: the Krone semitrailer Chrono pairs with the Kraz.
+  - `truck_8x8`: the MAN 10t: two steered front axles, eight driven wheels.
+  - `farm_tractor` (rigid rear axle, front axle on a pendulum pivot as a roll-free joint, big Fiala tyres, rear pintle hitch) and `farm_trailer` (a 2-axle drawbar trailer). No Chrono models; the parameters are published figures for a 100 kW tractor and a 10 t trailer.
+- **Simulation**:
+  - Scenario groups take `trailers = [...]`; the combined definition is stored in recordings.
+  - Agent contact shapes get per-sphere velocities and links, so forces reach the unit they hit.
+  - Events: `ROLLOVER` from any unit, and `JACKKNIFE` (new) when an articulation angle exceeds `jackknife_deg` (default 70°).
+  - State column `articulation` (2: yaw of the first two couplings); obs terms `articulation` (angles and rates) and `trailer_goal` (the goal in the last unit's frame, with its heading error).
+  - Recorded states carry the coupling joint angles; replays place every unit.
+- **Viewer**: trailer bodies, wheels on their units, articulation in the HUD, a reversing camera (C cycles to it), `--trailer <name>` for live driving, replay.
+- **Validation**:
+  - Low-speed offtracking: steady circles at 2 m/s; the trailer's path radius against the kinematic steady-state formula `R_t² = R_k² − L_t²` (semitrailer), and the chain of the same for the drawbar trailer; within 2 %.
+  - `truck_8x8`: steady turning against Chrono's MAN 10t (same tyres and geometry).
+  - Tractor-semitrailer: a step steer and a single lane change at 60–80 km/h against Chrono's Kraz with the truck tyre fitted to both: yaw rates, articulation angle and rearward amplification (trailer over tractor lateral acceleration).
+  - Statics: loads sum to the weight, the kingpin load matches the lever rule, a rig rolls straight and brakes straight.
+- **Demo**, `TrailerReverse-v0`:
+  - Goal kind `bay`: a pose at the far side of a farm yard (from the yard node and its access road), with the rear of the last unit as the reference point; spawns in the yard facing the exit, 15–30 m ahead of the bay, with lateral and heading jitter.
+  - Actions `vk` (reverse up to 3 m/s). Observation: `trailer_goal`, `articulation`, speed, steering, last action, and LiDAR on the trailer's rear.
+  - Reward: progress of the trailer's rear to the bay and heading alignment; success within 1 m and 5°; failure on a crash, jackknife or leaving the yard.
+  - A scripted reversing controller (a feedback law on the articulation angle) proves the task solvable in the tests.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Units and couplings in `vehicles::ground` (fifth wheel, drawbar, turntable), per-unit colliders and drag, `MAX_WHEELS` 16, general static equilibrium, `trailers` composition | A test tractor with a semitrailer and a drawbar trailer settles at the static solution; loads and kingpin load match statics; the two solvers agree on two-axle vehicles; existing goldens unchanged |
+| 2 | Truck tyre, multi-axle and forced steering, air-brake lag, presets `truck_6x4`, `semitrailer_3axle`, `truck_8x8`, `farm_tractor`, `farm_trailer` (Chrono extraction) | Presets load, settle and drive straight; static loads against Chrono's |
+| 3 | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
+| 4 | Simulation: scenario `trailers`, multi-body agent shapes, `JACKKNIFE`, `articulation` state and terms, `trailer_goal`, recordings with articulation | Rigs spawn, drive and record; replays reproduce them; goldens of existing scenarios unchanged |
+| 5 | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
+| 6 | `TrailerReverse-v0`: `bay` goals, scripted reversing controller, short training, export, viewer, replay | The task trains end to end; the exported policy reverses in the viewer; a recorded episode replays |
 
 ### M4c: Tracked vehicles and soft soil
 The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.
