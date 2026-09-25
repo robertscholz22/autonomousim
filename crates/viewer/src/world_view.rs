@@ -1,12 +1,14 @@
-//! The map: terrain chunks with distance-based level of detail, water, merged obstacle meshes
-//! (coarse ones far away), sun, sky and fog. When the simulation moves to another map (a
-//! replayed episode on another map of the pool, a regenerated map) the map is rebuilt.
+//! The map: terrain chunks with distance-based level of detail, water, road ribbons, merged
+//! obstacle meshes (coarse ones far away), sun, sky and fog. When the simulation moves to
+//! another map (a replayed episode on another map of the pool, a regenerated map) the map is
+//! rebuilt.
 
 use crate::convert;
 use crate::sim::Sim;
 use crate::{CameraRig, Quality};
 use autonomousim_scene::MeshData;
 use autonomousim_scene::props::{self, PropDetail};
+use autonomousim_scene::roads;
 use autonomousim_scene::terrain::{self, Chunk};
 use autonomousim_world::StaticWorld;
 use bevy::camera::primitives::Aabb;
@@ -53,6 +55,7 @@ struct MapMaterials {
     terrain: Handle<StandardMaterial>,
     water: Handle<StandardMaterial>,
     props: Handle<StandardMaterial>,
+    roads: Handle<StandardMaterial>,
 }
 
 /// Everything that belongs to the current map.
@@ -164,6 +167,14 @@ pub fn spawn_map(
             reflectance: 0.2,
             ..default()
         }),
+        // Drawn in front of the terrain they lie a few centimetres above.
+        roads: materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.85,
+            reflectance: 0.1,
+            depth_bias: 50.0,
+            ..default()
+        }),
     };
     view.materials = Some(m);
     build_map(&mut commands, &view, &mut meshes);
@@ -203,10 +214,30 @@ fn build_map(commands: &mut Commands, view: &MapView, meshes: &mut Assets<Mesh>)
             (t, terrain::water_chunk(world, c, terrain::water_color()))
         })
         .collect();
-    let (mut near, mut far) = rayon::join(
-        || props::props_by_chunk(world, &view.chunks, CHUNK_CELLS, PropDetail::default()),
-        || props::props_by_chunk(world, &view.chunks, CHUNK_CELLS, PropDetail::far()),
+    let ((mut near, mut far), road_meshes) = rayon::join(
+        || {
+            rayon::join(
+                || props::props_by_chunk(world, &view.chunks, CHUNK_CELLS, PropDetail::default()),
+                || props::props_by_chunk(world, &view.chunks, CHUNK_CELLS, PropDetail::far()),
+            )
+        },
+        || roads::roads_by_chunk(world, &view.chunks, CHUNK_CELLS),
     );
+    let mut road_triangles = 0;
+    // Roads are drawn where obstacles are drawn in detail.
+    for r in road_meshes.into_iter().filter(|r| !r.is_empty()) {
+        road_triangles += r.triangle_count();
+        let (rmin, rmax) = bevy_bounds(&r).unwrap();
+        commands.spawn((
+            Mesh3d(meshes.add(convert::mesh(&r))),
+            MeshMaterial3d(materials.roads.clone()),
+            aabb(rmin, rmax),
+            ChunkPart { min: rmin, max: rmax },
+            PropLod { near: true },
+            bevy::light::NotShadowCaster,
+            MapEntity,
+        ));
+    }
 
     let (mut triangles, mut prop_triangles, mut far_triangles) = (0, 0, 0);
     for (i, (c, (t, w))) in view.chunks.iter().zip(built).enumerate() {
@@ -255,10 +286,11 @@ fn build_map(commands: &mut Commands, view: &MapView, meshes: &mut Assets<Mesh>)
         }
     }
     info!(
-        "map {}: {} chunks, {} terrain triangles at the coarsest level, {} obstacle triangles ({} far) ({:.2} s)",
+        "map {}: {} chunks, {} terrain triangles at the coarsest level, {} road triangles, {} obstacle triangles ({} far) ({:.2} s)",
         world.meta.name,
         view.chunks.len(),
         triangles,
+        road_triangles,
         prop_triangles,
         far_triangles,
         start.elapsed().as_secs_f64()

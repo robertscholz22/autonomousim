@@ -184,6 +184,23 @@ pub fn cuboid(h: Vec3, color: [f32; 4]) -> MeshData {
     m
 }
 
+/// Gable roof over the rectangle `±h.x × ±h.y` at `z = 0`, its ridge along x at `z = h.z`:
+/// two slopes and two gable ends, without a bottom.
+pub fn gable_roof(h: Vec3, color: [f32; 4]) -> MeshData {
+    let mut m = MeshData::new();
+    let c = |x: f32, y: f32, z: f32| Vec3::new(x * h.x, y * h.y, z * h.z);
+    for side in [-1.0, 1.0] {
+        // Slope: eave to ridge, wound so that its normal points up and outwards.
+        let (a, b) = (c(-side, side, 0.0), c(side, side, 0.0));
+        let (r0, r1) = (c(-side, 0.0, 1.0), c(side, 0.0, 1.0));
+        m.push_flat_triangle(a, r1, b, color);
+        m.push_flat_triangle(a, r0, r1, color);
+        // Gable end at x = side·h.x.
+        m.push_flat_triangle(c(side, -side, 0.0), c(side, side, 0.0), c(side, 0.0, 1.0), color);
+    }
+    m
+}
+
 /// Icosphere: an icosahedron subdivided `subdivisions` times (20·4ⁿ triangles), flat-shaded
 /// or `smooth` (shared vertices).
 pub fn icosphere(radius: f32, subdivisions: u32, smooth: bool, color: [f32; 4]) -> MeshData {

@@ -33,10 +33,10 @@ use autonomousim_control::ground::{GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::ActionMode;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::Seed;
-use autonomousim_procgen::WildPreset;
+use autonomousim_procgen::{RuralPreset, WildPreset};
 use autonomousim_sim::policy::PolicyFile;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
-use autonomousim_sim::scenario::{MapSource, SpawnSpec, VehicleRef, WildMaps};
+use autonomousim_sim::scenario::{GoalKind, GoalSpec, MapSource, RuralMaps, SpawnSpec, VehicleRef, WildMaps};
 use autonomousim_sim::{CompiledScenario, Events, GroupSpec, Scenario, WorldInstance};
 use autonomousim_vehicles::{Vehicle, VehicleDef};
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
@@ -112,9 +112,12 @@ struct LiveArgs {
     /// Scenario file (TOML or JSON); replaces the map and vehicle options.
     #[arg(long)]
     scenario: Option<PathBuf>,
-    /// Wild map preset.
+    /// Map generator.
+    #[arg(long, value_enum, default_value_t = MapKind::Wild)]
+    map: MapKind,
+    /// Map preset: `training`, `showcase` or (wild maps) `offroad`.
     #[arg(long, default_value = "showcase")]
-    preset: WildPreset,
+    preset: String,
     /// Map seed.
     #[arg(long, default_value_t = 0)]
     seed: u64,
@@ -140,6 +143,13 @@ struct LiveArgs {
     /// Record the session to this MCAP file (replay it with `replay`).
     #[arg(long)]
     record: Option<PathBuf>,
+}
+
+/// Map generators of live mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum MapKind {
+    Wild,
+    Rural,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -228,12 +238,21 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
     let config = args.size.map(|s| serde_json::json!({ "size": s }));
     let vehicle = VehicleRef::Name(args.vehicle.clone());
     let ground = matches!(vehicle.resolve()?, VehicleDef::Wheeled(_));
+    let rural = args.map == MapKind::Rural;
     let group = if ground {
+        // On rural maps: start in a lane with a route to a farm yard.
+        let (spawn, goals) = if rural {
+            let goals = GoalSpec { kind: GoalKind::Route, distance: [150.0, 400.0], radius: 5.0, ..Default::default() };
+            (SpawnSpec { on_road: true, min_separation: 10.0, ..Default::default() }, goals)
+        } else {
+            (SpawnSpec { margin: 60.0, ..Default::default() }, GoalSpec::default())
+        };
         GroupSpec {
             name: "driver".into(),
             vehicle,
             action_mode: Some(GroundActionMode::Raw.into()),
-            spawn: SpawnSpec { margin: 60.0, ..Default::default() },
+            spawn,
+            goals,
             disable_on_terminal: false,
             ..Default::default()
         }
@@ -249,13 +268,22 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
     };
     let mut sc = Scenario {
         name: "viewer".into(),
-        map: MapSource::Wild(WildMaps {
-            seed: args.seed,
-            count: 1,
-            preset: args.preset,
-            config,
-            cache: !args.no_cache,
-        }),
+        map: match args.map {
+            MapKind::Wild => MapSource::Wild(WildMaps {
+                seed: args.seed,
+                count: 1,
+                preset: args.preset.parse::<WildPreset>().map_err(anyhow::Error::msg)?,
+                config,
+                cache: !args.no_cache,
+            }),
+            MapKind::Rural => MapSource::Rural(RuralMaps {
+                seed: args.seed,
+                count: 1,
+                preset: args.preset.parse::<RuralPreset>().map_err(anyhow::Error::msg)?,
+                config,
+                cache: !args.no_cache,
+            }),
+        },
         groups: vec![group],
         ..Default::default()
     };
@@ -567,6 +595,10 @@ fn drive_demo(sim: &mut sim::Sim, route: &mut DemoRoute) {
     }
     let agent = sim.world.agent(i);
     let p = agent.vehicle.position().truncate();
+    if let Some(lane) = agent.route.clone() {
+        drive_route(sim, &lane);
+        return;
+    }
     let grid = sim.world.scenario().groups[agent.group].drive[sim.world.map_index()].clone();
     if route.path.len() <= 1 && route.path.first().is_none_or(|q| q.distance(p) < LOOKAHEAD) {
         if route.rng == 0 {
@@ -590,6 +622,24 @@ fn drive_demo(sim: &mut sim::Sim, route: &mut DemoRoute) {
     let rel = glam::DVec2::from_angle(-yaw(agent.vehicle.orientation())).rotate(target - p);
     let curvature = 2.0 * rel.y / rel.length_squared().max(1.0);
     let speed = if rel.x > rel.y.abs() { 8.0 } else { 4.0 };
+    sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed, curvature });
+}
+
+/// Pure pursuit along the pilot's route lane, 8 m ahead, at up to 12 m/s (slower in bends,
+/// for 2 m/s² of lateral acceleration); a new episode at the end of the route.
+fn drive_route(sim: &mut sim::Sim, lane: &autonomousim_world::Polyline) {
+    const LOOKAHEAD: f64 = 8.0;
+    let agent = sim.world.agent(sim.pilot);
+    if agent.goal_index >= agent.goals.len() {
+        sim.reset();
+        return;
+    }
+    let (p, y) = (agent.vehicle.position().truncate(), yaw(agent.vehicle.orientation()));
+    let follow = autonomousim_sim::lane::Follow::new(Some(lane), sim.world.map(), p, y).expect("a route");
+    let rel = glam::DVec2::from_angle(-y).rotate(follow.point(LOOKAHEAD) - p);
+    let curvature = 2.0 * rel.y / rel.length_squared().max(1.0);
+    let bend = [0.0, 10.0, 20.0, 40.0].map(|a| follow.curvature(a).abs()).into_iter().fold(0.0, f64::max);
+    let speed = (2.0 / bend.max(1e-3)).sqrt().min(12.0);
     sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed, curvature });
 }
 

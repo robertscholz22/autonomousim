@@ -1,5 +1,6 @@
 //! Markers drawn over the scene with gizmos: the goals of every agent and the line to the
-//! current one, the path flown over the last seconds, and the hits of the latest LiDAR scan.
+//! current one, the route of agents with `route` goals, the path flown over the last seconds,
+//! and the hits of the latest LiDAR scan.
 //! O toggles the goals and trails, L the LiDAR points.
 
 use crate::convert;
@@ -35,6 +36,7 @@ impl Default for Overlay {
 const GOAL: Color = Color::srgb(1.0, 0.8, 0.1);
 const NEXT_GOALS: Color = Color::srgba(1.0, 0.8, 0.1, 0.4);
 const TO_GOAL: Color = Color::srgba(1.0, 0.8, 0.1, 0.6);
+const ROUTE: Color = Color::srgba(1.0, 0.45, 0.1, 0.8);
 const TRAIL_COLOR: Color = Color::srgb(0.2, 0.9, 1.0);
 const PILOT_TRAIL: Color = Color::srgb(1.0, 0.35, 0.8);
 
@@ -127,6 +129,13 @@ pub fn draw(keys: Res<ButtonInput<KeyCode>>, sim: Res<Sim>, mut overlay: ResMut<
             }
             if let Some(g) = agent.goals.get(current) {
                 gizmos.line(convert::vec(pos), convert::vec(g.position), TO_GOAL);
+            }
+            // The route's lane, half a metre above the road.
+            if let Some(route) = &agent.route {
+                let pts = route.points();
+                let last = pts.len().saturating_sub(1);
+                let lane = (0..pts.len()).step_by(2).chain([last]).map(|k| convert::vec(pts[k] + DVec3::Z * 0.5));
+                gizmos.linestrip(lane, ROUTE);
             }
             let color = if i == sim.pilot { PILOT_TRAIL } else { TRAIL_COLOR };
             let points: Vec<Vec3> = match &sim.replay {

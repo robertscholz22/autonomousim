@@ -3,8 +3,9 @@
 
 use crate::mesh::{self, MeshData, srgb};
 use crate::terrain::Chunk;
+use autonomousim_core::material::MaterialId;
 use autonomousim_world::obstacles::tags;
-use autonomousim_world::{HeightGrid, Obstacle, ObstacleShape, StaticWorld};
+use autonomousim_world::{HeightGrid, Obstacle, ObstacleClass, ObstacleShape, StaticWorld};
 use glam::{DQuat, DVec3, Vec3};
 
 /// Tessellation of the primitives.
@@ -56,6 +57,14 @@ fn base_color(world: &StaticWorld, o: &Obstacle) -> [u8; 3] {
         tags::TRUNK => [92, 66, 46],
         tags::CANOPY => [44, 82, 50],
         tags::CANOPY_BROADLEAF => [82, 124, 56],
+        tags::HEDGE if o.class == ObstacleClass::Foliage => [58, 94, 46],
+        tags::FENCE => [128, 104, 76],
+        tags::SILO => [188, 192, 196],
+        tags::BUILDING => match o.material {
+            MaterialId::CONCRETE => [218, 208, 186],
+            MaterialId::WOOD => [142, 98, 66],
+            _ => [166, 170, 176],
+        },
         _ => {
             let table = world.materials();
             if (o.material.0 as usize) < table.len() { table.get(o.material).color } else { [200, 0, 200] }
@@ -70,7 +79,56 @@ fn variation(index: usize) -> f32 {
     0.82 + 0.36 * ((h & 0xFFFF) as f32 / 65535.0)
 }
 
-/// Mesh of one obstacle in its local frame.
+/// Roof colour of a building by its material (house, barn, shed).
+fn roof_color(material: MaterialId) -> [u8; 3] {
+    match material {
+        MaterialId::CONCRETE => [156, 72, 52],
+        MaterialId::WOOD => [104, 52, 44],
+        _ => [112, 118, 124],
+    }
+}
+
+/// Mesh of one obstacle in its local frame as the viewer shows it: its shape, except that
+/// buildings get a gable roof (above their collision box), silos a conical cap, and fences
+/// are drawn as posts and wires.
+pub fn obstacle_visual(o: &Obstacle, color: [f32; 4], detail: PropDetail) -> MeshData {
+    match (o.tag, &o.shape) {
+        (tags::BUILDING, ObstacleShape::Cuboid { half_extents: h }) => {
+            let mut m = mesh::cuboid(h.as_vec3(), color);
+            // The ridge runs along the longer side; the roof overhangs by 0.3 m.
+            let (long, short, turn) =
+                if h.x >= h.y { (h.x, h.y, 0.0) } else { (h.y, h.x, std::f64::consts::FRAC_PI_2) };
+            let roof = Vec3::new((long + 0.3) as f32, (short + 0.3) as f32, (0.5 * short) as f32);
+            let roof = mesh::gable_roof(roof, srgb(roof_color(o.material)));
+            m.append_transformed(&roof, DQuat::from_rotation_z(turn), DVec3::new(0.0, 0.0, h.z));
+            m
+        }
+        (tags::SILO, ObstacleShape::Cylinder { half_height, radius }) => {
+            let s = detail.segments.max(3) * 2;
+            let mut m = mesh::cylinder(*radius as f32, *half_height as f32, s, color);
+            let cap = mesh::cone(*radius as f32 * 1.05, 0.2 * *radius as f32, s, srgb([150, 154, 158]));
+            m.append_transformed(&cap, DQuat::IDENTITY, DVec3::new(0.0, 0.0, half_height + 0.2 * radius));
+            m
+        }
+        (tags::FENCE, ObstacleShape::Cuboid { half_extents: h }) => {
+            let (long, turn) = if h.x >= h.y { (h.x, 0.0) } else { (h.y, std::f64::consts::FRAC_PI_2) };
+            let rot = DQuat::from_rotation_z(turn);
+            let mut m = MeshData::new();
+            let post = mesh::cuboid(Vec3::new(0.06, 0.06, h.z as f32), color);
+            for x in [-long + 0.06, long - 0.06] {
+                m.append_transformed(&post, rot, rot * DVec3::new(x, 0.0, 0.0));
+            }
+            let wire = mesh::cuboid(Vec3::new(long as f32, 0.012, 0.012), srgb([150, 152, 150]));
+            for z in [-0.35, 0.1, 0.55] {
+                m.append_transformed(&wire, rot, DVec3::new(0.0, 0.0, z * h.z / 0.6));
+            }
+            m
+        }
+        _ => obstacle_mesh(&o.shape, color, detail),
+    }
+}
+
+/// Mesh of one obstacle's shape in its local frame.
 pub fn obstacle_mesh(shape: &ObstacleShape, color: [f32; 4], detail: PropDetail) -> MeshData {
     let s = detail.segments.max(3);
     match shape {
@@ -105,12 +163,14 @@ pub fn props_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize, detail
     let grid = world.terrain();
     let mut out = vec![MeshData::new(); chunks.len()];
     for (i, o) in world.obstacles().obstacles().iter().enumerate() {
-        if detail.min_size > 0.0 && extent(&o.shape) < detail.min_size {
+        // Hedges hide their woody cores.
+        let hidden = o.tag == tags::HEDGE && o.class == ObstacleClass::Solid;
+        if hidden || (detail.min_size > 0.0 && extent(&o.shape) < detail.min_size) {
             continue;
         }
         let k = chunk_index(grid, size, o.pose.pos);
         let color = srgb(base_color(world, o));
-        let mut m = obstacle_mesh(&o.shape, color, detail);
+        let mut m = obstacle_visual(o, color, detail);
         m.tint(variation(i));
         out[k].append_transformed(&m, o.pose.rot, o.pose.pos);
     }
@@ -269,6 +329,39 @@ mod tests {
             assert!(lo.y as f64 > clo.y - 8.0 && (hi.y as f64) < chi.y + 8.0);
             assert!((hi.z as f64) > clo.z);
         }
+    }
+
+    #[test]
+    fn farm_obstacles_get_roofs_caps_and_wires() {
+        use autonomousim_core::math::Pose;
+        let color = srgb([200, 200, 200]);
+        let cuboid = |h: DVec3| ObstacleShape::Cuboid { half_extents: h };
+        let barn = Obstacle::solid(cuboid(DVec3::new(6.0, 11.0, 4.5)), Pose::IDENTITY, MaterialId::WOOD)
+            .with_tag(tags::BUILDING);
+        let m = obstacle_visual(&barn, color, PropDetail::default());
+        let (lo, hi) = m.bounds().unwrap();
+        // The ridge runs along the long (y) side, 0.5 × the short half-width above the walls;
+        // the roof overhangs by 0.3 m.
+        assert!((hi.z - 7.5).abs() < 1e-4 && (lo.z + 4.5).abs() < 1e-4, "{lo} {hi}");
+        assert!((hi.x - 6.3).abs() < 1e-4 && (hi.y - 11.3).abs() < 1e-4, "{hi}");
+        // Every face points away from the centre of the roof or walls.
+        for t in m.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from_array(m.positions[i as usize]));
+            let centre = if a.z.min(b.z).min(c.z) >= 4.5 - 1e-4 { Vec3::new(0.0, 0.0, 4.4) } else { Vec3::ZERO };
+            assert!((b - a).cross(c - a).dot((a + b + c) / 3.0 - centre) > 0.0);
+        }
+        let fence =
+            Obstacle::solid(cuboid(DVec3::new(0.05, 2.0, 0.6)), Pose::IDENTITY, MaterialId::WOOD).with_tag(tags::FENCE);
+        let (lo, hi) = obstacle_visual(&fence, color, PropDetail::default()).bounds().unwrap();
+        assert!(hi.y > 1.9 && lo.y < -1.9 && hi.x < 0.07 && hi.z <= 0.6 + 1e-4, "{lo} {hi}");
+        let silo = Obstacle::solid(
+            ObstacleShape::Cylinder { half_height: 6.0, radius: 2.0 },
+            Pose::IDENTITY,
+            MaterialId::METAL,
+        )
+        .with_tag(tags::SILO);
+        let (_, hi) = obstacle_visual(&silo, color, PropDetail::default()).bounds().unwrap();
+        assert!((hi.z - 6.8).abs() < 1e-4, "{hi}");
     }
 
     #[test]

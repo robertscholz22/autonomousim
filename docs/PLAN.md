@@ -1214,7 +1214,7 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
 | 2 | `procgen::rural` terrain, farm sites, road routing, terrain blending, road materials; `RuralConfig` and presets (done 2026-09-25) | Every farm is connected; grades and curvatures stay within the class limits; roads stay out of water; the hash is identical with 1 and 12 threads; golden hashes committed; 512 m in < 1.5 s, 2 km in < 20 s |
 | 3 | Fields, new materials (meadow, crop, plowed soil), buildings, hedges, fences, tree lines, woods (done 2026-09-25) | Parcels cover the farmland; no obstacle on a road or in a yard; gates connect tracks to fields; invariants tested; goldens re-blessed |
 | 4 | Simulation: `MapSource::Rural`, `on_road` spawns, `route` goals, `road`/`route`/`on_road` terms, road cost in `DriveGrid` (deferred); Python `map="rural"` (done 2026-09-25) | A car spawned `on_road` sits in its lane; routes follow the roads; terms match references; the Python env runs on rural maps |
-| 5 | Viewer: road ribbons, buildings, hedges and fences, `--map rural`, route display | A rural showcase renders at ≥ 60 fps at 1080p "medium" on the Iris Xe; the car drives on the roads by keyboard |
+| 5 | Viewer: road ribbons, buildings, hedges and fences, `--map rural`, route display (done 2026-09-25) | A rural showcase renders at ≥ 60 fps at 1080p "medium" on the Iris Xe; the car drives on the roads by keyboard |
 | 6 | `RoadFollowRural-v0`, a short training run, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
 **As built in step 1** (`world::roads`, `StaticWorld::with_roads`/`roads`, map file format 2):
@@ -1288,6 +1288,23 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
   - The terms match `Follow` and read the lane at the start of a route. Without a route they follow the road in the travel direction. Far from roads there is no reference.
   - The validation errors fire.
   - The Python `BatchSim` builds and caches a rural pool with these terms.
+
+**As built in step 5** (`scene::roads`, `scene::props::obstacle_visual`, viewer `--map rural`):
+- **Road ribbons** (`roads_by_chunk`):
+  - Strips follow each road's 1 m polyline. Every vertex is a few centimetres above the terrain below it: paved 6 cm, gravel 5 cm, tracks 4 cm, so paved roads cover the roads that join them. Paved and gravel surfaces are sampled across the width (5 and 3 columns) so they follow the crown.
+  - Paved roads get dark asphalt, white edge lines and a dashed centre line (3 m dashes every 9 m). Gravel roads take the gravel colour. Tracks get two darkened dirt ruts at 0.55–1.05 m either side of the centre, where the wheels run.
+  - Roads are cut into runs per terrain chunk (by segment midpoint) and merged per chunk.
+  - The viewer draws them with a `depth_bias` material, without shadows, within the obstacle detail distance (400 m at "medium"). Beyond that the terrain's road materials suffice.
+- **Farm obstacles** (`obstacle_visual`, visual only; collision shapes unchanged):
+  - Buildings get a gable roof along their long side (rise 0.5 × the short half-width, 0.3 m overhang) above the collision box. House walls are plaster with red tiles, barns wood with dark red, sheds metal with grey.
+  - Silos get a conical cap.
+  - Fences are drawn as two posts and three wires instead of a solid 0.1 m wall.
+  - Hedges are dark green; their woody cores are not drawn.
+- **Live mode**: `--map wild|rural` (the default is `wild`); `--preset` is parsed for the chosen generator. On rural maps a ground vehicle spawns `on_road` with `route` goals to a farm yard 150–400 m away. `--demo` then follows the route lane by pure pursuit, 8 m ahead, at up to 12 m/s and slower in bends (2 m/s² lateral), and starts a new episode at the end of the route.
+- **Overlay**: an agent's route lane is drawn 0.5 m above the road (orange), in live and policy modes. Replays do not carry the route yet (step 6).
+- **Measured** (Iris Xe, 1080p, "medium", 2 km showcase, sedan demo): 77–105 fps over five runs, with 109k road triangles and 809k obstacle triangles near (443k far). An iris-like drone demo runs at 87 fps. The map mesh builds in 0.16 s.
+- **Tests**: ribbons on a flat test world lie at least 3.5 cm above the terrain, face up, cover the paved road's area (180 m × 6 m) and exist exactly in the chunks the roads cross. Roofs and walls face outwards; the ridge height, overhang, fence extent and silo cap are checked.
+
 
 ### M4b: Trucks and trailers (outline, detailed when it starts)
 - **Articulated vehicles**: a wheeled vehicle becomes a chain of units (tractor, then trailers), each a body in the same tree. A fifth wheel is a Spherical joint with roll stiffness and pitch stops; a drawbar is two revolute joints (a dolly). Axles, colliders and forces attach to their unit's link instead of link 0.
