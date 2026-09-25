@@ -33,7 +33,7 @@ import pychrono.vehicle as veh
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "fixtures" / "chrono"
-TYRES = ["HMMWV_Pac02Tire", "Sedan_Pac02Tire"]
+TYRES = ["HMMWV_Pac02Tire", "Sedan_Pac02Tire", "Truck_Pac02Tire"]
 MU0 = 0.8  # "Coefficient of Friction" of the tyre JSON; road μ equal to it gives μ scale 1
 
 

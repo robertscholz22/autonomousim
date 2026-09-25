@@ -306,6 +306,85 @@ fn articulation_steers_trailer_axles() {
     assert!(off > 0.3 && off_s < 0.8 * off, "offtracking {off_s} vs {off}");
 }
 
+/// At walking pace, tyres barely slip, so every unit turns about a centre on the line of its
+/// unsteered axles (their mean, for a tandem). Chained from the tractor's rear, the radius of
+/// each yawing unit's pivot (kingpin, drawbar eye, turntable) follows as R_p² = R_a² + x², with
+/// x the pivot's distance ahead of the towing unit's axle line, and that of the unit's own
+/// axle line as R² = R_p² − L², with L its distance behind the pivot.
+#[test]
+fn low_speed_offtracking_is_kinematic() {
+    let flat = Flat::new();
+    for (vehicle, trailer) in [("truck_6x4", "semitrailer_3axle"), ("farm_tractor", "farm_trailer")] {
+        let d = rig(vehicle, Some(trailer));
+        let n = d.num_units();
+        // Units yawing together (a hinge only pitches), each group's pivot unit and axle wheels.
+        let pivot = |mut u: usize| {
+            while u > 0 && matches!(d.units[u - 1].joint, UnitJoint::Hinge) {
+                u = d.units[u - 1].parent;
+            }
+            u
+        };
+        let groups: Vec<usize> = (0..n).filter(|&u| pivot(u) == u).collect();
+        let axle_wheels = |g: usize| -> Vec<usize> {
+            (0..d.axles.len())
+                .filter(|&a| pivot(d.axles[a].unit) == g && !d.axles[a].is_steered())
+                .flat_map(|a| [2 * a, 2 * a + 1])
+                .collect()
+        };
+        let mut v = at_rest(d.clone(), 2.0);
+        let mut integral = 0.0;
+        let mut drive = |v: &mut Wheeled, seconds: f64| {
+            for _ in 0..(seconds / DT).round() as usize {
+                let e = 2.0 - v.speed();
+                integral = (integral + e * DT).clamp(-2.0, 2.0);
+                let u = 0.5 * e + 0.5 * integral;
+                let input = DriveInput {
+                    steering: 0.5,
+                    throttle: u.clamp(0.0, 1.0),
+                    brake: (-u).clamp(0.0, 1.0),
+                    ..Default::default()
+                };
+                flat.step(v, &input);
+            }
+        };
+        drive(&mut v, 90.0);
+        let axle_point = |v: &Wheeled, g: usize| {
+            let w = axle_wheels(g);
+            (w.iter().map(|&w| v.wheel_pose(w).pos).sum::<DVec3>() / w.len() as f64).truncate()
+        };
+        let mut path = vec![axle_point(&v, 0)];
+        for _ in 0..2 {
+            drive(&mut v, 4.0);
+            path.push(axle_point(&v, 0));
+        }
+        assert!((v.speed() - 2.0).abs() < 0.05, "{vehicle}: speed {}", v.speed());
+        let centre = circumcentre(path[0], path[1], path[2]);
+        let heading = |u: usize| (v.unit_pose(u).rot * DVec3::X).truncate().normalize();
+        let mut predicted = (path[2] - centre).length();
+        let tractor = predicted;
+        for (k, &g) in groups.iter().enumerate().skip(1) {
+            let towing = groups[..k].iter().rev().copied().find(|&t| t == pivot(d.units[g - 1].parent)).unwrap();
+            let p = v.unit_pose(g).pos.truncate();
+            let x = (p - axle_point(&v, towing)).dot(heading(towing));
+            let l = (p - axle_point(&v, g)).dot(heading(g));
+            predicted = (predicted * predicted + x * x - l * l).sqrt();
+            let actual = (axle_point(&v, g) - centre).length();
+            println!("{vehicle} + {trailer}, unit {g}: axle radius {actual:.3} m, kinematic {predicted:.3} m");
+            assert!(rel(actual, predicted) < 0.02, "{vehicle} + {trailer} unit {g}: {actual} vs {predicted}");
+        }
+        let off = tractor - (axle_point(&v, *groups.last().unwrap()) - centre).length();
+        println!(
+            "{vehicle} + {trailer}: offtracking {off:.3} m (kinematic {:.3} m) about a {tractor:.2} m radius",
+            tractor - predicted
+        );
+        assert!(off > 1.0 && rel(off, tractor - predicted) < 0.05, "{vehicle} + {trailer}: offtracking {off}");
+    }
+}
+
+fn rel(a: f64, b: f64) -> f64 {
+    (a - b).abs() / b.abs()
+}
+
 fn circumcentre(a: glam::DVec2, b: glam::DVec2, c: glam::DVec2) -> glam::DVec2 {
     let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
     let (a2, b2, c2) = (a.length_squared(), b.length_squared(), c.length_squared());

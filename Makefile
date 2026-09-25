@@ -60,6 +60,7 @@ fixtures-chrono:  ## PAC2002, full-vehicle, handling and truck reference runs fr
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_vehicle_fixtures.py
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_handling_fixtures.py
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_truck_fixtures.py
+	$(MICROMAMBA) run -n chrono python tools/gen_chrono_truck_handling_fixtures.py
 
 clean:
 	cargo clean

@@ -1380,7 +1380,7 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
 |---|---|---|
 | 1 ✅ | Units and couplings in `vehicles::ground` (fifth wheel, drawbar, turntable), per-unit colliders and drag, `MAX_WHEELS` 16, general static equilibrium, `trailers` composition | A test tractor with a semitrailer and a drawbar trailer settles at the static solution; loads and kingpin load match statics; the two solvers agree on two-axle vehicles; existing goldens unchanged |
 | 2 ✅ | Truck tyre, multi-axle and forced steering, air-brake lag, presets `truck_6x4`, `semitrailer_3axle`, `truck_8x8`, `farm_tractor`, `farm_trailer` (Chrono extraction) | Presets load, settle and drive straight; static loads against Chrono's |
-| 3 | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
+| 3 ✅ | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
 | 4 | Simulation: scenario `trailers`, multi-body agent shapes, `JACKKNIFE`, `articulation` state and terms, `trailer_goal`, recordings with articulation | Rigs spawn, drive and record; replays reproduce them; goldens of existing scenarios unchanged |
 | 5 | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
 | 6 | `TrailerReverse-v0`: `bay` goals, scripted reversing controller, short training, export, viewer, replay | The task trains end to end; the exported policy reverses in the viewer; a recorded episode replays |
@@ -1429,7 +1429,7 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
   - **Presets** (`presets::wheeled`; trailers in `presets::trailer`/`trailer_names`, a separate list):
     - `truck_6x4`: Kraz 64431, 13.2 t, two dual driven rear axles, 0.1 s + 0.15 s air brakes, fifth wheel.
     - `semitrailer_3axle`: Krone, 22.2 t laden, 0.25 s + 0.25 s brakes.
-    - `truck_8x8`: MAN 10t, 15.6 t, axle 2 geometric, limited-slip axle differentials, 9-speed gearbox.
+    - `truck_8x8`: MAN 10t, 15.6 t, axle 2 geometric, limited-slip axle differentials (Torsen since step 3), 9-speed gearbox.
     - `farm_tractor`: 6 t, pendulum front axle, Fiala tyres, 4WD 40/60, 8 gears, drawbar hitch.
     - `farm_trailer`: 9.9 t, dolly on a turntable.
     - Truck parameters come from Chrono's C++ and JSON sources (`MAN_10t`, `Kraz_tractor*`, `Kraz_trailer*`).
@@ -1443,6 +1443,20 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
     - Air-brake torque follows delay plus lag within 2 %.
     - Forced steering (k = 0.5 on the rear axle) cuts the Kraz rig's offtracking on a 23 m circle from 1.67 m to 1.11 m.
     - Dual tyres and degressive dampers follow their laws.
+- **Step 3** (validation):
+  - **Reference runs**: `tools/gen_chrono_truck_handling_fixtures.py` (`make fixtures-chrono`) writes `fixtures/chrono/truck_handling.json`, with the truck tyre on every wheel and μ at the tyre's reference:
+    - `man_constant_steer`: the MAN at a fixed steering input while the speed rises from 3 to 9 m/s (ISO 4138 style);
+    - `kraz_step_steer`: the Kraz rig at 60 km/h, a steering step in 0.2 s (ISO 7401 style);
+    - `kraz_sine_steer`: one period of sine steering at 0.4 Hz (ISO 14791 single sine).
+    Chrono's rigs drift on the straight (3–5 m over 200 m), so a pure-pursuit driver on y = 0 and a speed PI (both simple enough to re-implement exactly in the test) hold the approach.
+  - **Truck tyre check**: `Truck_Pac02Tire` joined the PAC2002 tyre fixtures (`tire_fixtures.rs`); our forces agree with Chrono's to about 1e-6 of the peak.
+  - **Steering replay**: Chrono's steering linkages are compliant. At a fixed input, the MAN's road-wheel angle falls from 0.35 to 0.11 rad between 4 and 9 m/s, and its second axle steers about 0.85× the first (1.04 at lock). The tests therefore replay Chrono's measured lead-axle angle, and the MAN run sets axle 2's share to Chrono's mean ratio.
+  - **Torsen differential**: `DifferentialDef::Torsen { bias }`, a coupling whose capacity each step is (B − 1)/(2(B + 1)) times the drive torque entering it, so the slower output takes up to B times the faster one's torque. `truck_8x8` now uses it with B = 2 on its axles, as Chrono's `SimpleDrivelineXWD`. With the old fixed 2000 N·m limited slip, the MAN's path curvature was up to 29 % off Chrono's at low speed (the locked axles push the truck wide); with the Torsen it is within 3.2 %.
+  - **Tests** (`vehicles/tests/truck_handling.rs`, no drag, camber-free tyres as Chrono's PAC2002):
+    - MAN constant steer: path curvature within 5 % over the speed sweep (actual 3.2 %).
+    - Kraz step steer: tractor and trailer yaw rates and articulation, peak and steady values within 5–10 % and peak times within 0.25 s (actual about 1.5 %).
+    - Kraz single sine: each lobe's peak within 10 % and 0.25 s. Peak lateral accelerations within 10 %. Rearward amplification is 1.09 against Chrono's 1.01 (absolute tolerance 0.1): our trailer's peak a_y is 7 % higher.
+  - **Low-speed offtracking** (`trucks.rs`, steady circles at 2 m/s): chained from the tractor's rear, each unit's axle-line radius follows `R_p² = R_a² + x²` (pivot ahead of the towing unit's axle line) and `R² = R_p² − L²`. The Kraz rig (22.4 m circle) and the farm tractor with its dolly trailer (6.7 m) match within 1.1 % on radii (2 % tolerance) and within 4 % on offtracking (5 %).
 
 ### M4c: Tracked vehicles and soft soil
 The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.

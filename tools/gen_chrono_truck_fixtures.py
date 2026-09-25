@@ -21,6 +21,7 @@ import json
 import math
 import pathlib
 import sys
+import tempfile
 
 import pychrono as ch
 import pychrono.vehicle as veh
@@ -37,14 +38,19 @@ def vec(v) -> list[float]:
 
 
 class Rig:
-    def __init__(self, name: str, z0: float = 0.6):
+    """A Chrono truck (with its trailer for `kraz_rig`) on flat ground, fitted with the truck
+    tyre; `powertrain` adds the vehicle's engine and gearbox, `patch` sizes the ground around
+    `centre`."""
+
+    def __init__(self, name: str, z0: float = 0.6, patch=(200.0, 40.0), centre=(0.0, 0.0),
+                 powertrain: bool = False):
         self.sys = ch.ChSystemNSC()
         self.sys.SetGravitationalAcceleration(ch.ChVector3d(0, 0, -9.81))
         self.sys.SetCollisionSystemType(ch.ChCollisionSystem.Type_BULLET)
         self.terrain = veh.RigidTerrain(self.sys)
         mat = ch.ChContactMaterialNSC()
         mat.SetFriction(MU0)
-        self.terrain.AddPatch(mat, ch.ChCoordsysd(ch.ChVector3d(0, 0, 0), ch.QUNIT), 200.0, 40.0)
+        self.terrain.AddPatch(mat, ch.ChCoordsysd(ch.ChVector3d(*centre, 0), ch.QUNIT), *patch)
         self.terrain.Initialize()
         pos = ch.ChCoordsysd(ch.ChVector3d(0, 0, z0), ch.QUNIT)
         self.units = []  # (vehicle or trailer, chassis body)
@@ -61,6 +67,8 @@ class Rig:
             v.Initialize(pos, 0.0)
             self.units.append(v)
         self.v = v
+        if powertrain:
+            v.InitializePowertrain(veh.ChPowertrainAssembly(*powertrain_of(name)))
         # Tyres per wheel (a dual wheel has two).
         self.tires = []
         for u in self.units:
@@ -144,6 +152,43 @@ class Rig:
             for w in ax.GetWheels():
                 m += w.GetMass() + w.GetTire().GetMass()
         return m
+
+
+def powertrain_of(name: str):
+    """Engine and gearbox: the MAN 7t maps Chrono fits to the MAN 10t, and the Kraz tractor's
+    (C++ only in Chrono, so rebuilt here as JSON from Kraz_tractor_EngineSimpleMap.cpp and
+    Kraz_tractor_AutomaticTransmissionSimpleMap.cpp)."""
+    if name.startswith("man"):
+        return veh.MAN_7t_EngineSimpleMap("Engine"), veh.MAN_7t_AutomaticTransmissionSimpleMap("Transmission")
+    rpm = 30.0 / math.pi
+    tune = 1.587
+    engine = {
+        "Name": "Kraz tractor engine", "Type": "Engine", "Template": "EngineSimpleMap",
+        "Maximal Engine Speed RPM": 2700.0,
+        "Map Full Throttle": [[-10.472 * rpm, 406.7 * tune]] + [[r, t * tune] for r, t in [
+            (500, 400), (1000, 500), (1200, 572), (1400, 664), (1600, 713), (1800, 733), (2000, 725),
+            (2100, 717), (2200, 707), (2300, 682), (2400, -800.0), (2500, -271.2)]],
+        "Map Zero Throttle": [[w * rpm, t] for w, t in [
+            (-10.472, 0.0), (83.776, -20.0), (104.720, -20.0), (125.664, -30.0), (146.608, -30.0),
+            (167.552, -30.0), (188.496, -40.0), (209.440, -50.0), (230.383, -70.0), (251.327, -100.0),
+            (282.743, -800.0)]],
+    }
+    transmission = {
+        "Name": "Kraz tractor transmission", "Type": "Transmission", "Template": "AutomaticTransmissionSimpleMap",
+        "Gear Box": {
+            "Reverse Gear Ratio": -0.162337662,
+            "Forward Gear Ratios": [0.162337662, 0.220750552, 0.283286119, 0.414937759, 0.571428571, 0.78125, 1.0],
+            "Shift Points Map RPM": [[1000, 2226], [1000, 2226], [1000, 2225], [1000, 2210], [1000, 2226],
+                                     [1000, 2225], [1000, 2700]],
+        },
+    }
+    out = []
+    for kind, data, read in (("engine", engine, veh.ReadEngineJSON), ("transmission", transmission,
+                                                                      veh.ReadTransmissionJSON)):
+        path = pathlib.Path(tempfile.gettempdir()) / f"kraz_tractor_{kind}.json"
+        path.write_text(json.dumps(data))
+        out.append(read(str(path)))
+    return out
 
 
 def generate(name: str) -> dict:

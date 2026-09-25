@@ -155,4 +155,5 @@ fn compare_chrono(name: &str) {
 fn preset_tyres_match_chrono_pac02() {
     compare_chrono("HMMWV_Pac02Tire");
     compare_chrono("Sedan_Pac02Tire");
+    compare_chrono("Truck_Pac02Tire");
 }

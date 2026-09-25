@@ -98,7 +98,7 @@ rebound_stop = { travel = -0.064, stiffness = 2.5e5 }
 type = "combustion"
 driven = [0, 1, 2, 3]
 final_drive = 0.1524                    # 1:6.56 (see source)
-axle_differential = { limited_slip = { torque = 2000.0 } }   # Chrono: Torsen, bias ratio 2
+axle_differential = { torsen = { bias = 2.0 } }   # Chrono SimpleDrivelineXWD: Torsen, bias ratio 2
 center_differential = "open"
 
 [powertrain.engine]

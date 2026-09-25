@@ -12,7 +12,7 @@
 //!   speed; back-EMF brakes a motor running faster than commanded),
 //!   each driving one or more wheels (per axle, per side or per wheel). A differential command
 //!   (`DriveInput::yaw`) is mixed into left and right motors for skid-steer and diff-drive robots.
-//! * **Couplings**: brakes, locked and limited-slip differentials and chain drives are
+//! * **Couplings**: brakes, locked, limited-slip and Torsen differentials and chain drives are
 //!   torsional "bristles" between groups of wheels (or between wheels and their carriers): a
 //!   stiff spring–damper on the integrated relative rotation whose torque is capped by the
 //!   coupling's capacity. A braked wheel therefore holds without creep, a slipping one feels
@@ -208,17 +208,41 @@ pub enum DifferentialDef {
     Locked,
     /// Relative rotation resisted by up to `torque` (N·m) on top of the open split.
     LimitedSlip { torque: f64 },
+    /// Torque-sensing (Torsen): the slower output may take up to `bias` (≥ 1) times the torque
+    /// of the faster one, so relative rotation is resisted by up to (bias − 1)/(2(bias + 1))
+    /// times the torque entering the differential (Chrono's `SimpleDrivelineXWD` axles).
+    Torsen { bias: f64 },
 }
 
 impl DifferentialDef {
-    /// Coupling capacity (N·m); `None` for an open differential.
-    fn capacity(&self) -> Option<f64> {
+    /// Coupling capacity; `None` for an open differential.
+    fn capacity(&self) -> Option<Capacity> {
         match *self {
             Self::Open => None,
-            Self::Locked => Some(f64::INFINITY),
-            Self::LimitedSlip { torque } => Some(torque),
+            Self::Locked => Some(Capacity::Fixed(f64::INFINITY)),
+            Self::LimitedSlip { torque } => Some(Capacity::Fixed(torque)),
+            Self::Torsen { bias } => Some(Capacity::TorqueSensing(0.5 * (bias - 1.0) / (bias + 1.0))),
         }
     }
+
+    fn validate(&self) -> Result<(), String> {
+        match *self {
+            Self::LimitedSlip { torque } if torque.is_nan() || torque < 0.0 => {
+                Err("limited-slip torque must be non-negative".into())
+            }
+            Self::Torsen { bias } if !(bias.is_finite() && bias >= 1.0) => {
+                Err("Torsen bias ratio must be finite and at least 1".into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Capacity of a coupling: fixed (N·m), or a fraction of the drive torque entering it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Capacity {
+    Fixed(f64),
+    TorqueSensing(f64),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -294,13 +318,8 @@ impl PowertrainDef {
                 if !nonneg(g.shift_time) {
                     return Err("shift_time must be non-negative".into());
                 }
-                for d in [c.axle_differential, c.center_differential] {
-                    if let DifferentialDef::LimitedSlip { torque } = d
-                        && !nonneg(torque)
-                    {
-                        return Err("limited-slip torque must be non-negative".into());
-                    }
-                }
+                c.axle_differential.validate()?;
+                c.center_differential.validate()?;
             }
             PowertrainDef::Electric(e) => {
                 if e.motors.is_empty() {
@@ -318,6 +337,7 @@ impl PowertrainDef {
                     if !(m.time_constant >= 0.0 && m.rotor_inertia >= 0.0) {
                         return Err("motor time constant and inertia must be non-negative".into());
                     }
+                    m.coupling.validate()?;
                 }
                 let mut seen = vec![false; 2 * axles];
                 for w in e.motors.iter().flat_map(|m| &m.wheels) {
@@ -464,7 +484,7 @@ pub struct Powertrain {
     /// Driven wheels and their torque shares (combustion).
     shares: Vec<(usize, f64)>,
     motors: Vec<Motor>,
-    couplings: Vec<(Coupling, f64)>,
+    couplings: Vec<(Coupling, Capacity)>,
     gear: i32,
     shift_timer: f64,
     status: PowertrainStatus,
@@ -579,6 +599,7 @@ impl Powertrain {
     /// Add this step's drive torques (N·m, per wheel, about the spin axes) to `out` and advance
     /// the gearbox, motors and couplings by `dt`.
     pub fn step(&mut self, input: &DriveInput, spin: &[f64], dt: f64, out: &mut [f64]) {
+        let mut drive = [0.0; MAX_WHEELS];
         match &self.def {
             PowertrainDef::Combustion(c) => {
                 let g = &c.gearbox;
@@ -617,7 +638,7 @@ impl Powertrain {
                 };
                 let wheel = delivered / (ratio * c.final_drive);
                 for &(w, s) in &self.shares {
-                    out[w] += wheel * s;
+                    drive[w] += wheel * s;
                 }
                 self.status = PowertrainStatus { gear: self.gear, engine_speed, engine_torque: delivered };
             }
@@ -639,7 +660,7 @@ impl Powertrain {
                     let blend = if m.time_constant > 0.0 { 1.0 - (-dt / m.time_constant).exp() } else { 1.0 };
                     m.torque += (demand - m.torque) * blend;
                     for &w in &m.wheels {
-                        out[w] += m.torque / m.ratio / n;
+                        drive[w] += m.torque / m.ratio / n;
                     }
                     if k == 0 {
                         self.status = PowertrainStatus { gear: 0, engine_speed: speed, engine_torque: m.torque };
@@ -647,8 +668,15 @@ impl Powertrain {
                 }
             }
         }
+        for (o, d) in out.iter_mut().zip(drive) {
+            *o += d;
+        }
         for (c, cap) in &mut self.couplings {
-            c.step(*cap, spin, dt, out);
+            let limit = match *cap {
+                Capacity::Fixed(t) => t,
+                Capacity::TorqueSensing(f) => f * c.a.iter().chain(&c.b).map(|&w| drive[w]).sum::<f64>().abs(),
+            };
+            c.step(limit, spin, dt, out);
         }
     }
 }
@@ -697,6 +725,31 @@ mod tests {
         }
         assert_eq!(c.torque, -100.0);
         assert!((w - w0 - 50.0).abs() < 0.5, "{w}");
+    }
+
+    #[test]
+    fn torsen_splits_torque_up_to_the_bias_ratio() {
+        let def: PowertrainDef = toml::from_str(
+            r#"type = "electric"
+               motors = [{ wheels = [0, 1], max_torque = 100.0, max_power = 1e9, ratio = 1.0,
+                 time_constant = 0.0, coupling = { torsen = { bias = 3.0 } } }]"#,
+        )
+        .unwrap();
+        def.validate(1).unwrap();
+        let dt = 1e-3;
+        let mut p = Powertrain::new(&def, &[1.0, 1.0], dt);
+        let input = DriveInput { throttle: 1.0, ..Default::default() };
+        // Wheel 1 is held by an 80 N·m load, wheel 0 runs free: the slow wheel gets 3/4 of the torque.
+        let mut w = [0.0; 2];
+        let mut t = [0.0; 2];
+        for _ in 0..3000 {
+            t = [0.0; 2];
+            p.step(&input, &w, dt, &mut t);
+            w[0] += t[0] * dt;
+            w[1] += (t[1] - 80.0).max(-w[1] / dt) * dt;
+        }
+        assert!((t[1] - 75.0).abs() < 1e-6 && (t[0] - 25.0).abs() < 1e-6, "{t:?}");
+        assert!(w[0] > 50.0 && w[1] < 1e-3, "{w:?}");
     }
 
     #[test]
