@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `/meta` | once | scenario, map pool (metadata and content hashes), vehicle definitions, rates, agent list |
 //! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses, goals and routes (lane points of agents with `route` goals) |
-//! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels and powertrain (ground vehicles) |
+//! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels, powertrain and the joints of trailers (ground vehicles) |
 //! | `/agent/<id>/pose` | `state_hz` | the pose as `foxglove.PoseInFrame` (frame `world`) |
 //! | `/agent/<id>/action` | each action | the normalised action |
 //! | `/agent/<id>/lidar` | each scan, if enabled | sensor pose and ranges |
@@ -431,6 +431,9 @@ impl Recorder {
                     m.insert("wheels".into(), json!(wheels));
                     m.insert("gear".into(), json!(pt.gear));
                     m.insert("engine_speed".into(), json!(pt.engine_speed));
+                    if v.num_units() > 1 {
+                        m.insert("joints".into(), json!(v.joints()));
+                    }
                 }
             }
             self.send(ch.state, &msg);
@@ -484,6 +487,9 @@ pub struct RecordedState {
     pub gear: i32,
     #[serde(default)]
     pub engine_speed: f64,
+    /// Ground vehicles with trailers: the units' joint coordinates (`Wheeled::joints`).
+    #[serde(default)]
+    pub joints: Vec<f64>,
     pub wind: DVec3,
     pub goal: DVec3,
     pub goal_yaw: f64,

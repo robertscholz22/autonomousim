@@ -46,8 +46,12 @@ pub const PARALLEL_AGENTS: usize = 32;
 /// vehicles, which sit on the terrain, to the nearest solid obstacle); `agent_clearance` the
 /// distance between the agent's colliders and the nearest other active agent's, up to 20 m;
 /// `road` the lateral offset from the lane followed, the heading error to it and the distance
-/// to the nearest road's surface ([`lane::road_state`]).
-pub const STATE_FIELDS: [(&str, usize); 11] = [
+/// to the nearest road's surface ([`lane::road_state`]); `articulation` the yaw of the first
+/// two trailers (or dollies) relative to the unit ahead (rad, positive pointing left; 0
+/// without); `tail` the x, y and heading of the last unit's tail, the reference point for
+/// reversing ([`Wheeled::tail_pose`](autonomousim_vehicles::ground::Wheeled::tail_pose); the
+/// position and heading for other vehicles).
+pub const STATE_FIELDS: [(&str, usize); 13] = [
     ("position", 3),
     ("orientation", 4),
     ("velocity", 3),
@@ -59,10 +63,12 @@ pub const STATE_FIELDS: [(&str, usize); 11] = [
     ("clearance", 1),
     ("agent_clearance", 1),
     ("road", 3),
+    ("articulation", 2),
+    ("tail", 3),
 ];
 
 /// Length of a state row.
-pub const STATE_DIM: usize = 24;
+pub const STATE_DIM: usize = 29;
 
 #[derive(Clone, Debug)]
 pub struct WorldInstance {
@@ -333,6 +339,18 @@ impl WorldInstance {
             row[20] = self.grid.clearance(&self.shapes, g.first_agent + k, CLEARANCE_RANGE);
             let road = lane::road_state(a.route.as_deref(), &self.map, v.position().truncate(), yaw(q));
             row[21..24].copy_from_slice(&road);
+            let (art, tail) = match v.as_wheeled() {
+                Some(w) => {
+                    let mut art = [0.0; 2];
+                    for (d, (a, _)) in art.iter_mut().zip(w.articulations()) {
+                        *d = a;
+                    }
+                    (art, w.tail_pose())
+                }
+                None => ([0.0; 2], v.pose()),
+            };
+            row[24..26].copy_from_slice(&art);
+            row[26..29].copy_from_slice(&[tail.pos.x, tail.pos.y, yaw(tail.rot)]);
         };
         let rows = out.as_chunks_mut::<STATE_DIM>().0;
         if g.spec.count >= PARALLEL_AGENTS {

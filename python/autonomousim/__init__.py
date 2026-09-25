@@ -20,7 +20,14 @@ wind, randomisation, observations and scenario overrides.
 
 import gymnasium as _gym
 
-from autonomousim._native import STATE_DIM, STATE_FIELDS, BatchSim, native_version, vehicle_presets
+from autonomousim._native import (
+    STATE_DIM,
+    STATE_FIELDS,
+    BatchSim,
+    native_version,
+    trailer_presets,
+    vehicle_presets,
+)
 from autonomousim.events import TERMINAL, Event
 from autonomousim.multiagent import MultiAgentVectorEnv
 from autonomousim.scenario import STATE, default_scenario, load_scenario
@@ -56,5 +63,6 @@ __all__ = [
     "__version__",
     "default_scenario",
     "load_scenario",
+    "trailer_presets",
     "vehicle_presets",
 ]

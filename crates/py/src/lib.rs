@@ -49,6 +49,12 @@ fn vehicle_presets() -> Vec<&'static str> {
     autonomousim_vehicles::presets::names().collect()
 }
 
+/// Names of the built-in trailers (for a group's `trailers`).
+#[pyfunction]
+fn trailer_presets() -> Vec<&'static str> {
+    autonomousim_vehicles::presets::trailer_names().collect()
+}
+
 /// A group given by index or name.
 #[derive(FromPyObject)]
 enum GroupRef {
@@ -431,6 +437,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(normalize_scenario, m)?)?;
     m.add_function(wrap_pyfunction!(default_scenario, m)?)?;
     m.add_function(wrap_pyfunction!(vehicle_presets, m)?)?;
+    m.add_function(wrap_pyfunction!(trailer_presets, m)?)?;
     m.add_class::<BatchSim>()?;
     m.add("STATE_DIM", STATE_DIM)?;
     m.add("STATE_FIELDS", STATE_FIELDS.to_vec())?;

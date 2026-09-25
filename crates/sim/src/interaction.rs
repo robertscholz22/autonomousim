@@ -6,7 +6,8 @@
 //! capped at `μ·F_n` with `μ` = [`AGENT_FRICTION`] times both spheres' friction factors. The
 //! two agents' springs act in series. A ground vehicle's wheels join its shape as spheres at
 //! the wheel centres with the tyre radius (they push and carry like rigid wheels; the force
-//! goes to the chassis).
+//! goes to their unit's frame). The spheres of trailers and other units behind the towing
+//! unit move with their unit ([`AgentShape::bodies`]), and their forces act on it.
 
 use autonomousim_core::contact::PenaltyParams;
 use autonomousim_core::geometry::{HitKind, HitMask, Ray, RayHit};
@@ -28,13 +29,26 @@ pub struct Sphere {
     pub friction: f64,
     /// Landing gear or wheel: slow contacts on it carry the agent instead of crashing it.
     pub gear: bool,
+    /// Body it moves with: 0 for the agent's main body, `k` for `bodies[k − 1]`.
+    pub body: u8,
 }
 
 impl Sphere {
-    /// A sphere with full friction that is not gear.
+    /// A sphere on the main body with full friction that is not gear.
     pub fn new(center: DVec3, radius: f64) -> Self {
-        Self { center, radius, friction: 1.0, gear: false }
+        Self { center, radius, friction: 1.0, gear: false, body: 0 }
     }
+}
+
+/// A rigid body of an agent other than its main one (a trailer), at the start of a step.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Body {
+    /// Frame origin, its velocity and the angular velocity (world frame).
+    pub origin: DVec3,
+    pub velocity: DVec3,
+    pub ang_vel: DVec3,
+    /// Link of the vehicle's multibody tree that receives the body's contact forces.
+    pub link: u16,
 }
 
 /// World-space collision shape of an agent at the start of a physics step.
@@ -50,6 +64,8 @@ pub struct AgentShape {
     /// Angular velocity (world frame).
     pub ang_vel: DVec3,
     pub spheres: SmallVec<[Sphere; 12]>,
+    /// Further bodies (units behind a towing vehicle) that spheres may move with.
+    pub bodies: SmallVec<[Body; 2]>,
     /// Normal and bristle stiffness and damping of the agent's colliders.
     pub stiffness: f64,
     pub damping: f64,
@@ -65,10 +81,25 @@ impl AgentShape {
         self.tangential_damping = p.tangential_damping;
     }
 
-    /// Velocity of a world point moving with the agent.
+    /// Velocity of a world point moving with sphere `s`'s body.
     #[inline]
-    fn point_velocity(&self, p: DVec3) -> DVec3 {
-        self.velocity + self.ang_vel.cross(p - self.center)
+    fn point_velocity(&self, s: &Sphere, p: DVec3) -> DVec3 {
+        match s.body {
+            0 => self.velocity + self.ang_vel.cross(p - self.center),
+            k => {
+                let b = &self.bodies[k as usize - 1];
+                b.velocity + b.ang_vel.cross(p - b.origin)
+            }
+        }
+    }
+
+    /// Link receiving the forces on sphere `s`.
+    #[inline]
+    fn link(&self, s: &Sphere) -> u16 {
+        match s.body {
+            0 => 0,
+            k => self.bodies[k as usize - 1].link,
+        }
     }
 }
 
@@ -87,8 +118,9 @@ pub struct AgentContacts {
     /// Resting on or pushing against another agent with gear or wheels
     /// ([`Events::GROUND_CONTACT`](crate::Events::GROUND_CONTACT)).
     pub supported: bool,
-    /// `(force, point)` in world coordinates, in application order.
-    pub forces: SmallVec<[(DVec3, DVec3); 2]>,
+    /// `(force, point, link)`: force and point in world coordinates, and the link of the
+    /// vehicle's tree it acts on (0: the main body), in application order.
+    pub forces: SmallVec<[(DVec3, DVec3, u16); 2]>,
 }
 
 /// Friction state of one touching sphere pair; `a < b` are agent indices.
@@ -181,7 +213,7 @@ pub(crate) fn agent_contacts(
                     // Normal towards a's sphere; the force acts midway into the overlap.
                     let n = if dist > 1e-12 { d / dist } else { DVec3::Z };
                     let point = cb.center + n * (cb.radius - 0.5 * depth);
-                    let v = sa.point_velocity(point) - sb.point_velocity(point);
+                    let v = sa.point_velocity(ca, point) - sb.point_velocity(cb, point);
                     let vn = v.dot(n);
                     if (ca.gear || cb.gear) && vn >= -crash_speed {
                         supported = true;
@@ -206,8 +238,8 @@ pub(crate) fn agent_contacts(
 
                     let f = n * fn_ + ft;
                     if f != DVec3::ZERO {
-                        out[a as usize].forces.push((f, point));
-                        out[b as usize].forces.push((-f, point));
+                        out[a as usize].forces.push((f, point, sa.link(ca)));
+                        out[b as usize].forces.push((-f, point, sb.link(cb)));
                     }
                 }
             }

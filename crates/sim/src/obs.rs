@@ -29,6 +29,8 @@
 //! | `road` | 6 | lateral offset from the lane centre (m, + left), lane heading − heading (rad), lane curvature 5, 10, 20 and 40 m ahead (1/m, + left) |
 //! | `route` | 8 | lane centre 5, 10, 20 and 40 m ahead in the heading frame (x, y; m) |
 //! | `on_road` | 1 | 1 on a road's surface, else 0 |
+//! | `articulation` | 4 | ground vehicles: yaw of the first two trailers (or dollies) relative to the unit ahead (rad, positive pointing left), then their rates (rad/s); 0 without |
+//! | `trailer_goal` | 4 | goal − tail of the last unit, in that unit's heading frame (x, y; m), then sin, cos of goal heading − the unit's heading (see `Wheeled::tail_pose`) |
 //! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
 //!
 //! `road` and `route` follow the lane of the agent's route (`route` goals), or else the lane
@@ -102,6 +104,8 @@ pub enum TermKind {
     Road,
     Route,
     OnRoad,
+    Articulation,
+    TrailerGoal,
 }
 
 /// Distances ahead at which the `road` and `route` terms look (m).
@@ -125,7 +129,7 @@ impl TermKind {
     /// Whether the term reads a ground vehicle's wheels, steering or powertrain.
     fn needs_wheels(self) -> bool {
         use TermKind::*;
-        matches!(self, WheelSpeeds | WheelSlip | Steering | GearRpm)
+        matches!(self, WheelSpeeds | WheelSlip | Steering | GearRpm | Articulation | TrailerGoal)
     }
 }
 
@@ -291,6 +295,7 @@ impl CompiledObs {
                     _,
                 ) => (1, 0.0),
                 (TermKind::Road, _) => (2 + LOOKAHEAD.len(), 0.0),
+                (TermKind::Articulation | TermKind::TrailerGoal, _) => (4, 0.0),
                 (TermKind::Route, _) => (2 * LOOKAHEAD.len(), 0.0),
                 (TermKind::NearestAgent, _) => (1, range),
                 (TermKind::Neighbors, _) => (7 * count, range),
@@ -386,9 +391,28 @@ impl CompiledObs {
                     let (_, pitch, roll) = q.to_euler(EulerRot::ZYX);
                     put(dst, &[pitch, roll], t)
                 }
-                TermKind::WheelSpeeds | TermKind::WheelSlip | TermKind::Steering | TermKind::GearRpm => {
+                TermKind::WheelSpeeds
+                | TermKind::WheelSlip
+                | TermKind::Steering
+                | TermKind::GearRpm
+                | TermKind::Articulation
+                | TermKind::TrailerGoal => {
                     let v = inp.wheeled.expect("ground terms are checked when the spec is compiled");
                     match t.kind {
+                        TermKind::Articulation => {
+                            let mut a = [0.0; 4];
+                            for (k, (angle, rate)) in v.articulations().take(2).enumerate() {
+                                (a[k], a[2 + k]) = (angle, rate);
+                            }
+                            put(dst, &a, t)
+                        }
+                        TermKind::TrailerGoal => {
+                            let tail = v.tail_pose();
+                            let y = yaw(tail.rot);
+                            let r = from_yaw(y).inverse() * (inp.goal.position - tail.pos);
+                            let e = wrap_angle(inp.goal.yaw - y);
+                            put(dst, &[r.x, r.y, e.sin(), e.cos()], t)
+                        }
                         TermKind::WheelSpeeds => {
                             for (w, (d, s)) in dst.iter_mut().zip(v.wheels()).enumerate() {
                                 *d = value(s.spin * v.def().tire(w / 2).radius(), t);

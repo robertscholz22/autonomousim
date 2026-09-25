@@ -123,6 +123,8 @@ pub struct Wheeled {
     /// Each wheel's tyre as mounted on its side.
     tires: Vec<Tire>,
     units: Vec<UnitLinks>,
+    /// [`WheeledDef::tail`].
+    tail: DVec3,
     powertrain: Powertrain,
     colliders: Vec<SphereCollider>,
     contact: ContactModel,
@@ -214,6 +216,7 @@ impl Wheeled {
             corners,
             tires: (0..def.num_wheels()).map(|w| def.tire(w / 2).on_side(w % 2 == 1)).collect(),
             units: tree.units,
+            tail: def.tail(),
             steer_angle: 0.0,
             specific_force: DVec3::ZERO,
             ang_acc: DVec3::ZERO,
@@ -320,11 +323,27 @@ impl Wheeled {
     }
 
     /// Show a recorded state instead of simulating: place the vehicle (as [`reset`](Self::reset))
-    /// with the bicycle steering angle `steering`, the wheels' travel, steering and spin angles
-    /// and outputs from `wheels` (one per wheel; fewer leave the rest as placed), and the
-    /// powertrain status `powertrain`.
-    pub fn show(&mut self, init: &WheeledInit, steering: f64, wheels: &[WheelState], powertrain: PowertrainStatus) {
+    /// with the units behind at the joint coordinates `joints` (as [`joints`](Self::joints);
+    /// empty: at rest, in line), the bicycle steering angle `steering`, the wheels' travel,
+    /// steering and spin angles and outputs from `wheels` (one per wheel; fewer leave the rest
+    /// as placed), and the powertrain status `powertrain`.
+    pub fn show(
+        &mut self,
+        init: &WheeledInit,
+        joints: &[f64],
+        steering: f64,
+        wheels: &[WheelState],
+        powertrain: PowertrainStatus,
+    ) {
         self.reset(init);
+        if joints.len() == self.num_joint_coords() {
+            let mut k = 0;
+            for u in &self.units[1..] {
+                let n = self.model.links()[u.link].joint.nq();
+                self.state.q[u.q..u.q + n].copy_from_slice(&joints[k..k + n]);
+                k += n;
+            }
+        }
         for (c, w) in self.corners.iter_mut().zip(wheels) {
             if let Some((q, v)) = c.travel {
                 (self.state.q[q], self.state.v[v]) = (w.travel, w.travel_rate);
@@ -480,8 +499,14 @@ impl Wheeled {
 
     /// Add an external force (world frame) acting on the chassis at a world point.
     pub fn apply_force(&mut self, force: DVec3, point: DVec3) {
-        let pose = self.ws.kin.pose[0];
-        self.f_ext[0] += SpatialForce::from_force_at_point(
+        self.apply_force_on(0, force, point);
+    }
+
+    /// Add an external force (world frame) acting on link `link` (see
+    /// [`unit_link`](Self::unit_link)) at a world point.
+    pub fn apply_force_on(&mut self, link: usize, force: DVec3, point: DVec3) {
+        let pose = self.ws.kin.pose[link];
+        self.f_ext[link] += SpatialForce::from_force_at_point(
             pose.inverse_transform_vector(force),
             pose.inverse_transform_point(point),
         );
@@ -587,6 +612,50 @@ impl Wheeled {
     /// Link of unit `u` in the multibody tree.
     pub fn unit_link(&self, u: usize) -> usize {
         self.units[u].link
+    }
+
+    /// Pose of the last unit's frame moved to its tail ([`WheeledDef::tail`]): the reference
+    /// point for reversing. Uses the unit poses of the last step's start, except for a single
+    /// unit.
+    pub fn tail_pose(&self) -> Pose {
+        let u = self.units.len() - 1;
+        let pose = if u == 0 { self.pose() } else { self.unit_pose(u) };
+        Pose::new(pose.transform_point(self.tail), pose.rot)
+    }
+
+    /// Unit whose frame is link `link`, if any.
+    pub fn link_unit(&self, link: usize) -> Option<usize> {
+        self.units.iter().position(|u| u.link == link)
+    }
+
+    /// Velocity of unit `u`'s frame origin and its angular velocity (world frame), at the
+    /// start of the last step (as [`unit_pose`](Self::unit_pose)).
+    pub fn unit_velocity(&self, u: usize) -> (DVec3, DVec3) {
+        let link = self.units[u].link;
+        (self.ws.kin.point_velocity_world(link, DVec3::ZERO), self.ws.kin.angular_velocity_world(link))
+    }
+
+    /// Joint coordinates of the units behind the towing unit, unit by unit: a coupling's
+    /// quaternion (x, y, z, w; relative to the unit ahead), a hinge's or turntable's angle.
+    pub fn joints(&self) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.num_joint_coords());
+        for u in &self.units[1..] {
+            let n = self.model.links()[u.link].joint.nq();
+            out.extend_from_slice(&self.state.q[u.q..u.q + n]);
+        }
+        out
+    }
+
+    fn num_joint_coords(&self) -> usize {
+        self.units[1..].iter().map(|u| self.model.links()[u.link].joint.nq()).sum()
+    }
+
+    /// Articulation angles and rates (see [`articulation`](Self::articulation)) of the units
+    /// that yaw relative to the unit ahead (couplings and turntables), in unit order.
+    pub fn articulations(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        (1..self.units.len())
+            .filter(|&u| !matches!(self.def.units[u - 1].joint, UnitJoint::Hinge))
+            .map(|u| self.articulation(u))
     }
 
     /// Yaw of unit `u` (≥ 1) relative to the unit ahead (rad, positive when it points to the

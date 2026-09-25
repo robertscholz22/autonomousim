@@ -683,6 +683,47 @@ impl WheeledDef {
         if w.is_multiple_of(2) { p } else { DVec3::new(p.x, -p.y, p.z) }
     }
 
+    /// The last unit's rear on its centreline, in its frame: the rearmost extent of its wheels
+    /// and colliders along x (for a single unit, the vehicle's rear).
+    pub fn tail(&self) -> DVec3 {
+        let u = self.num_units() - 1;
+        let link = self.unit_link(u);
+        let wheels = (0..self.num_wheels())
+            .filter(|&w| self.wheel_unit(w) == u)
+            .map(|w| self.wheel_position(w).x - self.tire(w / 2).radius());
+        let colliders = self.sphere_colliders().into_iter().filter(|c| c.link == link).map(|c| c.center.x - c.radius);
+        DVec3::new(wheels.chain(colliders).fold(f64::INFINITY, f64::min).min(0.0), 0.0, 0.0)
+    }
+
+    /// Origin of unit `u`'s frame in the towing unit's, with all units in line (design pose).
+    pub fn unit_origin(&self, u: usize) -> DVec3 {
+        let mut p = DVec3::ZERO;
+        let mut u = u;
+        while u > 0 {
+            p += self.units[u - 1].position;
+            u = self.units[u - 1].parent;
+        }
+        p
+    }
+
+    /// Design position of wheel `w` in the towing unit's frame, all units in line.
+    pub fn wheel_position_in_line(&self, w: usize) -> DVec3 {
+        self.unit_origin(self.wheel_unit(w)) + self.wheel_position(w)
+    }
+
+    /// [`sphere_colliders`](Self::sphere_colliders) with their centres in the towing unit's
+    /// frame, all units in line.
+    pub fn colliders_in_line(&self) -> Vec<SphereCollider> {
+        let origins: Vec<DVec3> = (0..self.num_units()).map(|u| self.unit_origin(u)).collect();
+        let links: Vec<usize> = (0..self.num_units()).map(|u| self.unit_link(u)).collect();
+        let mut cs = self.sphere_colliders();
+        for c in &mut cs {
+            let u = links.iter().position(|&l| l == c.link).expect("colliders sit on unit links");
+            c.center += origins[u];
+        }
+        cs
+    }
+
     /// Tyre of axle `axle` (after [`finish`](Self::finish)).
     pub fn tire(&self, axle: usize) -> &Tire {
         &self.tires[axle]

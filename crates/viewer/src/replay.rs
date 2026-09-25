@@ -29,6 +29,9 @@ pub struct Sample {
     /// Ground vehicles: bicycle steering angle (rad) and wheels.
     pub steering: f64,
     pub wheels: Vec<RecordedWheel>,
+    /// Joint coordinates of trailers (quaternions of neighbouring samples are close enough to
+    /// interpolate element-wise).
+    pub joints: Vec<f64>,
     pub goal: DVec3,
     /// The sample at or before the playback time (events, flags).
     pub last: RecordedState,
@@ -96,6 +99,7 @@ impl Replay {
             motors: a.motors.iter().zip(&b.motors).map(|(x, y)| x + (y - x) * alpha).collect(),
             steering: a.steering + (b.steering - a.steering) * alpha,
             wheels: a.wheels.iter().zip(&b.wheels).map(|(x, y)| lerp_wheel(x, y, alpha)).collect(),
+            joints: a.joints.iter().zip(&b.joints).map(|(x, y)| x + (y - x) * alpha).collect(),
             goal: a.goal,
             last: a.clone(),
         })
@@ -137,7 +141,7 @@ impl Replay {
                 let wheels: Vec<WheelState> = s.wheels.iter().map(wheel_state).collect();
                 let powertrain =
                     PowertrainStatus { gear: s.last.gear, engine_speed: s.last.engine_speed, engine_torque: f64::NAN };
-                v.show(&init, s.steering, &wheels, powertrain);
+                v.show(&init, &s.joints, s.steering, &wheels, powertrain);
             } else {
                 agent.vehicle.place(s.pose, s.velocity, s.rates);
             }

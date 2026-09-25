@@ -169,9 +169,9 @@ def test_example_scenarios_build(path, tmp_path, monkeypatch):
 
 def test_events():
     assert Event.CRASH_TERRAIN == 1 and Event.DISABLED == 1 << 9 and Event.FINISHED == 1 << 11
-    assert Event.ROLLOVER == 1 << 12 and Event.STUCK == 1 << 13
+    assert Event.ROLLOVER == 1 << 12 and Event.STUCK == 1 << 13 and Event.JACKKNIFE == 1 << 14
     assert TERMINAL == Event.CRASH_TERRAIN | Event.CRASH_OBSTACLE | Event.CRASH_AGENT | Event.WATER | (
-        Event.OUT_OF_BOUNDS | Event.NAN | Event.ROLLOVER
+        Event.OUT_OF_BOUNDS | Event.NAN | Event.ROLLOVER | Event.JACKKNIFE
     )
     assert autonomousim.events.names(int(Event.WATER | Event.LANDED)) == ["water", "landed"]
     # Falling from 2–3 m with the rotors off is a crash.
@@ -208,3 +208,30 @@ def test_recording(tmp_path):
     sim.close()
     with open(tmp_path / "b.mcap", "rb") as f:
         assert sum(1 for _ in make_reader(f).iter_messages()) > 0
+
+
+def test_trailers():
+    assert {"semitrailer_3axle", "farm_trailer"} <= set(autonomousim.trailer_presets())
+    rig = {
+        "name": "rig",
+        "map": {"type": "testworld", "kind": "flat", "size": 300.0},
+        "groups": [
+            {
+                "vehicle": "truck_6x4",
+                "trailers": ["semitrailer_3axle"],
+                "action_mode": "vk",
+                "obs": [{"term": "articulation"}, {"term": "trailer_goal"}],
+            }
+        ],
+    }
+    sim = BatchSim(json.dumps(rig), 1, num_threads=1)
+    assert sim.group_info(0)["obs_dim"] == 8
+    for _ in range(100):
+        sim.step([np.array([[[0.3, 0.8]]], np.float32)])
+    state = sim.state(0)[0, 0]
+    assert state[STATE["articulation"]][0] < -0.01
+    tail = state[STATE["tail"]]
+    assert np.linalg.norm(tail[:2] - state[STATE["position"]][:2]) > 8.0
+    bad = deep_merge(rig, {"groups": [{"vehicle": "cf2x"}]})
+    with pytest.raises(ValueError, match="tow"):
+        BatchSim(json.dumps(bad), 1)

@@ -55,7 +55,7 @@ use autonomousim_procgen::MapCache;
 use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
 use autonomousim_sensors::{Sensor, SensorSpec};
-use autonomousim_vehicles::ground::Wheeled;
+use autonomousim_vehicles::ground::{TrailerDef, Wheeled};
 use autonomousim_vehicles::multirotor::{MotorInit, MultirotorScales};
 use autonomousim_vehicles::presets;
 use autonomousim_vehicles::{Family, SharedDef, VehicleDef};
@@ -512,8 +512,11 @@ impl Default for EventConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroundEventConfig {
-    /// Rollover when the chassis up axis tilts more than this from the vertical (degrees).
+    /// Rollover when the up axis of any unit tilts more than this from the vertical (degrees).
     pub rollover_deg: f64,
+    /// Jackknife when a trailer's (or dolly's) yaw relative to the unit ahead exceeds this
+    /// (degrees).
+    pub jackknife_deg: f64,
     /// Stuck after moving less than `stuck_distance` (m) for `stuck_time` seconds (0: never).
     pub stuck_time: f64,
     pub stuck_distance: f64,
@@ -521,7 +524,7 @@ pub struct GroundEventConfig {
 
 impl Default for GroundEventConfig {
     fn default() -> Self {
-        Self { rollover_deg: 60.0, stuck_time: 5.0, stuck_distance: 0.5 }
+        Self { rollover_deg: 60.0, jackknife_deg: 70.0, stuck_time: 5.0, stuck_distance: 0.5 }
     }
 }
 
@@ -562,6 +565,10 @@ pub struct GroupSpec {
     pub name: String,
     pub count: usize,
     pub vehicle: VehicleRef,
+    /// Trailers coupled behind a ground vehicle, first to last: built-in names
+    /// (`presets::trailer_names`) or paths to trailer TOML files.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trailers: Vec<String>,
     pub controller: ControllerConfig,
     /// A mode of the vehicle's family (`ctbr`, `velocity`, …; `vk`, `vw`, …). `None`: the
     /// family's default, filled in when the scenario is compiled.
@@ -593,6 +600,7 @@ impl Default for GroupSpec {
             name: "agents".into(),
             count: 1,
             vehicle: VehicleRef::default(),
+            trailers: Vec::new(),
             controller: ControllerConfig::default(),
             action_mode: None,
             action_limits: ActionLimits::default(),
@@ -606,6 +614,25 @@ impl Default for GroupSpec {
             randomize: VehicleRandomization::default(),
             disable_on_terminal: true,
         }
+    }
+}
+
+impl GroupSpec {
+    /// The vehicle with its trailers coupled.
+    pub fn resolve_vehicle(&self) -> Result<VehicleDef, SimError> {
+        let def = self.vehicle.resolve()?;
+        if self.trailers.is_empty() {
+            return Ok(def);
+        }
+        let VehicleDef::Wheeled(towing) = def else {
+            return Err(SimError::Scenario("only ground vehicles tow trailers".into()));
+        };
+        let trailers = self
+            .trailers
+            .iter()
+            .map(|t| if t.ends_with(".toml") || t.contains('/') { TrailerDef::load(t) } else { presets::trailer(t) })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(VehicleDef::Wheeled(towing.with_trailers(&trailers)?))
     }
 }
 
@@ -884,8 +911,7 @@ impl CompiledScenario {
             .groups
             .iter()
             .map(|g| {
-                g.vehicle
-                    .resolve()
+                g.resolve_vehicle()
                     .map(SharedDef::from)
                     .map_err(|e| SimError::Scenario(format!("group {:?}: {e}", g.name)))
             })
@@ -907,6 +933,7 @@ impl CompiledScenario {
             && e.bounds_margin >= 0.0
             && e.ground.rollover_deg > 0.0
             && e.ground.rollover_deg <= 180.0
+            && e.ground.jackknife_deg > 0.0
             && e.ground.stuck_time >= 0.0
             && e.ground.stuck_distance >= 0.0)
         {
@@ -1036,7 +1063,11 @@ impl CompiledGroup {
         {
             return Err(fail(format!("invalid goals {gl:?}")));
         }
-        let colliders = def.sphere_colliders();
+        // Trailers in line behind the towing unit.
+        let colliders = match def.as_wheeled() {
+            Some(d) => d.colliders_in_line(),
+            None => def.sphere_colliders(),
+        };
         // Ground vehicles are placed from the ground point.
         let bottom = match family {
             Family::Multirotor => colliders.iter().map(|c| c.radius - c.center.z).fold(0.0, f64::max),

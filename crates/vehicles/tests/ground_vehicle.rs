@@ -351,7 +351,7 @@ fn shown_state_matches_the_simulated_one() {
     let wheels: Vec<WheelState> = v.wheels().copied().collect();
     let mut shown = vehicle("sedan_like");
     let state = WheeledInit { pose: v.pose(), lin_vel_world: v.lin_vel_world(), ang_vel_body: v.ang_vel_body() };
-    shown.show(&state, v.steering_angle(), &wheels, v.powertrain());
+    shown.show(&state, &v.joints(), v.steering_angle(), &wheels, v.powertrain());
     // Kinematics of the current state (a step computes them at its start).
     v.begin_step();
     for w in 0..v.num_wheels() {

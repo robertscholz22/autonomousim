@@ -8,7 +8,7 @@
 //! and runs after all of them.
 
 use crate::events::Events;
-use crate::interaction::{AgentContacts, AgentGrid, AgentShape, SceneRays, Sphere};
+use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
 use crate::obs::ObsInput;
 use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, Placement};
 use autonomousim_control::ground::GroundEstimate;
@@ -26,7 +26,7 @@ use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_
 use autonomousim_vehicles::{Family, Vehicle};
 use autonomousim_world::environment::{Dryden, EnvironmentConfig, MagneticField};
 use autonomousim_world::{Polyline, StaticWorld};
-use glam::{DVec2, DVec3};
+use glam::{DQuat, DVec2, DVec3};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -318,9 +318,17 @@ impl Agent {
             }
             (v, c, sp) => unreachable!("{} vehicle with a {} controller and {sp:?}", v.family(), c.family()),
         }
-        let v = &mut self.vehicle;
-        for &(force, point) in &agents.forces {
-            v.apply_force(force, point);
+        match &mut self.vehicle {
+            Vehicle::Wheeled(v) => {
+                for &(force, point, link) in &agents.forces {
+                    v.apply_force_on(link.into(), force, point);
+                }
+            }
+            v => {
+                for &(force, point, _) in &agents.forces {
+                    v.apply_force(force, point);
+                }
+            }
         }
         if agents.crashed {
             self.events |= Events::CRASH_AGENT;
@@ -390,17 +398,34 @@ impl Agent {
         shape.velocity = pose.rot * v.lin_vel_body();
         shape.ang_vel = pose.rot * v.ang_vel_body();
         shape.spheres.clear();
+        shape.bodies.clear();
+        // Units behind the towing unit are bodies 1…; their frames as of the step's start.
+        let units = v.as_wheeled().map_or(1, |w| w.num_units());
+        let unit_pose = |u: usize| match (u, v.as_wheeled()) {
+            (0, _) | (_, None) => pose,
+            (u, Some(w)) => w.unit_pose(u),
+        };
+        if let Some(w) = v.as_wheeled() {
+            for u in 1..units {
+                let origin = w.unit_pose(u).pos;
+                let (velocity, ang_vel) = w.unit_velocity(u);
+                shape.bodies.push(Body { origin, velocity, ang_vel, link: w.unit_link(u) as u16 });
+            }
+        }
         let mut radius: f64 = 0.0;
         for c in v.colliders() {
-            let center = pose.transform_point(c.center);
+            let body = v.as_wheeled().and_then(|w| w.link_unit(c.link)).unwrap_or(0);
+            let center = unit_pose(body).transform_point(c.center);
             radius = radius.max(center.distance(pose.pos) + c.radius);
-            shape.spheres.push(Sphere { center, radius: c.radius, friction: c.friction, gear: v.is_gear(c.group) });
+            let gear = v.is_gear(c.group);
+            shape.spheres.push(Sphere { center, radius: c.radius, friction: c.friction, gear, body: body as u8 });
         }
         if let Vehicle::Wheeled(w) = v {
             for i in 0..w.num_wheels() {
                 let (center, r) = (w.wheel_pose(i).pos, w.wheel_radius(i));
                 radius = radius.max(center.distance(pose.pos) + r);
-                shape.spheres.push(Sphere { center, radius: r, friction: 1.0, gear: true });
+                let body = w.def().wheel_unit(i) as u8;
+                shape.spheres.push(Sphere { center, radius: r, friction: 1.0, gear: true, body });
             }
         }
         shape.radius = radius;
@@ -456,9 +481,17 @@ impl Agent {
     /// Rollover and stuck (ground vehicles).
     fn ground_events(&mut self, dt: f64, cfg: &GroundEventConfig) -> Events {
         let mut e = Events::NONE;
-        let up = self.vehicle.orientation() * DVec3::Z;
-        if up.z < cfg.rollover_deg.to_radians().cos() {
+        let tilted = |rot: DQuat| (rot * DVec3::Z).z < cfg.rollover_deg.to_radians().cos();
+        if tilted(self.vehicle.orientation()) {
             e |= Events::ROLLOVER;
+        }
+        if let Some(w) = self.vehicle.as_wheeled() {
+            if (1..w.num_units()).any(|u| tilted(w.unit_pose(u).rot)) {
+                e |= Events::ROLLOVER;
+            }
+            if w.articulations().any(|(a, _)| a.abs() > cfg.jackknife_deg.to_radians()) {
+                e |= Events::JACKKNIFE;
+            }
         }
         let p = self.vehicle.position();
         if p.distance_squared(self.anchor) > cfg.stuck_distance * cfg.stuck_distance {

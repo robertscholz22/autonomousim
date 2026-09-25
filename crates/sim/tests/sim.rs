@@ -775,7 +775,7 @@ fn cars_push_each_other_by_the_wheels() {
     w.step_with(&mut |w: &WorldInstance| {
         let c = w.agent_contacts();
         let sum = |k: usize| {
-            c[k].forces.iter().fold((DVec3::ZERO, DVec3::ZERO), |(f, m), (fk, p)| (f + *fk, m + p.cross(*fk)))
+            c[k].forces.iter().fold((DVec3::ZERO, DVec3::ZERO), |(f, m), (fk, p, _)| (f + *fk, m + p.cross(*fk)))
         };
         let ((fa, ma), (fb, mb)) = (sum(0), sum(1));
         assert_eq!(fa, -fb);

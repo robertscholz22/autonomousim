@@ -264,8 +264,8 @@ impl DriveGrid {
 
 /// Half the width of a ground vehicle (m): its widest wheel or collider.
 pub fn half_width(def: &WheeledDef) -> f64 {
-    let wheels = (0..def.num_wheels()).map(|w| def.wheel_position(w).y.abs() + 0.5 * def.tire(w / 2).width());
-    let colliders = def.sphere_colliders().into_iter().map(|c| c.center.y.abs() + c.radius);
+    let wheels = (0..def.num_wheels()).map(|w| def.wheel_position_in_line(w).y.abs() + 0.5 * def.tire(w / 2).width());
+    let colliders = def.colliders_in_line().into_iter().map(|c| c.center.y.abs() + c.radius);
     wheels.chain(colliders).fold(0.0, f64::max)
 }
 
@@ -275,8 +275,10 @@ pub fn half_width(def: &WheeledDef) -> f64 {
 pub fn ground_pose(world: &StaticWorld, def: &WheeledDef, rest: &Pose, xy: DVec2, yaw: f64) -> Pose {
     let terrain = world.terrain();
     let heading = DQuat::from_rotation_z(yaw);
-    let contacts: Vec<DVec2> =
-        (0..def.num_wheels()).map(|w| (heading * def.wheel_position(w)).truncate()).chain([DVec2::ZERO]).collect();
+    let contacts: Vec<DVec2> = (0..def.num_wheels())
+        .map(|w| (heading * def.wheel_position_in_line(w)).truncate())
+        .chain([DVec2::ZERO])
+        .collect();
     // Least squares z = a + b·x + c·y over the contacts (relative to xy).
     let mut m = DMat3::ZERO;
     let mut rhs = DVec3::ZERO;
