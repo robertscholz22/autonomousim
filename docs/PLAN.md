@@ -1078,7 +1078,7 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 | 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors (done 2026-09-25) | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
 | 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario (done 2026-09-25) | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
 | 4 | PettingZoo `ParallelEnv` (done 2026-09-25) | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
-| 5 | Swarm performance | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
+| 5 | Swarm performance (done 2026-09-25) | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
 | 6 | `ppo_multiagent.py` and a quick check task (`SwarmHover-v0`: N drones hold assigned slots in a formation without touching) | Formation error < 0.3 m and no agent contacts in 95 % of episodes after ≤ 15 min of training |
 | 7 | `SwarmWaypointForest-v0`, training, viewer | ≥ 80 % of agents finish their waypoints on unseen maps and < 2 % of agents collide with another agent; the exported policy flies the swarm in the viewer; a recorded episode replays |
 
@@ -1117,6 +1117,20 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 - `task` is a `MultiAgentTask` or the name of one registered in `MULTI_TASKS` (`make_multi_task`; `MultiAgentVectorEnv` accepts names too).
 - `pettingzoo` 1.27 joined the dev group.
 - Tests: `parallel_api_test` (1000 cycles) and `parallel_seed_test` pass without warnings, for four hover drones and for a mixed team of two drones and a 4×4. Further tests check that a stopped agent leaves the dict outputs, and that the time limit truncates everyone and ends the episode.
+
+**As built in step 5** (`sim::interaction::AgentGrid`, `sim::world`):
+- **Profile first**: with 256 hovering drones, the physics step was not the bottleneck. Writing the state rows after each policy step took 3.5 ms, because `agent_clearance` compared every pair of agents sphere by sphere (all 256 drones were within 20 m of each other).
+- **`AgentGrid`**: a uniform grid on the xy plane over the active agents' centres. Cells hold about two agents each, with at most 64 × 64 cells, stored compressed. It is rebuilt after every policy step, reset, `place_agent` and `disable_agent`. `clearance` and `nearest` search ring by ring and stop once no unvisited agent can matter. Their results equal the scans bit for bit (a property test covers dense, sparse, line-shaped and duplicate layouts, plus an inactive agent outside the grid). Below 32 active agents the scans are used. Agent contacts keep the sweep along x, which was already cheap.
+- **Parallel outputs**: from 32 agents on, observations and state rows are written in parallel over agents (disjoint rows, so the results don't depend on the thread count). The static `clearance` term (a terrain closest-point search over 20 m, about 2 µs per agent) was the next largest serial cost.
+- **Result** (i7-1365U, 10 threads, `swarm` benchmark, one world stepped in a `BatchSim` pool, 20 ms policy steps at 500 Hz), with the laptop's power profile set to *performance*:
+
+  | Drones | Policy step | Real time |
+  |---|---|---|
+  | 256 | 0.744 ms | 26.9× |
+  | 128 | 0.344 ms | 58× (was 0.61 ms, 33×) |
+
+  In the default power profile, the same 256-drone step took 0.6 ms right after idle but 1.3–1.4 ms under sustained all-core load, as the clocks dropped. The earlier poor thread scaling of the car benchmarks (M2 step 9) probably has the same cause.
+- The later fallbacks were not needed: fewer fork–joins per tick, and a structure-of-arrays path for multirotors.
 
 ## Roadmap after M1
 | M | Content | Validation |
