@@ -318,7 +318,7 @@ impl Agent {
         for &(force, point) in &agents.forces {
             v.apply_force(force, point);
         }
-        if agents.touched {
+        if agents.crashed {
             self.events |= Events::CRASH_AGENT;
         }
     }
@@ -332,6 +332,7 @@ impl Agent {
         dt: f64,
         events: &EventConfig,
         disable_on_terminal: bool,
+        agents: &AgentContacts,
         shape: &mut AgentShape,
     ) {
         if self.disabled {
@@ -348,7 +349,7 @@ impl Agent {
             return;
         }
         self.update_shape(shape);
-        self.events |= self.detect_events(world, events, shape);
+        self.events |= self.detect_events(world, events, shape, agents.supported);
         if self.vehicle.family() == Family::Wheeled {
             let e = self.ground_events(dt, &events.ground);
             self.events |= e;
@@ -389,14 +390,21 @@ impl Agent {
         for c in v.colliders() {
             let center = pose.transform_point(c.center);
             radius = radius.max(center.distance(pose.pos) + c.radius);
-            shape.spheres.push(Sphere { center, radius: c.radius });
+            shape.spheres.push(Sphere { center, radius: c.radius, friction: c.friction, gear: v.is_gear(c.group) });
+        }
+        if let Vehicle::Wheeled(w) = v {
+            for i in 0..w.num_wheels() {
+                let (center, r) = (w.wheel_pose(i).pos, w.wheel_radius(i));
+                radius = radius.max(center.distance(pose.pos) + r);
+                shape.spheres.push(Sphere { center, radius: r, friction: 1.0, gear: true });
+            }
         }
         shape.radius = radius;
     }
 
-    fn detect_events(&self, world: &StaticWorld, cfg: &EventConfig, shape: &AgentShape) -> Events {
+    fn detect_events(&self, world: &StaticWorld, cfg: &EventConfig, shape: &AgentShape, on_agent: bool) -> Events {
         let v = &self.vehicle;
-        let mut e = Events::NONE;
+        let mut e = if on_agent { Events::GROUND_CONTACT } else { Events::NONE };
         let colliders = v.colliders();
         let mut crashed = false;
         for c in v.contacts() {

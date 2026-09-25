@@ -531,6 +531,11 @@ impl Wheeled {
         self.ws.kin.pose[self.corners[w].wheel]
     }
 
+    /// Unloaded tyre radius of wheel `w` (m).
+    pub fn wheel_radius(&self, w: usize) -> f64 {
+        self.def.tire(w / 2).radius()
+    }
+
     /// Bicycle steering angle (rad).
     pub fn steering_angle(&self) -> f64 {
         self.steer_angle

@@ -1,6 +1,8 @@
 //! World instances, batches, events and recording.
 
+use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
+use autonomousim_core::math::Pose;
 use autonomousim_core::rng::Seed;
 use autonomousim_sensors::Sensor;
 use autonomousim_sensors::lidar::ReturnKind;
@@ -654,4 +656,140 @@ fn neighbour_terms_and_agent_clearance() {
     w.step();
     assert!(!w.shapes()[2].active);
     check(&w);
+}
+
+/// A parked 4×4 and an iris-like drone on a flat map; neither is disabled by events.
+fn car_and_drone() -> WorldInstance {
+    let sc = compile(
+        r#"
+        name = "car_and_drone"
+        map = { type = "testworld", kind = "flat", size = 200.0 }
+        [[groups]]
+        name = "car"
+        vehicle = "offroad_4x4"
+        disable_on_terminal = false
+        [[groups]]
+        name = "drone"
+        vehicle = "iris_like"
+        disable_on_terminal = false
+        "#,
+    );
+    let mut w = WorldInstance::new(sc, Seed::from_u64(1));
+    w.set_command(0, GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 });
+    for _ in 0..50 {
+        w.step();
+    }
+    w
+}
+
+/// Put the drone at rest `height` above the top of the car's left roof sphere.
+fn drop_drone_on_roof(w: &mut WorldInstance, height: f64) {
+    let car = w.agent(0).vehicle.pose();
+    let pos = car.transform_point(DVec3::new(-0.3, 0.5, 0.79 + 0.45 + 0.12 + height));
+    w.place_agent(1, Pose::new(pos, car.rot), DVec3::ZERO, DVec3::ZERO);
+}
+
+#[test]
+fn drone_rides_on_a_car_roof() {
+    let mut w = car_and_drone();
+    drop_drone_on_roof(&mut w, 0.3);
+    let down =
+        Setpoint::Velocity { velocity: DVec3::new(0.0, 0.0, -0.3), frame: Frame::World, yaw: YawCommand::Rate(0.0) };
+    w.set_command(1, down);
+    let mut landed = false;
+    for _ in 0..150 {
+        w.step();
+        let e = w.agent(1).events;
+        assert!(!e.contains(Events::CRASH_AGENT), "{e:?}");
+        landed |= e.contains(Events::GROUND_CONTACT);
+    }
+    assert!(landed, "the drone never touched the roof");
+    // Rotors off: the drone rests on the roof.
+    w.set_command(1, Setpoint::Motors([0.0; 8]));
+    for _ in 0..100 {
+        w.step();
+    }
+    let rel = |w: &WorldInstance| w.agent(0).vehicle.pose().inverse_transform_point(w.agent(1).vehicle.position());
+    let rest = rel(&w);
+    assert!(w.agent(1).events.contains(Events::GROUND_CONTACT | Events::LANDED), "{:?}", w.agent(1).events);
+
+    // The car drives off at 2 m/s; the drone stays where it sat.
+    w.set_command(0, GroundSetpoint::SpeedCurvature { speed: 2.0, curvature: 0.0 });
+    let start = w.agent(0).vehicle.position();
+    for _ in 0..300 {
+        w.step();
+        let e = w.agent(1).events;
+        assert!(!e.intersects(Events::CRASH_AGENT | Events::CRASH_TERRAIN), "{e:?}");
+        assert!(e.contains(Events::GROUND_CONTACT), "{e:?}");
+    }
+    let car = &w.agent(0).vehicle;
+    assert!((car.lin_vel_body().x - 2.0).abs() < 0.1, "car speed {}", car.lin_vel_body().x);
+    assert!(car.position().distance(start) > 8.0);
+    let moved = rel(&w) - rest;
+    assert!(moved.length() < 0.05, "the drone slid {moved:?} on the roof");
+}
+
+#[test]
+fn falling_drone_crashes_into_the_car() {
+    let mut w = car_and_drone();
+    drop_drone_on_roof(&mut w, 2.0);
+    w.set_command(1, Setpoint::Motors([0.0; 8]));
+    let mut hit = Events::NONE;
+    for _ in 0..50 {
+        w.step();
+        if w.agent(1).events.contains(Events::CRASH_AGENT) {
+            hit = w.agent(0).events;
+            break;
+        }
+    }
+    assert!(hit.contains(Events::CRASH_AGENT), "car events {hit:?}");
+}
+
+#[test]
+fn cars_push_each_other_by_the_wheels() {
+    let sc = compile(
+        r#"
+        name = "two_cars"
+        map = { type = "testworld", kind = "flat", size = 200.0 }
+        [[groups]]
+        name = "cars"
+        vehicle = "offroad_4x4"
+        count = 2
+        disable_on_terminal = false
+        "#,
+    );
+    let mut w = WorldInstance::new(sc, Seed::from_u64(2));
+    for k in 0..2 {
+        w.set_command(k, GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 });
+    }
+    // Side by side, the wheel spheres overlapping by 2 cm.
+    let a = w.agent(0).vehicle.pose();
+    let wheels = |w: &WorldInstance| -> Vec<autonomousim_sim::interaction::Sphere> {
+        w.shapes()[0].spheres.iter().copied().filter(|s| s.gear).collect()
+    };
+    let reach = wheels(&w).iter().map(|s| a.inverse_transform_point(s.center).y.abs() + s.radius).fold(0.0, f64::max);
+    let offset = a.rot * DVec3::new(0.0, 2.0 * reach - 0.02, 0.0);
+    w.place_agent(1, Pose::new(a.pos + offset, a.rot), DVec3::ZERO, DVec3::ZERO);
+    // Forces are pairwise equal and opposite on every tick; the first tick pushes car 0 away.
+    let mut first: Option<(DVec3, bool, bool)> = None;
+    w.step_with(&mut |w: &WorldInstance| {
+        let c = w.agent_contacts();
+        let sum = |k: usize| {
+            c[k].forces.iter().fold((DVec3::ZERO, DVec3::ZERO), |(f, m), (fk, p)| (f + *fk, m + p.cross(*fk)))
+        };
+        let ((fa, ma), (fb, mb)) = (sum(0), sum(1));
+        assert_eq!(fa, -fb);
+        assert!((ma + mb).length() <= 1e-9 * ma.length().max(1.0));
+        first.get_or_insert((fa, c[0].supported, c[0].crashed));
+    });
+    let (push, supported, crashed) = first.unwrap();
+    assert!(supported && !crashed);
+    assert!(push.dot(offset) < -100.0, "{push:?}");
+    assert!(!w.agent(0).events.contains(Events::CRASH_AGENT));
+    for _ in 0..50 {
+        w.step();
+    }
+    let gap = w.agent(0).vehicle.position().distance(w.agent(1).vehicle.position());
+    assert!(gap > offset.length(), "{gap} vs {}", offset.length());
+    assert!(!w.agent(0).events.intersects(Events::ROLLOVER) && !w.agent(1).events.intersects(Events::ROLLOVER));
 }

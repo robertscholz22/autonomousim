@@ -21,16 +21,18 @@
 use crate::agent::{Agent, EnvState};
 use crate::drive::ground_pose;
 use crate::events::Events;
-use crate::interaction::{AgentContacts, AgentShape, agent_clearance, agent_contacts};
+use crate::interaction::{AgentContactState, AgentContacts, AgentShape, agent_clearance, agent_contacts};
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, Goal};
 use autonomousim_control::Command;
+use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::Seed;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::Vehicle;
 use autonomousim_world::StaticWorld;
+use glam::DVec3;
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -74,7 +76,7 @@ pub struct WorldInstance {
     episode_seed: Seed,
     /// Policy steps since the reset.
     steps: u64,
-    order: Vec<(f64, u32)>,
+    agent_contact_state: AgentContactState,
 }
 
 impl WorldInstance {
@@ -97,7 +99,7 @@ impl WorldInstance {
             episode: 0,
             episode_seed: seed,
             steps: 0,
-            order: Vec::new(),
+            agent_contact_state: AgentContactState::default(),
             map,
             map_index: 0,
             scenario,
@@ -128,6 +130,7 @@ impl WorldInstance {
         self.env = EnvState::new(env, world);
         self.clock = sc.clock;
         self.steps = 0;
+        self.agent_contact_state.clear();
 
         let mut spawn_rng = es.child("spawn").rng();
         let mut goal_rng = es.child("goals").rng();
@@ -204,7 +207,7 @@ impl WorldInstance {
 
     /// One physics tick.
     pub fn tick(&mut self) {
-        let Self { scenario, map, env, agents, shapes, contacts, clock, order, .. } = self;
+        let Self { scenario, map, env, agents, shapes, contacts, clock, agent_contact_state, .. } = self;
         let sc = &**scenario;
         let world = &**map;
         let env = &*env;
@@ -213,12 +216,12 @@ impl WorldInstance {
         let env_step = (clock.is_due(sc.environment_divider))
             .then(|| if clock.tick == 0 { 0.0 } else { sc.dt() * f64::from(sc.environment_divider) });
 
-        agent_contacts(shapes, order, contacts);
+        agent_contacts(shapes, sc.dt(), sc.spec.events.crash_speed, agent_contact_state, contacts);
 
         let step = |((a, s), c): ((&mut Agent, &mut AgentShape), &AgentContacts)| {
             let g = &sc.groups[a.group];
             a.pre_step(world, env, time, env_step, c);
-            a.post_step(world, env, sc.dt(), &sc.spec.events, g.spec.disable_on_terminal, s);
+            a.post_step(world, env, sc.dt(), &sc.spec.events, g.spec.disable_on_terminal, c, s);
         };
         if parallel {
             agents.par_iter_mut().zip(shapes.par_iter_mut()).zip(contacts.par_iter()).for_each(step);
@@ -322,6 +325,11 @@ impl WorldInstance {
         &self.shapes
     }
 
+    /// Contact forces between agents in the last tick, per agent.
+    pub fn agent_contacts(&self) -> &[AgentContacts] {
+        &self.contacts
+    }
+
     pub fn clock(&self) -> &Clock {
         &self.clock
     }
@@ -347,6 +355,13 @@ impl WorldInstance {
         self.map = self.scenario.maps[index].clone();
         self.map_index = index;
         self.env = EnvState::new(self.env.config.clone(), &self.map);
+    }
+
+    /// Put agent `i` at `pose` with the given velocities (world linear, body angular) and clear
+    /// its transient vehicle state; its shape follows at once.
+    pub fn place_agent(&mut self, i: usize, pose: Pose, lin_vel_world: DVec3, ang_vel_body: DVec3) {
+        self.agents[i].vehicle.place(pose, lin_vel_world, ang_vel_body);
+        self.agents[i].update_shape(&mut self.shapes[i]);
     }
 
     /// Replace the goals of an agent (at least one) and restart at the first.

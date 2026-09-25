@@ -1,5 +1,12 @@
 //! Interactions between agents: penalty contacts between their sphere colliders, ray casts
 //! that see other agents, and neighbour queries (nearest agents, distance between colliders).
+//!
+//! Agent contacts use the static contacts' model (`autonomousim_core::contact`): a
+//! spring–damper normal force and a bristle spring for friction per touching sphere pair,
+//! capped at `μ·F_n` with `μ` = [`AGENT_FRICTION`] times both spheres' friction factors. The
+//! two agents' springs act in series. A ground vehicle's wheels join its shape as spheres at
+//! the wheel centres with the tyre radius (they push and carry like rigid wheels; the force
+//! goes to the chassis).
 
 use autonomousim_core::contact::PenaltyParams;
 use autonomousim_core::geometry::{HitKind, HitMask, Ray, RayHit};
@@ -9,11 +16,25 @@ use autonomousim_world::StaticWorld;
 use glam::DVec3;
 use smallvec::SmallVec;
 
+/// Friction coefficient between agents (before the colliders' friction factors).
+pub const AGENT_FRICTION: f64 = 0.5;
+
 /// A collider sphere in world coordinates.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sphere {
     pub center: DVec3,
     pub radius: f64,
+    /// Multiplies [`AGENT_FRICTION`].
+    pub friction: f64,
+    /// Landing gear or wheel: slow contacts on it carry the agent instead of crashing it.
+    pub gear: bool,
+}
+
+impl Sphere {
+    /// A sphere with full friction that is not gear.
+    pub fn new(center: DVec3, radius: f64) -> Self {
+        Self { center, radius, friction: 1.0, gear: false }
+    }
 }
 
 /// World-space collision shape of an agent at the start of a physics step.
@@ -29,15 +50,19 @@ pub struct AgentShape {
     /// Angular velocity (world frame).
     pub ang_vel: DVec3,
     pub spheres: SmallVec<[Sphere; 12]>,
-    /// Normal stiffness and damping of the agent's colliders.
+    /// Normal and bristle stiffness and damping of the agent's colliders.
     pub stiffness: f64,
     pub damping: f64,
+    pub tangential_stiffness: f64,
+    pub tangential_damping: f64,
 }
 
 impl AgentShape {
     pub fn set_contact(&mut self, p: &PenaltyParams) {
         self.stiffness = p.stiffness;
         self.damping = p.damping;
+        self.tangential_stiffness = p.tangential_stiffness;
+        self.tangential_damping = p.tangential_damping;
     }
 
     /// Velocity of a world point moving with the agent.
@@ -56,67 +81,144 @@ fn series(a: f64, b: f64) -> f64 {
 /// Contact forces on one agent from the others during a tick.
 #[derive(Clone, Debug, Default)]
 pub struct AgentContacts {
-    /// Touching another agent ([`Events::CRASH_AGENT`](crate::Events::CRASH_AGENT)).
-    pub touched: bool,
+    /// Hit another agent ([`Events::CRASH_AGENT`](crate::Events::CRASH_AGENT)): a contact
+    /// without gear on either side, or one approaching faster than the crash speed.
+    pub crashed: bool,
+    /// Resting on or pushing against another agent with gear or wheels
+    /// ([`Events::GROUND_CONTACT`](crate::Events::GROUND_CONTACT)).
+    pub supported: bool,
     /// `(force, point)` in world coordinates, in application order.
     pub forces: SmallVec<[(DVec3, DVec3); 2]>,
 }
 
-/// Frictionless penalty contacts between the colliders of different agents. Pairs come from
-/// a sweep along x over the bounding spheres, in a fixed order, so the force sums are
-/// deterministic.
-pub(crate) fn agent_contacts(shapes: &[AgentShape], order: &mut Vec<(f64, u32)>, out: &mut [AgentContacts]) {
+/// Friction state of one touching sphere pair; `a < b` are agent indices.
+#[derive(Clone, Copy, Debug)]
+struct PairBristle {
+    a: u32,
+    sa: u16,
+    b: u32,
+    sb: u16,
+    /// Tangential spring deflection of `a`'s sphere relative to `b`'s (world frame).
+    deflection: DVec3,
+    seen: bool,
+}
+
+/// Persistent state of the agent contacts of one world: the sweep order and the friction
+/// springs of touching sphere pairs.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AgentContactState {
+    order: Vec<(f64, u32)>,
+    bristles: Vec<PairBristle>,
+}
+
+impl AgentContactState {
+    pub(crate) fn clear(&mut self) {
+        self.bristles.clear();
+    }
+
+    fn bristle(&mut self, a: u32, sa: u16, b: u32, sb: u16) -> &mut PairBristle {
+        let i = match self.bristles.iter().position(|p| p.a == a && p.sa == sa && p.b == b && p.sb == sb) {
+            Some(i) => i,
+            None => {
+                self.bristles.push(PairBristle { a, sa, b, sb, deflection: DVec3::ZERO, seen: false });
+                self.bristles.len() - 1
+            }
+        };
+        let p = &mut self.bristles[i];
+        p.seen = true;
+        p
+    }
+}
+
+/// Penalty contacts with friction between the colliders of different agents over one tick of
+/// `dt`. Pairs come from a sweep along x over the bounding spheres, in a fixed order, so the
+/// force sums are deterministic.
+pub(crate) fn agent_contacts(
+    shapes: &[AgentShape],
+    dt: f64,
+    crash_speed: f64,
+    state: &mut AgentContactState,
+    out: &mut [AgentContacts],
+) {
     for c in out.iter_mut() {
-        c.touched = false;
+        c.crashed = false;
+        c.supported = false;
         c.forces.clear();
     }
+    for p in &mut state.bristles {
+        p.seen = false;
+    }
+    let order = &mut state.order;
     order.clear();
     order.extend(shapes.iter().enumerate().filter(|(_, s)| s.active).map(|(i, s)| (s.center.x - s.radius, i as u32)));
-    if order.len() < 2 {
-        return;
-    }
     order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    for a in 0..order.len() {
-        let i = order[a].1 as usize;
-        let si = &shapes[i];
-        let x_max = si.center.x + si.radius;
-        for &(x_min, j) in &order[a + 1..] {
+    let order = std::mem::take(order);
+    for (n, &(_, i)) in order.iter().enumerate() {
+        let x_max = shapes[i as usize].center.x + shapes[i as usize].radius;
+        for &(x_min, j) in &order[n + 1..] {
             if x_min > x_max {
                 break;
             }
-            let j = j as usize;
-            let sj = &shapes[j];
-            let reach = si.radius + sj.radius;
-            if si.center.distance_squared(sj.center) > reach * reach {
+            let (a, b) = (i.min(j), i.max(j));
+            let (sa, sb) = (&shapes[a as usize], &shapes[b as usize]);
+            let reach = sa.radius + sb.radius;
+            if sa.center.distance_squared(sb.center) > reach * reach {
                 continue;
             }
-            let (k, c) = (series(si.stiffness, sj.stiffness), series(si.damping, sj.damping));
-            let mut touched = false;
-            for ci in &si.spheres {
-                for cj in &sj.spheres {
-                    let d = ci.center - cj.center;
+            let k = series(sa.stiffness, sb.stiffness);
+            let c = series(sa.damping, sb.damping);
+            let kt = series(sa.tangential_stiffness, sb.tangential_stiffness);
+            let ct = series(sa.tangential_damping, sb.tangential_damping);
+            let (mut crashed, mut supported) = (false, false);
+            for (ia, ca) in sa.spheres.iter().enumerate() {
+                for (ib, cb) in sb.spheres.iter().enumerate() {
+                    let d = ca.center - cb.center;
                     let dist = d.length();
-                    let depth = ci.radius + cj.radius - dist;
+                    let depth = ca.radius + cb.radius - dist;
                     if depth <= 0.0 {
                         continue;
                     }
-                    touched = true;
+                    // Normal towards a's sphere; the force acts midway into the overlap.
                     let n = if dist > 1e-12 { d / dist } else { DVec3::Z };
-                    let point = cj.center + n * (cj.radius - 0.5 * depth);
-                    let vn = (si.point_velocity(point) - sj.point_velocity(point)).dot(n);
-                    let f = (k * depth - c * vn).max(0.0);
-                    if f > 0.0 {
-                        out[i].forces.push((n * f, point));
-                        out[j].forces.push((-n * f, point));
+                    let point = cb.center + n * (cb.radius - 0.5 * depth);
+                    let v = sa.point_velocity(point) - sb.point_velocity(point);
+                    let vn = v.dot(n);
+                    if (ca.gear || cb.gear) && vn >= -crash_speed {
+                        supported = true;
+                    } else {
+                        crashed = true;
+                    }
+                    let fn_ = (k * depth - c * vn).max(0.0);
+
+                    let br = state.bristle(a, ia as u16, b, ib as u16);
+                    let vt = v - n * vn;
+                    let s = br.deflection - n * n.dot(br.deflection) + vt * dt;
+                    let trial = -kt * s - ct * vt;
+                    let limit = AGENT_FRICTION * ca.friction * cb.friction * fn_;
+                    let ft = if trial.length_squared() > limit * limit {
+                        let ft = trial.normalize_or_zero() * limit;
+                        br.deflection = if kt > 0.0 { -ft / kt } else { DVec3::ZERO };
+                        ft
+                    } else {
+                        br.deflection = s;
+                        trial
+                    };
+
+                    let f = n * fn_ + ft;
+                    if f != DVec3::ZERO {
+                        out[a as usize].forces.push((f, point));
+                        out[b as usize].forces.push((-f, point));
                     }
                 }
             }
-            if touched {
-                out[i].touched = true;
-                out[j].touched = true;
+            for x in [a, b] {
+                out[x as usize].crashed |= crashed;
+                out[x as usize].supported |= supported;
             }
         }
     }
+    state.order = order;
+    state.bristles.retain(|p| p.seen);
 }
 
 /// Distance between the colliders of two agents (surface to surface; 0 when they touch),
@@ -242,10 +344,7 @@ mod tests {
             id,
             center,
             radius: 0.5,
-            spheres: [DVec3::X, DVec3::NEG_X]
-                .iter()
-                .map(|d| Sphere { center: center + d * 0.3, radius: 0.2 })
-                .collect(),
+            spheres: [DVec3::X, DVec3::NEG_X].iter().map(|d| Sphere::new(center + d * 0.3, 0.2)).collect(),
             ..Default::default()
         }
     }

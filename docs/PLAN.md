@@ -1075,7 +1075,7 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 | # | Step | Done when |
 |---|---|---|
 | 1 | Neighbour observation terms, `agent_clearance` state column, xy grid for agent queries (done 2026-09-25; grid moved to step 5) | Terms match a brute-force reference on random swarms; order and ties deterministic; disabled agents are invisible; physics state hashes unchanged (goldens re-blessed for the new column only) |
-| 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
+| 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors (done 2026-09-25) | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
 | 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
 | 4 | PettingZoo `ParallelEnv` | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
 | 5 | Swarm performance | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
@@ -1089,6 +1089,16 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 - **Test** (`neighbour_terms_and_agent_clearance`): five drones flying apart and a car in one world; both terms and the state column match brute-force values, and a disabled drone disappears from the other agents' observations.
 - **Goldens**: before re-blessing, the old and new code were compared scenario by scenario: physics state hashes, observations, events and the first 20 state columns are identical in all four scenarios; the only changed recording message is `/meta` (the new state field). The goldens were then re-blessed.
 - **Deferred**: the xy grid for agent queries moves to step 5 (swarm performance), where it will be profiled together with the contact sweep. The queries are O(n²) per world for now, which is cheap at the sizes of steps 2–4 (8 agents).
+
+**As built in step 2** (`sim::interaction`, `sim::agent`, `sim::world`):
+- **Wheels**: a ground vehicle's shape gains one sphere per wheel at the wheel centre with the unloaded tyre radius (`Wheeled::wheel_radius`). As spheres they reach a tyre radius sideways, wider than the tyre itself. Their contact forces act on the chassis at the contact point, and the wheel's spin is not part of the contact velocity. Other agents' LiDAR now sees the wheels too, which changed the `cars` golden (one car's LiDAR sees the other's wheels). With the wheel spheres switched off, all four golden hashes were unchanged by the friction code; the `cars` golden was re-blessed.
+- **Friction**: a bristle spring per touching sphere pair, as for static contacts, keyed by (lower agent index, its sphere, higher agent index, its sphere) and kept in the world (`AgentContactState`, cleared on reset, part of snapshots). `μ` = `AGENT_FRICTION` (0.5) × both spheres' friction factors: colliders carry no material, so the collider's `friction` factor stands in for one; wheels use 1. Normal and bristle springs of the two agents act in series.
+- **Events**: a contact is a crash (`CRASH_AGENT`, both agents) unless one of the two spheres is gear (a multirotor's gear, a ground vehicle's skids or wheels) and the approach speed is below the scenario's `crash_speed`. Such a slow contact counts as `GROUND_CONTACT` for both, and `LANDED` follows as on the ground. A drone landing gently on a car, or two cars leaning on each other by the wheels, is therefore not a crash; a body-to-body touch still is.
+- **API**: `WorldInstance::place_agent` (put an agent at a pose; its shape follows at once) and `WorldInstance::agent_contacts` (per agent, the last tick's agent contact forces and flags).
+- **Tests** (`crates/sim/tests/sim.rs`):
+  - An iris-like drone descends onto a parked 4×4's roof without `CRASH_AGENT`, rests there with its rotors off (`LANDED`), and stays within 0.1 mm of its spot while the car drives 10 m at 2 m/s.
+  - The same drone dropped 2 m onto the roof crashes both agents.
+  - Two 4×4s placed side by side with their wheels overlapping by 2 cm exchange equal and opposite forces and moments on every tick. They are pushed apart without a crash or rollover.
 
 ## Roadmap after M1
 | M | Content | Validation |
