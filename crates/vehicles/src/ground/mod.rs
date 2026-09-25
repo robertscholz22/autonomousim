@@ -2,7 +2,10 @@
 
 mod def;
 mod powertrain;
+mod statics;
 pub mod tire;
+mod tree;
+pub mod units;
 mod wheeled;
 
 pub use def::{
@@ -12,5 +15,8 @@ pub use def::{
 pub use powertrain::{
     CombustionDef, Coupling, DifferentialDef, DriveInput, ElectricDef, EngineDef, GearboxDef, LinearTable, MAX_WHEELS,
     MotorDef, MotorSide, Powertrain, PowertrainDef, PowertrainStatus, WheelCommands,
+};
+pub use units::{
+    CouplingDef, CouplingJoint, CouplingKind, DollyDef, HitchDef, TrailerDef, UnitDef, UnitJoint, yaw_pitch_roll,
 };
 pub use wheeled::{GroundStepEnv, WheelState, Wheeled, WheeledInit};

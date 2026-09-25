@@ -25,8 +25,8 @@ use smallvec::SmallVec;
 
 const RPM: f64 = std::f64::consts::PI / 30.0;
 
-/// Most wheels a vehicle can have (four axles).
-pub const MAX_WHEELS: usize = 8;
+/// Most wheels a vehicle can have, over all its units (eight axles).
+pub const MAX_WHEELS: usize = 16;
 
 /// Per-wheel commands, indexed by wheel (`2·axle + side`). When given in
 /// [`DriveInput::wheels`], they replace the mixed commands: `drive` those of the electric

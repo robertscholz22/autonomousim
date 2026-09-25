@@ -29,6 +29,8 @@ pub enum VehicleError {
 /// Any vehicle definition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Loaded once and shared by `Arc`; the size difference does not matter.
+#[allow(clippy::large_enum_variant)]
 pub enum VehicleDef {
     Multirotor(multirotor::MultirotorDef),
     Wheeled(ground::WheeledDef),

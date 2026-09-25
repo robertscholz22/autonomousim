@@ -11,10 +11,15 @@
 //! prescribed joint) and spins about the carrier's lateral axis. Wheel positions are the
 //! **design** positions: at zero travel, which is the static ride height when the spring
 //! preload is left to the definition (`preload` omitted), since the preload is then computed
-//! to carry the static load (two-axle vehicles).
+//! to carry the static load.
+//!
+//! Trailers and other units behind the towing unit are in [`WheeledDef::units`] (see
+//! [`super::units`]); their axles follow the towing unit's, unit by unit, with positions in
+//! their unit's frame.
 
-use super::powertrain::PowertrainDef;
+use super::powertrain::{MAX_WHEELS, PowertrainDef};
 use super::tire::{FialaParams, MfParams, TirFile, Tire};
+use super::units::{HitchDef, UnitDef, UnitJoint};
 use crate::VehicleError;
 use crate::multirotor::ContactDef;
 use autonomousim_core::contact::SphereCollider;
@@ -48,12 +53,22 @@ pub struct WheeledDef {
     pub colliders: Vec<GroundColliderDef>,
     #[serde(default)]
     pub contact: ContactDef,
+    /// Coupling point for a trailer at the rear of the towing unit (fifth wheel or pintle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hitch: Option<HitchDef>,
+    /// Units behind the towing unit (trailers, dollies and drawbars; unit `k + 1` is
+    /// `units[k]`), usually added by [`with_trailers`](Self::with_trailers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<UnitDef>,
     /// Resolved per axle by [`finish`](Self::finish).
     #[serde(skip)]
     tires: Vec<Tire>,
     /// Spring preload per wheel (N), given or computed.
     #[serde(skip)]
     preload: Vec<f64>,
+    /// Static equilibrium under standard gravity, when there is one.
+    #[serde(skip)]
+    rest: Option<Box<StaticState>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +91,9 @@ pub struct ChassisDef {
 pub struct AxleDef {
     #[serde(default)]
     pub name: String,
+    /// Unit carrying the axle (0: the towing unit); axles are listed unit by unit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unit: usize,
     /// Left wheel centre at design ride height, chassis frame (m).
     pub position: DVec3,
     /// Independent suspension; `None` mounts the wheels rigidly (small robots).
@@ -219,6 +237,10 @@ fn one() -> f64 {
     1.0
 }
 
+fn is_zero(x: &usize) -> bool {
+    *x == 0
+}
+
 /// Role of a chassis collider for event classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -273,6 +295,9 @@ pub struct StaticState {
     pub loads: Vec<f64>,
     pub travel: Vec<f64>,
     pub deflection: Vec<f64>,
+    /// Per unit behind the towing unit: its joint's pitch and roll relative to the unit ahead
+    /// (rad; a hinge has only pitch, a turntable neither).
+    pub joints: Vec<[f64; 2]>,
 }
 
 impl StaticState {
@@ -351,6 +376,7 @@ impl WheeledDef {
             let preload = self.solve_static(STANDARD_GRAVITY, true).map_err(fail)?.1;
             self.preload = preload;
         }
+        self.rest = self.solve_static(STANDARD_GRAVITY, false).ok().map(|s| Box::new(s.0));
         Ok(())
     }
 
@@ -364,11 +390,35 @@ impl WheeledDef {
         if !nonneg(c.drag_area.min_element()) {
             return Err("drag area must be non-negative".into());
         }
-        if self.axles.is_empty() || self.axles.len() > 4 {
-            return Err("need 1 to 4 axles".into());
+        if self.axles.is_empty() || self.axles.len() > MAX_WHEELS / 2 {
+            return Err(format!("need 1 to {} axles", MAX_WHEELS / 2));
+        }
+        if self.axles.windows(2).any(|w| w[1].unit < w[0].unit) || self.axles.iter().any(|a| a.unit > self.units.len())
+        {
+            return Err("axles must be listed unit by unit, on existing units".into());
+        }
+        for (k, u) in self.units.iter().enumerate() {
+            let fail = |m: String| Err(format!("unit {} ({}): {m}", k + 1, u.name));
+            let c = &u.chassis;
+            if u.parent > k {
+                return fail("hangs from a later unit".into());
+            }
+            if !pos(c.mass) || !pos(c.inertia.min_element()) || !c.com.is_finite() || !nonneg(c.drag_area.min_element())
+            {
+                return fail("mass and inertia must be positive, drag non-negative".into());
+            }
+            if !u.position.is_finite() || u.hitch.is_some_and(|h| !h.position.is_finite()) {
+                return fail("positions must be finite".into());
+            }
+            if let UnitJoint::Coupling(j) = u.joint {
+                j.validate().or_else(fail)?;
+            }
         }
         for (i, a) in self.axles.iter().enumerate() {
             let fail = |m: &str| Err(format!("axle {i}: {m}"));
+            if a.unit > 0 && a.is_steered() {
+                return fail("only the towing unit steers");
+            }
             if !a.position.is_finite() || !pos(a.position.y) {
                 return fail("the (left) wheel position needs y > 0");
             }
@@ -415,7 +465,12 @@ impl WheeledDef {
             return Err("steering needs 0 < max_angle < 1.5 rad, a positive rate and ackermann in [0, 1]".into());
         }
         self.powertrain.validate(self.axles.len())?;
-        if self.colliders.iter().any(|c| !pos(c.radius) || !c.center.is_finite() || !nonneg(c.friction)) {
+        if self
+            .colliders
+            .iter()
+            .chain(self.units.iter().flat_map(|u| &u.colliders))
+            .any(|c| !pos(c.radius) || !c.center.is_finite() || !nonneg(c.friction))
+        {
             return Err("collider radii must be positive and friction non-negative".into());
         }
         Ok(())
@@ -430,7 +485,33 @@ impl WheeledDef {
         2 * self.axles.len()
     }
 
-    /// Design position of wheel `w` in the chassis frame.
+    /// Number of units (the towing unit and those behind it).
+    pub fn num_units(&self) -> usize {
+        self.units.len() + 1
+    }
+
+    /// Unit carrying wheel `w`.
+    pub fn wheel_unit(&self, w: usize) -> usize {
+        self.axles[w / 2].unit
+    }
+
+    /// Chassis of unit `u` (0: the towing unit).
+    pub fn unit_chassis(&self, u: usize) -> &ChassisDef {
+        if u == 0 { &self.chassis } else { &self.units[u - 1].chassis }
+    }
+
+    /// Coupling point for a trailer behind the last unit.
+    pub fn rear_hitch(&self) -> Option<HitchDef> {
+        self.units.last().map_or(self.hitch, |u| u.hitch)
+    }
+
+    /// Link of unit `u` in the multibody tree (see [`super::tree`]).
+    pub fn unit_link(&self, u: usize) -> usize {
+        let links = |a: &AxleDef| 2 * (1 + usize::from(a.suspension.is_some()) + usize::from(a.is_steered()));
+        (0..u).map(|v| 1 + self.axles.iter().filter(|a| a.unit == v).map(links).sum::<usize>()).sum()
+    }
+
+    /// Design position of wheel `w` in its unit's frame.
     pub fn wheel_position(&self, w: usize) -> DVec3 {
         let p = self.axles[w / 2].position;
         if w.is_multiple_of(2) { p } else { DVec3::new(p.x, -p.y, p.z) }
@@ -452,17 +533,26 @@ impl WheeledDef {
         a.wheel.mass + a.suspension.as_ref().map_or(0.0, |s| s.carrier_mass)
     }
 
+    /// Mass of all units (kg).
     pub fn total_mass(&self) -> f64 {
-        self.chassis.mass + (0..self.num_wheels()).map(|w| self.unsprung_mass(w)).sum::<f64>()
+        self.chassis.mass
+            + self.units.iter().map(|u| u.chassis.mass).sum::<f64>()
+            + (0..self.num_wheels()).map(|w| self.unsprung_mass(w)).sum::<f64>()
     }
 
-    /// Centre of mass of the whole vehicle at design (chassis frame).
+    /// Mass of unit `u` with its wheels (kg).
+    pub fn unit_mass(&self, u: usize) -> f64 {
+        self.unit_chassis(u).mass
+            + (0..self.num_wheels()).filter(|&w| self.wheel_unit(w) == u).map(|w| self.unsprung_mass(w)).sum::<f64>()
+    }
+
+    /// Centre of mass of the towing unit with its wheels at design (chassis frame).
     pub fn total_com(&self) -> DVec3 {
         let mut m = self.chassis.com * self.chassis.mass;
-        for w in 0..self.num_wheels() {
+        for w in (0..self.num_wheels()).filter(|&w| self.wheel_unit(w) == 0) {
             m += self.wheel_position(w) * self.unsprung_mass(w);
         }
-        m / self.total_mass()
+        m / self.unit_mass(0)
     }
 
     /// Wheel spin inertia including the driveline share (kg·m²), per wheel.
@@ -471,20 +561,51 @@ impl WheeledDef {
         self.wheels().zip(extra).map(|((a, _), e)| a.wheel.inertia.y + e).collect()
     }
 
-    /// Sphere colliders on the chassis link.
+    /// Sphere colliders on their units' links (the towing unit's first).
     pub fn sphere_colliders(&self) -> Vec<SphereCollider> {
-        self.colliders
-            .iter()
-            .map(|c| SphereCollider {
-                friction: c.friction,
-                ..SphereCollider::new(0, c.center, c.radius, c.part as u8)
+        let units = std::iter::once(&self.colliders).chain(self.units.iter().map(|u| &u.colliders));
+        units
+            .enumerate()
+            .flat_map(|(u, cs)| {
+                let link = self.unit_link(u);
+                cs.iter().map(move |c| SphereCollider {
+                    friction: c.friction,
+                    ..SphereCollider::new(link, c.center, c.radius, c.part as u8)
+                })
             })
             .collect()
     }
 
-    /// Static equilibrium on flat ground under gravity `g` (m/s²), for two-axle vehicles.
+    /// Static equilibrium on flat ground under gravity `g` (m/s²). Needs two axles, or a
+    /// vehicle whose axles carry it (at least two per chain of units).
     pub fn static_state(&self, g: f64) -> Result<StaticState, String> {
         Ok(self.solve_static(g, false)?.0)
+    }
+
+    /// The static equilibrium under standard gravity, when there is one (computed by
+    /// [`finish`](Self::finish)).
+    pub fn rest_state(&self) -> Option<&StaticState> {
+        self.rest.as_deref()
+    }
+
+    /// Two-axle single units keep the lever-rule solver; everything else minimises energy.
+    fn solve_static(&self, g: f64, auto: bool) -> Result<(StaticState, Vec<f64>), String> {
+        if self.tires.len() != self.axles.len() {
+            return Err("definition not finished".into());
+        }
+        if self.units.is_empty() && self.axles.len() == 2 {
+            self.solve_two_axle(g, auto)
+        } else if self.axles.len() >= 2 {
+            super::statics::solve(self, g, auto)
+        } else {
+            Err("static equilibrium (and automatic preload) needs two axles or more".into())
+        }
+    }
+
+    /// Static equilibrium by the energy solver, also for two-axle vehicles (for checks).
+    #[doc(hidden)]
+    pub fn static_state_general(&self, g: f64) -> Result<StaticState, String> {
+        Ok(super::statics::solve(self, g, false)?.0)
     }
 
     /// Loads by rigid-body statics over the wheel contacts (two axles; the attitude from the
@@ -492,13 +613,7 @@ impl WheeledDef {
     /// carries its load, and the chassis pose that puts every wheel centre at its loaded
     /// radius. With `auto`, springs without a given preload are preloaded to sit at zero
     /// travel; the preloads are returned.
-    fn solve_static(&self, g: f64, auto: bool) -> Result<(StaticState, Vec<f64>), String> {
-        if self.axles.len() != 2 {
-            return Err("static equilibrium (and automatic preload) needs exactly two axles".into());
-        }
-        if self.tires.len() != self.axles.len() {
-            return Err("definition not finished".into());
-        }
+    fn solve_two_axle(&self, g: f64, auto: bool) -> Result<(StaticState, Vec<f64>), String> {
         let n = self.num_wheels();
         let total = self.total_mass();
         let tables: Vec<Option<KcTable>> =
@@ -583,7 +698,7 @@ impl WheeledDef {
                 break;
             }
         }
-        Ok((StaticState { height, pitch, roll, loads, travel, deflection }, preload))
+        Ok((StaticState { height, pitch, roll, loads, travel, deflection, joints: Vec::new() }, preload))
     }
 }
 

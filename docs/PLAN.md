@@ -1378,12 +1378,31 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
 #### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | Units and couplings in `vehicles::ground` (fifth wheel, drawbar, turntable), per-unit colliders and drag, `MAX_WHEELS` 16, general static equilibrium, `trailers` composition | A test tractor with a semitrailer and a drawbar trailer settles at the static solution; loads and kingpin load match statics; the two solvers agree on two-axle vehicles; existing goldens unchanged |
+| 1 ✅ | Units and couplings in `vehicles::ground` (fifth wheel, drawbar, turntable), per-unit colliders and drag, `MAX_WHEELS` 16, general static equilibrium, `trailers` composition | A test tractor with a semitrailer and a drawbar trailer settles at the static solution; loads and kingpin load match statics; the two solvers agree on two-axle vehicles; existing goldens unchanged |
 | 2 | Truck tyre, multi-axle and forced steering, air-brake lag, presets `truck_6x4`, `semitrailer_3axle`, `truck_8x8`, `farm_tractor`, `farm_trailer` (Chrono extraction) | Presets load, settle and drive straight; static loads against Chrono's |
 | 3 | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
 | 4 | Simulation: scenario `trailers`, multi-body agent shapes, `JACKKNIFE`, `articulation` state and terms, `trailer_goal`, recordings with articulation | Rigs spawn, drive and record; replays reproduce them; goldens of existing scenarios unchanged |
 | 5 | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
 | 6 | `TrailerReverse-v0`: `bay` goals, scripted reversing controller, short training, export, viewer, replay | The task trains end to end; the exported policy reverses in the viewer; a recorded episode replays |
+
+#### As built
+- **Step 1** (units and couplings):
+  - **Trailer files and composition**: `TrailerDef` (`type = "trailer"`, loaded by `TrailerDef::from_toml`) gives its `[coupling]` (`kind` = `fifth_wheel` | `drawbar`, the kingpin or eye position, optional overrides), chassis, axles, colliders, an optional rear `[hitch]` and an optional `[dolly]`. `WheeledDef::with_trailers(&[..])` checks each coupling against the hitch ahead (`hitch = { kind, position }` on the towing vehicle) and appends units to `WheeledDef::units`, and their axles to `axles` with `unit` set.
+  - **Unit frames**: each unit's frame is moved to its joint centre. A dolly trailer becomes three units: the drawbar (80 kg bar, eye → hinge), the dolly (on a `Hinge` about y at the drawbar's hinge, so the pintle carries almost no vertical load) and the body (on a `Turntable` about z). Couplings are `Spherical` joints with `CouplingJoint::torque`: a roll spring and damper, and pitch and yaw stops, applied as generalised Euler-angle forces mapped through the Euler-rate Jacobian, so they are conservative (unit test).
+  - **Defaults**: fifth wheel roll 2·10⁷ N·m/rad, ±15° pitch; drawbar eye roll 10⁴ N·m/rad, ±30° pitch; ±90° yaw; stops 10⁷ N·m/rad with 10⁵ N·m·s/rad damping.
+  - **Shared tree**: the multibody tree is built by `ground::tree::build`, used by both `Wheeled` and the static solver. Link order is the towing unit and its wheels (unchanged, so single-unit goldens stay), then each unit and its wheels. `WheeledDef::unit_link(u)` predicts the link index, so `sphere_colliders()` carries per-unit links.
+  - **Drag, wheels and API**: drag acts per unit. Trailer wheels start rolling from their centre velocity. New accessors: `Wheeled::{num_units, unit_pose, unit_link, articulation(u)}`. Articulation is the yaw relative to the unit ahead, positive when the unit points left, so negative in a left turn.
+  - **Wheel limits**: `MAX_WHEELS` is 16 (8 axles); per-wheel drive masks are `u32`.
+  - **Statics**: two-axle single units keep the lever-rule solver. Everything else uses `ground::statics::solve`, which minimises energy with a gradient from the virtual work over finite-difference motions of the tree (forward kinematics) and a Gauss–Newton Hessian of the tyre, spring and coupling stiffnesses. It handles automatic preloads with travels fixed at zero.
+  - **Rest state**: computed once in `finish()` (`WheeledDef::rest_state()`); `rest()` and `reset()` use it and place the units at their rest pitch and roll. `StaticState::joints` holds per-unit pitch and roll.
+  - **Tests** (`vehicles/tests/trailers.rs`, with a 4×2 test tractor, a tandem semitrailer and a dolly drawbar trailer):
+    - the composition builds the right tree, and the JSON round trip is lossless;
+    - both solvers agree on the sedan, the 4×4 and the skid rover (height and travel within 1e-6, loads within 1e-5);
+    - the loads sum to the weight, and the kingpin load matches the lever rule within 1 %;
+    - the rigs settle at the static state (loads within 0.5 %);
+    - the rigs roll straight, and turning left gives negative articulation.
+  - Existing goldens are unchanged.
+  - **Tandem load split**: without load-equalising suspension, a tandem's axles share the load only roughly (the test rig splits 29.2 kN to 25.6 kN), because the trailer's pitch shifts load between them.
 
 ### M4c: Tracked vehicles and soft soil
 The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.

@@ -86,7 +86,7 @@ pub enum PerWheelChannel {
     Throttle,
     Steering,
     /// Motor driving the wheels in the bit mask.
-    Drive(u8),
+    Drive(u32),
     Brake(usize),
     Steer(usize),
 }

@@ -1,26 +1,28 @@
 //! Wheeled vehicle instance: the multibody tree, suspension, steering, brakes, powertrain,
 //! tyres, aerodynamic drag and chassis contacts, stepped in phases like the multirotor.
 //!
-//! Tree per wheel: chassis (free) → carrier (`KcTravel`, if sprung) → steering knuckle
+//! Tree per wheel: unit body → carrier (`KcTravel`, if sprung) → steering knuckle
 //! (massless revolute about the carrier's z axis, prescribed, if steered) → wheel (revolute
-//! about the lateral axis). Suspension, anti-roll bar, drive and brake forces are generalised
-//! forces on the travel and spin coordinates, so their reactions reach the chassis through the
-//! joints. Steering angles are prescribed trajectories: each step drives the knuckle exactly
+//! about the lateral axis); units behind the towing unit (free) hang on their couplings (see
+//! [`super::tree`]). Suspension, anti-roll bar, coupling, drive and brake forces are
+//! generalised forces on the joint coordinates, so their reactions reach the bodies through
+//! the joints. Steering angles are prescribed trajectories: each step drives the knuckle exactly
 //! to its target angle, and the joint torque this needs is reported.
 
 use super::def::{SteerMode, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
 use super::tire::{Surface, TireForces, TireState, WheelMotion};
+use super::tree::{UnitLinks, build};
+use super::units::{UnitJoint, yaw_pitch_roll};
 use crate::multirotor::AirData;
 use autonomousim_core::contact::{
     ContactCache, ContactModel, ContactPoint, ContactScratch, SphereCollider, StaticScene, compute_contacts,
 };
 use autonomousim_core::dynamics::{
-    AbaWorkspace, DynamicsError, JointType, MbState, MultibodyModel, aba_with_kinematics, forward_kinematics,
-    semi_implicit_euler,
+    AbaWorkspace, DynamicsError, MbState, MultibodyModel, aba_with_kinematics, forward_kinematics, semi_implicit_euler,
 };
-use autonomousim_core::math::{Pose, RigidInertia, SpatialForce};
-use glam::{DMat3, DQuat, DVec3};
+use autonomousim_core::math::{Pose, SpatialForce};
+use glam::{DQuat, DVec3};
 use std::sync::Arc;
 
 /// Everything outside the vehicle that one physics step needs.
@@ -94,6 +96,7 @@ pub struct Wheeled {
     model: MultibodyModel,
     mass: f64,
     corners: Vec<Corner>,
+    units: Vec<UnitLinks>,
     powertrain: Powertrain,
     colliders: Vec<SphereCollider>,
     contact: ContactModel,
@@ -121,83 +124,46 @@ impl Wheeled {
     /// pose for vehicles without a static solution).
     pub fn new(def: Arc<WheeledDef>, dt: f64) -> Self {
         assert!(dt > 0.0, "dt must be positive");
-        let c = &def.chassis;
-        let mut model = MultibodyModel::new();
-        model.add_link(
-            "chassis",
-            None,
-            JointType::Free,
-            Pose::IDENTITY,
-            RigidInertia::new(c.mass, c.com, DMat3::from_diagonal(c.inertia)),
-        );
         let inertia = def.spin_inertia();
-        // Reference for the Ackermann geometry: the axles without a steering share (or all).
-        let unsteered: Vec<f64> = def.axles.iter().filter(|a| a.steer == 0.0).map(|a| a.position.x).collect();
+        let tree = build(&def, &inertia);
+        let model = tree.model;
+        // Reference for the Ackermann geometry: the towing unit's axles without a steering
+        // share (or all of them).
+        let own = || def.axles.iter().filter(|a| a.unit == 0);
+        let unsteered: Vec<f64> = own().filter(|a| a.steer == 0.0).map(|a| a.position.x).collect();
         let reference = if unsteered.is_empty() {
-            def.axles.iter().map(|a| a.position.x).sum::<f64>() / def.axles.len() as f64
+            own().map(|a| a.position.x).sum::<f64>() / own().count() as f64
         } else {
             unsteered.iter().sum::<f64>() / unsteered.len() as f64
         };
-        let mut corners = Vec::with_capacity(def.num_wheels());
-        for (w, (axle, side)) in def.wheels().enumerate() {
-            let p = def.wheel_position(w);
-            let (mut parent, mut frame) = (0, Pose::from_translation(p));
-            let mut travel = None;
-            if let Some(s) = &axle.suspension {
-                let table = s.table(side).expect("validated");
-                let link = model.add_link(
-                    format!("carrier_{w}"),
-                    Some(0),
-                    JointType::KcTravel(Arc::new(table)),
-                    frame,
-                    RigidInertia::diag(s.carrier_mass, s.carrier_inertia),
-                );
-                travel = Some((model.q_offset(link), model.v_offset(link)));
-                (parent, frame) = (link, Pose::IDENTITY);
-            }
-            let carrier = parent;
-            let mut steer = None;
-            if axle.is_steered() {
-                let link = model.add_link(
-                    format!("knuckle_{w}"),
-                    Some(parent),
-                    JointType::Revolute { axis: DVec3::Z },
-                    frame,
-                    RigidInertia::ZERO,
-                );
-                model.set_prescribed(link, true);
-                steer = Some((model.q_offset(link), model.v_offset(link)));
-                (parent, frame) = (link, Pose::IDENTITY);
-            }
-            let mut moments = axle.wheel.inertia;
-            moments.y = inertia[w];
-            let wheel = model.add_link(
-                format!("wheel_{w}"),
-                Some(parent),
-                JointType::Revolute { axis: DVec3::Y },
-                frame,
-                RigidInertia::diag(axle.wheel.mass, moments),
-            );
-            corners.push(Corner {
-                wheel,
-                carrier,
-                travel,
-                steer,
-                spin: (model.q_offset(wheel), model.v_offset(wheel)),
-                steer_share: axle.steer,
-                independent: match axle.steer_mode {
-                    SteerMode::Independent { max_angle, rate } => Some((max_angle, rate)),
-                    SteerMode::Ackermann => None,
-                },
-                steer_cmd: 0.0,
-                wheelbase: p.x - reference,
-                lateral: p.y,
-                preload: def.preload(w),
-                brake: Coupling::new(&[w], &[], &inertia, dt),
-                tire: def.tire(w / 2).initial_state(),
-                out: WheelState::default(),
-            });
-        }
+        let corners = tree
+            .corners
+            .iter()
+            .zip(def.wheels())
+            .enumerate()
+            .map(|(w, (links, (axle, _)))| {
+                let p = def.wheel_position(w);
+                Corner {
+                    wheel: links.wheel,
+                    carrier: links.carrier,
+                    travel: links.travel,
+                    steer: links.steer,
+                    spin: links.spin,
+                    steer_share: axle.steer,
+                    independent: match axle.steer_mode {
+                        SteerMode::Independent { max_angle, rate } => Some((max_angle, rate)),
+                        SteerMode::Ackermann => None,
+                    },
+                    steer_cmd: 0.0,
+                    wheelbase: p.x - reference,
+                    lateral: p.y,
+                    preload: def.preload(w),
+                    brake: Coupling::new(&[w], &[], &inertia, dt),
+                    tire: def.tire(w / 2).initial_state(),
+                    out: WheelState::default(),
+                }
+            })
+            .collect();
         let n = model.num_links();
         let mass = def.total_mass();
         let mut s = Self {
@@ -215,6 +181,7 @@ impl Wheeled {
             model,
             mass,
             corners,
+            units: tree.units,
             steer_angle: 0.0,
             specific_force: DVec3::ZERO,
             ang_acc: DVec3::ZERO,
@@ -245,9 +212,9 @@ impl Wheeled {
     /// deflection for vehicles without a static solution.
     pub fn rest(&self, ground: DVec3, yaw: f64, speed: f64) -> WheeledInit {
         let heading = DQuat::from_rotation_z(yaw);
-        let (height, attitude) = match self.def.static_state(super::def::STANDARD_GRAVITY) {
-            Ok(st) => (st.height, st.rotation()),
-            Err(_) => {
+        let (height, attitude) = match self.def.rest_state() {
+            Some(st) => (st.height, st.rotation()),
+            None => {
                 let t = self.def.tire(0);
                 (t.radius() - deflection_at(t, t.nominal_load()) - self.def.axles[0].position.z, DQuat::IDENTITY)
             }
@@ -271,19 +238,41 @@ impl Wheeled {
         self.state.v[..3].copy_from_slice(&init.ang_vel_body.to_array());
         let v_body = rot.inverse() * init.lin_vel_world;
         self.state.v[3..6].copy_from_slice(&v_body.to_array());
-        let st = self.def.static_state(super::def::STANDARD_GRAVITY).ok();
+        let st = self.def.rest_state();
+        // Units behind at their rest pitch and roll, in line.
+        for (k, u) in self.def.units.iter().enumerate() {
+            let [pitch, roll] = st.map_or([0.0; 2], |s| s.joints[k]);
+            let off = self.units[k + 1].q;
+            match u.joint {
+                UnitJoint::Coupling(_) => {
+                    let rot = DQuat::from_rotation_y(pitch) * DQuat::from_rotation_x(roll);
+                    self.state.q[off..off + 4].copy_from_slice(&rot.to_array());
+                }
+                UnitJoint::Hinge => self.state.q[off] = pitch,
+                UnitJoint::Turntable => {}
+            }
+        }
         for (w, c) in self.corners.iter_mut().enumerate() {
-            if let (Some((q, _)), Some(st)) = (c.travel, &st) {
+            if let (Some((q, _)), Some(st)) = (c.travel, st) {
                 self.state.q[q] = st.travel[w];
             }
-            let tire = self.def.tire(w / 2);
-            let deflection = st.as_ref().map_or(0.0, |s| s.deflection[w]);
-            let v_wheel = v_body + init.ang_vel_body.cross(self.def.wheel_position(w));
-            self.state.v[c.spin.1] = v_wheel.x / (tire.radius() - deflection);
-            c.tire = tire.initial_state();
+            c.tire = self.def.tire(w / 2).initial_state();
             c.brake.reset();
             c.steer_cmd = 0.0;
             c.out = WheelState::default();
+        }
+        // Wheels rolling with their unit: the towing unit's from the chassis motion, the others
+        // from their centres' velocities along their heading.
+        forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut self.ws.kin);
+        for (w, c) in self.corners.iter().enumerate() {
+            let radius = self.def.tire(w / 2).radius() - st.map_or(0.0, |s| s.deflection[w]);
+            let forward = if self.def.wheel_unit(w) == 0 {
+                (v_body + init.ang_vel_body.cross(self.def.wheel_position(w))).x
+            } else {
+                let kin = &self.ws.kin;
+                kin.point_velocity_world(c.wheel, DVec3::ZERO).dot(kin.pose[c.carrier].rot * DVec3::X)
+            };
+            self.state.v[c.spin.1] = forward / radius;
         }
         self.steer_angle = 0.0;
         self.specific_force = rot.inverse() * DVec3::Z * super::def::STANDARD_GRAVITY;
@@ -376,12 +365,32 @@ impl Wheeled {
             c.brake.step(limit, &self.spin, dt, &mut self.brake);
             self.tau[c.spin.1] += self.drive[w] + self.brake[w];
         }
-        // Chassis drag at the centre of mass.
+        // Couplings: roll springs and dampers, pitch and yaw stops.
+        for (k, u) in self.def.units.iter().enumerate() {
+            let UnitJoint::Coupling(joint) = u.joint else { continue };
+            let UnitLinks { q, v, .. } = self.units[k + 1];
+            let rot = DQuat::from_slice(&self.state.q[q..q + 4]);
+            let t = joint.torque(rot, DVec3::from_slice(&self.state.v[v..v + 3]));
+            for (i, x) in t.to_array().into_iter().enumerate() {
+                self.tau[v + i] += x;
+            }
+        }
+        // Drag of each unit at its centre of mass.
         let drag = self.def.chassis.drag_area;
         if drag != DVec3::ZERO {
             let v_air = self.lin_vel_body() - self.orientation().inverse() * air.wind;
             let f = -0.5 * air.density * drag * v_air.abs() * v_air;
             self.f_ext[0] += SpatialForce::from_force_at_point(f, self.def.chassis.com);
+        }
+        for (k, u) in self.def.units.iter().enumerate() {
+            let (c, link) = (&u.chassis, self.units[k + 1].link);
+            if c.drag_area == DVec3::ZERO {
+                continue;
+            }
+            let pose = self.ws.kin.pose[link];
+            let v_air = self.ws.kin.vel[link].point_velocity(c.com) - pose.inverse_transform_vector(air.wind);
+            let f = -0.5 * air.density * c.drag_area * v_air.abs() * v_air;
+            self.f_ext[link] += SpatialForce::from_force_at_point(f, c.com);
         }
     }
 
@@ -516,6 +525,38 @@ impl Wheeled {
 
     pub fn num_wheels(&self) -> usize {
         self.corners.len()
+    }
+
+    /// Number of units (the towing unit and those behind it).
+    pub fn num_units(&self) -> usize {
+        self.units.len()
+    }
+
+    /// World pose of unit `u`'s frame (0: the chassis).
+    pub fn unit_pose(&self, u: usize) -> Pose {
+        self.ws.kin.pose[self.units[u].link]
+    }
+
+    /// Link of unit `u` in the multibody tree.
+    pub fn unit_link(&self, u: usize) -> usize {
+        self.units[u].link
+    }
+
+    /// Yaw of unit `u` (≥ 1) relative to the unit ahead (rad, positive when it points to the
+    /// left of the unit ahead, so its rear swings right) and its rate (rad/s); zero for a
+    /// hinge.
+    pub fn articulation(&self, u: usize) -> (f64, f64) {
+        let UnitLinks { q, v, .. } = self.units[u];
+        match self.def.units[u - 1].joint {
+            UnitJoint::Coupling(_) => {
+                let rot = DQuat::from_slice(&self.state.q[q..q + 4]);
+                // The rate about the unit ahead's z axis.
+                let omega = rot * DVec3::from_slice(&self.state.v[v..v + 3]);
+                (yaw_pitch_roll(rot)[0], omega.z)
+            }
+            UnitJoint::Turntable => (self.state.q[q], self.state.v[v]),
+            UnitJoint::Hinge => (0.0, 0.0),
+        }
     }
 
     pub fn wheel(&self, w: usize) -> &WheelState {
