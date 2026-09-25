@@ -21,6 +21,12 @@ pub mod tags {
     pub const WALL: u16 = 5;
     /// Broadleaf crown (sphere).
     pub const CANOPY_BROADLEAF: u16 = 6;
+    /// Hedgerow: a foliage cuboid around a solid woody core (both tagged).
+    pub const HEDGE: u16 = 7;
+    pub const FENCE: u16 = 8;
+    /// Farm building (cuboid) and silo (cylinder).
+    pub const BUILDING: u16 = 9;
+    pub const SILO: u16 = 10;
 }
 
 /// Obstacle geometry in its local frame. Axisymmetric shapes use the local `z` axis.

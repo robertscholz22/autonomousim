@@ -23,6 +23,11 @@ impl MaterialId {
     pub const WOOD: Self = Self(12);
     pub const FOLIAGE: Self = Self(13);
     pub const METAL: Self = Self(14);
+    /// Farmland, in [`MaterialTable::rural`] only.
+    pub const MEADOW: Self = Self(15);
+    pub const CROP: Self = Self(16);
+    /// Freshly plowed soil: loose and soft.
+    pub const PLOWED: Self = Self(17);
 }
 
 /// Physical and visual properties of a surface.
@@ -86,6 +91,17 @@ impl MaterialTable {
         }
     }
 
+    /// The standard table plus farmland (meadow, crop, plowed soil), for rural maps. The
+    /// standard table stays as it is so that the content hashes of other maps do not change.
+    pub fn rural() -> Self {
+        let mut t = Self::standard();
+        let m = Material::new;
+        t.push(m("meadow", 0.45, 0.06, 0.6, 0.4, [118, 150, 72]));
+        t.push(m("crop", 0.45, 0.08, 0.5, 0.45, [196, 176, 92]));
+        t.push(m("plowed", 0.5, 0.14, 0.3, 0.2, [112, 86, 62]));
+        t
+    }
+
     #[inline]
     pub fn get(&self, id: MaterialId) -> &Material {
         &self.materials[id.0 as usize]
@@ -133,6 +149,11 @@ mod tests {
         ] {
             assert_eq!(t.get(id).name, name);
             assert_eq!(t.find(name), Some(id));
+        }
+        let r = MaterialTable::rural();
+        assert_eq!(r.len(), t.len() + 3);
+        for (id, name) in [(MaterialId::MEADOW, "meadow"), (MaterialId::CROP, "crop"), (MaterialId::PLOWED, "plowed")] {
+            assert_eq!(r.find(name), Some(id));
         }
     }
 }

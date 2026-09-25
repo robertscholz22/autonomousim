@@ -9,7 +9,8 @@ use autonomousim_core::material::MaterialId;
 use autonomousim_core::terrain::Terrain;
 use autonomousim_procgen::rural::{self, RURAL_VERSION, RuralConfig, RuralPreset};
 use autonomousim_procgen::{MapCache, ProcgenError};
-use autonomousim_world::{NodeKind, RoadClass, StaticWorld};
+use autonomousim_world::obstacles::tags;
+use autonomousim_world::{NodeKind, ObstacleShape, RoadClass, StaticWorld};
 use glam::DVec2;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -89,13 +90,15 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
     assert!(stats.roads[0] >= 1 && stats.farms >= 1, "seed {seed}: {stats:?}");
     assert!(stats.farms * 2 >= stats.farm_sites, "seed {seed}: most farms connect: {stats:?}");
 
-    // Every farm yard is reachable from both ends of the main road.
+    // Every farm yard and field gate is reachable from both ends of the main road.
     let ends: Vec<DVec2> =
         net.nodes().iter().filter(|n| n.kind == NodeKind::End).map(|n| n.position.truncate()).collect();
     assert_eq!(ends.len(), 2);
     let yards: Vec<_> = net.nodes().iter().filter(|n| n.kind == NodeKind::Yard).collect();
     assert_eq!(yards.len(), stats.farms);
-    for y in &yards {
+    let gates = net.nodes().iter().filter(|n| n.kind == NodeKind::Gate);
+    assert_eq!(gates.clone().count(), stats.tracks);
+    for y in yards.iter().copied().chain(gates) {
         for &e in &ends {
             assert!(net.route(y.position.truncate(), e, 1.0).is_some(), "seed {seed}: farm at {} cut off", y.position);
         }
@@ -147,12 +150,79 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
         }
     }
 
+    // Parcels cover most of the land; every farm has buildings.
+    let cells = t.materials().len() as f64;
+    let farmland = t
+        .materials()
+        .iter()
+        .filter(|m| {
+            matches!(**m, MaterialId::MEADOW | MaterialId::CROP | MaterialId::PLOWED | MaterialId::FOREST_FLOOR)
+        })
+        .count() as f64;
+    assert!(farmland > 0.5 * cells, "seed {seed}: parcels cover only {:.0} %", 100.0 * farmland / cells);
+    assert!(stats.parcels >= 10 && stats.buildings >= stats.farms, "seed {seed}: {stats:?}");
+    assert!(stats.hedges > 0 && stats.fences > 0 && stats.trees > 0, "seed {seed}: {stats:?}");
+
+    // No obstacle on a road (below 4 m above it), in a yard or in water.
+    let mut by_tag = [0usize; 16];
+    for o in w.obstacles().obstacles() {
+        by_tag[o.tag as usize] += 1;
+        let p = o.pose.pos;
+        let (points, bottom): (Vec<DVec2>, f64) = match &o.shape {
+            ObstacleShape::Cuboid { half_extents: he } => {
+                let mut pts = Vec::new();
+                for i in 0..=4 {
+                    for j in 0..=4 {
+                        let local = glam::DVec3::new(he.x * (i as f64 / 2.0 - 1.0), he.y * (j as f64 / 2.0 - 1.0), 0.0);
+                        pts.push(o.pose.transform_point(local).truncate());
+                    }
+                }
+                (pts, p.z - he.z)
+            }
+            ObstacleShape::Sphere { radius } => (ring(p.truncate(), *radius), p.z - radius),
+            ObstacleShape::Capsule { half_height, radius } => (ring(p.truncate(), *radius), p.z - half_height - radius),
+            ObstacleShape::Cylinder { half_height, radius } | ObstacleShape::Cone { half_height, radius } => {
+                (ring(p.truncate(), *radius), p.z - half_height)
+            }
+            ObstacleShape::ConvexHull { .. } => panic!("no hulls on rural maps"),
+        };
+        for q in points {
+            if let Some(rp) = net.on_road(q) {
+                assert!(
+                    bottom >= rp.projection.point.z + 4.0,
+                    "seed {seed}: obstacle tag {} over the road at {q} (bottom {bottom:.2})",
+                    o.tag
+                );
+            }
+            assert_ne!(
+                t.material(q.x, q.y),
+                MaterialId::CONCRETE,
+                "seed {seed}: obstacle tag {} in a yard at {q}",
+                o.tag
+            );
+        }
+        assert!(t.water_level(p.x, p.y).is_none(), "seed {seed}: obstacle tag {} in water at {p}", o.tag);
+    }
+    assert_eq!(by_tag[tags::BUILDING as usize] + by_tag[tags::SILO as usize], stats.buildings);
+    assert_eq!(by_tag[tags::FENCE as usize], stats.fences);
+    assert_eq!(by_tag[tags::TRUNK as usize], stats.trees);
+
     // Yards are flat concrete.
     for y in &yards {
         let p = y.position;
         assert_eq!(t.material(p.x, p.y), MaterialId::CONCRETE);
         assert!((t.height(p.x, p.y) - p.z).abs() < 0.05, "seed {seed}: yard at {p} not flat");
     }
+}
+
+/// The centre and eight points around a circle.
+fn ring(c: DVec2, r: f64) -> Vec<DVec2> {
+    let mut out = vec![c];
+    out.extend((0..8).map(|k| {
+        let a = std::f64::consts::TAU * k as f64 / 8.0;
+        c + r * DVec2::new(a.cos(), a.sin())
+    }));
+    out
 }
 
 #[test]
@@ -186,12 +256,17 @@ fn config_round_trips_and_is_validated() {
         let text = toml::to_string(&c).unwrap();
         assert_eq!(toml::from_str::<RuralConfig>(&text).unwrap(), c);
     }
-    let c: RuralConfig = toml::from_str("size = 256.0\n[farms]\nspacing = 100.0").unwrap();
-    assert_eq!((c.size, c.farms.spacing), (256.0, 100.0));
+    let c: RuralConfig = toml::from_str("size = 256.0\n[farms]\nspacing = 100.0\n[scatter]\nhedge = 0.5").unwrap();
+    assert_eq!((c.size, c.farms.spacing, c.scatter.hedge), (256.0, 100.0, 0.5));
     assert!(toml::from_str::<RuralConfig>("sise = 256.0").is_err());
-    for bad in
-        [RuralConfig { size: 255.0, ..RuralConfig::training() }, RuralConfig { cell: 3.0, ..RuralConfig::training() }]
-    {
+    for bad in [
+        RuralConfig { size: 255.0, ..RuralConfig::training() },
+        RuralConfig { cell: 3.0, ..RuralConfig::training() },
+        RuralConfig {
+            scatter: autonomousim_procgen::ScatterConfig { hedge: 0.8, fence: 0.5, ..Default::default() },
+            ..RuralConfig::training()
+        },
+    ] {
         assert!(matches!(rural::generate(&bad, 0), Err(ProcgenError::Config(_))));
     }
     let o = serde_json::json!({"roads": {"paved": {"width": 7.0}}});

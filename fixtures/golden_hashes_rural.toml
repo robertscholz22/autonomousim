@@ -5,16 +5,16 @@
 preset = "training"
 size = 512.0
 seed = 1
-hash = "d31569b8050905333c80a47f2ba1c6f8bd967105780a615f2dd67e820f21e7ab"
+hash = "fb7b72d6b98c76dd9b9f4a9eff9bb4a5eb7a1896cff7f95957fa526d87ee6e09"
 
 [[rural]]
 preset = "training"
 size = 512.0
 seed = 2
-hash = "1ef07afaede2dc07494a540abbfbcc218b7c49be6f799bcad8bbf24360e17319"
+hash = "92b54c101f36061db7b0f3184b6bcf3a7b8c67ba4692a1228817ad14dc10e1df"
 
 [[rural]]
 preset = "showcase"
 size = 1024.0
 seed = 3
-hash = "00a70dd24cc6e98d00ac7120b85140667332cc34b63d03dd7c8047004b6c1909"
+hash = "3b4cfdc6497eae56d90bfc79a1e6c3d4500eb54c318cd94defc208e3002e8330"

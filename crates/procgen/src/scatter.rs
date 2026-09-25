@@ -302,7 +302,7 @@ pub(crate) fn trees(g: &Ground, c: &TreesConfig, seed: &Seed) -> Trees {
 }
 
 /// Broadleaf tree standing at `base`: a solid capsule trunk and a spherical foliage crown.
-fn broadleaf(base: DVec3, height: f64) -> [Obstacle; 2] {
+pub(crate) fn broadleaf(base: DVec3, height: f64) -> [Obstacle; 2] {
     let trunk_r = 0.03 * height;
     let trunk_hh = 0.25 * height;
     let crown_r = 0.3 * height;

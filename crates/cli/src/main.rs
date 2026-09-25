@@ -100,8 +100,8 @@ enum Generator {
 
 /// The effective configuration of either generator.
 enum Config {
-    Wild(WildConfig),
-    Rural(RuralConfig),
+    Wild(Box<WildConfig>),
+    Rural(Box<RuralConfig>),
 }
 
 /// Statistics of either generator.
@@ -129,7 +129,7 @@ fn config(args: &MapgenArgs) -> anyhow::Result<Config> {
                 c.size = size;
             }
             c.validate()?;
-            Config::Wild(c)
+            Config::Wild(Box::new(c))
         }
         Generator::Rural => {
             let mut c =
@@ -138,7 +138,7 @@ fn config(args: &MapgenArgs) -> anyhow::Result<Config> {
                 c.size = size;
             }
             c.validate()?;
-            Config::Rural(c)
+            Config::Rural(Box::new(c))
         }
     })
 }
@@ -242,9 +242,10 @@ fn print_rural_stats(s: &RuralStats) {
     }
     println!("  {:<18} {:>7.3} s", "total", s.total_seconds());
     println!(
-        "lakes {} ({} cells), farms {} of {} sites, {} junctions",
-        s.lakes, s.lake_cells, s.farms, s.farm_sites, s.junctions
+        "lakes {} ({} cells), farms {} of {} sites, {} junctions, {} parcels, {} field tracks",
+        s.lakes, s.lake_cells, s.farms, s.farm_sites, s.junctions, s.parcels, s.tracks
     );
+    println!("buildings {}, hedge pieces {}, fence pieces {}, trees {}", s.buildings, s.hedges, s.fences, s.trees);
     println!("heights {:.1} … {:.1} m", s.height_range.0, s.height_range.1);
     let cells: usize = s.materials.iter().map(|m| m.1).sum();
     let shares: Vec<String> =
@@ -268,6 +269,10 @@ fn info(w: &StaticWorld, hash: &str) -> String {
         tags::ROCK => "rocks".to_owned(),
         tags::PILLAR => "pillars".to_owned(),
         tags::WALL => "walls".to_owned(),
+        tags::HEDGE => "hedge pieces".to_owned(),
+        tags::FENCE => "fence pieces".to_owned(),
+        tags::BUILDING => "buildings".to_owned(),
+        tags::SILO => "silos".to_owned(),
         t => format!("tag {t}"),
     };
     let obstacles: Vec<String> = by_tag.iter().map(|(t, n)| format!("{n} {}", tag(*t))).collect();

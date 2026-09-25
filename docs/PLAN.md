@@ -1212,7 +1212,7 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
 |---|---|---|
 | 1 | `world::roads`: network type, segment grid and queries, routes; map file version 2 (done 2026-09-25) | Queries match brute force on random networks; routes are shortest; old map files still load; map files round-trip with roads |
 | 2 | `procgen::rural` terrain, farm sites, road routing, terrain blending, road materials; `RuralConfig` and presets (done 2026-09-25) | Every farm is connected; grades and curvatures stay within the class limits; roads stay out of water; the hash is identical with 1 and 12 threads; golden hashes committed; 512 m in < 1.5 s, 2 km in < 20 s |
-| 3 | Fields, new materials (meadow, crop, plowed soil), buildings, hedges, fences, tree lines, woods | Parcels cover the farmland; no obstacle on a road or in a yard; gates connect tracks to fields; invariants tested; goldens re-blessed |
+| 3 | Fields, new materials (meadow, crop, plowed soil), buildings, hedges, fences, tree lines, woods (done 2026-09-25) | Parcels cover the farmland; no obstacle on a road or in a yard; gates connect tracks to fields; invariants tested; goldens re-blessed |
 | 4 | Simulation: `MapSource::Rural`, `on_road` spawns, `route` goals, `road`/`route`/`on_road` terms, road cost in `DriveGrid`; Python `map="rural"` | A car spawned `on_road` sits in its lane; routes follow the roads; terms match references; the Python env runs on rural maps |
 | 5 | Viewer: road ribbons, buildings, hedges and fences, `--map rural`, route display | A rural showcase renders at ≥ 60 fps at 1080p "medium" on the Iris Xe; the car drives on the roads by keyboard |
 | 6 | `RoadFollowRural-v0`, a short training run, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
@@ -1238,6 +1238,33 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
   - Config round-trip and validation.
   - Cache round-trip with roads.
   - An ignored release test times the showcase and checks its invariants.
+
+**As built in step 3** (`procgen::farmland`, `RURAL_VERSION` 2):
+- **Materials**: `MaterialId::{MEADOW, CROP, PLOWED}` (15–17) live in `MaterialTable::rural()`, the standard table plus three entries. The table is part of the content hash, so leaving `standard()` alone keeps the wild goldens and existing recordings unchanged.
+- **Parcels**: the Voronoi cells of a jittered grid of centres (120 m training, 150 m showcase; jitter 0.8), extending one cell beyond the map. `locate(p)` returns the parcel and the distance to its edge from a 5×5 neighbourhood, per cell and in parallel. Parcel kinds are meadow, crop or plowed by share. A parcel is woods with probability 0.08, or always when its centre is steeper than 15°. A 10° threshold turned 40 % of the map into woods.
+- **Materials per cell**, in order of precedence: lake beds; yard concrete; road surfaces; rock on steep ground; shore sand; marsh mud; grass on 2 m verges beyond the road edges, on the farm pads and on 2 m headlands along parcel edges; otherwise the parcel's material. Parcels cover 55–75 % of a map.
+- **Tracks**: every non-woods parcel whose centre lies on the map (20 m inside), away from the farms and more than 50 m from any road gets a dirt track. Tracks join the nearest road, nearest first, and end at a `Gate` node at the parcel centre. The field gates are the gaps where tracks cross hedges.
+- **Farm pads**: routes avoid a circle around every other farm (cost × 20). The own farm's road may cross its pad, and field tracks avoid all pads. The yard is levelled together with a 14 m pad around it, which holds the buildings.
+- **A\* workspace**: it is reused between runs, and only the touched states are reset. Without that, clearing the 16 × 513² state arrays for about 150 tracks would dominate the showcase.
+- **Obstacles** (new tags `HEDGE`, `FENCE`, `BUILDING`, `SILO`):
+  - Buildings stand outside the yard on its pad, away from the road side: a barn behind, a house on one side, a shed on the other, and sometimes a silo.
+  - Parcel edges are found by sampling each neighbour pair's bisector from the midpoint. 40 % carry a hedge (3 m foliage cuboids 1.4 m wide and 1.6–2.8 m tall, each around a solid 0.3 m woody core), 30 % a wire fence (4 m solid cuboids, 0.1 m thick and 1.2 m tall), and the rest stay open. Edges between two woods stay open.
+  - 35 % of roads get broadleaf tree lines (12–17 m tall, 3.5–4.5 m beyond the edge, every 12 m).
+  - Woods and single trees on grass come from the wild tree scatter.
+- **Clearance**: every obstacle group (a tree's trunk and crown, a hedge's foliage and core) is dropped as a whole unless all its members pass. A member passes when:
+  - it keeps 1.5 m from road edges, unless its lowest point is 4.5 m above the road (tree-line crowns);
+  - it stays out of yards and water and on the map.
+  
+  Round shapes are checked with their bounding circle. Cuboids use circles about 1 m apart, because a single bounding circle rejected most buildings next to their yards.
+- **Measured**: a 512 m map in about 0.2 s (≈ 1,000 hedge and 250 fence pieces, 200–1,400 trees, 8–10 buildings); the 2 km showcase in about 5 s (routing 2.1 s with 74 tracks, materials 1.1 s).
+- **Tests**, added to the rural invariants for 8 seeds:
+  - field gates are routable to both ends of the main road;
+  - parcels cover more than half the map;
+  - every farm has buildings; hedges, fences and trees exist;
+  - no obstacle footprint point lies on a road below 4 m above it, in a yard or in water;
+  - the statistics match the obstacle tags;
+  - the scatter configuration is validated.
+- `autonomousim mapgen` prints the farmland statistics, and its preview draws hedges, fences, buildings and silos.
 
 ### M4b: Trucks and trailers (outline, detailed when it starts)
 - **Articulated vehicles**: a wheeled vehicle becomes a chain of units (tractor, then trailers), each a body in the same tree. A fifth wheel is a Spherical joint with roll stiffness and pitch stops; a drawbar is two revolute joints (a dolly). Axles, colliders and forces attach to their unit's link instead of link 0.

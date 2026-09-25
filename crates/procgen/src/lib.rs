@@ -6,6 +6,7 @@
 //! and anything order-dependent runs sequentially.
 
 pub mod cache;
+mod farmland;
 mod hydrology;
 pub mod noise;
 pub mod rural;
@@ -14,6 +15,7 @@ mod terrain;
 pub mod wild;
 
 pub use cache::MapCache;
+pub use farmland::{FieldsConfig, ScatterConfig};
 pub use rural::{RuralConfig, RuralPreset, RuralStats};
 pub use scatter::{RocksConfig, TreesConfig};
 pub use terrain::{ErosionConfig, TerrainConfig};

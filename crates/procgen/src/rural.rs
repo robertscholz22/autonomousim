@@ -1,11 +1,13 @@
-//! Rural maps: gentle farmland with a road network, farm yards and (later) fields.
+//! Rural maps: gentle farmland with a road network, farms and fields.
 //!
 //! Pipeline:
 //! 1. The wild landform (terrain noise, erosion, upsampling, lakes) with gentle relief.
-//! 2. Farm sites: flat, dry, low places, at least `farms.spacing` apart.
+//! 2. Farm sites: flat, dry, low places, at least `farms.spacing` apart; field parcels (the
+//!    Voronoi cells of a jittered grid), each meadow, crop, plowed soil or woods.
 //! 3. Roads, routed by A* on a coarse grid (length, grade, side slope and turning cost; water
-//!    and its surroundings forbidden): a paved main road across the map, then a gravel road
-//!    from each farm to the nearest road built so far.
+//!    and its surroundings forbidden, other farms avoided): a paved main road across the map,
+//!    then a gravel road from each farm and a dirt track to each field far from the roads,
+//!    each to the nearest road built so far.
 //! 4. The routed paths, split at junctions, become centripetal Catmull–Rom splines resampled
 //!    every metre, smoothed until they respect the class's minimum radius.
 //! 5. Road profiles: terrain heights along each road, smoothed, pinned to the node heights and
@@ -13,16 +15,21 @@
 //! 6. Terrain blending: the road surfaces (with a crown) and the farm yards are cut or filled
 //!    into the terrain, with shoulders falling off smoothly.
 //! 7. Materials per cell: roads (asphalt, gravel, dirt), yards (concrete), lake beds and
-//!    shores, rock on steep slopes, marsh, grass.
+//!    shores, rock on steep slopes, marsh, grass verges and headlands, and the parcels' crops.
+//! 8. Obstacles: farm buildings, hedges and fences along parcel edges, tree lines along some
+//!    roads, woods and single trees; none on a road (below the headroom) or in a yard.
 //!
 //! As for wild maps, the result depends only on the configuration and the seed.
 
 use crate::ProcgenError;
+use crate::farmland::{self, Clearance, FieldsConfig, ParcelKind, Parcels, ScatterConfig};
 use crate::noise::smoothstep;
+use crate::scatter::{Ground, trees};
 use crate::terrain::{ErosionConfig, TerrainConfig};
 use crate::wild::{Land, WaterConfig, landform, merge, moisture, nearby_water};
 use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::rng::Seed;
+use autonomousim_world::obstacles::{ObstacleClass, tags};
 use autonomousim_world::{
     GeoOrigin, HeightGrid, MapMeta, NodeKind, ObstacleSet, Polyline, Road, RoadClass, RoadNetwork, RoadNode,
     StaticWorld,
@@ -35,7 +42,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const RURAL_VERSION: u32 = 1;
+pub const RURAL_VERSION: u32 = 2;
 
 /// Geometry limits of one road class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -130,11 +137,13 @@ pub struct FarmsConfig {
     /// Farms keep this far from water (m) and from the map edge.
     pub water_clearance: f64,
     pub margin: f64,
+    /// Ground levelled around the yard for the buildings (m beyond the yard).
+    pub pad: f64,
 }
 
 impl Default for FarmsConfig {
     fn default() -> Self {
-        Self { spacing: 160.0, yard: [20.0, 15.0], max_relief: 5.0, water_clearance: 30.0, margin: 60.0 }
+        Self { spacing: 160.0, yard: [20.0, 15.0], max_relief: 5.0, water_clearance: 30.0, margin: 60.0, pad: 14.0 }
     }
 }
 
@@ -170,7 +179,9 @@ pub struct RuralConfig {
     pub water: WaterConfig,
     pub farms: FarmsConfig,
     pub roads: RoadsConfig,
+    pub fields: FieldsConfig,
     pub materials: RuralMaterialsConfig,
+    pub scatter: ScatterConfig,
 }
 
 impl Default for RuralConfig {
@@ -237,7 +248,9 @@ impl RuralConfig {
             water: WaterConfig::default(),
             farms: FarmsConfig::default(),
             roads: RoadsConfig::default(),
+            fields: FieldsConfig::default(),
             materials: RuralMaterialsConfig::default(),
+            scatter: ScatterConfig::default(),
         }
     }
 
@@ -246,6 +259,7 @@ impl RuralConfig {
             size: 2048.0,
             terrain: TerrainConfig { relief: 120.0, ..Self::terrain() },
             farms: FarmsConfig { spacing: 260.0, ..FarmsConfig::default() },
+            fields: FieldsConfig { spacing: 150.0, ..FieldsConfig::default() },
             ..Self::training()
         }
     }
@@ -282,9 +296,12 @@ impl RuralConfig {
             self.erosion.validate()?;
             self.roads.validate(self.cell)?;
             let f = &self.farms;
-            if !(f.spacing > 0.0 && f.yard[0] > 0.0 && f.yard[1] > 0.0 && f.max_relief >= 0.0 && f.margin >= 0.0) {
-                return Err("farms: spacing and yard must be positive, max_relief and margin ≥ 0".into());
+            let sizes = f.spacing > 0.0 && f.yard[0] > 0.0 && f.yard[1] > 0.0;
+            if !(sizes && f.max_relief >= 0.0 && f.margin >= 0.0 && f.pad >= 0.0) {
+                return Err("farms: spacing and yard must be positive, max_relief, margin and pad ≥ 0".into());
             }
+            self.fields.validate()?;
+            self.scatter.validate()?;
             let m = &self.materials;
             if !(m.rock_slope_deg > 0.0 && m.rock_slope_deg < 90.0 && m.shore_width >= 0.0) {
                 return Err("materials: rock_slope_deg in (0, 90), shore_width ≥ 0".into());
@@ -314,6 +331,14 @@ pub struct RuralStats {
     pub roads: [usize; 3],
     pub road_length: [f64; 3],
     pub junctions: usize,
+    /// Field parcels on the map, and fields reached by a track.
+    pub parcels: usize,
+    pub tracks: usize,
+    /// Obstacles: buildings (with silos), hedge and fence pieces, trees.
+    pub buildings: usize,
+    pub hedges: usize,
+    pub fences: usize,
+    pub trees: usize,
     pub height_range: (f64, f64),
     /// Cells per material id.
     pub materials: Vec<(String, usize)>,
@@ -352,10 +377,24 @@ impl Heights<'_> {
 
 /// A farm yard: a flat rectangle at `z`, turned by `heading` (its long side along it).
 #[derive(Clone, Debug)]
-struct Yard {
-    centre: DVec2,
-    z: f64,
-    heading: f64,
+pub(crate) struct Yard {
+    pub centre: DVec2,
+    pub z: f64,
+    pub heading: f64,
+}
+
+impl Yard {
+    /// `p` in the yard's frame.
+    fn local(&self, p: DVec2) -> DVec2 {
+        let (s, co) = self.heading.sin_cos();
+        let d = p - self.centre;
+        DVec2::new(co * d.x + s * d.y, -s * d.x + co * d.y)
+    }
+
+    /// Distance from `p` to the rectangle with half extents `half` (0 inside).
+    pub(crate) fn distance(&self, p: DVec2, half: DVec2) -> f64 {
+        (self.local(p).abs() - half).max(DVec2::ZERO).length()
+    }
 }
 
 /// Generate a rural map. Uses the current rayon pool; the output does not depend on its size.
@@ -390,15 +429,42 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
         near[cy * (n - 1) + cx] > f32::NEG_INFINITY
     };
 
-    // 2. Farm sites.
+    // 2. Farm sites and field parcels.
     let hs = Heights { h: &heights, n, origin, cell: c.cell };
     let sites = farm_sites(c, &hs, &|p| wet(&near_farm_water, p), &root.child("farms"));
     stats.farm_sites = sites.len();
+    let slope = |p: DVec2| {
+        let d = 10.0;
+        let gx = hs.at(p + DVec2::X * d) - hs.at(p - DVec2::X * d);
+        let gy = hs.at(p + DVec2::Y * d) - hs.at(p - DVec2::Y * d);
+        (gx * gx + gy * gy).sqrt() / (2.0 * d)
+    };
+    let parcels = Parcels::new(&c.fields, c.size, &slope, &root.child("parcels"));
+    let yard_half = DVec2::new(c.farms.yard[0], c.farms.yard[1]);
+    let pad_half = yard_half + c.farms.pad;
+    let pad_radius = pad_half.length() + 4.0;
+    // Field gates: parcel centres on the map, away from the farms.
+    let inner = 0.5 * c.size - 20.0;
+    let gates: Vec<DVec2> = parcels
+        .centres
+        .iter()
+        .zip(&parcels.kinds)
+        .filter(|&(p, &kind)| {
+            kind != ParcelKind::Woods
+                && p.x.abs() < inner
+                && p.y.abs() < inner
+                && sites.iter().all(|s| s.distance(*p) > pad_radius + 10.0)
+        })
+        .map(|(p, _)| *p)
+        .collect();
     stats.stage("farm sites", &mut t);
 
     // 3. Routing.
-    let grid = RouteGrid::new(c, &hs, &|p| wet(&near_road_water, p));
-    let plan = route_roads(c, &grid, &sites, &mut root.child("roads").rng());
+    let mut grid = RouteGrid::new(c, &hs, &|p| wet(&near_road_water, p));
+    for (k, &site) in sites.iter().enumerate() {
+        grid.mark_pad(k, site, pad_radius);
+    }
+    let plan = route_roads(c, &grid, &sites, &gates, &mut root.child("roads").rng());
     stats.farms = plan.farms.len();
     stats.stage("routing", &mut t);
 
@@ -410,7 +476,6 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
     stats.stage("splines", &mut t);
 
     // 5. Profiles: yard levels, node heights, then each road pinned to its nodes.
-    let (yx, yy) = (c.farms.yard[0], c.farms.yard[1]);
     let yards: Vec<Yard> = plan
         .farms
         .iter()
@@ -425,7 +490,7 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
             let mut count = 0.0;
             for i in -4..=4 {
                 for j in -4..=4 {
-                    let local = DVec2::new(yx * i as f64 / 4.0, yy * j as f64 / 4.0);
+                    let local = DVec2::new(pad_half.x * i as f64 / 4.0, pad_half.y * j as f64 / 4.0);
                     sum += hs.at(centre + DVec2::new(co * local.x - s * local.y, s * local.x + co * local.y));
                     count += 1.0;
                 }
@@ -470,6 +535,7 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
         .map(|(nd, &z)| RoadNode { position: nd.position.extend(z), kind: nd.kind })
         .collect();
     stats.junctions = nodes.iter().filter(|n| n.kind == NodeKind::Junction).count();
+    stats.tracks = nodes.iter().filter(|n| n.kind == NodeKind::Gate).count();
     for r in &roads {
         let k = r.class as usize;
         stats.roads[k] += 1;
@@ -479,18 +545,26 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
     stats.stage("profiles", &mut t);
 
     // 6. Terrain blending.
-    blend(c, &mut heights, n, origin, &network, &yards);
+    blend(c, &mut heights, n, origin, &network, &yards, pad_half);
     stats.stage("blending", &mut t);
 
     // 7. Materials.
     let moisture = moisture(&acc, n);
     drop(acc);
-    let materials = materials(c, origin, &heights, &water, &moisture, &network, &yards);
-    let table = MaterialTable::standard();
+    let land = Landuse { net: &network, yards: &yards, yard_half, pad_half, parcels: &parcels };
+    let (materials, slope) = materials(c, origin, &heights, &water, &moisture, &land);
+    drop(moisture);
+    let table = MaterialTable::rural();
     let mut counts = [0usize; 256];
-    for id in &materials {
+    let mut seen = vec![false; parcels.centres.len()];
+    for (k, id) in materials.iter().enumerate() {
         counts[id.0 as usize] += 1;
+        if matches!(*id, MaterialId::MEADOW | MaterialId::CROP | MaterialId::PLOWED | MaterialId::FOREST_FLOOR) {
+            let p = origin + (DVec2::new((k % (n - 1)) as f64, (k / (n - 1)) as f64) + 0.5) * c.cell;
+            seen[parcels.locate(p).0] = true;
+        }
     }
+    stats.parcels = seen.iter().filter(|&&s| s).count();
     stats.materials = (0..256)
         .filter(|&i| counts[i] > 0)
         .map(|i| {
@@ -502,11 +576,53 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
     stats.height_range = grid.height_range();
     stats.stage("materials", &mut t);
 
+    // 8. Obstacles.
+    let sc = &c.scatter;
+    let r = &c.roads;
+    let clear = Clearance {
+        net: &network,
+        yards: &yards,
+        yard_half,
+        grid: &grid,
+        clearance: sc.road_clearance,
+        headroom: sc.road_headroom,
+        max_half_width: 0.5 * r.paved.width.max(r.gravel.width).max(r.track.width),
+    };
+    let mut obstacles = Vec::new();
+    if sc.buildings {
+        let mut rng = root.child("buildings").rng();
+        let groups = yards.iter().flat_map(|y| farmland::buildings(y, yard_half, &grid, &mut rng)).collect::<Vec<_>>();
+        farmland::keep_clear(groups, &clear, &mut obstacles);
+    }
+    stats.buildings = obstacles.len();
+    let edges = farmland::edge_obstacles(sc, &parcels, &grid, &root.child("edges"));
+    // Hedges and fences keep off farm pads and leave gaps where tracks and roads pass.
+    let edges = edges.into_iter().filter(|g| {
+        let p = g[0].pose.pos.truncate();
+        yards.iter().all(|y| y.distance(p, pad_half) > 2.0)
+    });
+    let before = obstacles.len();
+    farmland::keep_clear(edges, &clear, &mut obstacles);
+    stats.hedges =
+        obstacles[before..].iter().filter(|o| o.tag == tags::HEDGE && o.class == ObstacleClass::Foliage).count();
+    stats.fences = obstacles[before..].iter().filter(|o| o.tag == tags::FENCE).count();
+    let before = obstacles.len();
+    farmland::keep_clear(farmland::tree_lines(sc, &network, &grid, &root.child("tree_lines")), &clear, &mut obstacles);
+    let ground = Ground { grid: &grid, slope: &slope, treeline: &|_, _| f64::INFINITY };
+    let scattered = trees(&ground, &sc.trees, &root.child("trees"));
+    let scattered = scattered.obstacles.chunks(2).map(|g| g.to_vec()).filter(|g| {
+        let p = g[0].pose.pos.truncate();
+        yards.iter().all(|y| y.distance(p, pad_half) > 1.0)
+    });
+    farmland::keep_clear(scattered, &clear, &mut obstacles);
+    stats.trees = obstacles[before..].iter().filter(|o| o.tag == tags::TRUNK).count();
+    stats.stage("obstacles", &mut t);
+
     let mut meta = MapMeta::new("rural", "rural", seed);
     meta.generator_version = RURAL_VERSION;
     meta.geo_origin = c.geo_origin;
-    let world = StaticWorld::new(meta, grid, ObstacleSet::new(Vec::new()), table).with_roads(network);
-    stats.stage("assembly", &mut t);
+    let world = StaticWorld::new(meta, grid, ObstacleSet::new(obstacles), table).with_roads(network);
+    stats.stage("obstacle index", &mut t);
     Ok((world, stats))
 }
 
@@ -595,6 +711,8 @@ struct RouteGrid {
     z: Vec<f64>,
     grad: Vec<DVec2>,
     blocked: Vec<bool>,
+    /// Farm pad around each vertex (index + 1; 0 for none): other roads avoid it.
+    pad: Vec<u16>,
 }
 
 impl RouteGrid {
@@ -617,7 +735,17 @@ impl RouteGrid {
             })
             .collect();
         let blocked = (0..m * m).into_par_iter().map(|i| wet(pos(i))).collect();
-        Self { m, cell, origin, z, grad, blocked }
+        Self { m, cell, origin, z, grad, blocked, pad: vec![0; m * m] }
+    }
+
+    /// Mark the vertices within `radius` of `centre` as the pad of farm `k`.
+    fn mark_pad(&mut self, k: usize, centre: DVec2, radius: f64) {
+        for (i, pad) in self.pad.iter_mut().enumerate() {
+            let p = self.origin + DVec2::new((i % self.m) as f64, (i / self.m) as f64) * self.cell;
+            if *pad == 0 && p.distance(centre) <= radius {
+                *pad = k as u16 + 1;
+            }
+        }
     }
 
     fn pos(&self, i: usize) -> DVec2 {
@@ -655,15 +783,17 @@ impl RouteGrid {
         Some(j)
     }
 
-    /// Cost of the move `d` from `i` to `j` for a road with maximum grade `max_grade`.
-    fn move_cost(&self, c: &RoadsConfig, i: usize, j: usize, d: usize, max_grade: f64) -> f64 {
+    /// Cost of the move `d` from `i` to `j` for a road with maximum grade `max_grade`, twenty
+    /// times higher inside a farm pad other than `own`.
+    fn move_cost(&self, c: &RoadsConfig, i: usize, j: usize, d: usize, max_grade: f64, own: u16) -> f64 {
         let (dx, dy) = DIRS[d];
         let dir = DVec2::new(dx as f64, dy as f64);
         let len = dir.length() * self.cell;
         let grade = (self.z[j] - self.z[i]).abs() / len;
         let side = 0.5 * (self.grad[i] + self.grad[j]).perp_dot(dir / dir.length()).abs();
         let steep = (grade - max_grade).max(0.0);
-        len * (1.0 + c.grade_cost * grade * grade + 400.0 * steep + c.side_slope_cost * side * side)
+        let pad = if self.pad[j] != 0 && self.pad[j] != own { 20.0 } else { 1.0 };
+        pad * len * (1.0 + c.grade_cost * grade * grade + 400.0 * steep + c.side_slope_cost * side * side)
     }
 }
 
@@ -685,23 +815,52 @@ impl PartialOrd for Open {
     }
 }
 
+/// Search state reused between A* runs: only the touched entries are reset.
+struct Search {
+    cost: Vec<f64>,
+    from: Vec<u32>,
+    touched: Vec<u32>,
+}
+
+impl Search {
+    fn new(g: &RouteGrid) -> Self {
+        let states = g.m * g.m * 16;
+        Self { cost: vec![f64::INFINITY; states], from: vec![u32::MAX; states], touched: Vec::new() }
+    }
+
+    fn reset(&mut self) {
+        for &s in &self.touched {
+            self.cost[s as usize] = f64::INFINITY;
+            self.from[s as usize] = u32::MAX;
+        }
+        self.touched.clear();
+    }
+}
+
+/// What a road being routed may do: its grade limit and the farm pad it may cross.
+struct Leg {
+    max_grade: f64,
+    own_pad: u16,
+}
+
 /// A* over (vertex, direction) states from `start` until `goal(vertex)`, with heuristic `h`.
 /// Turning by more than 67.5° in one step is not allowed. Returns the vertices of the path.
 fn astar(
     g: &RouteGrid,
     c: &RoadsConfig,
-    max_grade: f64,
+    leg: &Leg,
+    ws: &mut Search,
     start: usize,
     goal: &dyn Fn(usize) -> bool,
     h: &dyn Fn(usize) -> f64,
 ) -> Option<Vec<usize>> {
-    let states = g.m * g.m * 16;
-    let mut cost = vec![f64::INFINITY; states];
-    let mut from = vec![u32::MAX; states];
+    ws.reset();
+    let Search { cost, from, touched } = ws;
     let mut heap = BinaryHeap::new();
     for d in 0..16 {
         let s = start * 16 + d;
         cost[s] = 0.0;
+        touched.push(s as u32);
         heap.push(Open(h(start), s as u32));
     }
     let step_angle = std::f64::consts::TAU / 16.0;
@@ -726,9 +885,12 @@ fn astar(
             let nd = (d as i32 + turn).rem_euclid(16) as usize;
             let Some(w) = g.step(v, nd) else { continue };
             let a = turn as f64 * step_angle;
-            let nc = gs + g.move_cost(c, v, w, nd, max_grade) + c.turn_cost * g.cell * a * a;
+            let nc = gs + g.move_cost(c, v, w, nd, leg.max_grade, leg.own_pad) + c.turn_cost * g.cell * a * a;
             let ns = w * 16 + nd;
             if nc < cost[ns] {
+                if cost[ns] == f64::INFINITY {
+                    touched.push(ns as u32);
+                }
                 cost[ns] = nc;
                 from[ns] = s as u32;
                 heap.push(Open(nc + h(w), ns as u32));
@@ -847,14 +1009,22 @@ impl Plan {
     }
 }
 
-/// The main road across the map, then a road from each farm (nearest to the network first)
-/// to the nearest road built so far. Farms that cannot be reached are left out.
-fn route_roads(c: &RuralConfig, g: &RouteGrid, sites: &[DVec2], rng: &mut autonomousim_core::rng::SimRng) -> Plan {
+/// The main road across the map, then a road from each farm and a track to each field far
+/// from the roads (nearest to the network first) to the nearest road built so far.
+fn route_roads(
+    c: &RuralConfig,
+    g: &RouteGrid,
+    sites: &[DVec2],
+    fields: &[DVec2],
+    rng: &mut autonomousim_core::rng::SimRng,
+) -> Plan {
     let mut plan = Plan { paths: Vec::new(), node_at: BTreeMap::new(), nodes: Vec::new(), farms: Vec::new() };
     let r = &c.roads;
     let m = g.m;
+    let mut ws = Search::new(g);
     let half = 0.5 * c.size - 2.0;
     // Main road: between opposite edges, on dry ground; a few attempts.
+    let main = Leg { max_grade: r.paved.max_grade, own_pad: 0 };
     for attempt in 0..16 {
         let along_x = (rng.below(2) == 0) != (attempt % 2 == 1);
         let a = rng.range(-0.6, 0.6) * half;
@@ -869,7 +1039,7 @@ fn route_roads(c: &RuralConfig, g: &RouteGrid, sites: &[DVec2], rng: &mut autono
             continue;
         }
         let target = g.pos(vb);
-        let Some(path) = astar(g, r, r.paved.max_grade, va, &|v| v == vb, &|v| g.pos(v).distance(target)) else {
+        let Some(path) = astar(g, r, &main, &mut ws, va, &|v| v == vb, &|v| g.pos(v).distance(target)) else {
             continue;
         };
         plan.node(va, g.pos(va), NodeKind::End);
@@ -880,35 +1050,50 @@ fn route_roads(c: &RuralConfig, g: &RouteGrid, sites: &[DVec2], rng: &mut autono
     if plan.paths.is_empty() {
         return plan;
     }
-    // Farm roads, the farm nearest to the network first.
     let mut on_road = vec![false; m * m];
     for p in &plan.paths {
         for &v in &p.vertices {
             on_road[v] = true;
         }
     }
-    let dist = distance_to(g, &on_road);
-    let mut order: Vec<(f64, usize)> = sites.iter().enumerate().map(|(k, &p)| (dist[g.index(p)], k)).collect();
-    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    for (_, k) in order {
-        let site = sites[k];
-        let v = g.index(site);
-        if g.blocked[v] || on_road[v] {
-            continue;
-        }
+    // Farm roads (gravel), then field tracks, each joining the nearest road built so far,
+    // the one nearest to the network first. Places that cannot be reached are left out.
+    let mut connect = |points: &[DVec2], class: RoadClass, min_distance: f64, plan: &mut Plan| {
         let dist = distance_to(g, &on_road);
-        let Some(path) = astar(g, r, r.gravel.max_grade, v, &|w| on_road[w], &|w| 0.92 * dist[w]) else {
-            continue;
-        };
-        let node = plan.node(v, site, NodeKind::Yard);
-        let end = *path.last().expect("a path");
-        plan.node(end, g.pos(end), NodeKind::Junction);
-        for &w in &path {
-            on_road[w] = true;
+        let mut order: Vec<(f64, usize)> = points.iter().enumerate().map(|(k, &p)| (dist[g.index(p)], k)).collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, k) in order {
+            let p = points[k];
+            let v = g.index(p);
+            if g.blocked[v] || on_road[v] {
+                continue;
+            }
+            let dist = distance_to(g, &on_road);
+            if dist[v] < min_distance {
+                continue;
+            }
+            let (kind, own_pad) = match class {
+                RoadClass::Gravel => (NodeKind::Yard, k as u16 + 1),
+                _ => (NodeKind::Gate, 0),
+            };
+            let leg = Leg { max_grade: r.class(class).max_grade, own_pad };
+            let Some(path) = astar(g, r, &leg, &mut ws, v, &|w| on_road[w], &|w| 0.92 * dist[w]) else {
+                continue;
+            };
+            let node = plan.node(v, p, kind);
+            let end = *path.last().expect("a path");
+            plan.node(end, g.pos(end), NodeKind::Junction);
+            for &w in &path {
+                on_road[w] = true;
+            }
+            plan.paths.push(RoutedPath { class, vertices: path });
+            if class == RoadClass::Gravel {
+                plan.farms.push(Farm { centre: p, node });
+            }
         }
-        plan.paths.push(RoutedPath { class: RoadClass::Gravel, vertices: path });
-        plan.farms.push(Farm { centre: site, node });
-    }
+    };
+    connect(sites, RoadClass::Gravel, 0.0, &mut plan);
+    connect(fields, RoadClass::Track, c.fields.track_distance, &mut plan);
     plan
 }
 
@@ -1069,13 +1254,20 @@ fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, win
 
 // ------------------------------------------------------------------------------ blending
 
-/// Cut and fill the road surfaces and yards into the terrain.
-fn blend(c: &RuralConfig, heights: &mut [f32], n: usize, origin: DVec2, net: &RoadNetwork, yards: &[Yard]) {
+/// Cut and fill the road surfaces and farm pads into the terrain.
+fn blend(
+    c: &RuralConfig,
+    heights: &mut [f32],
+    n: usize,
+    origin: DVec2,
+    net: &RoadNetwork,
+    yards: &[Yard],
+    pad_half: DVec2,
+) {
     let r = &c.roads;
     let max_half = [&r.paved, &r.gravel, &r.track].iter().map(|k| 0.5 * k.width).fold(0.0, f64::max);
     // Deep cuts get wide shoulders; beyond this reach nothing is touched.
     let reach = max_half + 0.5 + r.shoulder.max(15.0);
-    let (yx, yy) = (c.farms.yard[0], c.farms.yard[1]);
     heights.par_chunks_mut(n).enumerate().for_each(|(iy, row)| {
         let y = origin.y + iy as f64 * c.cell;
         for (ix, h) in row.iter_mut().enumerate() {
@@ -1096,10 +1288,7 @@ fn blend(c: &RuralConfig, heights: &mut [f32], n: usize, origin: DVec2, net: &Ro
                 }
             }
             for yard in yards {
-                let (s, co) = yard.heading.sin_cos();
-                let d = p - yard.centre;
-                let local = DVec2::new(co * d.x + s * d.y, -s * d.x + co * d.y);
-                let out = (local.abs() - DVec2::new(yx, yy)).max(DVec2::ZERO).length();
+                let out = yard.distance(p, pad_half);
                 let shoulder = r.shoulder.max(1.5 * (yard.z - h0).abs());
                 let w = 1.0 - smoothstep(0.0, shoulder, out);
                 if w > 0.0 && best.is_none_or(|b| w > b.0) {
@@ -1115,15 +1304,24 @@ fn blend(c: &RuralConfig, heights: &mut [f32], n: usize, origin: DVec2, net: &Ro
 
 // ------------------------------------------------------------------------------ materials
 
+/// What covers the land: roads, yards and their pads, parcels.
+struct Landuse<'a> {
+    net: &'a RoadNetwork,
+    yards: &'a [Yard],
+    yard_half: DVec2,
+    pad_half: DVec2,
+    parcels: &'a Parcels,
+}
+
+/// Material and slope (rise over run) per cell.
 fn materials(
     c: &RuralConfig,
     origin: DVec2,
     heights: &[f32],
     water: &[f32],
     moisture: &[f32],
-    net: &RoadNetwork,
-    yards: &[Yard],
-) -> Vec<MaterialId> {
+    land: &Landuse,
+) -> (Vec<MaterialId>, Vec<f32>) {
     let m = &c.materials;
     let n = c.vertices();
     let cw = n - 1;
@@ -1133,33 +1331,36 @@ fn materials(
     } else {
         None
     };
-    let (yx, yy) = (c.farms.yard[0], c.farms.yard[1]);
+    let r = &c.roads;
+    let headland = c.fields.headland;
+    let reach = 0.5 * r.paved.width.max(r.gravel.width).max(r.track.width) + headland;
     let inv = 1.0 / c.cell;
     let mut out = vec![MaterialId::GRASS; cw * cw];
-    out.par_chunks_mut(cw).enumerate().for_each(|(cy, row)| {
+    let mut slopes = vec![0.0f32; cw * cw];
+    out.par_chunks_mut(cw).zip(slopes.par_chunks_mut(cw)).enumerate().for_each(|(cy, (row, slope_row))| {
         let y = origin.y + (cy as f64 + 0.5) * c.cell;
-        for (cx, mat) in row.iter_mut().enumerate() {
+        for (cx, (mat, slope_out)) in row.iter_mut().zip(slope_row.iter_mut()).enumerate() {
             let i = cy * n + cx;
             let (h00, h10, h01, h11) =
                 (heights[i] as f64, heights[i + 1] as f64, heights[i + n] as f64, heights[i + n + 1] as f64);
             let gx = 0.5 * (h10 - h00 + h11 - h01) * inv;
             let gy = 0.5 * (h01 - h00 + h11 - h10) * inv;
             let slope = (gx * gx + gy * gy).sqrt();
+            *slope_out = slope as f32;
             let z = 0.25 * (h00 + h10 + h01 + h11);
             let p = DVec2::new(origin.x + (cx as f64 + 0.5) * c.cell, y);
             let k = cy * cw + cx;
-            let in_yard = yards.iter().any(|yard| {
-                let (s, co) = yard.heading.sin_cos();
-                let d = p - yard.centre;
-                (co * d.x + s * d.y).abs() <= yx && (-s * d.x + co * d.y).abs() <= yy
-            });
             let wet = moisture[i].max(moisture[i + 1]).max(moisture[i + n]).max(moisture[i + n + 1]) as f64;
+            let road = land.net.nearest(p, reach).map(|rp| {
+                let road = &land.net.roads()[rp.road as usize];
+                (road.class, rp.projection.distance - 0.5 * road.width)
+            });
             *mat = if !water[k].is_nan() {
                 if water[k] as f64 - z < 0.5 { MaterialId::SAND } else { MaterialId::MUD }
-            } else if in_yard {
+            } else if land.yards.iter().any(|y| y.distance(p, land.yard_half) == 0.0) {
                 MaterialId::CONCRETE
-            } else if let Some(rp) = net.on_road(p) {
-                match net.roads()[rp.road as usize].class {
+            } else if let Some((class, _)) = road.filter(|r| r.1 <= 0.0) {
+                match class {
                     RoadClass::Paved => MaterialId::ASPHALT,
                     RoadClass::Gravel => MaterialId::GRAVEL,
                     RoadClass::Track => MaterialId::DIRT,
@@ -1170,10 +1371,16 @@ fn materials(
                 MaterialId::SAND
             } else if wet > m.marsh_moisture && slope < 0.05 {
                 MaterialId::MUD
-            } else {
+            } else if road.is_some_and(|r| r.1 < headland)
+                || land.yards.iter().any(|y| y.distance(p, land.pad_half) == 0.0)
+            {
                 MaterialId::GRASS
+            } else {
+                let (parcel, edge) = land.parcels.locate(p);
+                let kind = land.parcels.kinds[parcel];
+                if edge < headland && kind != ParcelKind::Woods { MaterialId::GRASS } else { kind.material() }
             };
         }
     });
-    out
+    (out, slopes)
 }
