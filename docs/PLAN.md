@@ -1077,7 +1077,7 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 | 1 | Neighbour observation terms, `agent_clearance` state column, xy grid for agent queries (done 2026-09-25; grid moved to step 5) | Terms match a brute-force reference on random swarms; order and ties deterministic; disabled agents are invisible; physics state hashes unchanged (goldens re-blessed for the new column only) |
 | 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors (done 2026-09-25) | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
 | 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario (done 2026-09-25) | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
-| 4 | PettingZoo `ParallelEnv` | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
+| 4 | PettingZoo `ParallelEnv` (done 2026-09-25) | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
 | 5 | Swarm performance | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
 | 6 | `ppo_multiagent.py` and a quick check task (`SwarmHover-v0`: N drones hold assigned slots in a formation without touching) | Formation error < 0.3 m and no agent contacts in 95 % of episodes after ≤ 15 min of training |
 | 7 | `SwarmWaypointForest-v0`, training, viewer | ≥ 80 % of agents finish their waypoints on unseen maps and < 2 % of agents collide with another agent; the exported policy flies the swarm in the viewer; a recorded episode replays |
@@ -1110,6 +1110,13 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
   - a world ends by termination when all its agents have stopped, another by truncation, each with its own episode length and a fresh spawn;
   - seeding reproduces every group of a mixed team;
   - a mixed team (3 drones with 19 observations and 4 actions, one 4×4 with 231 and 2) runs at 1 kHz and is truncated and reset per world.
+
+**As built in step 4** (`python/autonomousim/pettingzoo.py`):
+- `parallel_env(task, seed=..., num_threads=1)` wraps a one-world `MultiAgentVectorEnv` without autoreset. Agents are named `"<group>_<k>"`, and `observation_space(agent)` and `action_space(agent)` return one cached space object per agent. Actions of agents that are missing from the dict (stopped ones) are zero. `infos[agent]["events"]` holds the event bits; `state()` returns all agents' state rows in `possible_agents` order.
+- A stopping agent reports `terminations[agent] = True` once and leaves `env.agents`. At the time limit every agent still going is truncated and the list empties.
+- `task` is a `MultiAgentTask` or the name of one registered in `MULTI_TASKS` (`make_multi_task`; `MultiAgentVectorEnv` accepts names too).
+- `pettingzoo` 1.27 joined the dev group.
+- Tests: `parallel_api_test` (1000 cycles) and `parallel_seed_test` pass without warnings, for four hover drones and for a mixed team of two drones and a 4×4. Further tests check that a stopped agent leaves the dict outputs, and that the time limit truncates everyone and ends the episode.
 
 ## Roadmap after M1
 | M | Content | Validation |

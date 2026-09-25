@@ -43,12 +43,13 @@ import gymnasium as gym
 import numpy as np
 
 from autonomousim._native import BatchSim
-from autonomousim.tasks.multi import MultiAgentTask
+from autonomousim.tasks.multi import MultiAgentTask, make_multi_task
 from autonomousim.vector_env import _seeds
 
 
 class MultiAgentVectorEnv:
-    """``num_envs`` worlds of a multi-agent task, stepped in parallel on ``num_threads``
+    """``num_envs`` worlds of a multi-agent task (an instance, or a registered name with its
+    keyword arguments), stepped in parallel on ``num_threads``
     threads (0: one per logical CPU). ``seed`` sets the worlds' base seeds before the first
     ``reset``. With ``copy=False``, ``reset`` and ``step`` return views of the observation
     buffers, which the next call overwrites."""
@@ -56,17 +57,18 @@ class MultiAgentVectorEnv:
     def __init__(
         self,
         num_envs: int = 1,
-        task: MultiAgentTask | None = None,
+        task: str | MultiAgentTask | None = None,
         *,
         seed: int = 0,
         num_threads: int = 0,
         autoreset: bool = True,
         copy: bool = True,
+        **task_kwargs: Any,
     ):
         if task is None:
-            raise ValueError("pass a MultiAgentTask")
-        self.task = task
-        self.sim = BatchSim(json.dumps(task.scenario()), num_envs, seed, num_threads)
+            raise ValueError("pass a MultiAgentTask or the name of one")
+        self.task = make_multi_task(task, **task_kwargs)
+        self.sim = BatchSim(json.dumps(self.task.scenario()), num_envs, seed, num_threads)
         self.num_envs = num_envs
         self.groups: list[str] = list(self.sim.group_names)
         self.autoreset = autoreset

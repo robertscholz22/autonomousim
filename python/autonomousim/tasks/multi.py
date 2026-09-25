@@ -168,3 +168,21 @@ class MultiAgentTask:
 
 def _flat(state: np.ndarray) -> np.ndarray:
     return state.reshape(-1, state.shape[-1])
+
+
+#: Registered multi-agent tasks by name.
+MULTI_TASKS: dict[str, type[MultiAgentTask]] = {}
+
+
+def make_multi_task(task: str | MultiAgentTask, **kwargs: Any) -> MultiAgentTask:
+    """A multi-agent task from its registered name and keyword arguments, or the instance
+    itself."""
+    if isinstance(task, MultiAgentTask):
+        if kwargs:
+            raise TypeError("keyword arguments are only accepted with a task name")
+        return task
+    try:
+        cls = MULTI_TASKS[task]
+    except KeyError:
+        raise ValueError(f"unknown multi-agent task {task!r}; available: {sorted(MULTI_TASKS)}") from None
+    return cls(**kwargs)

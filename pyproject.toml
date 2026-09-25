@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "pytest>=8",
     "mcap>=1.4",
+    "pettingzoo>=1.25",
 ]
 # Reference implementations used only to generate test fixtures (tools/gen_*_fixtures.py).
 oracle = [
