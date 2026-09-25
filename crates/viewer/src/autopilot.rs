@@ -26,6 +26,8 @@ pub struct Autopilot {
     /// Episodes flown by the policy (per agent) and how many of them reached the last goal.
     pub flown: u64,
     pub finished: u64,
+    /// Of those, the episodes in which the agent hit another agent (`CRASH_AGENT`).
+    pub agent_crashes: u64,
 }
 
 impl Autopilot {
@@ -58,6 +60,7 @@ impl Autopilot {
             ended: None,
             flown: 0,
             finished: 0,
+            agent_crashes: 0,
         })
     }
 
@@ -78,6 +81,19 @@ impl Autopilot {
         }
     }
 
+    /// After a physics tick: stop the group's agents that just reached their last goal, as the
+    /// training environments do (frozen, out of contacts and the other agents' sensors).
+    pub fn after_tick(&self, world: &mut WorldInstance, manual: Option<usize>) {
+        let g = &world.scenario().groups[self.group];
+        let (first, count) = (g.first_agent, g.spec.count);
+        for i in first..first + count {
+            let a = &world.agents()[i];
+            if Some(i) != manual && a.events.contains(Events::FINISHED) && !a.disabled {
+                world.disable_agent(i);
+            }
+        }
+    }
+
     /// Whether the episode of every agent of the group is over (`latched`: events per agent
     /// since the reset) or the task would have truncated it.
     pub fn episode_over(&self, world: &WorldInstance, latched: &[Events]) -> bool {
@@ -93,6 +109,7 @@ impl Autopilot {
             if Some(i) != manual {
                 self.flown += 1;
                 self.finished += u64::from(latched[i].contains(Events::FINISHED));
+                self.agent_crashes += u64::from(latched[i].contains(Events::CRASH_AGENT));
             }
         }
     }
@@ -102,6 +119,7 @@ impl Autopilot {
 mod tests {
     use crate::sim::Sim;
     use autonomousim_core::rng::Seed;
+    use autonomousim_sim::Events;
     use autonomousim_sim::policy::PolicyFile;
     use autonomousim_sim::{Scenario, WorldInstance};
     use serde_json::json;
@@ -109,10 +127,14 @@ mod tests {
 
     /// Two drones on a flat test world and a policy that always flies forward at half speed.
     fn forward_policy(episode_time: f64) -> (PolicyFile, WorldInstance) {
+        forward_policy_with_goals(episode_time, json!({}))
+    }
+
+    fn forward_policy_with_goals(episode_time: f64, goals: serde_json::Value) -> (PolicyFile, WorldInstance) {
         let scenario = json!({
             "name": "t",
             "map": { "type": "testworld", "kind": "flat", "size": 400.0 },
-            "groups": [{ "name": "agent", "count": 2, "vehicle": "iris_like", "action_mode": "velocity" }],
+            "groups": [{ "name": "agent", "count": 2, "vehicle": "iris_like", "action_mode": "velocity", "goals": goals }],
         });
         let compiled = serde_json::from_value::<Scenario>(scenario.clone()).unwrap().compile().unwrap();
         let (obs, act) = (compiled.groups[0].obs_dim(), compiled.groups[0].act_dim());
@@ -175,6 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn agents_stop_at_their_last_goal() {
+        // One goal each at the spawn, within reach at once: both finish on the first tick.
+        let (file, world) = forward_policy_with_goals(60.0, json!({ "kind": "spawn", "radius": 1.0 }));
+        let start: Vec<_> = world.agents().iter().map(|a| a.vehicle.position()).collect();
+        let mut s = Sim::new(world);
+        s.autopilot = Some(super::Autopilot::new(&file, &s.world).unwrap());
+        for _ in 0..5 {
+            s.advance(0.1);
+        }
+        for (i, p) in start.iter().enumerate() {
+            let a = s.world.agent(i);
+            assert!(a.disabled && s.latched[i].contains(Events::FINISHED));
+            assert!(a.vehicle.position().distance(*p) < 0.05, "agent {i} kept flying");
+        }
+        // Both episodes are over: the next one starts after RESET_DELAY.
+        for _ in 0..16 {
+            s.advance(0.1);
+        }
+        let a = s.autopilot.as_ref().unwrap();
+        assert_eq!((s.episodes, a.flown, a.finished), (2, 2, 2));
+    }
+
+    #[test]
     fn a_policy_for_other_dimensions_is_rejected() {
         let (mut file, world) = forward_policy(1.0);
         file.group = "other".into();
@@ -195,10 +240,10 @@ mod tests {
     fn exported_policy_success_rate() {
         let path = std::env::var("AUTONOMOUSIM_POLICY").expect("AUTONOMOUSIM_POLICY");
         let file = PolicyFile::read(path).unwrap();
-        // Agents per world (AUTONOMOUSIM_AGENTS, default 1 as in training): they can collide.
-        let agents = std::env::var("AUTONOMOUSIM_AGENTS").map_or(1, |n| n.parse().unwrap());
+        // Agents per world (AUTONOMOUSIM_AGENTS, default as in training).
+        let agents = std::env::var("AUTONOMOUSIM_AGENTS").ok().map(|n| n.parse().unwrap());
         for map_seed in [1000, 1001, 1002, 1003] {
-            let sc = crate::policy_scenario(&file, map_seed, Some(agents), true).unwrap();
+            let sc = crate::policy_scenario(&file, map_seed, agents, true).unwrap();
             let world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(0));
             let mut s = Sim::new(world);
             s.autopilot = Some(super::Autopilot::new(&file, &s.world).unwrap());
@@ -206,7 +251,10 @@ mod tests {
                 s.advance(0.1);
             }
             let a = s.autopilot.as_ref().unwrap();
-            println!("map {map_seed}: {} of {} episodes reached the last goal", a.finished, a.flown);
+            println!(
+                "map {map_seed}: {} of {} agent episodes reached the last goal, {} hit another agent",
+                a.finished, a.flown, a.agent_crashes
+            );
         }
     }
 }

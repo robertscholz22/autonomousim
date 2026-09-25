@@ -135,6 +135,9 @@ fn status_window(
                         a.flown,
                         100.0 * a.finished as f64 / a.flown as f64
                     ));
+                    if a.agent_crashes > 0 {
+                        ui.label(format!("{} hit another agent", a.agent_crashes));
+                    }
                 }
             }
             if let Some(mut regen) = regen

@@ -316,6 +316,9 @@ impl Sim {
                 self.world.agent_mut(a).events = Events::NONE;
             }
             self.world.tick();
+            if let Some(a) = &self.autopilot {
+                a.after_tick(&mut self.world, manual);
+            }
             if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
                 r.on_tick(&self.world);
             }

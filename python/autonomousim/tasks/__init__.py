@@ -7,7 +7,7 @@ from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.hover import QuadHover
 from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.tasks.recover import QuadRecover
-from autonomousim.tasks.swarm import FormationHover, SwarmHover
+from autonomousim.tasks.swarm import FormationHover, SwarmForestDrone, SwarmHover, SwarmWaypointForest
 from autonomousim.tasks.waypoint_forest import QuadWaypointForest
 
 TASKS: dict[str, type[Task]] = {
@@ -41,7 +41,9 @@ __all__ = [
     "QuadHover",
     "QuadRecover",
     "QuadWaypointForest",
+    "SwarmForestDrone",
     "SwarmHover",
+    "SwarmWaypointForest",
     "Task",
     "Team",
     "make_task",

@@ -12,6 +12,12 @@ then read back and checked in two ways:
    hashes, the episode seeds and the recorded actions) reproduces every recorded state bit
    for bit. This is what the viewer's replay relies on.
 
+Multi-agent checkpoints (from ``ppo_multiagent.py``) fly their task in one world with the
+same policy for every agent of the group; each episode runs until every agent has stopped
+or the time is up. Agents the task stops (e.g. at their last waypoint) are disabled by
+Python between steps; the replay disables them at the same steps, found from the recorded
+states (``disabled`` with no other event bit).
+
 Recordings open in Foxglove Studio as well (``/agent/<id>/pose`` is a ``foxglove.PoseInFrame``).
 """
 
@@ -29,6 +35,8 @@ from gymnasium.vector import AutoresetMode
 from mcap.reader import make_reader
 
 from autonomousim import STATE, BatchSim, events
+from autonomousim.events import Event
+from autonomousim.multiagent import MultiAgentVectorEnv
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -43,7 +51,7 @@ def load_policy(path: pathlib.Path):
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("policy", type=pathlib.Path, help="policy.pt written by ppo_continuous.py or sac_continuous.py")
+    p.add_argument("policy", type=pathlib.Path, help="policy.pt written by ppo_continuous.py, sac_continuous.py or ppo_multiagent.py")
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--seed", type=int, default=0, help="episode k uses seed + k")
     p.add_argument("--out", type=pathlib.Path, default=None, help="default: recordings/<run>.mcap")
@@ -103,11 +111,22 @@ def read_recording(path: pathlib.Path) -> dict[str, Any]:
             if channel.topic == "/meta":
                 rec["meta"] = data
             elif channel.topic == "/episode":
-                rec["episodes"].append({"info": data, "states": [], "actions": []})
-            elif channel.topic == "/agent/0/state":
-                rec["episodes"][-1]["states"].append(data)
-            elif channel.topic == "/agent/0/action":
-                rec["episodes"][-1]["actions"].append(data["action"])
+                n = len(rec["meta"]["agents"]) if "agents" in rec["meta"] else 1
+                rec["episodes"].append(
+                    {"info": data, "states": [], "actions": [], "agents": [{"states": [], "actions": []} for _ in range(n)]}
+                )
+            elif channel.topic.startswith("/agent/"):
+                _, _, agent, kind = channel.topic.split("/")
+                ep = rec["episodes"][-1]
+                a = int(agent)
+                while len(ep["agents"]) <= a:
+                    ep["agents"].append({"states": [], "actions": []})
+                if kind == "state":
+                    ep["agents"][a]["states"].append(data)
+                elif kind == "action":
+                    ep["agents"][a]["actions"].append(data["action"])
+    for ep in rec["episodes"]:
+        ep["states"], ep["actions"] = ep["agents"][0]["states"], ep["agents"][0]["actions"]
     return rec
 
 
@@ -142,10 +161,151 @@ def replay(rec: dict[str, Any], seeds: list[int]) -> list[np.ndarray]:
     return out
 
 
+# ---------------------------------------------------------------------------- multi-agent
+
+
+def run_multi_episodes(policy, task: str, task_kwargs: dict[str, Any], group: str, args: argparse.Namespace, path):
+    """Fly the episodes of a multi-agent task in one world with a recorder; the policy flies
+    every agent of ``group``, other groups hold zero actions. Returns per-episode results and
+    the live state rows, ``[steps + 1, agents, STATE_DIM]`` (all groups in agent order)."""
+    envs = MultiAgentVectorEnv(1, task, seed=args.seed, num_threads=1, autoreset=False, **task_kwargs)
+    sim = envs.sim
+    results, live = [], []
+    for k in range(args.episodes):
+        obs, _ = envs.reset(seed=args.seed + k)
+        if k == 0:
+            sim.attach_recorder(0, str(path), state_hz=round(1.0 / sim.policy_dt), lidar=args.lidar)
+        rows = lambda: np.concatenate([envs.state[g][0] for g in envs.groups])  # noqa: E731
+        states = [rows()]
+        n = envs.count[group]
+        ret, seen = np.zeros(n), np.zeros(n, dtype=np.uint32)
+        finished = np.zeros(n, dtype=bool)
+        while True:
+            actions = {g: np.zeros(envs.action_space(g).shape, np.float32) for g in envs.groups}
+            actions[group][0] = policy(obs[group][0], deterministic=not args.stochastic)
+            obs, reward, terminated, truncated, info = envs.step(actions)
+            states.append(rows())
+            live_now = info["active"][group][0]
+            ret += np.where(live_now, reward[group][0], 0.0)
+            seen |= np.where(live_now, info["events"][group][0], 0).astype(np.uint32)
+            finished |= envs.task.success[group][0] & live_now
+            if info.get("_episode", [False])[0]:
+                break
+        crashed = (seen & int(Event.CRASH_AGENT)) != 0
+        results.append(
+            {
+                "seed": args.seed + k,
+                "return": float(ret.mean()),
+                "steps": len(states) - 1,
+                "outcome": f"{int(finished.sum())}/{n} finished",
+                "agent_crashes": int(crashed.sum()),
+                "events": events.names(int(np.bitwise_or.reduce(seen))),
+            }
+        )
+        live.append(np.array(states))
+    if not sim.detach_recorder(0):
+        raise RuntimeError("no recorder was attached")
+    map_hashes = sim.map_hashes
+    groups = [(g, envs.count[g], envs.act_dim[g]) for g in envs.groups]
+    envs.close()
+    return results, live, map_hashes, groups
+
+
+def replay_multi(rec: dict[str, Any], seeds: list[int], groups: list[tuple[str, int, int]]) -> list[np.ndarray]:
+    """Re-simulate every episode of a multi-agent recording from the file alone: scenario,
+    seeds, every agent's actions, and the agents the task stopped between steps."""
+    meta = rec["meta"]
+    sim = BatchSim(json.dumps(meta["scenario"]), 1, num_threads=1)
+    hashes = [m["hash"] for m in meta["maps"]]
+    if sim.map_hashes != hashes:
+        raise AssertionError(f"rebuilt maps differ from the recording: {sim.map_hashes} != {hashes}")
+    disabled_only = int(Event.DISABLED)
+    out = []
+    for ep, seed in zip(rec["episodes"], seeds):
+        sim.reset(seeds=[seed])
+        agents = ep["agents"]
+        rows = lambda: np.concatenate([sim.state(gi)[0] for gi in range(len(groups))])  # noqa: E731
+        states = [rows()]
+        for step in range(len(agents[0]["actions"])):
+            first = 0
+            acts = []
+            for _, count, dim in groups:
+                acts.append(np.array([agents[first + k]["actions"][step] for k in range(count)], np.float64).reshape(1, count, dim))
+                first += count
+            sim.step(acts)
+            # Agents stopped by the task after this step: disabled in the state recorded during
+            # the next step (row step + 2) without having hit anything.
+            first = 0
+            for gi, (_, count, _) in enumerate(groups):
+                mask = np.zeros((1, count), dtype=bool)
+                for k in range(count):
+                    recorded = agents[first + k]["states"]
+                    if step + 2 < len(recorded):
+                        now, after = recorded[step + 1], recorded[step + 2]
+                        mask[0, k] = after["disabled"] and not now["disabled"] and after["events"] == disabled_only
+                if mask.any():
+                    sim.disable(gi, mask)
+                first += count
+            states.append(rows())
+        out.append(np.array(states))
+    sim.close()
+    return out
+
+
+def main_multi(args: argparse.Namespace, policy, ckpt: dict[str, Any]) -> None:
+    train_args = ckpt["args"]
+    task = train_args["task"]
+    group = ckpt.get("group", "drones")
+    task_kwargs = (
+        {**train_args.get("task_kwargs", {}), **train_args.get("eval_task_kwargs", {})}
+        if args.env_kwargs is None
+        else args.env_kwargs
+    )
+    path = args.out or pathlib.Path("recordings") / f"{args.policy.resolve().parent.name}.mcap"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    results, live, map_hashes, groups = run_multi_episodes(policy, task, task_kwargs, group, args, path)
+    options = f" {json.dumps(task_kwargs)}" if task_kwargs else ""
+    print(f"{task}{options}, group {group!r}, {'stochastic' if args.stochastic else 'deterministic'} policy")
+    print(f"{'seed':>5} {'return':>8} {'steps':>6} {'outcome':>14} {'agent crashes':>14}  events")
+    for r in results:
+        print(
+            f"{r['seed']:5d} {r['return']:8.2f} {r['steps']:6d} {r['outcome']:>14} {r['agent_crashes']:14d}  "
+            f"{','.join(r['events']) or '-'}"
+        )
+
+    rec = read_recording(path)
+    size = path.stat().st_size
+    seconds = sum(r["steps"] for r in results) / rec["meta"]["policy_hz"]
+    print(f"\nwrote {path} ({size / 1024:.0f} KiB, {seconds:.1f} s simulated, {size / 1024 / seconds:.1f} KiB/s)")
+
+    # 1. Read-back.
+    assert [m["hash"] for m in rec["meta"]["maps"]] == map_hashes, "map hashes"
+    assert len(rec["episodes"]) == args.episodes, f"{len(rec['episodes'])} episodes recorded"
+    for k, (ep, states) in enumerate(zip(rec["episodes"], live)):
+        for a, agent in enumerate(ep["agents"]):
+            recorded = state_rows(agent["states"])
+            if recorded.shape != (len(states), 13) or not np.array_equal(recorded, live_rows(states[:, a])):
+                raise AssertionError(f"episode {k}, agent {a}: recorded states differ from the live ones")
+    agents = len(rec["episodes"][0]["agents"])
+    print(f"read-back: {sum(len(s) for s in live) * agents} recorded states of {agents} agents equal the live ones")
+
+    # 2. Replay.
+    for k, (ep, rows) in enumerate(zip(rec["episodes"], replay_multi(rec, [r["seed"] for r in results], groups))):
+        for a, agent in enumerate(ep["agents"]):
+            if not np.array_equal(live_rows(rows[:, a]), state_rows(agent["states"])):
+                diff = np.abs(live_rows(rows[:, a]) - state_rows(agent["states"])).max()
+                raise AssertionError(f"episode {k}, agent {a}: replay differs from the recording (max {diff:.3g})")
+    print(f"replay: {args.episodes} episodes re-simulated from the file match it bit for bit")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     policy, ckpt = load_policy(args.policy)
     train_args = ckpt["args"]
+    if "task" in train_args:
+        main_multi(args, policy, ckpt)
+        return
     env_id = train_args["env_id"]
     env_kwargs = train_args.get("env_kwargs", {}) if args.env_kwargs is None else args.env_kwargs
     path = args.out or pathlib.Path("recordings") / f"{args.policy.resolve().parent.name}.mcap"

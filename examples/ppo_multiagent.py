@@ -71,6 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a("--target-kl", type=float, default=None)
     a("--hidden", type=int, default=128)
     a("--init-log-std", type=float, default=-0.5)
+    a(
+        "--init",
+        default=None,
+        help="policy.pt to start every group from (ppo_multiagent.py or ppo_continuous.py); observations the "
+        "checkpoint lacks at the end of the vector start with zero weights",
+    )
     a("--sim-threads", type=int, default=9)
     a("--torch-threads", type=int, default=3)
     a("--log-every", type=int, default=10, help="iterations between progress lines")
@@ -134,9 +140,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     groups = {g: Group(g, envs, args) for g in envs.groups}
     has_success = envs.task.has_success
     n = args.num_envs
-    # Iterations as if every agent stayed active throughout.
-    args.num_iterations = max(1, args.total_timesteps // (n * sum(envs.count.values()) * args.num_steps))
-    print(f"{run_name}: {n} worlds × {envs.count} agents × {args.num_steps} steps, {args.num_iterations} iterations", flush=True)
+    budget = f"{args.total_timesteps:,} agent steps" + (f" or {args.time_limit:g} min" if args.time_limit > 0 else "")
+    print(f"{run_name}: {n} worlds × {envs.count} agents × {args.num_steps} steps, {budget}", flush=True)
+    if args.init:
+        for g, grp in groups.items():
+            init_group(grp, args.init, envs, g)
 
     agent_steps = 0
     start = time.time()
@@ -147,8 +155,14 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     lengths: list[float] = []
     no_world_done = np.zeros(n, dtype=bool)
 
-    for iteration in range(1, args.num_iterations + 1):
-        frac = 1.0 - (iteration - 1.0) / args.num_iterations
+    iteration = 0
+    while agent_steps < args.total_timesteps:
+        iteration += 1
+        # Anneal over the agent steps, or the time limit if that comes first.
+        done_frac = agent_steps / args.total_timesteps
+        if args.time_limit > 0:
+            done_frac = max(done_frac, (time.time() - start) / (60 * args.time_limit))
+        frac = max(0.0, 1.0 - done_frac)
         for grp in groups.values():
             if args.anneal_lr:
                 grp.optimizer.param_groups[0]["lr"] = frac * args.learning_rate
@@ -220,7 +234,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             writer.add_scalar("charts/episodic_length", recent_l, agent_steps)
             writer.add_scalar("charts/SPS", sps, agent_steps)
         out_of_time = args.time_limit > 0 and elapsed > 60 * args.time_limit
-        if iteration % args.log_every == 0 or iteration == args.num_iterations or out_of_time:
+        last = out_of_time or agent_steps >= args.total_timesteps
+        if iteration % args.log_every == 0 or last:
             line.append(f"{sps:,.0f} agent SPS (sim {sim_time / elapsed:.0%})")
             print("  ".join(line), flush=True)
         if args.save_every and iteration % args.save_every == 0:
@@ -244,6 +259,41 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 writer.add_scalar(f"eval/{k}", v, agent_steps)
         writer.close()
     return result
+
+
+def init_group(grp: Group, path: str, envs: MultiAgentVectorEnv, group: str, warmup: int = 50) -> None:
+    """Start ``grp`` from a checkpoint with the same actions and hidden size. If the
+    checkpoint sees only a prefix of the group's observation (e.g. a single-agent policy for
+    a task whose multi-agent version appends neighbour terms), the extra inputs get zero
+    first-layer weights, so the policy acts exactly as before, and their normalisation
+    statistics come from ``warmup`` steps flown with it; the environment is reset after."""
+    ckpt = torch.load(path, weights_only=False)
+    old = ckpt["obs_dim"]
+    if (ckpt["act_dim"], ckpt["hidden"]) != (grp.act_dim, grp.agent.critic[0].out_features) or old > grp.obs_dim:
+        raise SystemExit(f"{path} does not fit group {group!r} and --hidden")
+    state = ckpt["agent"]
+    for net in ("critic", "actor_mean"):
+        w = state[f"{net}.0.weight"]
+        state[f"{net}.0.weight"] = torch.cat([w, torch.zeros(w.shape[0], grp.obs_dim - old)], dim=1)
+    grp.agent.load_state_dict(state)
+    rms = grp.obs_norm.rms
+    norm = ckpt["obs_norm"]
+    rms.mean[:old], rms.var[:old], rms.count = np.asarray(norm["mean"]), np.asarray(norm["var"]), norm["count"]
+    grp.obs_norm.clip = norm.get("clip", grp.obs_norm.clip)
+    if old == grp.obs_dim:
+        return
+    policy = Policy(grp.agent, grp.obs_norm)
+    obs, info = envs.reset(seed=0)
+    seen = []
+    for _ in range(warmup):
+        flat = obs[group].reshape(grp.slots, -1)
+        seen.append(flat[info["active"][group].reshape(-1)])
+        actions = {g: np.zeros(envs.action_space(g).shape, np.float32) for g in envs.groups}
+        actions[group] = policy(flat).reshape(actions[group].shape)
+        obs, _, _, _, info = envs.step(actions)
+    x = np.concatenate(seen)[:, old:]
+    rms.mean[old:], rms.var[old:] = x.mean(axis=0), np.maximum(x.var(axis=0), 0.05)
+    print(f"{group}: started from {path} ({old} of {grp.obs_dim} observations; the rest from {len(x):,} samples)")
 
 
 def update(grp: Group, next_obs: torch.Tensor, args: argparse.Namespace) -> dict[str, float]:

@@ -9,6 +9,9 @@ observation normalisation and the actor network as a list of dense layers:
 - PPO: the action mean (two tanh layers and a linear one), clipped to [−1, 1];
 - SAC: the tanh of the mean (two ReLU layers and a linear one).
 
+Checkpoints of ``ppo_multiagent.py`` export the policy of their group with the multi-agent
+task's scenario; the viewer flies every agent of that group with it.
+
 The file also carries observations from a few short episodes with the actions PyTorch
 computed for them; the Rust loader checks its network against them.
 """
@@ -23,6 +26,8 @@ import gymnasium as gym
 import numpy as np
 from gymnasium.vector import AutoresetMode
 from torch import nn
+
+from autonomousim.multiagent import MultiAgentVectorEnv
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from eval_record import load_policy  # noqa: E402
@@ -76,13 +81,39 @@ def check_samples(policy, env_id: str, env_kwargs: dict[str, Any], episodes: int
     return np.concatenate(seen), np.concatenate(actions), task
 
 
+def check_samples_multi(policy, task: str, task_kwargs: dict[str, Any], group: str, episodes: int = 2, steps: int = 25):
+    """As ``check_samples`` for a multi-agent task: the group's agents in a few worlds."""
+    envs = MultiAgentVectorEnv(episodes, task, seed=12345, num_threads=1, autoreset=False, **task_kwargs)
+    obs, _ = envs.reset(seed=12345)
+    seen, actions = [], []
+    for k in range(steps):
+        acts = {g: np.zeros(envs.action_space(g).shape, np.float32) for g in envs.groups}
+        o = obs[group].reshape(-1, envs.obs_dim[group])
+        a = policy(o, deterministic=True)
+        acts[group] = a.reshape(acts[group].shape)
+        if k % 5 == 0:
+            seen.append(o.copy())
+            actions.append(a.copy())
+        obs, *_ = envs.step(acts)
+    task_obj = envs.task
+    envs.close()
+    return np.concatenate(seen), np.concatenate(actions), task_obj
+
+
 def export(path: pathlib.Path, out: pathlib.Path | None = None, env_kwargs: dict[str, Any] | None = None) -> pathlib.Path:
     policy, ckpt = load_policy(path)
     args = ckpt["args"]
-    env_id = args["env_id"]
-    kwargs = args.get("env_kwargs", {}) if env_kwargs is None else env_kwargs
     layers, output = network(policy, ckpt["algo"])
-    obs, actions, task = check_samples(policy, env_id, kwargs)
+    if "task" in args:
+        env_id = args["task"]
+        kwargs = args.get("task_kwargs", {}) if env_kwargs is None else env_kwargs
+        group = ckpt["group"]
+        obs, actions, task = check_samples_multi(policy, env_id, kwargs, group)
+    else:
+        env_id = args["env_id"]
+        kwargs = args.get("env_kwargs", {}) if env_kwargs is None else env_kwargs
+        obs, actions, task = check_samples(policy, env_id, kwargs)
+        group = task.scenario()["groups"][0]["name"]
     rms = policy.obs_norm.rms
     data = {
         "format": FORMAT,
@@ -93,7 +124,7 @@ def export(path: pathlib.Path, out: pathlib.Path | None = None, env_kwargs: dict
         "algo": ckpt["algo"],
         "global_step": ckpt.get("global_step"),
         "scenario": task.scenario(),
-        "group": task.scenario()["groups"][0]["name"],
+        "group": group,
         "episode_time": task.episode_time,
         "obs_norm": {
             "mean": rms.mean.tolist(),
@@ -112,7 +143,7 @@ def export(path: pathlib.Path, out: pathlib.Path | None = None, env_kwargs: dict
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("policy", type=pathlib.Path, help="policy.pt written by ppo_continuous.py or sac_continuous.py")
+    p.add_argument("policy", type=pathlib.Path, help="policy.pt written by ppo_continuous.py, sac_continuous.py or ppo_multiagent.py")
     p.add_argument("--out", type=pathlib.Path, default=None, help="default: policy.json next to the checkpoint")
     p.add_argument("--env-kwargs", type=json.loads, default=None, help="task options (default: the training ones)")
     args = p.parse_args(argv)

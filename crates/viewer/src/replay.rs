@@ -312,4 +312,41 @@ mod tests {
         assert!(shown.wheels().next().unwrap().steer > 0.05);
         assert_eq!(shown.powertrain().gear, live.powertrain().gear);
     }
+
+    /// Plays every episode of a recording as the viewer's `replay` mode does, for recordings
+    /// the tests cannot make (`examples/eval_record.py`): `AUTONOMOUSIM_RECORDING=$PWD/recordings/<run>.mcap
+    /// cargo test -p autonomousim-viewer --release -- --ignored --nocapture recorded_file`.
+    #[test]
+    #[ignore = "needs a recording (AUTONOMOUSIM_RECORDING)"]
+    fn recorded_file_plays() {
+        let path = std::env::var("AUTONOMOUSIM_RECORDING").expect("AUTONOMOUSIM_RECORDING");
+        let recording = Recording::read(path).unwrap();
+        // Rebuilds the maps and checks their hashes.
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let episodes = recording.episodes.len();
+        let mut r = Replay::new(recording, 0);
+        for e in 0..episodes {
+            r.set_episode(e);
+            let ep = r.current();
+            let last: Vec<_> = ep.states.iter().map(|s| s.last().unwrap().clone()).collect();
+            let mut t = 0.0;
+            while t < r.duration() {
+                r.seek(t);
+                r.apply(&mut world);
+                t += 0.05;
+            }
+            r.seek(r.duration());
+            r.apply(&mut world);
+            for (i, s) in last.iter().enumerate() {
+                assert!((world.agent(i).vehicle.position() - s.position).length() < 1e-9, "agent {i}");
+                assert_eq!(world.agent(i).disabled, s.disabled, "agent {i}");
+            }
+            let stopped = world.agents().iter().filter(|a| a.disabled).count();
+            println!(
+                "episode {e}: {:.1} s, {} agents, {stopped} stopped at the end",
+                r.duration(),
+                world.agents().len()
+            );
+        }
+    }
 }

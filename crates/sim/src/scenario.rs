@@ -72,6 +72,8 @@ pub const AERIAL_PHYSICS_HZ: u32 = 500;
 
 /// Candidate positions tried before falling back to the best one seen.
 const MAX_ATTEMPTS: usize = 200;
+/// Candidate centres of a spawn cluster.
+const CLUSTER_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -559,7 +561,9 @@ pub struct SpawnSpec {
     pub region: Option<[DVec2; 2]>,
     pub margin: f64,
     /// Side of a square (m), placed at random inside the region each episode, that the
-    /// group spawns in (a cluster); default: the whole region.
+    /// group spawns in (a cluster); default: the whole region. The centre is the most open
+    /// of up to 32 random candidates (distance to the nearest solid obstacle at the middle
+    /// spawn height, enough at half the side).
     pub cluster: Option<f64>,
     /// Height of the centre of mass above the ground or water surface (m).
     pub agl: [f64; 2],
@@ -1056,11 +1060,29 @@ impl SpawnSpec {
         let [lo, hi] = match self.cluster {
             Some(side) => {
                 let half = DVec2::splat(0.5 * side).min(0.5 * (hi - lo));
-                let centre = DVec2::new(
-                    sample(rng, [lo.x + half.x, hi.x - half.x]),
-                    sample(rng, [lo.y + half.y, hi.y - half.y]),
-                );
-                [centre - half, centre + half]
+                // The most open of a few random centres: the group takes off from a clearing
+                // when there is one nearby, not from wherever the square happens to land. Lakes
+                // are free of obstacles too, so openness counts only in proportion to the dry
+                // land in the square (with `avoid_water`).
+                let open_enough = half.max_element();
+                let mid = 0.5 * (self.agl[0] + self.agl[1]);
+                let mut best = (f64::NEG_INFINITY, DVec2::ZERO);
+                for _ in 0..CLUSTER_ATTEMPTS {
+                    let centre = DVec2::new(
+                        sample(rng, [lo.x + half.x, hi.x - half.x]),
+                        sample(rng, [lo.y + half.y, hi.y - half.y]),
+                    );
+                    let p = centre.extend(world.surface_height(centre.x, centre.y) + mid);
+                    let dry = if self.avoid_water { dry_fraction(world, centre, half) } else { 1.0 };
+                    let open = world.obstacle_clearance(p, open_enough) * dry;
+                    if open > best.0 {
+                        best = (open, centre);
+                    }
+                    if open >= open_enough {
+                        break;
+                    }
+                }
+                [best.1 - half, best.1 + half]
             }
             None => [lo, hi],
         };
@@ -1117,7 +1139,9 @@ impl SpawnSpec {
         out
     }
 
-    /// 1 or more if `p` is acceptable; otherwise how close it comes (for the fallback).
+    /// 1 or more if `p` is acceptable; otherwise how close it comes (for the fallback): in
+    /// [0, 1) for a point too close to obstacles, below 0 for one too close to another agent
+    /// or over water.
     fn score<'a>(
         &self,
         world: &StaticWorld,
@@ -1125,9 +1149,7 @@ impl SpawnSpec {
         ground: Option<GroundSampling>,
         others: impl Iterator<Item = &'a DVec3>,
     ) -> f64 {
-        if self.avoid_water
-            && world.terrain().water_level(p.x, p.y).is_some_and(|w| w > world.terrain().height(p.x, p.y))
-        {
+        if self.avoid_water && over_water(world, p.truncate()) {
             return -1.0;
         }
         // On the ground, check the space just above it instead.
@@ -1154,7 +1176,9 @@ impl SpawnSpec {
         } else {
             f64::INFINITY
         };
-        free.min(apart)
+        // Agents too close together start in contact: rank such points below every point
+        // that keeps the separation, however cramped it is otherwise.
+        if apart < 1.0 { apart - 1.0 } else { free }
     }
 
     /// Orientation, velocities and motor state at `position`.
@@ -1174,6 +1198,24 @@ impl SpawnSpec {
         };
         Placement { pose: Pose::new(position, rot), lin_vel: v_dir * speed, ang_vel: w_dir * rate, motors }
     }
+}
+
+/// Whether `xy` lies in a lake or river.
+fn over_water(world: &StaticWorld, xy: DVec2) -> bool {
+    world.terrain().water_level(xy.x, xy.y).is_some_and(|w| w > world.terrain().height(xy.x, xy.y))
+}
+
+/// Share of a 5 × 5 grid of points over the square `centre ± half` that is not over water.
+fn dry_fraction(world: &StaticWorld, centre: DVec2, half: DVec2) -> f64 {
+    const N: usize = 5;
+    let mut dry = 0;
+    for i in 0..N {
+        for j in 0..N {
+            let f = DVec2::new(i as f64, j as f64) / (N - 1) as f64 * 2.0 - 1.0;
+            dry += usize::from(!over_water(world, centre + f * half));
+        }
+    }
+    dry as f64 / (N * N) as f64
 }
 
 impl GoalSpec {
@@ -1345,6 +1387,41 @@ mod tests {
             assert!((4.0 - 1e-9..=8.0 + 1e-9).contains(&d), "{d}");
             assert!(world.is_free(goal.position, 1.0, true, false));
             prev = goal.position;
+        }
+    }
+
+    #[test]
+    fn clusters_form_on_dry_land() {
+        // No trees anywhere, so every centre is equally open; one over the lake would squeeze
+        // the group onto its shore.
+        let world = testworlds::lake(120.0, 2.0, -0.5);
+        let spec = SpawnSpec { cluster: Some(20.0), min_separation: 4.0, ..SpawnSpec::default() };
+        let mut rng = Seed::from_u64(4).rng();
+        for _ in 0..20 {
+            let ps = spec.sample_positions(&world, 8, 0.05, None, &mut Vec::new(), &mut rng);
+            for (i, p) in ps.iter().enumerate() {
+                assert!(!over_water(&world, p.truncate()), "{p}");
+                for q in &ps[..i] {
+                    assert!(p.distance(*q) >= 4.0, "{p} {q}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cramped_spawns_keep_their_separation() {
+        // So dense that hardly any point is free of trunks and canopies: the fallback may
+        // start agents near trees, but never on top of each other.
+        let world = testworlds::forest_patch(120.0, 1500.0, 7);
+        let spec = SpawnSpec { cluster: Some(20.0), min_separation: 4.0, clearance: 2.0, ..SpawnSpec::default() };
+        let mut rng = Seed::from_u64(2).rng();
+        for _ in 0..20 {
+            let ps = spec.sample_positions(&world, 8, 0.05, None, &mut Vec::new(), &mut rng);
+            for (i, p) in ps.iter().enumerate() {
+                for q in &ps[..i] {
+                    assert!(p.distance(*q) >= 4.0, "{p} {q}");
+                }
+            }
         }
     }
 

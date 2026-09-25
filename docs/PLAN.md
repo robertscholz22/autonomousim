@@ -1080,7 +1080,7 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 | 4 | PettingZoo `ParallelEnv` (done 2026-09-25) | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
 | 5 | Swarm performance (done 2026-09-25) | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
 | 6 | `ppo_multiagent.py` and a quick check task (`SwarmHover-v0`: N drones hold assigned slots in a formation without touching) (done 2026-09-25) | Formation error < 0.3 m and no agent contacts in 95 % of episodes after ≤ 15 min of training |
-| 7 | `SwarmWaypointForest-v0`, training, viewer | ≥ 80 % of agents finish their waypoints on unseen maps and < 2 % of agents collide with another agent; the exported policy flies the swarm in the viewer; a recorded episode replays |
+| 7 | `SwarmWaypointForest-v0`, training pipeline, viewer (done 2026-09-25) | The task trains end to end; the exported policy flies the swarm in the viewer; a recorded episode replays. Policy targets (≥ 80 % finish, < 2 % agent collisions) moved to the user's own training (2026-09-25) |
 
 **As built in step 1** (`sim::interaction`, `sim::obs`, `sim::world`):
 - **Queries** (`sim::interaction`): `surface_distance` (the smallest gap between two agents' collider spheres, with a bounding-sphere early exit), `agent_clearance` (over the other active agents) and `nearest_agents` (the `k` nearest active agents by centre distance within a range, sorted by distance, ties by agent index). A unit test checks all three against brute force on 60 random shapes, with inactive agents and an exact tie.
@@ -1139,6 +1139,32 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 - **Goldens**: physics, observations and events of all four golden scenarios are unchanged (compared with the recordings left out); `/meta` carries the new scenario fields, so the goldens were re-blessed.
 - **Result** (laptop, performance profile, 64 worlds × 8 drones, 9 sim and 3 torch threads, 15 min, 24M agent steps at 27k agent steps/s): on 128 unseen episodes the mean final formation error is 0.038 m, and 96.1 % of the episodes end in formation without any contact (0.98 % of agents touched another). A first run with a weaker proximity term (weight 0.5 within 1 m) reached 94.5 %; all its contacts were crossing collisions at about 2 m/s. The PPO update takes about 90 % of the time; the simulation only about 11 %.
 - Tests (`tests_py/test_swarm.py`): formation layout and centring through the environment, the proximity cost, and a short IPPO run whose checkpoint loads with `load_policy`.
+
+**As built in step 7** (`SwarmWaypointForest-v0`, multi-agent export, recording and viewer support):
+- **Task** (`swarm_waypoint_forest`, `SwarmWaypointForest` + per-drone `SwarmForestDrone`): 8 iris-like drones in `velocity` mode on the wild 512 m map pool, wind 0–3 m/s, 60 s. The group spawns in a 20 m cluster, 4 m apart, with 2 m clearance; each drone then flies its own chain of `QuadWaypointForest` waypoints. Observations: the forest task's 148 values, then 3 `neighbors` within 20 m and `nearest_agent` (170). Reward: the forest task's, minus `agent_weight·max(0, 1 − d/agent_distance)²` (2.0, 4 m) and `agent_crash_penalty` (50) on `CRASH_AGENT`, on top of the terminal penalty.
+- **Spawn fixes** (`SpawnSpec::sample_positions`, found by training):
+  - The cluster centre is the most open of up to 32 random centres (obstacle clearance), so the group does not start inside dense forest.
+  - Openness is weighted by the dry share of the square (5 × 5 probes). Otherwise lakes, being free of trees, won; the group was then squeezed onto the shore, in 14 of 64 evaluation worlds with drones as close as 0.36 m.
+  - When no point satisfies everything, separation now outranks clearance in the fallback. Before, foliage capped every point's score at 0.5 and agents could start in contact.
+  - Tests: `cramped_spawns_keep_their_separation` and `clusters_form_on_dry_land`; both fail without their fix. The goldens are unchanged.
+- **Training** (`ppo_multiagent.py`):
+  - The budget counts agent steps (`while agent_steps < total`); the learning rate anneals by the larger of the step and time fractions.
+  - `--init` starts every group from a checkpoint, `ppo_continuous.py`'s included. Observations the checkpoint lacks at the end of the vector get zero input weights; their normalisation statistics are estimated from 50 warm-up steps. Test: `test_warm_start_from_a_single_agent_policy`.
+- **Export and recording**:
+  - `export_policy.py` exports multi-agent checkpoints: the task and its options come from the checkpoint, and the group name goes into the JSON. The samples are checked against the Rust `ObsSpec`.
+  - `eval_record.py` records and evaluates multi-agent tasks. It reads back every agent's states and re-simulates the file bit for bit, including agents stopped by Python: a drone disabled after step s shows `disabled` with only `DISABLED` in state row s + 2.
+- **Viewer**:
+  - The autopilot stops agents at their last goal, as the environments do (`after_tick`), and counts agents that hit another one; the HUD shows it.
+  - Ignored tests fly an exported policy (`exported_policy_success_rate`, all agents by default) and play a recording (`recorded_file_plays`, `AUTONOMOUSIM_RECORDING`).
+- **Pipeline check** (warm start from the single-drone forest policy, 60 min, 32M agent steps; not tuned further):
+
+  | Check | Result |
+  |---|---|
+  | Python evaluation, 64 worlds × 8 drones, map seed 1000 | 88.9 % finish; 3.9 % hit another drone, mostly level crossings at 2–7 m/s |
+  | Exported policy flown in Rust, 4 × 64 drones | 202 of 256 finish; 8 hit another drone |
+  | Recording | 2 episodes replay bit for bit |
+
+  A from-scratch run (hidden 256, 15M agent steps) reached 67 % with 7 % agent crashes. The policy targets are left to the user's own training.
 
 ## Roadmap after M1
 | M | Content | Validation |

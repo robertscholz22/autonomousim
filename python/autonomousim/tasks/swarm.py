@@ -1,12 +1,15 @@
-"""SwarmHover-v0: a swarm of drones flies into formation and holds it without touching."""
+"""Swarm tasks: SwarmHover-v0 (fly into formation and hold it without touching) and
+SwarmWaypointForest-v0 (every drone flies its own waypoints through generated forests)."""
 
 from typing import Any
 
 import numpy as np
 
+from autonomousim.events import Event
 from autonomousim.scenario import STATE, quat_up_z
 from autonomousim.tasks.base import Task
 from autonomousim.tasks.multi import MULTI_TASKS, MultiAgentTask, Team
+from autonomousim.tasks.waypoint_forest import QuadWaypointForest
 
 
 class FormationHover(Task):
@@ -169,3 +172,107 @@ class SwarmHover(MultiAgentTask):
 
 
 MULTI_TASKS["swarm_hover"] = SwarmHover
+
+
+class SwarmForestDrone(QuadWaypointForest):
+    """One drone of a swarm in the forest: ``QuadWaypointForest`` with the group spawning
+    together and the other drones in view.
+
+    The group spawns inside a ``cluster`` × ``cluster`` m square placed at random on the map,
+    at least ``min_separation`` apart; every drone then flies its own chain of waypoints from
+    its spawn. The observation adds the ``neighbors`` nearest other drones within 20 m and the
+    distance to the nearest one (``148 + 7·neighbors + 1`` values). The reward adds
+    ``−agent_weight·max(0, 1 − d/agent_distance)²`` with ``d`` the surface distance to the
+    nearest other drone; touching another drone faster than 2 m/s is a crash, which costs
+    ``agent_crash_penalty`` on top of the terminal penalty.
+    """
+
+    name = "swarm_forest_drone"
+
+    def __init__(
+        self,
+        *,
+        cluster: float = 20.0,
+        min_separation: float = 4.0,
+        neighbors: int = 3,
+        agent_weight: float = 2.0,
+        agent_distance: float = 4.0,
+        agent_crash_penalty: float = 50.0,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self.cluster = cluster
+        self.min_separation = min_separation
+        self.neighbors = neighbors
+        self.agent_weight = agent_weight
+        self.agent_distance = agent_distance
+        self.agent_crash_penalty = agent_crash_penalty
+
+    def group(self) -> dict[str, Any]:
+        g = super().group()
+        g["spawn"] = {**g["spawn"], "cluster": self.cluster, "min_separation": self.min_separation, "clearance": 2.0}
+        g["obs"] = [
+            *g["obs"],
+            {"term": "neighbors", "count": self.neighbors, "range": 20.0, "scale": 0.1, "clip": 3.0},
+            {"term": "nearest_agent", "range": 10.0, "scale": 0.2},
+        ]
+        return g
+
+    def reward(
+        self, state: np.ndarray, action: np.ndarray, prev_action: np.ndarray, events: np.ndarray
+    ) -> np.ndarray:
+        near = np.clip(1.0 - state[:, STATE["agent_clearance"]][:, 0] / self.agent_distance, 0.0, 1.0)
+        crash = (events & Event.CRASH_AGENT) != 0
+        return (
+            super().reward(state, action, prev_action, events)
+            - self.agent_weight * near**2
+            - self.agent_crash_penalty * crash
+        )
+
+
+class SwarmWaypointForest(MultiAgentTask):
+    """SwarmWaypointForest-v0: ``count`` iris-like drones (default 8, one group ``drones``
+    sharing a policy) start together in a generated forest and each flies its own chain of
+    waypoints (see ``SwarmForestDrone`` and ``QuadWaypointForest``, which take the remaining
+    keyword arguments). A drone stops when it reaches its last waypoint (success), crashes
+    (into a tree, the ground or another drone) or breaks the task's limits; the episode is
+    truncated after ``episode_time`` (60 s). Maps: a pool of ``map_count`` generated 512 m
+    maps from ``map_seed``; evaluate on another ``map_seed`` for unseen maps. Wind: 0–3 m/s.
+    """
+
+    name = "swarm_waypoint_forest"
+    default_episode_time = 60.0
+
+    def __init__(
+        self,
+        *,
+        count: int = 8,
+        vehicle: str = "iris_like",
+        map: str | dict[str, Any] = "wild",
+        map_seed: int = 0,
+        map_count: int = 16,
+        physics_hz: int | None = None,
+        policy_hz: int | None = None,
+        episode_time: float | None = None,
+        wind: tuple[float, float] | None = (0.0, 3.0),
+        overrides: dict[str, Any] | None = None,
+        **agent_kwargs: Any,
+    ):
+        super().__init__(
+            map=map,
+            map_seed=map_seed,
+            map_count=map_count,
+            physics_hz=physics_hz,
+            policy_hz=policy_hz,
+            episode_time=episode_time,
+            wind=wind,
+            overrides=overrides,
+        )
+        self.count = count
+        self.agent = SwarmForestDrone(vehicle=vehicle, **agent_kwargs)
+
+    def teams(self) -> dict[str, Team]:
+        return {"drones": Team(self.agent, self.count)}
+
+
+MULTI_TASKS["swarm_waypoint_forest"] = SwarmWaypointForest
