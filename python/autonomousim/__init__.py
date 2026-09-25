@@ -10,7 +10,8 @@ Importing the package registers the Gymnasium environments:
   off-road terrain with LiDAR.
 
 ``gym.make_vec(id, num_envs=N, ...)`` gives the native vector environment
-(``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Keyword arguments
+(``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Worlds with several
+agents use ``MultiAgentVectorEnv`` (``autonomousim.multiagent``) with a ``MultiAgentTask``. Keyword arguments
 configure the task (``autonomousim.tasks``): vehicle, action mode, map, rates, episode time,
 wind, randomisation, observations and scenario overrides.
 """
@@ -19,6 +20,7 @@ import gymnasium as _gym
 
 from autonomousim._native import STATE_DIM, STATE_FIELDS, BatchSim, native_version, vehicle_presets
 from autonomousim.events import TERMINAL, Event
+from autonomousim.multiagent import MultiAgentVectorEnv
 from autonomousim.scenario import STATE, default_scenario, load_scenario
 
 __version__ = native_version()
@@ -47,6 +49,7 @@ __all__ = [
     "TERMINAL",
     "BatchSim",
     "Event",
+    "MultiAgentVectorEnv",
     "__version__",
     "default_scenario",
     "load_scenario",

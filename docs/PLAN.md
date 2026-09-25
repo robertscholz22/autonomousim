@@ -1076,7 +1076,7 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 |---|---|---|
 | 1 | Neighbour observation terms, `agent_clearance` state column, xy grid for agent queries (done 2026-09-25; grid moved to step 5) | Terms match a brute-force reference on random swarms; order and ties deterministic; disabled agents are invisible; physics state hashes unchanged (goldens re-blessed for the new column only) |
 | 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors (done 2026-09-25) | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
-| 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
+| 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario (done 2026-09-25) | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
 | 4 | PettingZoo `ParallelEnv` | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
 | 5 | Swarm performance | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
 | 6 | `ppo_multiagent.py` and a quick check task (`SwarmHover-v0`: N drones hold assigned slots in a formation without touching) | Formation error < 0.3 m and no agent contacts in 95 % of episodes after ≤ 15 min of training |
@@ -1099,6 +1099,17 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
   - An iris-like drone descends onto a parked 4×4's roof without `CRASH_AGENT`, rests there with its rotors off (`LANDED`), and stays within 0.1 mm of its spot while the car drives 10 m at 2 m/s.
   - The same drone dropped 2 m onto the roof crashes both agents.
   - Two 4×4s placed side by side with their wheels overlapping by 2 cm exchange equal and opposite forces and moments on every tick. They are pushed apart without a crash or rollover.
+
+**As built in step 3** (`python/autonomousim/{multiagent.py, tasks/multi.py}`, `BatchSim.disable`):
+- **Teams**: a `MultiAgentTask` is made of teams, `{group name: Team(task, count)}`, where each team's task is an ordinary single-agent `Task`. It supplies the vehicle, the action mode, the group entries and the reward, failure and success rules. The team task is bound over `num_envs × count` slots and gets the state rows flattened to `[num_envs·count, STATE_DIM]`, so single-agent reward code (hover, waypoints, the car) runs unchanged. The team tasks' own truncation is ignored. Map, rates (by default the first team's), episode time and wind belong to the `MultiAgentTask`; the teams' `settings()` are deep-merged in team order.
+- **`MultiAgentVectorEnv`**: a plain class with the Gymnasium method names rather than a `gymnasium.vector.VectorEnv`, since the spaces are per group (`observation_space(g)`, `action_space(g)` batched; `single_observation_spaces[g]`). Autoreset is `SAME_STEP` or off (`autoreset=False`) rather than an `AutoresetMode`. Per step it returns, per group, rewards and `terminated` (`[num_envs, count]`), plus a per-world `truncated`. `info` has `active` (agents still going before the step), `events`, and on episode ends `episode` (returns and success per agent, length per world) and dense `final_obs`.
+- **Stopping**: an agent stops when its team task says so (terminal event, failure events, `failed`, `succeeded`). The environment then calls `BatchSim.disable(group, mask)` (`WorldInstance::disable_agent`: frozen, and out of contacts and sensors at once), which is idempotent for agents Rust already disabled on a terminal event. Rewards of stopped agents are zeroed, and their `terminated` stays false after the step they stop.
+- **Tests** (`tests_py/test_multiagent.py`):
+  - shapes and dtypes for one group;
+  - an agent flying out of its goal box stops, is masked and stays frozen while the others go on;
+  - a world ends by termination when all its agents have stopped, another by truncation, each with its own episode length and a fresh spawn;
+  - seeding reproduces every group of a mixed team;
+  - a mixed team (3 drones with 19 observations and 4 actions, one 4×4 with 231 and 2) runs at 1 kHz and is truncated and reset per world.
 
 ## Roadmap after M1
 | M | Content | Validation |

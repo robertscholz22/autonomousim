@@ -173,6 +173,19 @@ impl BatchSim {
         self.gather(mask);
     }
 
+    /// Stop the agents of group `g` where `mask` (`[num_envs, count]`) is true, for the rest
+    /// of their episodes ([`WorldInstance::disable_agent`]).
+    pub fn disable(&mut self, g: usize, mask: &[bool]) {
+        let group = &self.scenario.groups[g];
+        let (first, count) = (group.first_agent, group.spec.count);
+        assert_eq!(mask.len(), self.slots.len() * count, "disable mask of group {:?}", group.spec.name);
+        for (s, m) in self.slots.iter_mut().zip(mask.chunks_exact(count)) {
+            for (k, _) in m.iter().enumerate().filter(|(_, d)| **d) {
+                s.world.disable_agent(first + k);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------ outputs
 
     /// Observations of group `g`, `[num_envs, count, obs_dim]`.

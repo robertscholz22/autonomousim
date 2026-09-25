@@ -357,6 +357,13 @@ impl WorldInstance {
         self.env = EnvState::new(self.env.config.clone(), &self.map);
     }
 
+    /// Stop agent `i` for the rest of the episode, as a terminal event would: it freezes and
+    /// drops out of contacts and sensors at once.
+    pub fn disable_agent(&mut self, i: usize) {
+        self.agents[i].disabled = true;
+        self.shapes[i].active = false;
+    }
+
     /// Put agent `i` at `pose` with the given velocities (world linear, body angular) and clear
     /// its transient vehicle state; its shape follows at once.
     pub fn place_agent(&mut self, i: usize, pose: Pose, lin_vel_world: DVec3, ang_vel_body: DVec3) {

@@ -5,6 +5,7 @@ from typing import Any
 from autonomousim.tasks.base import Task, map_source
 from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.hover import QuadHover
+from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.tasks.recover import QuadRecover
 from autonomousim.tasks.waypoint_forest import QuadWaypointForest
 
@@ -31,4 +32,15 @@ def make_task(task: str | Task, **kwargs: Any) -> Task:
     return cls(**kwargs)
 
 
-__all__ = ["TASKS", "CarWaypointOffroad", "QuadHover", "QuadRecover", "QuadWaypointForest", "Task", "make_task", "map_source"]
+__all__ = [
+    "TASKS",
+    "CarWaypointOffroad",
+    "MultiAgentTask",
+    "QuadHover",
+    "QuadRecover",
+    "QuadWaypointForest",
+    "Task",
+    "Team",
+    "make_task",
+    "map_source",
+]

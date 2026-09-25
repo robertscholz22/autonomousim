@@ -236,6 +236,24 @@ impl BatchSim {
         publish(py, &self.arrays, sim)
     }
 
+    /// Stop the agents of a group where `mask` (bool, `[num_envs, count]`) is true, for the
+    /// rest of their episodes: they freeze and drop out of contacts and sensors, as after a
+    /// terminal event.
+    fn disable(&mut self, group: GroupRef, mask: PyReadonlyArrayDyn<'_, bool>) -> PyResult<()> {
+        let g = self.group(&group)?;
+        let count = self.scenario.groups[g].spec.count;
+        if mask.len() != self.num_envs * count || mask.shape().first() != Some(&self.num_envs) {
+            return Err(PyValueError::new_err(format!(
+                "disable mask: expected [num_envs = {}, count = {count}], got shape {:?}",
+                self.num_envs,
+                mask.shape()
+            )));
+        }
+        let mask: Vec<bool> = mask.as_array().iter().copied().collect();
+        self.sim.get_mut().unwrap_or_else(PoisonError::into_inner).disable(g, &mask);
+        Ok(())
+    }
+
     /// Observations of a group, `float32 [num_envs, count, obs_dim]`, overwritten in place by
     /// every step and reset.
     #[pyo3(signature = (group = GroupRef::Index(0)))]
