@@ -495,7 +495,15 @@ impl Agent {
         p.z - world.surface_height(p.x, p.y)
     }
 
-    pub(crate) fn observe(&self, group: &CompiledGroup, world: &StaticWorld, out: &mut [f32]) {
+    /// Write the observation; `agents` are the world's agent shapes, `me` this agent's index.
+    pub(crate) fn observe(
+        &self,
+        group: &CompiledGroup,
+        world: &StaticWorld,
+        agents: &[AgentShape],
+        me: usize,
+        out: &mut [f32],
+    ) {
         let kin = self.kinematics();
         let (motors, motor_range) = match &self.vehicle {
             Vehicle::Multirotor(v) => (v.motor_speeds(), v.speed_range()),
@@ -512,6 +520,8 @@ impl Agent {
                 wheeled: self.vehicle.as_wheeled(),
                 sensors: &self.sensors,
                 world,
+                agents,
+                me,
             },
             out,
         );

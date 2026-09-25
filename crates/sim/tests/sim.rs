@@ -1,6 +1,6 @@
 //! World instances, batches, events and recording.
 
-use autonomousim_control::multirotor::{Setpoint, YawCommand};
+use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::rng::Seed;
 use autonomousim_sensors::Sensor;
 use autonomousim_sensors::lidar::ReturnKind;
@@ -556,4 +556,102 @@ fn wild_map_pool_is_drawn_per_episode() {
     let episodes = sink.topic("/episode");
     assert_eq!(episodes.len(), 24);
     assert!(episodes.iter().all(|e| e.1["map"].as_u64().unwrap() < 3));
+}
+
+/// Drones and a car in one world: the `neighbors` and `nearest_agent` terms against positions
+/// and velocities read from the agents, the `agent_clearance` state column, and disabled agents
+/// dropping out of both.
+#[test]
+fn neighbour_terms_and_agent_clearance() {
+    use autonomousim_core::math::quat::{from_yaw, yaw};
+    let sc = compile(
+        r#"
+        name = "neighbours"
+        map = { type = "testworld", kind = "flat", size = 200.0 }
+        [[groups]]
+        name = "drones"
+        count = 5
+        spawn = { layout = { type = "grid", spacing = 3.0 }, agl = [2.0, 4.0], yaw_deg = [-180.0, 180.0] }
+        obs = [ { term = "neighbors", count = 3, range = 5.0, scale = 0.5 }, { term = "nearest_agent" } ]
+        [[groups]]
+        name = "car"
+        vehicle = "offroad_4x4"
+        obs = [ { term = "nearest_agent", range = 50.0 } ]
+        "#,
+    );
+    let g = &sc.groups[0];
+    assert_eq!(g.obs_dim(), 7 * 3 + 1);
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(4));
+    // Drift apart a little so relative velocities are not zero.
+    for k in 0..5 {
+        w.set_command(
+            k,
+            Setpoint::Velocity {
+                velocity: DVec3::new(0.3 * k as f64, -0.2, 0.1),
+                frame: Frame::World,
+                yaw: YawCommand::Rate(0.0),
+            },
+        );
+    }
+    let check = |w: &WorldInstance| {
+        let mut obs = vec![0.0f32; 5 * g.obs_dim()];
+        w.observe(0, &mut obs);
+        let mut state = vec![0.0; 5 * STATE_DIM];
+        w.write_state(0, &mut state);
+        let agents = w.agents();
+        for (i, o) in obs.chunks_exact(g.obs_dim()).enumerate() {
+            let me = &agents[i];
+            if me.disabled {
+                continue;
+            }
+            let p = me.vehicle.position();
+            let v = me.vehicle.lin_vel_world();
+            let to_heading = from_yaw(yaw(me.vehicle.orientation())).inverse();
+            let mut near: Vec<(f64, usize)> = (0..agents.len())
+                .filter(|&j| j != i && !agents[j].disabled)
+                .map(|j| (agents[j].vehicle.position().distance(p), j))
+                .filter(|e| e.0 <= 5.0)
+                .collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            near.truncate(3);
+            for (slot, s) in o[..21].as_chunks::<7>().0.iter().enumerate() {
+                let Some(&(_, j)) = near.get(slot) else {
+                    assert!(s.iter().all(|x| *x == 0.0), "agent {i} slot {slot}: {s:?}");
+                    continue;
+                };
+                let rel_p = 0.5 * (to_heading * (agents[j].vehicle.position() - p));
+                let rel_v = 0.5 * (to_heading * (agents[j].vehicle.lin_vel_world() - v));
+                let want = [rel_p.x, rel_p.y, rel_p.z, rel_v.x, rel_v.y, rel_v.z, 1.0];
+                for (x, y) in s.iter().zip(want) {
+                    assert!((f64::from(*x) - y).abs() < 1e-5, "agent {i} slot {slot}: {s:?} vs {want:?}");
+                }
+            }
+            // The observation and the state column agree (both up to 20 m).
+            let clearance = state[i * STATE_DIM + 20];
+            assert!((f64::from(o[21]) - clearance).abs() < 1e-5 && clearance < 3.0, "{} vs {clearance}", o[21]);
+        }
+    };
+    for _ in 0..25 {
+        w.step();
+    }
+    check(&w);
+    // The car's distance to the nearest drone, against all pairs of collider spheres.
+    let mut car = [0.0f32; 1];
+    w.observe(1, &mut car);
+    let shapes = w.shapes();
+    let brute = shapes[..5]
+        .iter()
+        .flat_map(|d| {
+            shapes[5]
+                .spheres
+                .iter()
+                .flat_map(move |a| d.spheres.iter().map(move |b| a.center.distance(b.center) - a.radius - b.radius))
+        })
+        .fold(50.0f64, f64::min);
+    assert!((f64::from(car[0]) - brute).abs() < 1e-4, "{car:?} vs {brute}");
+    // A disabled drone vanishes from the others' neighbours and clearances.
+    w.agent_mut(2).disabled = true;
+    w.step();
+    assert!(!w.shapes()[2].active);
+    check(&w);
 }

@@ -1074,13 +1074,21 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 ### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | Neighbour observation terms, `agent_clearance` state column, xy grid for agent queries | Terms match a brute-force reference on random swarms; order and ties deterministic; disabled agents are invisible; physics state hashes unchanged (goldens re-blessed for the new column only) |
+| 1 | Neighbour observation terms, `agent_clearance` state column, xy grid for agent queries (done 2026-09-25; grid moved to step 5) | Terms match a brute-force reference on random swarms; order and ties deterministic; disabled agents are invisible; physics state hashes unchanged (goldens re-blessed for the new column only) |
 | 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
 | 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
 | 4 | PettingZoo `ParallelEnv` | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
 | 5 | Swarm performance | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
 | 6 | `ppo_multiagent.py` and a quick check task (`SwarmHover-v0`: N drones hold assigned slots in a formation without touching) | Formation error < 0.3 m and no agent contacts in 95 % of episodes after ≤ 15 min of training |
 | 7 | `SwarmWaypointForest-v0`, training, viewer | ≥ 80 % of agents finish their waypoints on unseen maps and < 2 % of agents collide with another agent; the exported policy flies the swarm in the viewer; a recorded episode replays |
+
+**As built in step 1** (`sim::interaction`, `sim::obs`, `sim::world`):
+- **Queries** (`sim::interaction`): `surface_distance` (the smallest gap between two agents' collider spheres, with a bounding-sphere early exit), `agent_clearance` (over the other active agents) and `nearest_agents` (the `k` nearest active agents by centre distance within a range, sorted by distance, ties by agent index). A unit test checks all three against brute force on 60 random shapes, with inactive agents and an exact tie.
+- **Observation terms**: `neighbors` (`count` 1–16, default 3; `range`, default 20 m): per slot the relative position and velocity in the heading frame (scaled and clipped like the other terms), then 1 for a present slot; missing slots are zero, so `7·count` values. `nearest_agent` (`range`): the surface distance to the nearest other agent, `range` when there is none. `count` and `range` are new optional `ObsTerm` fields, validated per term. Filtering neighbours by group is not built; no task needs it yet.
+- **State column** `agent_clearance` (STATE_DIM 21), up to 20 m. Python's `STATE` slices follow `STATE_FIELDS` on their own.
+- **Test** (`neighbour_terms_and_agent_clearance`): five drones flying apart and a car in one world; both terms and the state column match brute-force values, and a disabled drone disappears from the other agents' observations.
+- **Goldens**: before re-blessing, the old and new code were compared scenario by scenario: physics state hashes, observations, events and the first 20 state columns are identical in all four scenarios; the only changed recording message is `/meta` (the new state field). The goldens were then re-blessed.
+- **Deferred**: the xy grid for agent queries moves to step 5 (swarm performance), where it will be profiled together with the contact sweep. The queries are O(n²) per world for now, which is cheap at the sizes of steps 2–4 (8 agents).
 
 ## Roadmap after M1
 | M | Content | Validation |

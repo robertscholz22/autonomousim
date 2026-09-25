@@ -25,10 +25,13 @@
 //! | `mag` | 3 | magnetic field (sensor frame, µT) |
 //! | `range` | 1 | rangefinder distance / max range (no return: 1) |
 //! | `lidar` / `lidar_log` | beams | range / max range, or ln(1 + r)/ln(1 + max) (no return: 1) |
+//! | `neighbors` | 7 × `count` | the `count` (default 3) nearest other active agents with centres within `range` (default 20 m), nearest first (ties by agent index): position and velocity relative to this agent in the heading frame (m, m/s), then 1; empty slots are all 0. The 1 is neither scaled nor clipped |
+//! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
 //!
 //! Sensor terms name their sensor (`sensor = "imu"`) and read zeros until its first reading
 //! arrives. Non-finite values are written as 0.
 
+use crate::interaction::{AgentShape, agent_clearance, nearest_agents};
 use crate::scenario::Goal;
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
@@ -39,6 +42,13 @@ use serde::{Deserialize, Serialize};
 
 /// Largest distance the `clearance` term looks (m).
 pub const CLEARANCE_RANGE: f64 = 20.0;
+
+/// Default `range` of the agent terms (m).
+pub const NEIGHBOR_RANGE: f64 = 20.0;
+
+/// Default and largest `count` of the `neighbors` term.
+pub const NEIGHBOR_COUNT: usize = 3;
+pub const MAX_NEIGHBORS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +89,8 @@ pub enum TermKind {
     Range,
     Lidar,
     LidarLog,
+    Neighbors,
+    NearestAgent,
 }
 
 impl TermKind {
@@ -121,11 +133,17 @@ pub struct ObsTerm {
     /// Sensor name, for sensor terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensor: Option<String>,
+    /// Agents in the `neighbors` term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    /// Range of the agent terms (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<f64>,
 }
 
 impl ObsTerm {
     pub fn new(term: TermKind, scale: f64) -> Self {
-        Self { term, scale, clip: None, sensor: None }
+        Self { term, scale, clip: None, sensor: None, count: None, range: None }
     }
 
     pub fn clip(mut self, clip: f64) -> Self {
@@ -135,6 +153,16 @@ impl ObsTerm {
 
     pub fn sensor(mut self, name: &str) -> Self {
         self.sensor = Some(name.into());
+        self
+    }
+
+    pub fn count(mut self, count: usize) -> Self {
+        self.count = Some(count);
+        self
+    }
+
+    pub fn range(mut self, range: f64) -> Self {
+        self.range = Some(range);
         self
     }
 }
@@ -159,8 +187,10 @@ struct Compiled {
     dim: usize,
     scale: f64,
     clip: f64,
-    /// Maximum range of a range sensor (m).
+    /// Maximum range of a range sensor or of the agent terms (m).
     max_range: f64,
+    /// Agents in the `neighbors` term.
+    count: usize,
 }
 
 /// An observation spec resolved against a group's sensors and action size.
@@ -183,6 +213,9 @@ pub struct ObsInput<'a> {
     pub wheeled: Option<&'a Wheeled>,
     pub sensors: &'a [Sensor],
     pub world: &'a StaticWorld,
+    /// Shapes of all agents in the world, and this agent's index among them.
+    pub agents: &'a [AgentShape],
+    pub me: usize,
 }
 
 impl CompiledObs {
@@ -217,6 +250,15 @@ impl CompiledObs {
             if t.term.needs_wheels() && num_wheels == 0 {
                 return Err(format!("observation {:?} needs a ground vehicle", t.term));
             }
+            let agent_term = matches!(t.term, TermKind::Neighbors | TermKind::NearestAgent);
+            if (t.count.is_some() && t.term != TermKind::Neighbors) || (t.range.is_some() && !agent_term) {
+                return Err(format!("observation {:?} takes no count or range", t.term));
+            }
+            let count = t.count.unwrap_or(NEIGHBOR_COUNT);
+            let range = t.range.unwrap_or(NEIGHBOR_RANGE);
+            if agent_term && (!(1..=MAX_NEIGHBORS).contains(&count) || !(range > 0.0 && range.is_finite())) {
+                return Err(format!("observation {:?}: count must be 1–{MAX_NEIGHBORS} and range positive", t.term));
+            }
             let (d, max_range) = match (t.term, spec) {
                 (TermKind::GoalYaw | TermKind::Yaw | TermKind::PitchRoll | TermKind::GearRpm, _) => (2, 0.0),
                 (
@@ -229,6 +271,8 @@ impl CompiledObs {
                     | TermKind::Steering,
                     _,
                 ) => (1, 0.0),
+                (TermKind::NearestAgent, _) => (1, range),
+                (TermKind::Neighbors, _) => (7 * count, range),
                 (TermKind::WheelSpeeds | TermKind::WheelSlip, _) => (num_wheels, 0.0),
                 (TermKind::Rot6d | TermKind::Imu, _) => (6, 0.0),
                 (TermKind::Quat, _) => (4, 0.0),
@@ -251,6 +295,7 @@ impl CompiledObs {
                 scale: t.scale,
                 clip: t.clip.unwrap_or(f64::INFINITY),
                 max_range,
+                count,
             });
             dim += d;
         }
@@ -355,6 +400,29 @@ impl CompiledObs {
                         inp.world.clearance(k.position, CLEARANCE_RANGE)
                     };
                     put(dst, &[c], t)
+                }
+                TermKind::NearestAgent => {
+                    let c = if inp.agents.is_empty() {
+                        t.max_range
+                    } else {
+                        agent_clearance(inp.agents, inp.me, t.max_range)
+                    };
+                    put(dst, &[c], t)
+                }
+                TermKind::Neighbors => {
+                    dst.fill(0.0);
+                    if inp.agents.is_empty() {
+                        continue;
+                    }
+                    let mut near = Vec::with_capacity(t.count);
+                    nearest_agents(inp.agents, inp.me, t.max_range, t.count, &mut near);
+                    let to_heading = heading.inverse();
+                    for (slot, &(_, j)) in dst.as_chunks_mut::<7>().0.iter_mut().zip(&near) {
+                        let o = &inp.agents[j];
+                        put(&mut slot[0..3], &(to_heading * (o.center - k.position)).to_array(), t);
+                        put(&mut slot[3..6], &(to_heading * (o.velocity - k.velocity)).to_array(), t);
+                        slot[6] = 1.0;
+                    }
                 }
                 _ => write_sensor(t, &inp.sensors[t.sensor], inp.goal, dst),
             }
@@ -486,6 +554,8 @@ mod tests {
             wheeled: None,
             sensors: &built,
             world: &world,
+            agents: &[],
+            me: 0,
         };
         let mut out = vec![f32::NAN; obs.dim()];
         obs.write(&inp, &mut out);

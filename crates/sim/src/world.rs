@@ -21,7 +21,7 @@
 use crate::agent::{Agent, EnvState};
 use crate::drive::ground_pose;
 use crate::events::Events;
-use crate::interaction::{AgentContacts, AgentShape, agent_contacts};
+use crate::interaction::{AgentContacts, AgentShape, agent_clearance, agent_contacts};
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, Goal};
 use autonomousim_control::Command;
@@ -40,8 +40,9 @@ pub const PARALLEL_AGENTS: usize = 32;
 /// Per-agent state row written by [`WorldInstance::write_state`]: `(name, length)` in order.
 /// `goal_index` equals the number of goals once the last one has been reached; `clearance` is
 /// the distance to the nearest terrain or solid obstacle surface, up to 20 m (for ground
-/// vehicles, which sit on the terrain, to the nearest solid obstacle).
-pub const STATE_FIELDS: [(&str, usize); 9] = [
+/// vehicles, which sit on the terrain, to the nearest solid obstacle); `agent_clearance` the
+/// distance between the agent's colliders and the nearest other active agent's, up to 20 m.
+pub const STATE_FIELDS: [(&str, usize); 10] = [
     ("position", 3),
     ("orientation", 4),
     ("velocity", 3),
@@ -51,10 +52,11 @@ pub const STATE_FIELDS: [(&str, usize); 9] = [
     ("agl", 1),
     ("goal_index", 1),
     ("clearance", 1),
+    ("agent_clearance", 1),
 ];
 
 /// Length of a state row.
-pub const STATE_DIM: usize = 20;
+pub const STATE_DIM: usize = 21;
 
 #[derive(Clone, Debug)]
 pub struct WorldInstance {
@@ -246,7 +248,8 @@ impl WorldInstance {
         let dim = g.obs_dim();
         assert_eq!(out.len(), g.spec.count * dim, "observation array of group {:?}", g.spec.name);
         for (k, o) in out.chunks_exact_mut(dim).enumerate() {
-            self.agents[g.first_agent + k].observe(g, &self.map, o);
+            let me = g.first_agent + k;
+            self.agents[me].observe(g, &self.map, &self.shapes, me, o);
         }
     }
 
@@ -271,6 +274,7 @@ impl WorldInstance {
                 Vehicle::Wheeled(_) => self.map.obstacle_clearance(v.position(), CLEARANCE_RANGE),
                 _ => self.map.clearance(v.position(), CLEARANCE_RANGE),
             };
+            row[20] = agent_clearance(&self.shapes, g.first_agent + k, CLEARANCE_RANGE);
         }
     }
 

@@ -16,7 +16,8 @@ from autonomousim._native import STATE_FIELDS, default_scenario as _default_json
 #: Slices of the state row fields (``BatchSim.state``): position, orientation (x, y, z, w),
 #: velocity (world), rates (body), goal, goal_yaw, agl, goal_index (the number of goals once
 #: the last one is reached) and clearance (distance to the nearest terrain or solid obstacle,
-#: up to 20 m; for ground vehicles to the nearest solid obstacle only).
+#: up to 20 m; for ground vehicles to the nearest solid obstacle only) and agent_clearance
+#: (surface distance to the nearest other active agent's colliders, up to 20 m).
 STATE: dict[str, slice] = {}
 _offset = 0
 for _name, _len in STATE_FIELDS:
