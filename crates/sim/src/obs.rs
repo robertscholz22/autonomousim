@@ -18,7 +18,7 @@
 //! | `gear_rpm` | 2 | ground vehicles: gear (1… forward, −1 reverse, 0 electric) and engine (first motor) speed (1000 rpm) |
 //! | `motor_speeds` | rotors | rotor speeds mapped to [−1, 1] over their range |
 //! | `last_action` | action | the action held during the last step |
-//! | `clearance` | 1 | distance to the nearest terrain or solid obstacle, up to 20 m (costs ~0.6 µs) |
+//! | `clearance` | 1 | distance to the nearest terrain or solid obstacle (ground vehicles: solid obstacle), up to 20 m (costs ~0.6 µs) |
 //! | `imu` / `imu_accel` / `imu_gyro` | 6 / 3 / 3 | IMU reading (sensor frame): specific force (m/s²) then rates (rad/s) |
 //! | `gps_position` / `gps_velocity` / `gps_goal_rel_world` | 3 | GPS fix (ENU; m, m/s); goal − GPS position |
 //! | `baro_altitude` | 1 | pressure altitude (m) |
@@ -348,7 +348,14 @@ impl CompiledObs {
                     }
                 }
                 TermKind::LastAction => put(dst, inp.last_action, t),
-                TermKind::Clearance => put(dst, &[inp.world.clearance(k.position, CLEARANCE_RANGE)], t),
+                TermKind::Clearance => {
+                    let c = if inp.wheeled.is_some() {
+                        inp.world.obstacle_clearance(k.position, CLEARANCE_RANGE)
+                    } else {
+                        inp.world.clearance(k.position, CLEARANCE_RANGE)
+                    };
+                    put(dst, &[c], t)
+                }
                 _ => write_sensor(t, &inp.sensors[t.sensor], inp.goal, dst),
             }
         }

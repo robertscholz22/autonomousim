@@ -1,7 +1,7 @@
 # autonomousim
 
-A 3D simulator for training control policies for autonomous vehicles: drones now, ground
-vehicles next. It has a deterministic Rust physics core, procedurally generated worlds, a
+A 3D simulator for training control policies for autonomous vehicles: drones and wheeled
+ground vehicles. It has a deterministic Rust physics core, procedurally generated worlds, a
 batched Gymnasium API for reinforcement learning, and a native Bevy viewer that replays
 recorded episodes bit for bit.
 
@@ -37,8 +37,23 @@ policy replayed in the viewer:
 Trained policies also fly inside the viewer, without Python: an exported network runs in Rust,
 and you can take over any drone from the keyboard.
 
-Next up: ground vehicles (Milestone 2: tires, suspension, powertrain). The full plan, the design decisions and as-built notes for every
-step are in [docs/PLAN.md](docs/PLAN.md).
+**Milestone 2 (ground vehicles I) is done**:
+
+- **Vehicle dynamics**: Magic Formula 6.1/6.2 tyres (`.tir` files, combined slip, relaxation
+  length, low-speed damping), suspension kinematics and compliance, steering, engine maps with
+  an automatic gearbox or electric motors, open/limited-slip/locked differentials and brakes. Handling (ISO 4138 constant
+  radius, ISO 7401 step steer, ISO 3888-1 lane change, straight braking) is checked against
+  Project Chrono.
+- **Vehicles**: a sedan (`sedan_like`), an off-road 4×4 (`offroad_4x4`) and two rovers
+  (`rover_diff`, `rover_skid`). They drive in `raw`, `vk` (speed + path curvature), `vw`
+  (speed + yaw rate) or `per_wheel` mode, at 1 kHz physics, on generated `offroad` maps.
+- **Viewer**: drive from the keyboard or a gamepad, with tyre force plots and per-wheel
+  telemetry; recorded drives replay with their wheels.
+- **Training**: a PPO policy for **CarWaypointOffroad-v0** (drive the 4×4 through three
+  waypoints between the trees using LiDAR) reaches **82 % success on unseen maps**.
+
+Next up: multi-agent (Milestone 3). The full plan, the design decisions and as-built notes for
+every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
 
@@ -59,6 +74,9 @@ cargo run -p autonomousim-viewer --release -- --preset showcase --seed 0
 
 # The forest scenario: two drones, LiDAR (L: hits in the scene, V: LiDAR view).
 cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
+
+# Drive a 4×4 over an off-road map (W/S pedal, A/D steering, Space handbrake).
+cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4
 ```
 
 ### Python
@@ -72,8 +90,9 @@ obs, info = envs.reset()
 obs, reward, terminated, truncated, info = envs.step(envs.action_space.sample())
 ```
 
-Registered tasks: `QuadHover-v0`, `QuadRecover-v0` and `QuadWaypointForest-v0`. Task options
-such as `action_mode`, `map_seed` or reward weights are passed as keyword arguments.
+Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0` and
+`CarWaypointOffroad-v0`. Task options such as `action_mode`, `map_seed` or reward weights are
+passed as keyword arguments.
 
 ### Train, record, replay
 
@@ -102,8 +121,8 @@ re-simulated from the file. The viewer relies on this for replay.
 | `crates/core` | Spatial math, multibody dynamics, contacts, seeded RNG, time |
 | `crates/world` | Height grids, static worlds (terrain, obstacles, water), atmosphere, wind |
 | `crates/procgen` | Noise, erosion, hydrology, biomes, scatter; the wild map generator and cache |
-| `crates/vehicles` | Vehicle definitions (TOML) and multirotor models |
-| `crates/control` | Multirotor cascade, allocation, action modes |
+| `crates/vehicles` | Vehicle definitions (TOML), multirotor and wheeled-vehicle models, tyres |
+| `crates/control` | Multirotor cascade, allocation, ground-vehicle controllers, action modes |
 | `crates/sensors` | IMU, GPS, baro, mag, rangefinder, LiDAR |
 | `crates/sim` | Worlds, agents, scenarios, observations, batched simulation, MCAP recording, policy playback |
 | `crates/scene` | Renderer-independent meshes (terrain chunks, vegetation, vehicles) |

@@ -3,15 +3,22 @@
 from typing import Any
 
 from autonomousim.tasks.base import Task, map_source
+from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.hover import QuadHover
 from autonomousim.tasks.recover import QuadRecover
 from autonomousim.tasks.waypoint_forest import QuadWaypointForest
 
-TASKS: dict[str, type[Task]] = {"hover": QuadHover, "recover": QuadRecover, "waypoint_forest": QuadWaypointForest}
+TASKS: dict[str, type[Task]] = {
+    "hover": QuadHover,
+    "recover": QuadRecover,
+    "waypoint_forest": QuadWaypointForest,
+    "car_waypoint": CarWaypointOffroad,
+}
 
 
 def make_task(task: str | Task, **kwargs: Any) -> Task:
-    """A task instance from its name (``hover``, ``recover``, ``waypoint_forest``) and keyword
+    """A task instance from its name (``hover``, ``recover``, ``waypoint_forest``,
+    ``car_waypoint``) and keyword
     arguments, or the instance itself."""
     if isinstance(task, Task):
         if kwargs:
@@ -24,4 +31,4 @@ def make_task(task: str | Task, **kwargs: Any) -> Task:
     return cls(**kwargs)
 
 
-__all__ = ["TASKS", "QuadHover", "QuadRecover", "QuadWaypointForest", "Task", "make_task", "map_source"]
+__all__ = ["TASKS", "CarWaypointOffroad", "QuadHover", "QuadRecover", "QuadWaypointForest", "Task", "make_task", "map_source"]

@@ -79,31 +79,31 @@ def bench(task: str, num_envs: int, threads: int, steps: int, repeat: int, **tas
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--task", default="hover", choices=["hover", "recover"])
+    p.add_argument("--task", default="hover", choices=["hover", "recover", "waypoint_forest", "car_waypoint"])
     p.add_argument("--num-envs", type=int, nargs="+", default=[256])
     p.add_argument("--threads", type=int, nargs="+", default=[10])
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--repeat", type=int, default=5)
-    p.add_argument("--map", default="flat")
-    p.add_argument("--vehicle", default="cf2x")
-    p.add_argument("--action-mode", default="ctbr")
+    p.add_argument("--map", default=None, help="default: flat for hover and recover, the task's own otherwise")
+    p.add_argument("--vehicle", default=None, help="default: the task's")
+    p.add_argument("--action-mode", default=None, help="default: the task's")
     p.add_argument("--save", action="store_true", help="append to benchmarks/results/<date>-<host>.json")
     args = p.parse_args()
 
     rows = []
     print(
-        f"{'task':8} {'envs':>5} {'thr':>4} {'vector env/s':>13} {'native/s':>10} "
+        f"{'task':12} {'envs':>5} {'thr':>4} {'vector env/s':>13} {'native/s':>10} "
         f"{'step µs':>8} {'reset µs':>9} {'python µs':>10} {'ep len':>7}"
     )
     for n in args.num_envs:
         for t in args.threads:
-            r = bench(
-                args.task, n, t, args.steps, args.repeat,
-                map=args.map, vehicle=args.vehicle, action_mode=args.action_mode,
-            )  # fmt: skip
+            options = {"map": args.map, "vehicle": args.vehicle, "action_mode": args.action_mode}
+            if args.task in ("hover", "recover"):
+                options["map"] = options["map"] or "flat"
+            r = bench(args.task, n, t, args.steps, args.repeat, **{k: v for k, v in options.items() if v is not None})
             rows.append(r)
             print(
-                f"{r['task']:8} {n:5d} {r['threads']:4d} {r['vector_env_steps_per_s']:13,.0f} "
+                f"{r['task']:12} {n:5d} {r['threads']:4d} {r['vector_env_steps_per_s']:13,.0f} "
                 f"{r['native_steps_per_s']:10,.0f} {r['native_step_us']:8.0f} {r['native_reset_us']:9.0f} "
                 f"{r['python_us']:10.0f} {r['mean_episode_steps']:7.1f}"
             )

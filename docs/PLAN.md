@@ -635,7 +635,7 @@ Benchmarking: take the median of 5 runs with the performance governor (the lapto
 
 ## Milestone 2: Ground vehicles I
 
-Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` joint), Magic Formula tires with transient slip, steering, powertrain, brakes; Ackermann cars, diff-drive and skid-steer robots; ground action modes; a 1 kHz preset. Two things were decided with the user at the start:
+Planned 2026-09-24; **done 2026-09-25** (steps 0–9, as built below). Scope from the roadmap: suspension kinematics (`KcTravel` joint), Magic Formula tires with transient slip, steering, powertrain, brakes; Ackermann cars, diff-drive and skid-steer robots; ground action modes; a 1 kHz preset. Two things were decided with the user at the start:
 - **Validation oracle**: Project Chrono (PyChrono, conda) in its own environment outside the repo. It is used only to generate committed fixtures, as Pinocchio is for the multibody tests. Analytic checks come on top.
 - **Closing demo**: `CarWaypointOffroad-v0`. A 4×4 drives through waypoints over wild-map terrain between the trees, using LiDAR and `(v, κ)` actions.
 
@@ -1003,6 +1003,35 @@ Planned 2026-09-24. Scope from the roadmap: suspension kinematics (`KcTravel` jo
   - Viewer: keys drive, steer, brake and hold a car; a skid-steer turns on the spot; the demo command overrides the keys; a ground replay reproduces spin, steer, travel, tyre forces and wheel poses; tracking references and tyre samples; `--record` writes a drive with wheel data.
   - Vehicles: a shown state matches the simulated one.
   - Scene: links only on suspended wheels, and an eye point inside the body.
+
+**As built in step 9** (`python/autonomousim/tasks/car_waypoint.py`, plus what the task needed in `world`, `sim` and the Python package):
+- **Simulation support**:
+  - `StaticWorld::obstacle_clearance`: the distance to the nearest solid obstacle only. For ground vehicles, the state row's `clearance` column and the `clearance` observation term use it: the terrain under a car is always about a ride height away, so the old terrain-or-obstacle distance said nothing. Multirotors are unchanged; only the `cars` golden trajectory hash changed (re-blessed).
+- **Python API**:
+  - `Task.failure_events`: event bits a task adds to the terminal set (`TERMINAL_EVENTS`); the car task adds `STUCK`.
+  - `map="offroad"`: a pool of `offroad`-preset wild maps (as `"wild"` is for the `training` preset).
+  - Ground vehicles and their action modes (`raw`, `vk`, `vw`, `per_wheel`) are accepted by `Task`; `randomize` stays multirotor-only.
+  - `bench.py --task car_waypoint`; `--map`, `--vehicle` and `--action-mode` default to the task's own.
+  - `ppo_continuous.py --init <policy.pt>` continues training from a checkpoint (weights and observation statistics; the reward normaliser starts afresh).
+- **CarWaypointOffroad-v0**:
+  - **Setup**: `offroad_4x4` in `vk` mode (speed up to 8 m/s forward, 2.4 m/s in reverse; path curvature up to the steering lock), policy at 20 Hz, physics at 1 kHz; a pool of 16 `offroad` maps; 3 waypoints, each 25–50 m from the previous one and reachable from it, reached within 3 m; 90 s episodes.
+  - **Drivable margin**: goals and spawns lie on the drive grid computed with `drivable_margin` = 3 m of room beside the vehicle, so every route passes gaps about 8 m wide. With the default 1 m, routes squeezed between trunks 4 m apart. The same policy (v2, trained at 1 m) reached 52 % success at 1 m, 60 % at 2 m and 72 % at 3 m; the scripted driver went from 46–51 % to 70 %.
+  - **Observation** (231 values): goal in the heading frame (1/20, clipped to ±3), speed, body velocity and rates, pitch and roll, steering angle, last action, and a roof LiDAR (3 rings at −10°, −3° and 3°, 72 azimuths, 30 m, log ranges).
+  - **Reward**: horizontal progress to the current goal (measured from the positions before and after the step, so switching goals does not jump), +10 per waypoint, a proximity penalty `0.2·max(0, 1 − c/3 m)²` on the obstacle clearance, smoothness `0.02‖Δa‖²`, −50 on terminal events (crash, rollover, water, out of bounds, stuck: less than 0.5 m in 4 s).
+  - **Tests**: on the flat map a scripted driver reaches all three goals with the expected return; a car that stands still for `stuck_time` ends `STUCK` (terminated, not a success) with the terminal penalty; spaces, dtypes and `check_env`.
+- **Throughput** (i7-1365U):
+  - One `offroad_4x4` tick, single thread: 4.8 µs (FK 0.75, drive 0.15, tyres 1.74, contacts 0.12, ABA 1.53). The full Magic Formula stays: an approximation would give up the validated fidelity for at most a third of the tick.
+  - `BatchSim`, 20 Hz policy (50 ticks per step), LiDAR on: 4.1k env-steps/s with 1 thread, 6.5k with 2, 8.5k with 4, about 11k with 10. The scaling is poor, most likely from the laptop's power limit (all-core clocks drop); `perf` is not available here to confirm it. Short benchmarks read about 23k because crashed worlds are disabled and skipped; the numbers above keep every world driving.
+  - PPO: 3–5.6k SPS (the simulation takes 57–60 % of the time; slower when the laptop throttles). The ≥ 15k raw target in the table below is missed, and the per-tick target (≤ 4 µs) by 20 %.
+- **Training** (`ppo_continuous.py --hidden 256 --torch-threads 6 --bound-coef 0.01`, evaluated deterministically on unseen maps, `map_seed` 1000, over 512 episodes; 256 for v1, v2 and the task variants):
+  - v1 (32 azimuths, 1 m margin, 10M steps): 60 % success; 27 % obstacle crashes, 12 % truncated.
+  - v2 (72 azimuths, 1 m margin, 11M steps): 52 %; LiDAR resolution was not the limit. The crashes fell in two groups: reversing at full speed into trunks the car had just turned away from, and approaching at 4–8 m/s with the turn started too late.
+  - v3 (3 m margin, 30M steps, 2 h 5 min, trained with 60 s episodes): 78.5 % with 60 s episodes (11 % obstacle crashes, 7 % truncated, 3 % stuck). Success was still rising slowly when the learning rate reached zero.
+  - Attempts to pass 80 % within 60 s, all worse: v3 continued 15M steps at learning rate 1e-4 (76 %); continued 20M steps with γ = 0.995, a 10 s horizon for manoeuvres (77 %); a penalty per metre reversed (70.5 %: in 8 m gaps a forward U-turn, about 11 m across, rarely fits, so reversing is needed, not a bad habit); a proximity penalty sized to the car (5 m from the centre, weight 0.5; the bumpers reach 2.6 m) from scratch (74 %).
+  - Where the rest fails: tracing the truncated episodes showed the car shuffling back and forth near goals 3–5 m to its side, inside its turning circle (about 5.5 m), or reversing long stretches towards goals behind it at 2.4 m/s. The same v3 policy scores 83 % with 90 s episodes and 85 % with a 4 m goal radius.
+  - **Decision (with the user)**: the episode time became 90 s, since routes detour round trees and a car needs three-point turns a drone does not. The goal radius stays 3 m. **v3 with 90 s episodes: 82.2 % success over 512 episodes on unseen maps** (13 % failures, 4.7 % truncated, 2.6 of 3 goals on average).
+  - Not tried: a recurrent policy, or a planner's route direction (`DriveGrid::path`) as an observation term.
+- **Viewer**: `export_policy.py` + `autonomousim-viewer policy <json> --agents 4 --lidar-view` drives the exported v3 network in Rust on an unseen map (seed 1000) at about 140 fps; the export is checked against PyTorch.
 
 ### Performance targets (i7-1365U, release)
 | Metric | Target |

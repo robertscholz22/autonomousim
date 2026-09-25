@@ -92,6 +92,12 @@ impl StaticWorld {
         terrain.min(obstacle).min(max_dist)
     }
 
+    /// Distance from `p` to the nearest solid obstacle (terrain left out), capped at
+    /// `max_dist`: the clearance of ground vehicles, which always sit on the terrain.
+    pub fn obstacle_clearance(&self, p: DVec3, max_dist: f64) -> f64 {
+        self.obstacles.nearest_distance(p, max_dist, HitMask::SOLID).unwrap_or(max_dist).min(max_dist)
+    }
+
     /// Whether a sphere at `p` is free of terrain, solid obstacles and (optionally) foliage
     /// and water.
     pub fn is_free(&self, p: DVec3, radius: f64, avoid_foliage: bool, avoid_water: bool) -> bool {

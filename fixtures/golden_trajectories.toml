@@ -1,5 +1,5 @@
 # Golden trajectory hashes (crates/sim/tests/golden.rs); bless with AUTONOMOUSIM_BLESS=1.
-cars = "e6492cf1329b782643a66a7607ff320500d1c0e52b5f3ea3d084ac3e17965528"
+cars = "fc21556b03c0b58051e820686af78fd3fadf3a602010ab3e54e589b2ad41f0be"
 forest = "176447dada9033a09c8a544f7538c8b24efea4c85abfcf1255a8125dc0e51903"
 hover = "a51ac419adc65b3b127e25f1030360ef4c961e34abc90560f8cfae22fec44cc2"
 modes = "3b8a290c3deb68046ca2878cd2ced2a12a50c3506d378c0b4a6f2a5182f1d538"

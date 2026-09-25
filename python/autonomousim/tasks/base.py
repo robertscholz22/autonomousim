@@ -13,21 +13,22 @@ from autonomousim._native import TERMINAL_EVENTS
 from autonomousim.scenario import deep_merge
 
 #: Map shortcuts accepted by ``map=``. A dict is used as the map source itself.
-MAPS = ("flat", "forest", "wild")
+MAPS = ("flat", "forest", "wild", "offroad")
 
 
 def map_source(name: str | dict[str, Any], seed: int, count: int) -> dict[str, Any]:
     """Map source of the scenario for a shortcut: ``flat`` (200 m grass plane), ``forest``
-    (200 m hilly test forest, 150 trees/ha) or ``wild`` (a pool of ``count`` generated
-    512 m training maps, one per episode)."""
+    (200 m hilly test forest, 150 trees/ha), ``wild`` (a pool of ``count`` generated 512 m
+    training maps, one per episode) or ``offroad`` (the same with the drivable ``offroad``
+    preset: low relief, open forest with clearings)."""
     if isinstance(name, dict):
         return name
     if name == "flat":
         return {"type": "testworld", "kind": "flat", "size": 200.0}
     if name == "forest":
         return {"type": "testworld", "kind": "forest_patch", "size": 200.0, "density": 150.0, "seed": seed}
-    if name == "wild":
-        return {"type": "wild", "seed": seed, "count": count, "preset": "training"}
+    if name in ("wild", "offroad"):
+        return {"type": "wild", "seed": seed, "count": count, "preset": "training" if name == "wild" else "offroad"}
     raise ValueError(f"unknown map {name!r}; use one of {MAPS} or a map source dict")
 
 
@@ -38,9 +39,10 @@ class Task:
     action.
 
     Keyword arguments (all tasks):
-        vehicle: preset name (``cf2x``, ``iris_like``) or path to a vehicle TOML file.
-        action_mode: how the normalised actions in [−1, 1] command the vehicle (full-scale
-            values are the scenario's ``action_limits``):
+        vehicle: preset name (``cf2x``, ``iris_like``; ground vehicles ``sedan_like``,
+            ``offroad_4x4``, ``rover_diff``, ``rover_skid``) or path to a vehicle TOML file.
+        action_mode: how the normalised actions in [−1, 1] command the vehicle. Multirotors
+            (full-scale values are the scenario's ``action_limits``):
 
             - ``motors``: rotor speeds from idle to maximum, one per rotor;
             - ``ctbr`` (default): roll, pitch and yaw rates (±2π, ±2π, ±π rad/s), collective
@@ -50,13 +52,18 @@ class Task:
               vertical velocity (±2 m/s), yaw rate;
             - ``position``: offset from the current position in the heading frame
               (±5, ±5, ±2 m), heading change (±π).
+
+            Ground vehicles (full-scale values are the group's ``ground_action_limits``):
+            ``raw`` (pedal and steering), ``vk`` (speed and path curvature), ``vw`` (speed
+            and yaw rate) and ``per_wheel``.
         map, map_seed, map_count: see ``map_source``.
         physics_hz, policy_hz: simulation and action rates (the policy rate must divide the
             physics rate); ``physics_hz=None`` lets the scenario choose (500 Hz for aerial
             vehicles, 1 kHz with ground vehicles).
         episode_time: seconds until truncation.
         wind: ``[min, max]`` mean wind speed per episode (m/s, uniform direction), or None.
-        randomize: relative spreads of the vehicle parameters, e.g. ``{"mass": 0.1}``.
+        randomize: relative spreads of the vehicle parameters, e.g. ``{"mass": 0.1}``
+            (multirotors).
         obs: observation terms replacing the task's (see ``docs/PLAN.md``).
         overrides: dict deep-merged into the final scenario (``autonomousim.scenario.deep_merge``).
     """
@@ -156,13 +163,14 @@ class Task:
 
         ``state`` is ``[num_envs, STATE_DIM]``, ``events`` ``[num_envs]`` (uint32) and
         ``actions`` the actions just applied, ``[num_envs, act_dim]``. Episodes end on
-        success (``succeeded``) or failure (a terminal event or ``failed``); failures cost
+        success (``succeeded``) or failure (a terminal event, one of ``failure_events`` or
+        ``failed``); failures cost
         ``terminal_penalty``. ``self.success`` marks the worlds that succeeded on this step.
         """
         # The simulator clips actions and reads non-finite values as 0; so does the reward.
         a = np.clip(np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0), -1.0, 1.0)
         self.steps += 1
-        failure = ((events & TERMINAL_EVENTS) != 0) | self.failed(state)
+        failure = ((events & (TERMINAL_EVENTS | self.failure_events)) != 0) | self.failed(state)
         self.success[:] = self.succeeded(state, events) & ~failure
         terminated = failure | self.success
         reward = self.reward(state, a, self.prev_action, events)
@@ -172,6 +180,8 @@ class Task:
         return reward, terminated, truncated
 
     terminal_penalty = 0.0
+    #: Event bits that end the episode as a failure besides the terminal ones (e.g. ``STUCK``).
+    failure_events = 0
 
     def failed(self, state: np.ndarray) -> np.ndarray:
         """Task-specific end conditions besides the terminal events."""

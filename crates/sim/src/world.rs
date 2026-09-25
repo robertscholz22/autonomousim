@@ -39,7 +39,8 @@ pub const PARALLEL_AGENTS: usize = 32;
 
 /// Per-agent state row written by [`WorldInstance::write_state`]: `(name, length)` in order.
 /// `goal_index` equals the number of goals once the last one has been reached; `clearance` is
-/// the distance to the nearest terrain or solid obstacle surface, up to 20 m.
+/// the distance to the nearest terrain or solid obstacle surface, up to 20 m (for ground
+/// vehicles, which sit on the terrain, to the nearest solid obstacle).
 pub const STATE_FIELDS: [(&str, usize); 9] = [
     ("position", 3),
     ("orientation", 4),
@@ -266,7 +267,10 @@ impl WorldInstance {
             row[16] = goal.yaw;
             row[17] = a.agl_now(&self.map);
             row[18] = a.goal_index as f64;
-            row[19] = self.map.clearance(v.position(), CLEARANCE_RANGE);
+            row[19] = match v {
+                Vehicle::Wheeled(_) => self.map.obstacle_clearance(v.position(), CLEARANCE_RANGE),
+                _ => self.map.clearance(v.position(), CLEARANCE_RANGE),
+            };
         }
     }
 

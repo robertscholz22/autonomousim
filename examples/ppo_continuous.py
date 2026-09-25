@@ -64,6 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a("--target-kl", type=float, default=None)
     a("--hidden", type=int, default=128)
     a("--init-log-std", type=float, default=-0.5)
+    a("--init", default=None, help="policy.pt to continue from (weights and observation statistics)")
     a("--sim-threads", type=int, default=9)
     a("--torch-threads", type=int, default=3)
     a("--log-every", type=int, default=10, help="iterations between progress lines")
@@ -194,8 +195,14 @@ def main(argv: list[str] | None = None) -> dict[str, float]:
     obs_dim = envs.single_observation_space.shape[0]
     act_dim = envs.single_action_space.shape[0]
     agent = Agent(obs_dim, act_dim, args.hidden, args.init_log_std)
-    optimizer = torch.optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     obs_norm = ObsNormalizer(obs_dim)
+    if args.init:
+        ckpt = torch.load(args.init, weights_only=False)
+        if (ckpt["obs_dim"], ckpt["act_dim"], ckpt["hidden"]) != (obs_dim, act_dim, args.hidden):
+            raise SystemExit(f"{args.init} does not fit this environment and --hidden")
+        agent.load_state_dict(ckpt["agent"])
+        obs_norm.load_state_dict(ckpt["obs_norm"])
+    optimizer = torch.optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     reward_scale = RewardScaler(args.num_envs, args.gamma) if args.norm_reward else None
 
     shape = (args.num_steps, args.num_envs)
