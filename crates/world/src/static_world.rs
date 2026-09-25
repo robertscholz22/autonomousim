@@ -1,8 +1,9 @@
-//! A complete static map: terrain with water, obstacles, the material table and metadata.
+//! A complete static map: terrain with water, obstacles, roads, the material table and metadata.
 
 use crate::geodesy::GeoOrigin;
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::ObstacleSet;
+use crate::roads::RoadNetwork;
 use autonomousim_core::geometry::{HitMask, Ray, RayHit, StaticGeometry};
 use autonomousim_core::material::{Material, MaterialId, MaterialTable};
 use autonomousim_core::terrain::Terrain;
@@ -42,11 +43,23 @@ pub struct StaticWorld {
     terrain: HeightGrid,
     obstacles: ObstacleSet,
     materials: MaterialTable,
+    roads: RoadNetwork,
 }
 
 impl StaticWorld {
     pub fn new(meta: MapMeta, terrain: HeightGrid, obstacles: ObstacleSet, materials: MaterialTable) -> Self {
-        Self { meta, terrain, obstacles, materials }
+        Self { meta, terrain, obstacles, materials, roads: RoadNetwork::default() }
+    }
+
+    /// The same map with a road network.
+    pub fn with_roads(mut self, roads: RoadNetwork) -> Self {
+        self.roads = roads;
+        self
+    }
+
+    /// The road network (empty for maps without roads).
+    pub fn roads(&self) -> &RoadNetwork {
+        &self.roads
     }
 
     pub fn terrain(&self) -> &HeightGrid {

@@ -1,16 +1,20 @@
 //! Map files and content hashes.
 //!
-//! A map file is `MAGIC ‖ format version (u32 LE) ‖ content hash (32 bytes) ‖ zstd(postcard(map))`.
-//! The map part holds the metadata, the height grid (heights, cell materials, water), the
-//! obstacles in their stored order and the material table; the height pyramid and the obstacle
-//! BVH are rebuilt on load.
+//! A map file is `MAGIC ‖ format version (u32 LE) ‖ content hash (32 bytes) ‖ zstd(postcard(map)
+//! ‖ postcard(roads))`. The map part holds the metadata, the height grid (heights, cell
+//! materials, water), the obstacles in their stored order and the material table; the road part
+//! (format 2 on, written only for maps with roads) the road nodes and polylines. The height
+//! pyramid, the obstacle BVH and the road grid are rebuilt on load. Format 1 files (no roads)
+//! still load.
 //!
-//! The **content hash** is blake3 over a domain tag and the same postcard encoding, so two maps
+//! The **content hash** is blake3 over a domain tag and the same postcard encoding (the roads
+//! only when there are any, so maps without roads keep their format-1 hashes), so two maps
 //! have equal hashes exactly when every stored value is bit-identical. Generators use it for
 //! golden tests; recordings store it to check that a replay rebuilt the same map.
 
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::{Obstacle, ObstacleClass, ObstacleSet, ObstacleShape};
+use crate::roads::{RoadNetwork, RoadsData};
 use crate::static_world::{MapMeta, StaticWorld};
 use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::math::Pose;
@@ -22,7 +26,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 const MAGIC: &[u8; 8] = b"AUTOSIMM";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const HASH_DOMAIN: &[u8] = b"autonomousim map v1";
 
 /// blake3 content hash of a map (see the module docs).
@@ -80,7 +84,7 @@ pub enum MapFileError {
     Io(#[from] std::io::Error),
     #[error("not an autonomousim map file")]
     BadMagic,
-    #[error("unsupported map file version {0} (this build reads {FORMAT_VERSION})")]
+    #[error("unsupported map file version {0} (this build reads 1 to {FORMAT_VERSION})")]
     Version(u32),
     #[error("corrupt map file: {0}")]
     Corrupt(String),
@@ -218,6 +222,9 @@ pub fn content_hash(world: &StaticWorld) -> MapHash {
     let mut h = blake3::Hasher::new();
     h.update(HASH_DOMAIN);
     postcard::to_io(&view(world), &mut h).expect("hashing cannot fail");
+    if !world.roads().is_empty() {
+        postcard::to_io(&world.roads().stored(), &mut h).expect("hashing cannot fail");
+    }
     MapHash(*h.finalize().as_bytes())
 }
 
@@ -229,7 +236,10 @@ pub fn write(world: &StaticWorld, w: impl Write, level: i32) -> Result<MapHash, 
     w.write_all(&FORMAT_VERSION.to_le_bytes())?;
     w.write_all(&hash.0)?;
     let enc = zstd::Encoder::new(w, level)?;
-    let enc = postcard::to_io(&view(world), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    let mut enc = postcard::to_io(&view(world), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    if !world.roads().is_empty() {
+        enc = postcard::to_io(&world.roads().stored(), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    }
     enc.finish()?.flush()?;
     Ok(hash)
 }
@@ -243,12 +253,19 @@ pub fn read(r: impl Read) -> Result<(StaticWorld, MapHash), MapFileError> {
         return Err(MapFileError::BadMagic);
     }
     let version = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes"));
-    if version != FORMAT_VERSION {
+    if !(1..=FORMAT_VERSION).contains(&version) {
         return Err(MapFileError::Version(version));
     }
     let stored = MapHash(header[12..44].try_into().expect("32 bytes"));
     let bytes = zstd::decode_all(r)?;
-    let d: MapData = postcard::from_bytes(&bytes).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    let (d, rest): (MapData, _) =
+        postcard::take_from_bytes(&bytes).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    let roads = if rest.is_empty() {
+        RoadNetwork::default()
+    } else {
+        let r: RoadsData = postcard::from_bytes(rest).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+        RoadNetwork::try_from(r).map_err(MapFileError::Corrupt)?
+    };
     let (nx, ny) = (d.nx as usize, d.ny as usize);
     let cells = nx.saturating_sub(1) * ny.saturating_sub(1);
     let valid = nx >= 2
@@ -270,7 +287,8 @@ pub fn read(r: impl Read) -> Result<(StaticWorld, MapHash), MapFileError> {
         terrain,
         ObstacleSet::new(d.obstacles.into_iter().map(Obstacle::from).collect()),
         d.material_table,
-    );
+    )
+    .with_roads(roads);
     let actual = content_hash(&world);
     if actual != stored {
         return Err(MapFileError::HashMismatch { stored, actual });
@@ -341,5 +359,38 @@ mod tests {
         let h = testworlds::flat(10.0).content_hash();
         assert_eq!(h.to_string().parse::<MapHash>().unwrap(), h);
         assert_eq!(serde_json::from_str::<MapHash>(&serde_json::to_string(&h).unwrap()).unwrap(), h);
+    }
+
+    #[test]
+    fn roads_round_trip_and_old_files_load() {
+        use crate::roads::{NodeKind, Polyline, Road, RoadClass, RoadNode};
+        let plain = testworlds::lake(120.0, 3.0, -1.0);
+        let before = plain.content_hash();
+        let nodes = vec![
+            RoadNode { position: DVec3::new(-50.0, -50.0, 0.0), kind: NodeKind::End },
+            RoadNode { position: DVec3::new(50.0, -40.0, 0.0), kind: NodeKind::Yard },
+        ];
+        let line =
+            Polyline::new((0..=100).map(|i| DVec3::new(-50.0 + i as f64, -50.0 + 0.1 * i as f64, 0.0)).collect());
+        let road = Road { class: RoadClass::Gravel, width: 4.0, start: 0, end: 1, line };
+        let with = plain.clone().with_roads(RoadNetwork::new(nodes, vec![road]).unwrap());
+        // Roads change the hash; a map without them keeps its old one.
+        assert_ne!(with.content_hash(), before);
+        assert_eq!(plain.clone().with_roads(RoadNetwork::default()).content_hash(), before);
+        let mut buf = Vec::new();
+        write(&with, &mut buf, 3).unwrap();
+        let (back, h) = read(&buf[..]).unwrap();
+        assert_eq!(h, with.content_hash());
+        assert_eq!(back.roads(), with.roads());
+        assert!(back.roads().on_road(DVec2::new(0.0, -45.0)).is_some());
+        // A format-1 file: the same bytes as a map without roads, under version 1.
+        let mut old = Vec::new();
+        write(&plain, &mut old, 3).unwrap();
+        old[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let (back, h) = read(&old[..]).unwrap();
+        assert_eq!(h, before);
+        assert!(back.roads().is_empty());
+        old[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(matches!(read(&old[..]), Err(MapFileError::Version(3))));
     }
 }
