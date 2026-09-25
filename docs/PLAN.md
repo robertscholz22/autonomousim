@@ -1041,17 +1041,58 @@ Planned 2026-09-24; **done 2026-09-25** (steps 0–9, as built below). Scope fro
 | Tire force evaluation (combined MF 6.1) | ≤ 150 ns |
 
 
+## Milestone 3: Multi-agent
+
+Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance, neighbour observations. Two things were decided with the user at the start:
+- **Closing demo**: `SwarmWaypointForest-v0`. Eight drones share one policy; each flies its own chain of waypoints through the forest, sees its nearest neighbours and its LiDAR, and must avoid the trees and the other drones.
+- **Live viewer attach** moves to M9, where the ROS 2 bridge brings the transport (zenoh or DDS).
+
+**Already in place from M1/M2**: several groups per world (any vehicle family), per-agent spawns (`min_separation`) and goal chains, frictionless penalty contacts between agents' sphere colliders with a deterministic sweep-and-prune (`sim::interaction`), `CRASH_AGENT`, LiDAR that sees other agents, per-agent parallel phases from 32 agents on, per-agent MCAP channels, and viewer replay and policy playback of several agents. A swarm of 128 hovering drones runs at 33× real time in one world.
+
+### Design
+- **Episodes with several agents**: all agents of a world share one episode. An agent with a terminal event (crash, water, bounds, a task's failure events) or that finished its task stops: it is disabled (`disable_on_terminal`, already the default), frozen, and drops out of contacts and sensors. Its reward stops, and its later transitions are masked out. The world ends when every agent has stopped, or at the time limit (truncation for all agents still going). Autoreset is per world.
+- **Native multi-agent vector env** (`autonomousim.MultiAgentVectorEnv`, `gym.make_vec`-free, like the Rust `BatchSim`): arrays per group, keyed by group name:
+  - `obs[g]`: `float32 [num_envs, count_g, obs_dim_g]`; `reward[g]`, `terminated[g]`: `[num_envs, count_g]`; `truncated`: `[num_envs]` (per world); `info["active"][g]`: agents still going before this step.
+  - `step(actions)` takes `{group: [num_envs, count_g, act_dim_g]}`, or one array for single-group scenarios.
+  - SAME_STEP autoreset with dense `final_obs[g]` and a per-world `_final_obs` mask, as the single-agent env.
+  - Groups with different vehicles, observation and action sizes (mixed air/ground teams) work the same way.
+- **Tasks for several agents**: `MultiAgentTask` computes rewards and ends on `[num_envs, count]` arrays per group, with world-level truncation and per-agent success. Existing single-agent tasks keep working unchanged (the single-agent `VectorEnv` stays as it is). Agent-to-agent terms (distance to the nearest other agent) come from a new state column rather than numpy pairwise distances, so they cost O(n) and follow the colliders.
+- **PettingZoo `ParallelEnv`** (`autonomousim.pettingzoo.parallel_env(task, ...)`): one world. Agents are named `"<group>_<k>"`; stopped agents leave `env.agents` as PettingZoo requires; the episode ends when no agent is left. It passes `pettingzoo.test.parallel_api_test` and the seed test. `pettingzoo` joins the dev dependency group.
+- **Neighbour observations** (Rust `ObsSpec`, so the viewer can run multi-agent policies without Python):
+  - `neighbors`: the `k` nearest other active agents within `range` (optionally of given groups), sorted by distance with ties broken by agent id. Per neighbour: relative position and relative velocity in the heading frame, and 1 for a present slot. Missing slots are zero. `6k + k` values.
+  - `nearest_agent`: distance to the nearest other agent's colliders (surface to surface), up to `range`.
+  - A state column `agent_clearance` (STATE_DIM 21), the same distance up to 20 m, for rewards. The golden trajectory hashes include the state rows, so they are re-blessed once, after checking that every world's physics `state_hash` is unchanged.
+  - Neighbour search reuses the per-tick sweep order; with ≥ 64 agents a uniform grid on the xy plane replaces the O(n²) scan.
+- **Full-shape agent contacts**:
+  - Ground vehicles' wheels join their agent shapes (a sphere per wheel at the wheel centre with the tyre's radius), so drones can hit and rest on cars and cars can push each other by the wheels.
+  - Regularised Coulomb friction between agents (μ from the two colliders' materials, 0.5 by default), with bristle anchors keyed by the collider pair as for terrain contacts, so a drone can sit on a moving car's roof.
+  - Contact normals and forces stay pairwise in the sweep order (deterministic).
+- **Swarm performance**: 256 drones in one world at ≥ 20× real time (≤ 1 ms per 20 ms policy step at 500 Hz physics, laptop). Profile first (per-phase timers, since `perf` is blocked); options in order: fewer fork–joins per tick, the xy grid for pairs and neighbours, chunked parallel work, and a structure-of-arrays fast path for multirotors only if the others fall short.
+- **Training**: `examples/ppo_multiagent.py`, parameter-shared PPO (IPPO): every (world, agent) slot is a sample, masked while its agent is stopped; per-agent GAE, truncation bootstraps from `final_obs`. Observation normalisation and the network are the single-agent script's, so exported policies run in the viewer's `policy` command unchanged.
+- **Viewer**: `policy` runs multi-agent policies (neighbour terms come from the Rust `ObsSpec`); the HUD shows the followed agent's neighbours; replay shows agent contacts.
+
+### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Neighbour observation terms, `agent_clearance` state column, xy grid for agent queries | Terms match a brute-force reference on random swarms; order and ties deterministic; disabled agents are invisible; physics state hashes unchanged (goldens re-blessed for the new column only) |
+| 2 | Full-shape agent contacts: wheel spheres, friction with bristle anchors | A drone lands on a parked car's roof and stays there while the car drives off at 2 m/s; two cars pushing wheel to wheel exchange equal and opposite forces; a drone falling onto a car hits `CRASH_AGENT`; determinism suite passes |
+| 3 | Python: `MultiAgentVectorEnv`, `MultiAgentTask`, per-agent stopping and per-world autoreset; a mixed drone + car scenario | Shape, dtype, masking, autoreset and seeding tests for one group and for a mixed team with different obs/act sizes |
+| 4 | PettingZoo `ParallelEnv` | `parallel_api_test` and the seed test pass for a single-group and a mixed-team task |
+| 5 | Swarm performance | 256 drones hovering in one world ≥ 20× real time; 128 unchanged or faster; benchmarks recorded |
+| 6 | `ppo_multiagent.py` and a quick check task (`SwarmHover-v0`: N drones hold assigned slots in a formation without touching) | Formation error < 0.3 m and no agent contacts in 95 % of episodes after ≤ 15 min of training |
+| 7 | `SwarmWaypointForest-v0`, training, viewer | ≥ 80 % of agents finish their waypoints on unseen maps and < 2 % of agents collide with another agent; the exported policy flies the swarm in the viewer; a recorded episode replays |
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
 | M2 | (Detailed above.) Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
-| M3 | Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations, live viewer attach over zenoh | pettingzoo API tests; 256 drones at ≥ 20× real time |
+| M3 | (Detailed above.) Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations | pettingzoo API tests; 256 drones at ≥ 20× real time |
 | M4 | Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
 | M5 | Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
 | M6 | Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
-| M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export | Round trip with `ros2 topic echo` |
+| M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export; live viewer attach to a running simulation (moved from M3, 2026-09-25) | Round trip with `ros2 topic echo` |
 
 ### Tracked vehicles (M4; added 2026-09-24)
 - **Scope and presets**:
