@@ -1,10 +1,11 @@
 //! `autonomousim` command-line tool.
 
 use anyhow::{Context, bail};
+use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
-use autonomousim_procgen::{MapCache, WildStats};
-use autonomousim_world::{StaticWorld, mapfile, obstacles::tags};
-use clap::{Args, Parser, Subcommand};
+use autonomousim_procgen::{MapCache, RuralStats, WildStats};
+use autonomousim_world::{RoadClass, StaticWorld, mapfile, obstacles::tags};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -21,7 +22,7 @@ struct Cli {
 enum Command {
     /// Print version information.
     Version,
-    /// Generate a wild map (or load it from the map cache) and print statistics.
+    /// Generate a wild or rural map (or load it from the map cache) and print statistics.
     Mapgen(MapgenArgs),
     /// Print the content hash of map files (verifying each).
     MapHash {
@@ -34,9 +35,12 @@ enum Command {
 
 #[derive(Args)]
 struct MapgenArgs {
-    /// Starting configuration: training (512 m), showcase (2 km) or offroad (512 m, gentle).
+    #[arg(long, value_enum, default_value_t = Generator::Wild)]
+    generator: Generator,
+    /// Starting configuration: training (512 m) or showcase (2 km); wild maps also have
+    /// offroad (512 m, gentle).
     #[arg(long, default_value = "training")]
-    preset: WildPreset,
+    preset: String,
     /// TOML file whose values override the preset (same layout as `--print-config`).
     #[arg(long)]
     config: Option<PathBuf>,
@@ -88,7 +92,27 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn config(args: &MapgenArgs) -> anyhow::Result<WildConfig> {
+#[derive(Clone, Copy, ValueEnum)]
+enum Generator {
+    Wild,
+    Rural,
+}
+
+/// The effective configuration of either generator.
+enum Config {
+    Wild(WildConfig),
+    Rural(RuralConfig),
+}
+
+/// Statistics of either generator.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Stats {
+    Wild(WildStats),
+    Rural(RuralStats),
+}
+
+fn config(args: &MapgenArgs) -> anyhow::Result<Config> {
     let overrides = match &args.config {
         Some(path) => {
             let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -96,35 +120,65 @@ fn config(args: &MapgenArgs) -> anyhow::Result<WildConfig> {
         }
         None => None,
     };
-    let mut config = WildConfig::from_preset(args.preset, overrides.as_ref())?;
-    if let Some(size) = args.size {
-        config.size = size;
-    }
-    config.validate()?;
-    Ok(config)
+    let preset = |e: String| anyhow::anyhow!(e);
+    Ok(match args.generator {
+        Generator::Wild => {
+            let mut c =
+                WildConfig::from_preset(args.preset.parse::<WildPreset>().map_err(preset)?, overrides.as_ref())?;
+            if let Some(size) = args.size {
+                c.size = size;
+            }
+            c.validate()?;
+            Config::Wild(c)
+        }
+        Generator::Rural => {
+            let mut c =
+                RuralConfig::from_preset(args.preset.parse::<RuralPreset>().map_err(preset)?, overrides.as_ref())?;
+            if let Some(size) = args.size {
+                c.size = size;
+            }
+            c.validate()?;
+            Config::Rural(c)
+        }
+    })
 }
 
 fn mapgen(args: MapgenArgs) -> anyhow::Result<()> {
     let config = config(&args)?;
     if args.print_config {
-        print!("{}", toml::to_string(&config)?);
+        match &config {
+            Config::Wild(c) => print!("{}", toml::to_string(c)?),
+            Config::Rural(c) => print!("{}", toml::to_string(c)?),
+        }
         return Ok(());
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(args.threads).build()?;
     let t = Instant::now();
     let (world, hash, stats, source) = pool.install(|| -> anyhow::Result<_> {
         if args.no_cache {
-            let (world, stats) = wild::generate(&config, args.seed)?;
+            let (world, stats) = match &config {
+                Config::Wild(c) => wild::generate(c, args.seed).map(|(w, s)| (w, Stats::Wild(s)))?,
+                Config::Rural(c) => rural::generate(c, args.seed).map(|(w, s)| (w, Stats::Rural(s)))?,
+            };
             let hash = world.content_hash();
             Ok((world, hash, Some(stats), "generated (cache disabled)".to_owned()))
         } else {
             let Some(cache) = MapCache::user() else { bail!("no cache directory (set AUTONOMOUSIM_MAP_CACHE)") };
-            let c = cache.wild(&config, args.seed)?;
-            let source = match c.generated {
-                Some(_) => format!("generated, cached at {}", c.path.display()),
-                None => format!("loaded from {}", c.path.display()),
+            let (world, hash, path, stats) = match &config {
+                Config::Wild(c) => {
+                    let c = cache.wild(c, args.seed)?;
+                    (c.world, c.hash, c.path, c.generated.map(Stats::Wild))
+                }
+                Config::Rural(c) => {
+                    let c = cache.rural(c, args.seed)?;
+                    (c.world, c.hash, c.path, c.generated.map(Stats::Rural))
+                }
             };
-            Ok((c.world, c.hash, c.generated, source))
+            let source = match stats {
+                Some(_) => format!("generated, cached at {}", path.display()),
+                None => format!("loaded from {}", path.display()),
+            };
+            Ok((world, hash, stats, source))
         }
     })?;
     let total = t.elapsed().as_secs_f64();
@@ -147,8 +201,10 @@ fn mapgen(args: MapgenArgs) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    if let Some(s) = &stats {
-        print_stats(s);
+    match &stats {
+        Some(Stats::Wild(s)) => print_stats(s),
+        Some(Stats::Rural(s)) => print_rural_stats(s),
+        None => {}
     }
     println!("{}", info(&world, &hash.to_string()));
     println!("{source} in {total:.2} s ({} threads)", pool.current_num_threads());
@@ -179,6 +235,23 @@ fn print_stats(s: &WildStats) {
     println!("materials: {}", shares.join(", "));
 }
 
+fn print_rural_stats(s: &RuralStats) {
+    println!("stages:");
+    for (name, secs) in &s.stages {
+        println!("  {name:<18} {secs:>7.3} s");
+    }
+    println!("  {:<18} {:>7.3} s", "total", s.total_seconds());
+    println!(
+        "lakes {} ({} cells), farms {} of {} sites, {} junctions",
+        s.lakes, s.lake_cells, s.farms, s.farm_sites, s.junctions
+    );
+    println!("heights {:.1} … {:.1} m", s.height_range.0, s.height_range.1);
+    let cells: usize = s.materials.iter().map(|m| m.1).sum();
+    let shares: Vec<String> =
+        s.materials.iter().map(|(n, c)| format!("{n} {:.1}%", 100.0 * *c as f64 / cells as f64)).collect();
+    println!("materials: {}", shares.join(", "));
+}
+
 fn info(w: &StaticWorld, hash: &str) -> String {
     let t = w.terrain();
     let (nx, ny) = t.dims();
@@ -199,9 +272,27 @@ fn info(w: &StaticWorld, hash: &str) -> String {
     };
     let obstacles: Vec<String> = by_tag.iter().map(|(t, n)| format!("{n} {}", tag(*t))).collect();
     let wet = t.water().map_or(0, |w| w.iter().filter(|v| !v.is_nan()).count());
+    let net = w.roads();
+    let roads = if net.is_empty() {
+        "none".to_owned()
+    } else {
+        let classes = [(RoadClass::Paved, "paved"), (RoadClass::Gravel, "gravel"), (RoadClass::Track, "track")];
+        let parts: Vec<String> = classes
+            .iter()
+            .filter_map(|&(class, name)| {
+                let (n, len) = net
+                    .roads()
+                    .iter()
+                    .filter(|r| r.class == class)
+                    .fold((0, 0.0), |(n, l), r| (n + 1, l + r.line.length()));
+                (n > 0).then(|| format!("{n} {name} ({:.2} km)", len / 1000.0))
+            })
+            .collect();
+        format!("{}, {} nodes", parts.join(", "), net.nodes().len())
+    };
     format!(
         "map {:?} (generator {} v{}, seed {})\n  extent [{:.0}, {:.0}] × [{:.0}, {:.0}] m, {nx}×{ny} vertices at {} m\n  \
-         heights {lo:.1} … {hi:.1} m, {wet} water cells\n  obstacles: {}\n  hash {hash}",
+         heights {lo:.1} … {hi:.1} m, {wet} water cells\n  obstacles: {}\n  roads: {roads}\n  hash {hash}",
         w.meta.name,
         w.meta.generator,
         w.meta.generator_version,

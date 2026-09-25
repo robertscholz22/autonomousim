@@ -5,6 +5,7 @@
 //! so several processes can share a cache directory.
 
 use crate::ProcgenError;
+use crate::rural::{self, RURAL_VERSION, RuralConfig, RuralStats};
 use crate::wild::{self, WILD_VERSION, WildConfig, WildStats};
 use autonomousim_world::{MapHash, StaticWorld, mapfile};
 use serde::Serialize;
@@ -91,6 +92,13 @@ impl MapCache {
         config.validate()?;
         let key = Self::key("wild", WILD_VERSION, config, seed);
         self.load_or_generate(&key, || wild::generate(config, seed))
+    }
+
+    /// A rural map from the cache, generated on a miss.
+    pub fn rural(&self, config: &RuralConfig, seed: u64) -> Result<Cached<RuralStats>, ProcgenError> {
+        config.validate()?;
+        let key = Self::key("rural", RURAL_VERSION, config, seed);
+        self.load_or_generate(&key, || rural::generate(config, seed))
     }
 }
 

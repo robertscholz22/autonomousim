@@ -8,11 +8,13 @@
 pub mod cache;
 mod hydrology;
 pub mod noise;
+pub mod rural;
 mod scatter;
 mod terrain;
 pub mod wild;
 
 pub use cache::MapCache;
+pub use rural::{RuralConfig, RuralPreset, RuralStats};
 pub use scatter::{RocksConfig, TreesConfig};
 pub use terrain::{ErosionConfig, TerrainConfig};
 pub use wild::{WildConfig, WildPreset, WildStats};

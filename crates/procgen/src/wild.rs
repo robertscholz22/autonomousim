@@ -285,7 +285,7 @@ impl WildConfig {
 }
 
 /// Recursively overlay `top` onto `base` (objects merge key by key, anything else replaces).
-fn merge(base: &mut serde_json::Value, top: &serde_json::Value) {
+pub(crate) fn merge(base: &mut serde_json::Value, top: &serde_json::Value) {
     match (base, top) {
         (serde_json::Value::Object(b), serde_json::Value::Object(t)) => {
             for (k, v) in t {
@@ -341,13 +341,26 @@ struct LineSeeds {
 const LINE_FRACTAL: Fractal = Fractal { octaves: 3, lacunarity: 2.0, gain: 0.5 };
 const LINE_WAVELENGTH: f64 = 250.0;
 
-/// Generate a wild map. Uses the current rayon pool; the output does not depend on its size.
-pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStats), ProcgenError> {
-    config.validate()?;
-    let c = config;
-    let mut stats = WildStats::default();
-    let mut t = Instant::now();
-    let root = Seed::from_u64(seed).child("map/wild");
+/// What shapes the bare land: size, terrain noise, erosion and water.
+pub(crate) struct Land<'a> {
+    pub size: f64,
+    pub cell: f64,
+    pub terrain: &'a TerrainConfig,
+    pub erosion: &'a ErosionConfig,
+    pub water: &'a WaterConfig,
+}
+
+/// Vertex heights, lakes and upstream areas of the final grid.
+pub(crate) struct Landform {
+    pub heights: Vec<f32>,
+    pub lakes: crate::hydrology::Lakes,
+    pub accumulation: Vec<u32>,
+    pub droplets: u64,
+}
+
+/// Steps 1–4 of the wild pipeline (terrain, erosion, upsampling, hydrology), shared with the
+/// rural generator; `stage` is called after each step with its name.
+pub(crate) fn landform(c: &Land, root: &Seed, stage: &mut dyn FnMut(&'static str)) -> Landform {
     let terrain_seed = root.child("terrain");
     let layer = |name: &str| terrain_seed.child(name).short();
     let ts = TerrainSeeds {
@@ -358,29 +371,29 @@ pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStat
         detail: layer("detail"),
     };
     let relief = c.terrain.relief;
-    let n = c.vertices();
+    let n = (c.size / c.cell).round() as usize + 1;
     let nc = (n - 1) / 2 + 1;
     let origin = DVec2::splat(-0.5 * c.size);
     let coarse_cell = 2.0 * c.cell;
-    stats.vertices = n * n;
 
     // 1. Terrain on the coarse grid.
     let mut coarse = Field::from_rows(nc, nc, |iy, row| {
         let y = origin.y + iy as f64 * coarse_cell;
         for (ix, h) in row.iter_mut().enumerate() {
-            *h = base_height(&c.terrain, &ts, origin.x + ix as f64 * coarse_cell, y);
+            *h = base_height(c.terrain, &ts, origin.x + ix as f64 * coarse_cell, y);
         }
     });
-    stats.stage("terrain", &mut t);
+    stage("terrain");
 
     // 2. Erosion (hydraulic erosion works in units of the relief).
+    let mut droplets = 0;
     if c.erosion.enabled {
         coarse.data.iter_mut().for_each(|h| *h /= relief);
-        stats.droplets = hydraulic_erosion(&mut coarse, &c.erosion, &mut root.child("erosion").rng());
+        droplets = hydraulic_erosion(&mut coarse, c.erosion, &mut root.child("erosion").rng());
         coarse.data.iter_mut().for_each(|h| *h *= relief);
-        stats.stage("hydraulic erosion", &mut t);
-        thermal_erosion(&mut coarse, coarse_cell, &c.erosion);
-        stats.stage("thermal erosion", &mut t);
+        stage("hydraulic erosion");
+        thermal_erosion(&mut coarse, coarse_cell, c.erosion);
+        stage("thermal erosion");
     }
 
     // 3. Final resolution.
@@ -389,27 +402,48 @@ pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStat
     fine.data.par_chunks_mut(n).enumerate().for_each(|(iy, row)| {
         let y = origin.y + iy as f64 * c.cell;
         for (ix, h) in row.iter_mut().enumerate() {
-            *h += detail_height(&c.terrain, &ts, origin.x + ix as f64 * c.cell, y);
+            *h += detail_height(c.terrain, &ts, origin.x + ix as f64 * c.cell, y);
         }
     });
     let heights: Vec<f32> = fine.data.iter().map(|&h| h as f32).collect();
     drop(fine);
-    stats.stage("upsample", &mut t);
+    stage("upsample");
 
     // 4. Hydrology.
     let drainage = priority_flood(&heights, n, n);
     let acc = accumulation(&drainage);
     let min_vertices = (c.water.min_area / (c.cell * c.cell)).ceil() as usize;
     let lakes = if c.water.enabled {
-        let w = &c.water;
+        let w = c.water;
         lakes(&heights, &drainage.filled, &acc, n, n, w.min_depth as f32, min_vertices, w.max_catchment_share)
     } else {
         crate::hydrology::Lakes { water: vec![f32::NAN; (n - 1) * (n - 1)], count: 0, cells: 0 }
     };
     drop(drainage);
+    stage("hydrology");
+    Landform { heights, lakes, accumulation: acc, droplets }
+}
+
+/// Generate a wild map. Uses the current rayon pool; the output does not depend on its size.
+pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStats), ProcgenError> {
+    config.validate()?;
+    let c = config;
+    let mut stats = WildStats::default();
+    let mut t = Instant::now();
+    let root = Seed::from_u64(seed).child("map/wild");
+    let relief = c.terrain.relief;
+    let n = c.vertices();
+    let origin = DVec2::splat(-0.5 * c.size);
+    stats.vertices = n * n;
+    let land = landform(
+        &Land { size: c.size, cell: c.cell, terrain: &c.terrain, erosion: &c.erosion, water: &c.water },
+        &root,
+        &mut |name| stats.stage(name, &mut t),
+    );
+    let (heights, lakes, acc) = (land.heights, land.lakes, land.accumulation);
+    stats.droplets = land.droplets;
     stats.lakes = lakes.count;
     stats.lake_cells = lakes.cells;
-    stats.stage("hydrology", &mut t);
 
     // 5. Moisture and materials.
     let moisture = moisture(&acc, n);
@@ -471,7 +505,7 @@ pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStat
 }
 
 /// Moisture in [0, 1] per vertex: log upstream area, blurred.
-fn moisture(acc: &[u32], n: usize) -> Vec<f32> {
+pub(crate) fn moisture(acc: &[u32], n: usize) -> Vec<f32> {
     let scale = 1.0 / libm::log(MOISTURE_AREA);
     let raw: Vec<f32> = acc.par_iter().map(|&a| (libm::log(a as f64) * scale).min(1.0) as f32).collect();
     box_blur(&raw, n, n, MOISTURE_BLUR)
@@ -505,7 +539,7 @@ fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 }
 
 /// Highest water level within `r` cells (−∞ where there is none).
-fn nearby_water(water: &[f32], w: usize, r: usize) -> Vec<f32> {
+pub(crate) fn nearby_water(water: &[f32], w: usize, r: usize) -> Vec<f32> {
     let h = water.len() / w;
     let level = |v: f32| if v.is_nan() { f32::NEG_INFINITY } else { v };
     let mut tmp = vec![0.0f32; water.len()];

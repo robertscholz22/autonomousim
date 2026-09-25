@@ -1,0 +1,20 @@
+# Content hashes of generated rural maps (see crates/procgen/tests/rural.rs).
+# Regenerate: AUTONOMOUSIM_BLESS=1 cargo test -p autonomousim-procgen --test rural
+
+[[rural]]
+preset = "training"
+size = 512.0
+seed = 1
+hash = "d31569b8050905333c80a47f2ba1c6f8bd967105780a615f2dd67e820f21e7ab"
+
+[[rural]]
+preset = "training"
+size = 512.0
+seed = 2
+hash = "1ef07afaede2dc07494a540abbfbcc218b7c49be6f799bcad8bbf24360e17319"
+
+[[rural]]
+preset = "showcase"
+size = 1024.0
+seed = 3
+hash = "00a70dd24cc6e98d00ac7120b85140667332cc34b63d03dd7c8047004b6c1909"
