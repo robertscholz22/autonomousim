@@ -1383,7 +1383,7 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
 | 3 ✅ | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
 | 4 ✅ | Simulation: scenario `trailers`, multi-body agent shapes, `JACKKNIFE`, `articulation` state and terms, `trailer_goal`, recordings with articulation | Rigs spawn, drive and record; replays reproduce them; goldens of existing scenarios unchanged |
 | 5 ✅ | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
-| 6 | `TrailerReverse-v0`: `bay` goals, scripted reversing controller, short training, export, viewer, replay | The task trains end to end; the exported policy reverses in the viewer; a recorded episode replays |
+| 6 ✅ | `TrailerReverse-v0`: `bay` goals, scripted reversing controller, short training, export, viewer, replay | The task trains end to end; the exported policy reverses in the viewer; a recorded episode replays |
 
 #### As built
 - **Step 1** (units and couplings):
@@ -1482,6 +1482,32 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
     - viewer `vehicle_view`: the farm rig's wheels, composed through their unit entities, land where the simulation has them.
     - viewer `replay`: a recorded semitrailer rig replays with the same articulation and trailer pose.
     - viewer `main`: the `--trailer` flag works.
+- **Step 6** (`TrailerReverse-v0`, `bay` goals, sensors on trailers, level farm yards):
+  - **Bay goals** (`sim::bay`, goal kind `bay`, ground vehicles only; maps without farm yards are rejected when compiled):
+    - `bay::yards(world)` finds the yards (the `Yard` nodes) with the generator's heading: toward the eighth point of the road that leaves the yard.
+    - The bay lies `depth` (16 m) behind the yard's centre, within ±`offset` (4 m) across it. The goal is the last unit's tail there (`WheeledDef::tail`), heading toward the exit.
+    - The spawn puts the rig in line with its tail `distance` m (the task uses 12–24 m) ahead of the bay, within ±`lateral` (2 m) of the bay's line, with the heading within ±`yaw_deg` (10°) of the yard's. Each agent prefers a yard not used yet.
+    - `GoalSpec::bay` is written to `/meta` only when changed, so existing goldens stay.
+  - **Sensors on trailers**: `SensorSpec::unit` mounts a rangefinder or LiDAR on a unit behind the towing unit, in that unit's frame. It samples with the unit's pose and velocity at the step's start. Inertial and navigation sensors (IMU, GPS, baro, mag) must stay on unit 0. Tests: a LiDAR on the semitrailer's tail scans backward from there; `unit` 2 and an IMU on unit 1 are rejected.
+  - **TrailerReverse-v0** (`tasks/trailer_reverse.py`):
+    - **Setup**: `truck_6x4` + `semitrailer_3axle` in `vk` mode, up to 3 m/s either way and curvature 0.09 1/m. `bay` goals on a pool of 16 rural maps. 20 Hz policy, 1 kHz physics, 60 s episodes.
+    - **Observation** (31 values): `trailer_goal` (×0.1), `articulation`, speed, steering, last action, and a LiDAR on the trailer's tail (one ring 1° down, 19 beams over the 180° behind, 30 m, log ranges).
+    - **Reward**: progress of the tail toward the bay; −0.05·|ψ|·min(1, 5/d) for the trailer's heading error; −0.05·φ² for the articulation; smoothness 0.02‖Δa‖²; +20 on success; −20 on a crash, a jackknife (70°), a rollover, or the tail more than 35 m from the bay.
+    - **Success**: the tail within 1 m of the bay, the trailer within 5° of the yard's heading, and below 0.5 m/s.
+    - **Scripted driver** (`TrailerReverse.scripted`): the tail aims at the point 10 m behind its projection on the bay's line. That gives the trailer a wanted heading, which is turned into an articulation target φ* = asin(L·0.15·e), capped at 0.25 rad. The tractor's curvature holds it (κ = −sin φ/L − (φ − φ*), L = 7.6 m), and the speed tapers to a stop on the bay. It parks 90 % of the rigs (64 episodes on unseen seeds). The rest stop on the bay 5–10° off.
+  - **Level yards** (`RURAL_VERSION` 4; rural golden hashes re-blessed). The yards were not level: 0.4–1.4 m of relief across the rectangle.
+    - **Cause**: the road into a yard starts at its centre and follows its own graded profile from there. Its surface and shoulders are blended in after the pad, so they cut a ramp through the yard.
+    - **Effect**: a rig spawned on the ramp lifted a drive wheel. With the open differentials the engine speed follows the free wheel's spin, so the engine ran at its governor with little torque and the rig stalled at full lock.
+    - **Fix**: roads now stay level with the yard while on its pad and climb only beyond it; `reach_nodes` budgets the grade over that length. The yards are now level to 4 cm (the road crown).
+    - **Test driver**: the road-follow test driver now also slows while turning onto a lane, as the new terrain made it run wide at one hairpin junction. The off-road test accepts a crash into a cutting's bank as the way off the road.
+  - **Map pools**: `CompiledScenario::episode_maps` lists the maps episodes are drawn from. With `bay` goals that is only the maps with farm yards (map 8 of the unseen pool, seed 1000, has none), and a pool with no yards at all is rejected. Otherwise all maps are listed and the draw is unchanged.
+  - **Viewer**: a bay goal is drawn as a 1 m sphere (the success radius) with an arrow along the bay's heading. The goal sphere sized to the vehicle was 17 m across for the rig.
+  - **Training** (`ppo_continuous.py --hidden 256 --bound-coef 0.01`, 5M steps, 256 envs, 23 min at 3.7k SPS; basic training only, to check the pipeline):
+    - Success on the training maps rose to 35 % and was still rising.
+    - Deterministic evaluation: 39 % over 64 episodes (training pool). In 10 recorded episodes on unseen maps (`map_seed` 1000), 1 parked; 4 ended `STUCK` or stalled near the bay, the rest ran out of time about 16 m out.
+    - A real policy needs far more training; the user trains the agents.
+  - **Export and viewer**: `export_policy.py` wrote `policy.json`. `autonomousim-viewer policy <json> --map-seed 0` reverses the rig at 140–170 fps. `eval_record.py` recordings re-simulate bit for bit and replay in the viewer at about 150 fps.
+  - **Tests**: Rust `trailers.rs` (bay placement, errors, trailer sensors, bay episodes skipping yard-less maps); Python: the scripted driver parks at least 3 of 4 rigs and the parked ones meet the success conditions; driving away fails; spaces and `check_env`.
 
 ### M4c: Tracked vehicles and soft soil
 The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.

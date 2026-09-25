@@ -10,8 +10,8 @@
 //!    each to the nearest road built so far.
 //! 4. The routed paths, split at junctions, become centripetal Catmull–Rom splines resampled
 //!    every metre, smoothed until they respect the class's minimum radius.
-//! 5. Road profiles: terrain heights along each road, smoothed, pinned to the node heights and
-//!    limited to the class's maximum grade.
+//! 5. Road profiles: terrain heights along each road, smoothed, pinned to the node heights
+//!    (level with a yard across its pad) and limited to the class's maximum grade.
 //! 6. Terrain blending: the road surfaces (with a crown) and the farm yards are cut or filled
 //!    into the terrain, with shoulders falling off smoothly.
 //! 7. Materials per cell: roads (asphalt, gravel, dirt), yards (concrete), lake beds and
@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const RURAL_VERSION: u32 = 3;
+pub const RURAL_VERSION: u32 = 4;
 
 /// Geometry limits of one road class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -514,19 +514,36 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
         node_z[f.node as usize] = y.z;
         fixed[f.node as usize] = true;
     }
-    reach_nodes(&c.roads, &pieces, &mut node_z, &fixed);
-    let roads: Vec<Road> = pieces
+    // A road stays level with a yard while it crosses the yard's pad, so that its surface
+    // (blended in after the pads) does not cut a ramp into the yard: it climbs only over
+    // `points[a..b]`, from the last point on the start's pad to the first on the end's.
+    let on_pad = |node: u32, q: DVec2| {
+        plan.farms.iter().zip(&yards).any(|(f, y)| f.node == node && y.distance(q, pad_half) == 0.0)
+    };
+    let ramps: Vec<(usize, usize)> = pieces
         .iter()
         .map(|p| {
+            let n = p.points.len();
+            let a = p.points.iter().position(|&q| !on_pad(p.start, q)).unwrap_or(n);
+            let b = p.points.iter().rposition(|&q| !on_pad(p.end, q)).map_or(0, |i| i + 1);
+            if a < b { (a.saturating_sub(1), (b + 1).min(n)) } else { (0, n) }
+        })
+        .collect();
+    let lengths: Vec<f64> = pieces
+        .iter()
+        .zip(&ramps)
+        .map(|(p, &(a, b))| p.points[a..b].windows(2).map(|w| w[0].distance(w[1])).sum())
+        .collect();
+    reach_nodes(&c.roads, &pieces, &lengths, &mut node_z, &fixed);
+    let roads: Vec<Road> = pieces
+        .iter()
+        .zip(&ramps)
+        .map(|(p, &(a, b))| {
             let cc = c.roads.class(p.class);
-            let z = profile(
-                &p.points,
-                &hs,
-                node_z[p.start as usize],
-                node_z[p.end as usize],
-                cc.max_grade,
-                c.roads.profile_window,
-            );
+            let (z0, z1) = (node_z[p.start as usize], node_z[p.end as usize]);
+            let mut z = vec![z0; a];
+            z.extend(profile(&p.points[a..b], &hs, z0, z1, cc.max_grade, c.roads.profile_window));
+            z.resize(p.points.len(), z1);
             let points = p.points.iter().zip(z).map(|(q, z)| q.extend(z)).collect();
             Road { class: p.class, width: cc.width, start: p.start, end: p.end, line: Polyline::new(points) }
         })
@@ -1214,14 +1231,13 @@ fn resample(points: &[DVec2], step: f64) -> Vec<DVec2> {
 /// over the first and last 15 m, then limited to `max_grade`. Too steep only where the
 /// nodes themselves are too far apart in height.
 /// Move the heights of the free (non-yard) nodes so that every piece can climb from one end to
-/// the other within 90 % of its class's grade limit: a road whose ends are too far apart in
+/// the other within 90 % of its class's grade limit over its graded length (`lengths`): a road whose ends are too far apart in
 /// height could not meet both (see `profile`). Pieces pull their ends together in a fixed
 /// order until all fit or the passes run out; the terrain is then cut and filled to match.
-fn reach_nodes(c: &RoadsConfig, pieces: &[Piece], node_z: &mut [f64], fixed: &[bool]) {
-    let lengths: Vec<f64> = pieces.iter().map(|p| p.points.windows(2).map(|w| w[0].distance(w[1])).sum()).collect();
+fn reach_nodes(c: &RoadsConfig, pieces: &[Piece], lengths: &[f64], node_z: &mut [f64], fixed: &[bool]) {
     for _ in 0..100 {
         let mut moved = false;
-        for (p, &len) in pieces.iter().zip(&lengths) {
+        for (p, &len) in pieces.iter().zip(lengths) {
             let (a, b) = (p.start as usize, p.end as usize);
             let allowed = 0.9 * c.class(p.class).max_grade * len;
             let excess = (node_z[b] - node_z[a]).abs() - allowed;

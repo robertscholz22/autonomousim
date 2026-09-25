@@ -64,7 +64,14 @@ with lane-following observations. In the viewer (`--map rural`) the roads carry 
 **RoadFollowRural-v0** (a car follows its route to a farm yard, keeping to its lane) reaches
 **83 % success on unseen maps** after 14 minutes of training.
 
-Next up: trucks and trailers (Milestone 4b), then tracked vehicles (4c). The full plan, the design decisions and as-built notes for
+**Milestone 4b (trucks and trailers) is done**: articulated vehicles as chains of units
+(fifth wheel, drawbar, dolly), truck presets (6×4 tractor, 3-axle semitrailer, 8×8, farm
+tractor and trailer) validated against Chrono, jackknife events and articulation observations,
+sensors on trailers, and trailers in the viewer with a reversing camera. **TrailerReverse-v0**
+backs the semitrailer into a bay in a farm yard; a scripted reversing controller parks 90 % of
+the rigs.
+
+Next up: tracked vehicles and soft soil (Milestone 4c). The full plan, the design decisions and as-built notes for
 every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
@@ -106,7 +113,7 @@ obs, reward, terminated, truncated, info = envs.step(envs.action_space.sample())
 ```
 
 Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0`,
-`CarWaypointOffroad-v0` and `RoadFollowRural-v0`; for several agents `SwarmHover-v0` and
+`CarWaypointOffroad-v0`, `RoadFollowRural-v0` and `TrailerReverse-v0`; for several agents `SwarmHover-v0` and
 `SwarmWaypointForest-v0` (`autonomousim.multiagent.MultiAgentVectorEnv(num_envs, "swarm_hover")`
 or `autonomousim.pettingzoo.parallel_env`). Task options such as `action_mode`, `map_seed` or reward weights are
 passed as keyword arguments.

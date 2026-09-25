@@ -577,8 +577,8 @@ mod tests {
     #[test]
     fn terms_resolve_and_write() {
         let sensors = vec![
-            SensorSpec { name: "imu".into(), config: SensorConfig::Imu(ImuConfig::ideal()) },
-            SensorSpec { name: "lidar".into(), config: SensorConfig::Lidar(LidarConfig::rl64()) },
+            SensorSpec { name: "imu".into(), unit: 0, config: SensorConfig::Imu(ImuConfig::ideal()) },
+            SensorSpec { name: "lidar".into(), unit: 0, config: SensorConfig::Lidar(LidarConfig::rl64()) },
         ];
         let terms = vec![
             ObsTerm::new(TermKind::GoalRelBody, 1.0),

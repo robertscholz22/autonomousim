@@ -21,7 +21,7 @@ use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorEnv};
-use autonomousim_vehicles::ground::WheeledInit;
+use autonomousim_vehicles::ground::{Wheeled, WheeledInit};
 use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
 use autonomousim_vehicles::{Family, Vehicle};
 use autonomousim_world::environment::{Dryden, EnvironmentConfig, MagneticField};
@@ -71,6 +71,8 @@ pub struct Agent {
     /// Normalised action held since the last policy step (zeros after a reset).
     pub action: SmallVec<[f64; MAX_ROTORS]>,
     pub sensors: Vec<Sensor>,
+    /// Unit carrying each sensor (see `SensorSpec::unit`).
+    sensor_units: Vec<usize>,
     pub goals: Vec<Goal>,
     /// Index of the current goal; `goals.len()` once the last one has been reached.
     pub goal_index: usize,
@@ -92,6 +94,21 @@ pub struct Agent {
     turbulence_rng: SimRng,
 }
 
+/// Kinematics of unit `u` (≥ 1) of a wheeled vehicle at the start of the last physics step,
+/// for the sensors it carries (no accelerations: those carry no inertial sensors).
+fn unit_kinematics(w: &Wheeled, u: usize) -> BodyKinematics {
+    let pose = w.unit_pose(u);
+    let (velocity, omega) = w.unit_velocity(u);
+    BodyKinematics {
+        position: pose.pos,
+        attitude: pose.rot,
+        velocity,
+        rates: pose.rot.inverse() * omega,
+        specific_force: DVec3::ZERO,
+        ang_acc: DVec3::ZERO,
+    }
+}
+
 impl Agent {
     pub(crate) fn new(group: &CompiledGroup, group_index: usize, id: u32, clock: &Clock) -> Self {
         let sensors = group
@@ -100,6 +117,7 @@ impl Agent {
             .iter()
             .map(|s| Sensor::new(&s.config, clock, Seed::from_u64(0)).expect("validated when compiled"))
             .collect();
+        let sensor_units = group.spec.sensors.iter().map(|s| s.unit).collect();
         Self {
             id,
             group: group_index,
@@ -109,6 +127,7 @@ impl Agent {
             cmd: [0.0; MAX_ROTORS],
             action: SmallVec::from_elem(0.0, group.act_dim()),
             sensors,
+            sensor_units,
             goals: vec![Goal::default()],
             goal_index: 0,
             route: None,
@@ -529,8 +548,16 @@ impl Agent {
             magnetic: &env.magnetic,
             gravity: env.config.gravity,
         };
-        for s in &mut self.sensors {
-            s.update(tick, time, &kin, &senv);
+        for (s, &u) in self.sensors.iter_mut().zip(&self.sensor_units) {
+            let unit_kin;
+            let kin = match (u, self.vehicle.as_wheeled()) {
+                (1.., Some(w)) => {
+                    unit_kin = unit_kinematics(w, u);
+                    &unit_kin
+                }
+                _ => &kin,
+            };
+            s.update(tick, time, kin, &senv);
         }
     }
 

@@ -23,13 +23,19 @@ KWARGS = {
     "autonomousim/QuadWaypointForest-v0": {"map": "forest"},
     "autonomousim/CarWaypointOffroad-v0": {"map": "flat"},
     "autonomousim/RoadFollowRural-v0": {"map": RURAL},
+    "autonomousim/TrailerReverse-v0": {"map": RURAL},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
     "autonomousim/CarWaypointOffroad-v0": 231,
     "autonomousim/RoadFollowRural-v0": 97,
+    "autonomousim/TrailerReverse-v0": 31,
 }
-ACT_DIM = {"autonomousim/CarWaypointOffroad-v0": 2, "autonomousim/RoadFollowRural-v0": 2}
+ACT_DIM = {
+    "autonomousim/CarWaypointOffroad-v0": 2,
+    "autonomousim/RoadFollowRural-v0": 2,
+    "autonomousim/TrailerReverse-v0": 2,
+}
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
 FALL = np.array([0.0, 0.0, 0.0, -1.0], np.float32)
@@ -359,12 +365,13 @@ def test_car_waypoint_on_open_ground():
 def road_driver(obs: np.ndarray) -> np.ndarray:
     """``vk`` actions steering at the lane point 5 m ahead (the first point of the ``route``
     term, scaled by 1/20) at up to 60 % of the 15 m/s speed limit, slower where the lane bends
-    within 20 m (``road`` curvatures 5, 10 and 20 m ahead) for 2 m/s² of lateral acceleration:
-    junctions turn sharply."""
+    within 20 m (``road`` curvatures 5, 10 and 20 m ahead) for 2 m/s² of lateral acceleration,
+    and while turning onto the lane (junctions turn sharply)."""
     ahead = obs[:, 6:8]
     heading_error = np.arctan2(ahead[:, 1], ahead[:, 0])
     bend = np.abs(obs[:, 2:5]).max(axis=1)
-    speed = np.minimum(9.0, np.sqrt(2.0 / np.maximum(bend, 1e-3))) / 15.0
+    turning = np.maximum(2.5, 9.0 - 12.0 * np.abs(heading_error))
+    speed = np.minimum(turning, np.sqrt(2.0 / np.maximum(bend, 1e-3))) / 15.0
     return np.stack([speed, np.clip(2.0 * heading_error, -1.0, 1.0)], 1).astype(np.float32)
 
 
@@ -411,15 +418,82 @@ def test_road_follow_fails_off_the_road():
     envs = gym.make_vec(
         "autonomousim/RoadFollowRural-v0", num_envs=2, map=RURAL, autoreset_mode=AutoresetMode.DISABLED
     )
+    from autonomousim import Event
+
     envs.reset(seed=0)
-    # Full lock to the left: off the road within a few seconds.
+    # Full lock to the left: off the road (or into the bank of its cutting) within a few
+    # seconds.
     turn = np.tile(np.array([0.5, 1.0], np.float32), (2, 1))
+    failed, off, crashed = np.zeros(2, bool), np.zeros(2), np.zeros(2, bool)
     for _ in range(200):
         _, reward, terminated, truncated, info = envs.step(turn)
-        if terminated.all():
+        ended = terminated & ~failed
+        assert not envs.unwrapped.task.success.any()
+        off[ended] = envs.unwrapped.state[ended, STATE["road"]][:, 2]
+        crashed[ended] = (info["events"].reshape(-1)[ended] & int(Event.CRASH_TERRAIN)) != 0
+        failed |= terminated
+        if failed.all():
             break
-    assert terminated.all() and not envs.unwrapped.task.success.any()
-    assert (envs.unwrapped.state[:, STATE["road"]][:, 2] > 3.0).all()
+    assert failed.all() and ((off > 3.0) | crashed).all() and (off > 3.0).any(), (off, crashed)
+    envs.close()
+
+
+def test_trailer_reverse_scripted_driver_parks():
+    n = 4
+    envs = gym.make_vec(
+        "autonomousim/TrailerReverse-v0", num_envs=n, num_threads=2, map=RURAL, autoreset_mode=AutoresetMode.DISABLED
+    )
+    task = envs.unwrapped.task
+    assert [t[0] for t in envs.unwrapped.obs_layout] == [
+        "trailer_goal",
+        "articulation",
+        "speed",
+        "steering",
+        "last_action",
+        "lidar_log",
+    ]
+    envs.reset(seed=0)
+    d, psi = task.bay_errors(envs.unwrapped.state)
+    assert ((d > 11.0) & (d < 25.0)).all() and (np.abs(psi) < np.radians(10.5)).all(), (d, psi)
+    ret, done, success = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool)
+    final = np.zeros_like(envs.unwrapped.state)
+    while not done.all():
+        _, reward, terminated, truncated, _ = envs.step(task.scripted(envs.unwrapped.state))
+        live = ~done
+        ret[live] += reward[live]
+        ended = live & (terminated | truncated)
+        success |= live & task.success
+        final[ended] = envs.unwrapped.state[ended]
+        assert not (terminated & ~task.success).any(), "the driver never crashes or jackknifes"
+        done |= terminated | truncated
+    # The feedback driver parks most rigs (it may run out of room to align the last few
+    # degrees); parked rigs stand in the bay, aligned.
+    assert success.sum() >= 3, success
+    d, psi = task.bay_errors(final[success])
+    assert (d < 1.0).all() and (np.abs(psi) < np.radians(5.0)).all()
+    assert (ret[success] > task.success_bonus).all(), ret
+    envs.close()
+
+
+def test_trailer_reverse_fails_driving_away():
+    envs = gym.make_vec("autonomousim/TrailerReverse-v0", num_envs=2, map=RURAL, autoreset_mode=AutoresetMode.DISABLED)
+    envs.reset(seed=0)
+    task = envs.unwrapped.task
+    ahead = np.tile(np.array([1.0, 0.0], np.float32), (2, 1))
+    failed, last, distance = np.zeros(2, bool), np.zeros(2), np.zeros(2)
+    for _ in range(400):
+        _, reward, terminated, truncated, _ = envs.step(ahead)
+        ended = terminated & ~failed
+        assert not (task.success | truncated).any()
+        last[ended] = reward[ended]
+        distance[ended] = task.bay_errors(envs.unwrapped.state)[0][ended]
+        failed |= terminated
+        if failed.all():
+            break
+    # Driving forward, away from the bay, ends the episode as a failure: more than 35 m off,
+    # or a crash on the way out of the yard.
+    assert failed.all() and (distance > 25.0).all() and (distance > 35.0).any(), distance
+    assert (last < -10.0).all(), last
     envs.close()
 
 

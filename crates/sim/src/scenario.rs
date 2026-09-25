@@ -38,6 +38,7 @@
 //! Angles in scenario files are in degrees (`*_deg`); everything else is SI.
 
 use crate::SimError;
+use crate::bay::BayGoals;
 use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
@@ -54,7 +55,7 @@ use autonomousim_core::time::Clock;
 use autonomousim_procgen::MapCache;
 use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
-use autonomousim_sensors::{Sensor, SensorSpec};
+use autonomousim_sensors::{Sensor, SensorConfig, SensorSpec};
 use autonomousim_vehicles::ground::{TrailerDef, Wheeled};
 use autonomousim_vehicles::multirotor::{MotorInit, MultirotorScales};
 use autonomousim_vehicles::presets;
@@ -737,6 +738,11 @@ pub enum GoalKind {
     /// agent keeps the route for the `road` and `route` observation terms. Needs a map with
     /// roads.
     Route,
+    /// One goal: a bay at the far side of a farm yard for the tail of the vehicle's last unit
+    /// (see [`BayGoals`]); the vehicle spawns in the yard ahead of it, facing the yard's road
+    /// (the spawn spec's position settings are ignored). Ground vehicles on maps with farm
+    /// yards.
+    Bay,
 }
 
 /// Slot layout of `GoalKind::Formation`.
@@ -775,6 +781,9 @@ pub struct GoalSpec {
     pub spacing: f64,
     /// Settings of `GoalKind::Route`.
     pub route: RouteGoals,
+    /// Settings of `GoalKind::Bay`.
+    #[serde(skip_serializing_if = "is_default")]
+    pub bay: BayGoals,
 }
 
 impl Default for GoalSpec {
@@ -791,6 +800,7 @@ impl Default for GoalSpec {
             formation: FormationShape::Grid,
             spacing: 2.0,
             route: RouteGoals::default(),
+            bay: BayGoals::default(),
         }
     }
 }
@@ -859,6 +869,9 @@ pub struct CompiledScenario {
     /// The map pool (one map is drawn per episode) and the content hashes of its maps.
     pub maps: Vec<Arc<StaticWorld>>,
     pub map_hashes: Vec<MapHash>,
+    /// The maps episodes are drawn from: all of them, or with `bay` goals those with farm
+    /// yards.
+    pub episode_maps: Vec<usize>,
     pub groups: Vec<CompiledGroup>,
 }
 
@@ -961,12 +974,22 @@ impl CompiledScenario {
                 )));
             }
         }
+        let mut episode_maps: Vec<usize> = (0..maps.len()).collect();
+        if let Some(g) = groups.iter().find(|g| g.spec.goals.kind == GoalKind::Bay) {
+            episode_maps.retain(|&k| !crate::bay::yards(&maps[k]).is_empty());
+            if episode_maps.is_empty() {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: `bay` goals need farm yards, no map has any",
+                    g.spec.name
+                )));
+            }
+        }
         build_drive_grids(&mut groups, &maps);
         // Defaults that depend on the vehicle, filled in.
         for (s, g) in spec.groups.iter_mut().zip(&groups) {
             s.clone_from(&g.spec);
         }
-        Ok(Self { spec, clock, decimation, environment_divider, maps, map_hashes, groups })
+        Ok(Self { spec, clock, decimation, environment_divider, maps, map_hashes, episode_maps, groups })
     }
 
     pub fn num_agents(&self) -> usize {
@@ -1025,6 +1048,14 @@ impl CompiledGroup {
                 return Err(fail(format!("duplicate sensor name {:?}", s.name)));
             }
             Sensor::new(&s.config, clock, Seed::from_u64(0))?;
+            let units = def.as_wheeled().map_or(1, |d| d.num_units());
+            let carried = matches!(s.config, SensorConfig::Rangefinder(_) | SensorConfig::Lidar(_));
+            if s.unit >= units || (s.unit > 0 && !carried) {
+                return Err(fail(format!(
+                    "sensor {:?} on unit {}: the vehicle has {units} units, and only rangefinders and LiDARs ride on units behind the first",
+                    s.name, s.unit
+                )));
+            }
         }
         let terms = if spec.obs.is_empty() { default_obs() } else { spec.obs.clone() };
         let num_rotors = def.as_multirotor().map_or(0, |d| d.rotors.len());
@@ -1062,6 +1093,10 @@ impl CompiledGroup {
             && gl.count >= 1)
         {
             return Err(fail(format!("invalid goals {gl:?}")));
+        }
+        gl.bay.validate().map_err(&fail)?;
+        if gl.kind == GoalKind::Bay && family != Family::Wheeled {
+            return Err(fail("`bay` goals need a ground vehicle".into()));
         }
         // Trailers in line behind the towing unit.
         let colliders = match def.as_wheeled() {
@@ -1369,7 +1404,7 @@ impl GoalSpec {
         use autonomousim_core::math::quat::yaw;
         match self.kind {
             // Route goals come from `lane`; this is the fallback when no route is found.
-            GoalKind::Spawn | GoalKind::Formation | GoalKind::Route => {
+            GoalKind::Spawn | GoalKind::Formation | GoalKind::Route | GoalKind::Bay => {
                 vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }]
             }
             GoalKind::Random => {

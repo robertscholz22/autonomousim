@@ -7,6 +7,7 @@ use crate::convert;
 use crate::sim::Sim;
 use autonomousim_core::math::Pose;
 use autonomousim_sensors::{LidarConfig, Sensor};
+use autonomousim_sim::scenario::GoalKind;
 use autonomousim_world::StaticWorld;
 use bevy::prelude::*;
 use glam::DVec3;
@@ -113,16 +114,23 @@ pub fn draw(keys: Res<ButtonInput<KeyCode>>, sim: Res<Sim>, mut overlay: ResMut<
             let pos = sim.render_pose(i).pos;
             // Goals: the current one solid, the ones after it faint and joined up; as large as
             // the vehicle.
+            let group = &sim.world.scenario().groups[agent.group];
             let arm = match agent.vehicle.as_multirotor() {
                 Some(m) => m.def().rotors.iter().map(|r| r.position.length()).fold(0.0, f64::max),
-                None => sim.world.scenario().groups[agent.group].radius / 1.5,
+                None => group.radius / 1.5,
             };
-            let radius = (1.5 * arm).max(0.05) as f32;
+            // A bay is marked by the tail's success area (1 m) and its heading.
+            let bay = group.spec.goals.kind == GoalKind::Bay;
+            let radius = if bay { 1.0 } else { (1.5 * arm).max(0.05) as f32 };
             let current = agent.goal_index.min(agent.goals.len().saturating_sub(1));
             for (k, g) in agent.goals.iter().enumerate().skip(current) {
                 let p = convert::vec(g.position);
                 let color = if k == current { GOAL } else { NEXT_GOALS };
                 gizmos.sphere(Isometry3d::from_translation(p), radius, color);
+                if bay {
+                    let ahead = g.position + 4.0 * DVec3::new(g.yaw.cos(), g.yaw.sin(), 0.0);
+                    gizmos.arrow(p, convert::vec(ahead), color);
+                }
                 if let Some(next) = agent.goals.get(k + 1) {
                     gizmos.line(p, convert::vec(next.position), NEXT_GOALS);
                 }

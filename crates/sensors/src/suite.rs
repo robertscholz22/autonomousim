@@ -52,8 +52,16 @@ impl SensorConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SensorSpec {
     pub name: String,
+    /// Unit carrying the sensor on a ground vehicle with trailers (0: the towing unit; its
+    /// mount is in that unit's frame). Only rangefinders and LiDARs ride on the units behind.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unit: usize,
     #[serde(flatten)]
     pub config: SensorConfig,
+}
+
+fn is_zero(x: &usize) -> bool {
+    *x == 0
 }
 
 /// One sensor of any kind. Not boxed: vehicles keep their sensors in a `Vec` and update them

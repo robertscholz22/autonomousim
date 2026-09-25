@@ -133,7 +133,7 @@ impl WorldInstance {
         self.episode_seed = es;
         let sc = self.scenario.clone();
 
-        let pick = es.child("map").rng().below(sc.maps.len() as u64) as usize;
+        let pick = sc.episode_maps[es.child("map").rng().below(sc.episode_maps.len() as u64) as usize];
         self.map = sc.maps[pick].clone();
         self.map_index = pick;
         let world = &*self.map;
@@ -157,7 +157,23 @@ impl WorldInstance {
             // Height of the centre of mass (the chassis frame for ground vehicles) above the
             // terrain on roads and at route goals.
             let lift = ground.map_or(g.bottom, |gs| gs.ride);
-            let (positions, mut road_spawns) = if spawn.on_road {
+            let bay_goals = g.spec.goals.kind == GoalKind::Bay;
+            let mut bays = Vec::new();
+            let (positions, mut road_spawns) = if bay_goals {
+                // Spawn and goal in a farm yard.
+                let d = g.def.as_wheeled().expect("bay goals are for ground vehicles");
+                let yards = crate::bay::yards(world);
+                let mut used = Vec::new();
+                for _ in 0..g.spec.count {
+                    let b = crate::bay::sample(world, &yards, &g.spec.goals, d, lift, &mut used, &mut goal_rng)
+                        .expect("maps of bay goals have yards");
+                    placed.push(b.xy.extend(0.0));
+                    bays.push(b);
+                }
+                let p: Vec<DVec3> = bays.iter().map(|b| b.xy.extend(0.0)).collect();
+                let n = p.len();
+                (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            } else if spawn.on_road {
                 let rs = lane::road_spawns(
                     world,
                     spawn,
@@ -188,6 +204,9 @@ impl WorldInstance {
                 if let Some(rs) = &road_spawn {
                     placement.pose.rot = from_yaw(rs.yaw);
                 }
+                if let Some(b) = bays.get(k) {
+                    placement.pose.rot = from_yaw(b.yaw);
+                }
                 if let Some(d) = g.def.as_wheeled() {
                     placement.pose = ground_pose(world, d, &g.rest, p.truncate(), yaw(placement.pose.rot));
                 }
@@ -196,6 +215,7 @@ impl WorldInstance {
                     route = lane::plan_route(world, p.truncate(), &g.spec.goals, &mut goal_rng);
                 }
                 let goals = match (formation.next(), &route) {
+                    _ if bay_goals => vec![bays[k].goal],
                     (Some(slot), _) => vec![slot],
                     (None, Some(lane)) => lane::route_goals(world, lane, g.spec.goals.route.step, lift),
                     (None, None) => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),

@@ -291,7 +291,7 @@ mod tests {
     /// horizon (the bottom rows) all see the ground and the ones above it nothing.
     #[test]
     fn live_scan_over_flat_ground() {
-        let lidar = SensorSpec { name: "lidar".into(), config: SensorConfig::Lidar(LidarConfig::rl64()) };
+        let lidar = SensorSpec { name: "lidar".into(), unit: 0, config: SensorConfig::Lidar(LidarConfig::rl64()) };
         let sc = Scenario {
             map: MapSource::Testworld(Testworld::Flat { size: 200.0 }),
             groups: vec![GroupSpec {
