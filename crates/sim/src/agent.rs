@@ -8,7 +8,7 @@
 //! and runs after all of them.
 
 use crate::events::Events;
-use crate::interaction::{AgentContacts, AgentShape, SceneRays, Sphere};
+use crate::interaction::{AgentContacts, AgentGrid, AgentShape, SceneRays, Sphere};
 use crate::obs::ObsInput;
 use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, Placement};
 use autonomousim_control::ground::GroundEstimate;
@@ -509,6 +509,7 @@ impl Agent {
         group: &CompiledGroup,
         world: &StaticWorld,
         agents: &[AgentShape],
+        grid: &AgentGrid,
         me: usize,
         out: &mut [f32],
     ) {
@@ -530,6 +531,7 @@ impl Agent {
                 world,
                 agents,
                 me,
+                grid,
             },
             out,
         );

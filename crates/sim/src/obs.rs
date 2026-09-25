@@ -31,7 +31,7 @@
 //! Sensor terms name their sensor (`sensor = "imu"`) and read zeros until its first reading
 //! arrives. Non-finite values are written as 0.
 
-use crate::interaction::{AgentShape, agent_clearance, nearest_agents};
+use crate::interaction::{AgentGrid, AgentShape};
 use crate::scenario::Goal;
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
@@ -216,6 +216,8 @@ pub struct ObsInput<'a> {
     /// Shapes of all agents in the world, and this agent's index among them.
     pub agents: &'a [AgentShape],
     pub me: usize,
+    /// Neighbour index over `agents`.
+    pub grid: &'a AgentGrid,
 }
 
 impl CompiledObs {
@@ -405,7 +407,7 @@ impl CompiledObs {
                     let c = if inp.agents.is_empty() {
                         t.max_range
                     } else {
-                        agent_clearance(inp.agents, inp.me, t.max_range)
+                        inp.grid.clearance(inp.agents, inp.me, t.max_range)
                     };
                     put(dst, &[c], t)
                 }
@@ -415,7 +417,7 @@ impl CompiledObs {
                         continue;
                     }
                     let mut near = Vec::with_capacity(t.count);
-                    nearest_agents(inp.agents, inp.me, t.max_range, t.count, &mut near);
+                    inp.grid.nearest(inp.agents, inp.me, t.max_range, t.count, &mut near);
                     let to_heading = heading.inverse();
                     for (slot, &(_, j)) in dst.as_chunks_mut::<7>().0.iter_mut().zip(&near) {
                         let o = &inp.agents[j];
@@ -556,6 +558,7 @@ mod tests {
             world: &world,
             agents: &[],
             me: 0,
+            grid: &AgentGrid::default(),
         };
         let mut out = vec![f32::NAN; obs.dim()];
         obs.write(&inp, &mut out);

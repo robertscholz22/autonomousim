@@ -121,17 +121,19 @@ fn world(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("swarm");
     g.sample_size(20);
-    let sc = compile(SWARM);
-    let mut w = WorldInstance::new(sc, Seed::from_u64(0));
-    // Agent-steps: 128 agents per policy step, hovering at their spawn.
-    g.throughput(Throughput::Elements(128));
-    g.bench_function("128_agents", |b| b.iter(|| w.step()));
-    assert_active(&w, "swarm");
-    let a = hover_action(w.scenario());
     let threads = std::env::var("AUTONOMOUSIM_BENCH_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let mut b = BatchSim::from_compiled(w.scenario().clone(), 1, 0, threads).unwrap();
-    g.bench_function("128_agents_in_pool", |bench| bench.iter(|| b.step(&[&a])));
-    assert_active(b.world(0), "swarm in pool");
+    for n in [128, 256] {
+        let sc = compile(&SWARM.replace("count = 128", &format!("count = {n}")));
+        let mut w = WorldInstance::new(sc, Seed::from_u64(0));
+        // Agent-steps: n agents per policy step, hovering at their spawn.
+        g.throughput(Throughput::Elements(n));
+        g.bench_function(format!("{n}_agents"), |b| b.iter(|| w.step()));
+        assert_active(&w, "swarm");
+        let a = hover_action(w.scenario());
+        let mut b = BatchSim::from_compiled(w.scenario().clone(), 1, 0, threads).unwrap();
+        g.bench_function(format!("{n}_agents_in_pool"), |bench| bench.iter(|| b.step(&[&a])));
+        assert_active(b.world(0), "swarm in pool");
+    }
     let mut w = WorldInstance::new(compile(CARS), Seed::from_u64(0));
     // 64 cars per policy step, standing.
     g.throughput(Throughput::Elements(64));

@@ -273,6 +273,181 @@ pub fn nearest_agents(shapes: &[AgentShape], me: usize, range: f64, count: usize
     }
 }
 
+/// Agent count from which neighbour queries use an [`AgentGrid`] instead of scanning all
+/// agents.
+pub const GRID_MIN_AGENTS: usize = 32;
+
+/// Uniform grid over the xy plane of the active agents' centres, for neighbour queries
+/// ([`clearance`](Self::clearance), [`nearest`](Self::nearest)) in O(n) instead of O(n²)
+/// per world. Cells are stored compressed (per cell a range of agent indices, in index
+/// order). Results equal the brute-force [`agent_clearance`] and [`nearest_agents`] bit for
+/// bit: the grid only skips agents that cannot change them. Below [`GRID_MIN_AGENTS`]
+/// active agents it stays empty and the queries scan all agents.
+#[derive(Clone, Debug, Default)]
+pub struct AgentGrid {
+    on: bool,
+    cell: f64,
+    lo: glam::DVec2,
+    nx: usize,
+    ny: usize,
+    /// `start[c]..start[c + 1]` indexes `items` for cell `c = y·nx + x`.
+    start: Vec<u32>,
+    items: Vec<u32>,
+    max_radius: f64,
+}
+
+impl AgentGrid {
+    /// Rebuild from the shapes (active agents only).
+    pub fn build(&mut self, shapes: &[AgentShape]) {
+        let active = shapes.iter().filter(|s| s.active).count();
+        self.on = active >= GRID_MIN_AGENTS;
+        if !self.on {
+            return;
+        }
+        let (mut lo, mut hi) = (glam::DVec2::splat(f64::INFINITY), glam::DVec2::splat(f64::NEG_INFINITY));
+        let mut max_radius: f64 = 0.0;
+        for s in shapes.iter().filter(|s| s.active) {
+            lo = lo.min(s.center.truncate());
+            hi = hi.max(s.center.truncate());
+            max_radius = max_radius.max(s.radius);
+        }
+        // About two agents per cell on average, at least 1 m, at most 64 × 64 cells.
+        let extent = (hi - lo).max(glam::DVec2::splat(1e-3));
+        let mut cell = (extent.x * extent.y * 2.0 / active as f64).sqrt().max(1.0);
+        cell = cell.max(extent.x.max(extent.y) / 64.0);
+        self.cell = cell;
+        self.lo = lo;
+        self.nx = (extent.x / cell) as usize + 1;
+        self.ny = (extent.y / cell) as usize + 1;
+        self.max_radius = max_radius;
+        let cells = self.nx * self.ny;
+        self.start.clear();
+        self.start.resize(cells + 1, 0);
+        for s in shapes.iter().filter(|s| s.active) {
+            let c = self.cell_index(s.center);
+            self.start[c + 1] += 1;
+        }
+        for c in 0..cells {
+            self.start[c + 1] += self.start[c];
+        }
+        self.items.clear();
+        self.items.resize(active, 0);
+        let mut fill: Vec<u32> = self.start[..cells].to_vec();
+        for (i, s) in shapes.iter().enumerate().filter(|(_, s)| s.active) {
+            let c = self.cell_index(s.center);
+            self.items[fill[c] as usize] = i as u32;
+            fill[c] += 1;
+        }
+    }
+
+    #[inline]
+    fn cell_xy(&self, p: DVec3) -> (i64, i64) {
+        let x = ((p.x - self.lo.x) / self.cell).floor() as i64;
+        let y = ((p.y - self.lo.y) / self.cell).floor() as i64;
+        (x, y)
+    }
+
+    #[inline]
+    fn cell_index(&self, p: DVec3) -> usize {
+        let (x, y) = self.cell_xy(p);
+        let x = x.clamp(0, self.nx as i64 - 1) as usize;
+        let y = y.clamp(0, self.ny as i64 - 1) as usize;
+        y * self.nx + x
+    }
+
+    /// Agents in the cells at Chebyshev distance `r` from cell `(cx, cy)`; false once the
+    /// ring lies entirely outside the grid.
+    fn ring(&self, cx: i64, cy: i64, r: i64, mut visit: impl FnMut(usize)) -> bool {
+        let (nx, ny) = (self.nx as i64, self.ny as i64);
+        if cx - r < 0 && cx + r >= nx && cy - r < 0 && cy + r >= ny {
+            return false;
+        }
+        let mut cell = |x: i64, y: i64| {
+            if (0..nx).contains(&x) && (0..ny).contains(&y) {
+                let c = (y * nx + x) as usize;
+                for &i in &self.items[self.start[c] as usize..self.start[c + 1] as usize] {
+                    visit(i as usize);
+                }
+            }
+        };
+        if r == 0 {
+            cell(cx, cy);
+            return true;
+        }
+        for x in cx - r..=cx + r {
+            cell(x, cy - r);
+            cell(x, cy + r);
+        }
+        for y in cy - r + 1..cy + r {
+            cell(cx - r, y);
+            cell(cx + r, y);
+        }
+        true
+    }
+
+    /// Lower bound of the horizontal distance from a point in cell `(cx, cy)` to any point in
+    /// a cell at Chebyshev distance `r`.
+    #[inline]
+    fn ring_gap(&self, r: i64) -> f64 {
+        (r - 1).max(0) as f64 * self.cell
+    }
+
+    /// [`agent_clearance`] of agent `me`.
+    pub fn clearance(&self, shapes: &[AgentShape], me: usize, max: f64) -> f64 {
+        if !self.on {
+            return agent_clearance(shapes, me, max);
+        }
+        let mine = &shapes[me];
+        let (cx, cy) = self.cell_xy(mine.center);
+        let mut best = max;
+        for r in 0.. {
+            if self.ring_gap(r) - mine.radius - self.max_radius >= best {
+                break;
+            }
+            let inside = self.ring(cx, cy, r, |k| {
+                if k != me {
+                    best = best.min(surface_distance(mine, &shapes[k], best));
+                }
+            });
+            if !inside {
+                break;
+            }
+        }
+        best
+    }
+
+    /// [`nearest_agents`] of agent `me`.
+    pub fn nearest(&self, shapes: &[AgentShape], me: usize, range: f64, count: usize, out: &mut Vec<(f64, usize)>) {
+        if !self.on {
+            return nearest_agents(shapes, me, range, count, out);
+        }
+        out.clear();
+        if count == 0 {
+            return;
+        }
+        let c = shapes[me].center;
+        let (cx, cy) = self.cell_xy(c);
+        for r in 0.. {
+            // Every agent not yet visited is at least this far away.
+            let gap = self.ring_gap(r);
+            if gap > range || (out.len() >= count && out[count - 1].0 < gap) {
+                break;
+            }
+            let inside = self.ring(cx, cy, r, |k| {
+                let d = c.distance(shapes[k].center);
+                if k != me && d <= range {
+                    out.push((d, k));
+                }
+            });
+            out.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            out.truncate(count);
+            if !inside {
+                break;
+            }
+        }
+    }
+}
+
 /// Ray targets for one agent's sensors: the static world plus all other active agents.
 pub struct SceneRays<'a> {
     pub world: &'a StaticWorld,
@@ -372,6 +547,44 @@ mod tests {
     }
 
     /// Brute-force references on a random swarm: sorted neighbours and surface distances.
+    #[test]
+    fn grid_queries_equal_the_scans() {
+        let mut rng = autonomousim_core::rng::Seed::from_u64(9).rng();
+        // A dense block, a sparse spread, a line along y and duplicates at one point.
+        let layouts: [(usize, f64, f64); 4] = [(256, 12.0, 12.0), (100, 150.0, 150.0), (64, 0.0, 80.0), (40, 0.0, 0.0)];
+        let mut grid = AgentGrid::default();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for (n, wx, wy) in layouts {
+            let mut shapes: Vec<AgentShape> = (0..n as u32)
+                .map(|i| {
+                    let p = DVec3::new(rng.range(-wx, wx + 1e-9), rng.range(-wy, wy + 1e-9), rng.range(0.0, 3.0));
+                    shape(i, p)
+                })
+                .collect();
+            for k in (0..n).step_by(5) {
+                shapes[k].active = false;
+            }
+            // An inactive agent far outside the grid still gets answers.
+            shapes[0] = AgentShape { active: false, ..shape(0, DVec3::new(500.0, -300.0, 2.0)) };
+            grid.build(&shapes);
+            assert!(grid.on, "{n} agents");
+            for me in 0..n {
+                assert_eq!(grid.clearance(&shapes, me, 20.0), agent_clearance(&shapes, me, 20.0), "{n}: agent {me}");
+                assert_eq!(grid.clearance(&shapes, me, 0.5), agent_clearance(&shapes, me, 0.5), "{n}: agent {me}");
+                for (range, count) in [(5.0, 3), (20.0, 8), (1e3, 16), (0.5, 2)] {
+                    grid.nearest(&shapes, me, range, count, &mut a);
+                    nearest_agents(&shapes, me, range, count, &mut b);
+                    assert_eq!(a, b, "{n}: agent {me}, range {range}, count {count}");
+                }
+            }
+        }
+        // Few agents: no grid, the scans themselves.
+        let few: Vec<AgentShape> = (0..5).map(|i| shape(i, DVec3::new(i as f64, 0.0, 0.0))).collect();
+        grid.build(&few);
+        assert!(!grid.on);
+        assert_eq!(grid.clearance(&few, 0, 20.0), agent_clearance(&few, 0, 20.0));
+    }
+
     #[test]
     fn neighbour_queries_match_brute_force() {
         let mut rng = autonomousim_core::rng::Seed::from_u64(3).rng();

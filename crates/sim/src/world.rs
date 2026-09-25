@@ -21,7 +21,7 @@
 use crate::agent::{Agent, EnvState};
 use crate::drive::ground_pose;
 use crate::events::Events;
-use crate::interaction::{AgentContactState, AgentContacts, AgentShape, agent_clearance, agent_contacts};
+use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, Goal};
 use autonomousim_control::Command;
@@ -77,6 +77,9 @@ pub struct WorldInstance {
     /// Policy steps since the reset.
     steps: u64,
     agent_contact_state: AgentContactState,
+    /// Neighbour index over `shapes`, rebuilt after every policy step, reset and change of
+    /// an agent's placement or status.
+    grid: AgentGrid,
 }
 
 impl WorldInstance {
@@ -100,6 +103,7 @@ impl WorldInstance {
             episode_seed: seed,
             steps: 0,
             agent_contact_state: AgentContactState::default(),
+            grid: AgentGrid::default(),
             map,
             map_index: 0,
             scenario,
@@ -161,6 +165,7 @@ impl WorldInstance {
                 agent.update_shape(&mut self.shapes[id]);
             }
         }
+        self.grid.build(&self.shapes);
     }
 
     // ------------------------------------------------------------------------ stepping
@@ -203,6 +208,7 @@ impl WorldInstance {
             after_tick(self);
         }
         self.steps += 1;
+        self.grid.build(&self.shapes);
     }
 
     /// One physics tick.
@@ -250,9 +256,14 @@ impl WorldInstance {
         let g = &self.scenario.groups[group];
         let dim = g.obs_dim();
         assert_eq!(out.len(), g.spec.count * dim, "observation array of group {:?}", g.spec.name);
-        for (k, o) in out.chunks_exact_mut(dim).enumerate() {
+        let write = |(k, o): (usize, &mut [f32])| {
             let me = g.first_agent + k;
-            self.agents[me].observe(g, &self.map, &self.shapes, me, o);
+            self.agents[me].observe(g, &self.map, &self.shapes, &self.grid, me, o);
+        };
+        if g.spec.count >= PARALLEL_AGENTS {
+            out.par_chunks_exact_mut(dim).enumerate().for_each(write);
+        } else {
+            out.chunks_exact_mut(dim).enumerate().for_each(write);
         }
     }
 
@@ -260,7 +271,7 @@ impl WorldInstance {
     pub fn write_state(&self, group: usize, out: &mut [f64]) {
         let g = &self.scenario.groups[group];
         assert_eq!(out.len(), g.spec.count * STATE_DIM, "state array of group {:?}", g.spec.name);
-        for (k, row) in out.as_chunks_mut::<STATE_DIM>().0.iter_mut().enumerate() {
+        let write = |(k, row): (usize, &mut [f64; STATE_DIM])| {
             let a = &self.agents[g.first_agent + k];
             let v = &a.vehicle;
             let q = v.orientation();
@@ -277,7 +288,13 @@ impl WorldInstance {
                 Vehicle::Wheeled(_) => self.map.obstacle_clearance(v.position(), CLEARANCE_RANGE),
                 _ => self.map.clearance(v.position(), CLEARANCE_RANGE),
             };
-            row[20] = agent_clearance(&self.shapes, g.first_agent + k, CLEARANCE_RANGE);
+            row[20] = self.grid.clearance(&self.shapes, g.first_agent + k, CLEARANCE_RANGE);
+        };
+        let rows = out.as_chunks_mut::<STATE_DIM>().0;
+        if g.spec.count >= PARALLEL_AGENTS {
+            rows.par_iter_mut().enumerate().for_each(write);
+        } else {
+            rows.iter_mut().enumerate().for_each(write);
         }
     }
 
@@ -362,6 +379,7 @@ impl WorldInstance {
     pub fn disable_agent(&mut self, i: usize) {
         self.agents[i].disabled = true;
         self.shapes[i].active = false;
+        self.grid.build(&self.shapes);
     }
 
     /// Put agent `i` at `pose` with the given velocities (world linear, body angular) and clear
@@ -369,6 +387,7 @@ impl WorldInstance {
     pub fn place_agent(&mut self, i: usize, pose: Pose, lin_vel_world: DVec3, ang_vel_body: DVec3) {
         self.agents[i].vehicle.place(pose, lin_vel_world, ang_vel_body);
         self.agents[i].update_shape(&mut self.shapes[i]);
+        self.grid.build(&self.shapes);
     }
 
     /// Replace the goals of an agent (at least one) and restart at the first.
