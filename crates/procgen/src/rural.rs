@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const RURAL_VERSION: u32 = 2;
+pub const RURAL_VERSION: u32 = 3;
 
 /// Geometry limits of one road class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -509,9 +509,12 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
             (hs.at(nd.position) + ring.sum::<f64>()) / 9.0
         })
         .collect();
+    let mut fixed = vec![false; node_z.len()];
     for (f, y) in plan.farms.iter().zip(&yards) {
         node_z[f.node as usize] = y.z;
+        fixed[f.node as usize] = true;
     }
+    reach_nodes(&c.roads, &pieces, &mut node_z, &fixed);
     let roads: Vec<Road> = pieces
         .iter()
         .map(|p| {
@@ -1210,6 +1213,42 @@ fn resample(points: &[DVec2], step: f64) -> Vec<DVec2> {
 /// Heights along a road: the terrain averaged over `window` m, eased onto the node heights
 /// over the first and last 15 m, then limited to `max_grade`. Too steep only where the
 /// nodes themselves are too far apart in height.
+/// Move the heights of the free (non-yard) nodes so that every piece can climb from one end to
+/// the other within 90 % of its class's grade limit: a road whose ends are too far apart in
+/// height could not meet both (see `profile`). Pieces pull their ends together in a fixed
+/// order until all fit or the passes run out; the terrain is then cut and filled to match.
+fn reach_nodes(c: &RoadsConfig, pieces: &[Piece], node_z: &mut [f64], fixed: &[bool]) {
+    let lengths: Vec<f64> = pieces.iter().map(|p| p.points.windows(2).map(|w| w[0].distance(w[1])).sum()).collect();
+    for _ in 0..100 {
+        let mut moved = false;
+        for (p, &len) in pieces.iter().zip(&lengths) {
+            let (a, b) = (p.start as usize, p.end as usize);
+            let allowed = 0.9 * c.class(p.class).max_grade * len;
+            let excess = (node_z[b] - node_z[a]).abs() - allowed;
+            if excess <= 1e-9 || (fixed[a] && fixed[b]) {
+                continue;
+            }
+            // Towards each other: all of it on a free end facing a fixed one, else half each.
+            let dir = (node_z[b] - node_z[a]).signum();
+            let (ka, kb) = match (fixed[a], fixed[b]) {
+                (true, _) => (0.0, 1.0),
+                (_, true) => (1.0, 0.0),
+                _ => (0.5, 0.5),
+            };
+            node_z[a] += dir * ka * excess;
+            node_z[b] -= dir * kb * excess;
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// Heights along a road from `z0` to `z1`: the terrain, smoothed over `window` m, eased into
+/// the end heights and limited to `max_grade`. Where the ends are too far apart for the grade
+/// (only between two yards, see `reach_nodes`), a straight ramp instead: the road meets its
+/// ends and exceeds the grade.
 fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, window: f64) -> Vec<f64> {
     let n = points.len();
     let raw: Vec<f64> = points.iter().map(|&p| hs.at(p)).collect();
@@ -1219,6 +1258,9 @@ fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, win
         s[i] = s[i - 1] + ds[i - 1];
     }
     let len = s[n - 1];
+    if (z1 - z0).abs() > max_grade * len {
+        return s.iter().map(|&si| z0 + (z1 - z0) * si / len.max(1e-9)).collect();
+    }
     let half = (0.5 * window / (len / (n - 1).max(1) as f64)).round() as usize;
     let mut z: Vec<f64> = (0..n)
         .map(|i| {
@@ -1237,7 +1279,7 @@ fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, win
     for i in 0..n {
         let lo = (z0 - max_grade * s[i]).max(z1 - max_grade * (len - s[i]));
         let hi = (z0 + max_grade * s[i]).min(z1 + max_grade * (len - s[i]));
-        z[i] = if lo <= hi { z[i].clamp(lo, hi) } else { z0 + (z1 - z0) * s[i] / len };
+        z[i] = z[i].clamp(lo, hi.max(lo));
     }
     z[0] = z0;
     z[n - 1] = z1;
@@ -1254,7 +1296,9 @@ fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, win
 
 // ------------------------------------------------------------------------------ blending
 
-/// Cut and fill the road surfaces and farm pads into the terrain.
+/// Cut and fill the farm pads, then the road surfaces, into the terrain. The roads go last, so
+/// that each keeps its surface out to its edges (plus 0.5 m) where it passes a pad; the pad
+/// then falls off towards the road over the road's shoulder.
 fn blend(
     c: &RuralConfig,
     heights: &mut [f32],
@@ -1274,19 +1318,6 @@ fn blend(
             let p = DVec2::new(origin.x + ix as f64 * c.cell, y);
             let h0 = *h as f64;
             let mut best: Option<(f64, f64)> = None; // (weight, target)
-            if let Some(rp) = net.nearest(p, reach) {
-                let road = &net.roads()[rp.road as usize];
-                let cc = r.class(road.class);
-                let half = 0.5 * road.width;
-                let pr = rp.projection;
-                let target = pr.point.z - cc.crown * pr.offset.abs().min(half);
-                let flat = half + 0.5;
-                let shoulder = r.shoulder.max(1.5 * (target - h0).abs());
-                let w = 1.0 - smoothstep(flat, flat + shoulder, pr.distance);
-                if w > 0.0 {
-                    best = Some((w, target));
-                }
-            }
             for yard in yards {
                 let out = yard.distance(p, pad_half);
                 let shoulder = r.shoulder.max(1.5 * (yard.z - h0).abs());
@@ -1295,9 +1326,19 @@ fn blend(
                     best = Some((w, yard.z));
                 }
             }
-            if let Some((w, target)) = best {
-                *h = (h0 + w * (target - h0)) as f32;
+            let mut h1 = best.map_or(h0, |(w, target)| h0 + w * (target - h0));
+            if let Some(rp) = net.nearest(p, reach) {
+                let road = &net.roads()[rp.road as usize];
+                let cc = r.class(road.class);
+                let half = 0.5 * road.width;
+                let pr = rp.projection;
+                let target = pr.point.z - cc.crown * pr.offset.abs().min(half);
+                let flat = half + 0.5;
+                let shoulder = r.shoulder.max(1.5 * (target - h1).abs());
+                let w = 1.0 - smoothstep(flat, flat + shoulder, pr.distance);
+                h1 += w * (target - h1);
             }
+            *h = h1 as f32;
         }
     });
 }

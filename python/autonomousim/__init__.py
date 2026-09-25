@@ -7,7 +7,9 @@ Importing the package registers the Gymnasium environments:
 - ``autonomousim/QuadWaypointForest-v0``: fly through waypoints in generated forests with
   LiDAR;
 - ``autonomousim/CarWaypointOffroad-v0``: drive a 4×4 through waypoints over generated
-  off-road terrain with LiDAR.
+  off-road terrain with LiDAR;
+- ``autonomousim/RoadFollowRural-v0``: drive a car along a route over the roads of generated
+  farmland to a farm yard.
 
 ``gym.make_vec(id, num_envs=N, ...)`` gives the native vector environment
 (``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Worlds with several
@@ -30,6 +32,7 @@ ENVS = {
     "QuadRecover-v0": "recover",
     "QuadWaypointForest-v0": "waypoint_forest",
     "CarWaypointOffroad-v0": "car_waypoint",
+    "RoadFollowRural-v0": "road_follow",
 }
 
 for _name, _task in ENVS.items():

@@ -1215,7 +1215,7 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
 | 3 | Fields, new materials (meadow, crop, plowed soil), buildings, hedges, fences, tree lines, woods (done 2026-09-25) | Parcels cover the farmland; no obstacle on a road or in a yard; gates connect tracks to fields; invariants tested; goldens re-blessed |
 | 4 | Simulation: `MapSource::Rural`, `on_road` spawns, `route` goals, `road`/`route`/`on_road` terms, road cost in `DriveGrid` (deferred); Python `map="rural"` (done 2026-09-25) | A car spawned `on_road` sits in its lane; routes follow the roads; terms match references; the Python env runs on rural maps |
 | 5 | Viewer: road ribbons, buildings, hedges and fences, `--map rural`, route display (done 2026-09-25) | A rural showcase renders at ≥ 60 fps at 1080p "medium" on the Iris Xe; the car drives on the roads by keyboard |
-| 6 | `RoadFollowRural-v0`, a short training run, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
+| 6 | `RoadFollowRural-v0`, a short training run, export, viewer, replay (done 2026-09-25) | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
 **As built in step 1** (`world::roads`, `StaticWorld::with_roads`/`roads`, map file format 2):
 - **Types**: `RoadNetwork` holds `RoadNode`s (position and kind: junction, end, yard, gate) and `Road`s (class, width, start and end node, and a `Polyline`). `Polyline` stores cumulative horizontal stations and answers `point_at`, `heading_at`, `curvature_at`, `project` (station, closest point, heading, signed lateral offset positive to the left, distance) and `slice` (forward or reversed). Curvature is that of the circle through the points 2 m either side, which is smooth on 1 m polylines; per-segment headings were off by up to 25 %.
@@ -1301,10 +1301,37 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
   - Fences are drawn as two posts and three wires instead of a solid 0.1 m wall.
   - Hedges are dark green; their woody cores are not drawn.
 - **Live mode**: `--map wild|rural` (the default is `wild`); `--preset` is parsed for the chosen generator. On rural maps a ground vehicle spawns `on_road` with `route` goals to a farm yard 150–400 m away. `--demo` then follows the route lane by pure pursuit, 8 m ahead, at up to 12 m/s and slower in bends (2 m/s² lateral), and starts a new episode at the end of the route.
-- **Overlay**: an agent's route lane is drawn 0.5 m above the road (orange), in live and policy modes. Replays do not carry the route yet (step 6).
+- **Overlay**: an agent's route lane is drawn 0.5 m above the road (orange), in live and policy modes, and in replays since step 6.
 - **Measured** (Iris Xe, 1080p, "medium", 2 km showcase, sedan demo): 77–105 fps over five runs, with 109k road triangles and 809k obstacle triangles near (443k far). An iris-like drone demo runs at 87 fps. The map mesh builds in 0.16 s.
 - **Tests**: ribbons on a flat test world lie at least 3.5 cm above the terrain, face up, cover the paved road's area (180 m × 6 m) and exist exactly in the chunks the roads cross. Roofs and walls face outwards; the ridge height, overhang, fence extent and silo cap are checked.
 
+
+**As built in step 6** (`RoadFollowRural-v0`, state column `road`, routes in recordings, two map fixes):
+- **State**: rows gain `road` (3 values, `lane::road_state`): the lateral offset from the lane, the heading error, and the distance off the road surface (0 on it, capped at 30 m). They are computed like the `road` term: along the route's lane, or else the nearest road in the travel direction. `STATE_DIM` is 24. Trajectories are unchanged; the goldens were re-blessed for the new `/meta`.
+- **RoadFollowRural-v0** (`tasks/road_follow.py`):
+  - **Setup**: `sedan_like` in `vk` mode, up to 15 m/s. The car spawns in the lane of a random road on a pool of 16 rural maps, with `route` goals every 20 m (radius 5 m) along a 150–400 m route to a farm yard. The policy runs at 20 Hz and the physics at 1 kHz; episodes last 60 s.
+  - **Observation** (97 values): `road`, `route` (×1/20), `on_road`, speed, body velocity and rates, steering, last action, and a roof LiDAR (2 rings at ±3°, 36 azimuths, 40 m, log ranges).
+  - **Reward**:
+    - progress to the current goal, +1 per goal and +20 at the yard;
+    - −0.1·|lane offset| and −0.1·|heading error|;
+    - −0.5 per metre off the road;
+    - smoothness 0.02‖Δa‖²;
+    - −20 on a terminal event, on `STUCK` (5 s), or at more than 3 m off the road.
+- **Route fallback**: some maps have roads but no farm (map 8 of the pool with seed 1000). `yard` routes then go to a random road point, the same as `destination = "road"`. If no draw finds a route at all, a road spawn falls back to a lane spawn with the spawn goal; before this it panicked.
+- **Recordings**: `/episode` carries each agent's route lane (`route`: points), only when it has one, so older files and the hover fixture are unchanged. `RecordedEpisode::routes` reads it back, and the viewer's replay draws it.
+- **Map fixes** (`RURAL_VERSION` 3; golden hashes re-blessed). The first trained policy crashed on two kinds of terrain fault, both invisible to the invariants, which only checked the centre line:
+  - **Yard pads beside roads**: blending took the stronger of the road and yard weights. Where a road passed a pad 1.7 m higher, the pad won right at the road's edge and left a step where the wheels run. Now the pads are blended first and the roads on top, so each road keeps its surface out to 0.5 m beyond its edges.
+  - **Steps at junctions**: a road whose end nodes differ in height by more than its grade limit allows could not meet both. Its grade-limited profile pulled one end away from its node, leaving a 1.25 m step in the main road that launched the car at 11 m/s. Now `reach_nodes` first moves the free (non-yard) node heights until every piece fits within 90 % of its grade limit. A piece that still cannot fit (between two yards) becomes a straight ramp: continuous, over the grade.
+  - **Invariants added**: every road meets its nodes; the terrain matches the crowned surface across the width (8 cm) and 0.5 m beyond each edge (15 cm), away from nodes and other roads. Over both 16-map pools (seeds 0 and 1000), the worst deviation 0.5 m beyond an edge is now 0.19 m away from nodes, down from 1.7 m.
+- **Scripted driver** (test): it steers at the lane point 5 m ahead, at up to 9 m/s, slowing to keep lateral acceleration at 2 m/s² for the curvature within 20 m. It reaches every yard in the test with a mean lane offset of 0.21 m; junction corners are cut by up to 3 m. Steering at the 10 m point cut corners by 1.3 m (90th percentile), and without slowing it ran off at junctions.
+- **Training** (`ppo_continuous.py --hidden 256 --bound-coef 0.01`, 5M steps, 256 envs, 14 min at 5.9k SPS; basic training only):
+  - Success on the training maps was 86 % at the end.
+  - Deterministic evaluation over 256 episodes on the fixed maps: **82.8 % success on unseen maps** (`map_seed` 1000) and 87.9 % on the training pool.
+  - In 20 recorded unseen episodes, 3 failed: one drove off a paved road into the ditch, one cut onto a track's edge at a field gate, and one got stuck.
+- **Export and viewer**: `export_policy.py` wrote `policy.json`. `autonomousim-viewer policy <json> --map-seed 1000` drives it at about 136 fps. `eval_record.py` recordings replay bit for bit, with the route drawn, at about 146 fps.
+- **Tests**:
+  - Rust: state rows against `road_state`; routes survive a recording; yard-less maps route to road points; the new map invariants.
+  - Python: the scripted driver reaches every yard; a full-lock car fails off the road; spaces and `check_env` for the new id.
 
 ### M4b: Trucks and trailers (outline, detailed when it starts)
 - **Articulated vehicles**: a wheeled vehicle becomes a chain of units (tractor, then trailers), each a body in the same tree. A fifth wheel is a Spherical joint with roll stiffness and pitch stops; a drawbar is two revolute joints (a dolly). Axles, colliders and forces attach to their unit's link instead of link 0.

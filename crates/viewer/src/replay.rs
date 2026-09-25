@@ -123,7 +123,7 @@ impl Replay {
     }
 
     /// Put the agents of `world` where the recording has them: the episode's map, the
-    /// interpolated state, rotor speeds, events and goals.
+    /// interpolated state, rotor speeds, events, goals and route.
     pub fn apply(&self, world: &mut WorldInstance) {
         let ep = self.current();
         if world.map_index() != ep.map {
@@ -153,6 +153,9 @@ impl Replay {
                     agent.goals = goals.clone();
                 }
                 agent.goal_index = goals.iter().position(|g| g.position == s.goal).unwrap_or(agent.goal_index);
+            }
+            if let Some(route) = ep.routes.get(i) {
+                agent.route.clone_from(route);
             }
         }
     }

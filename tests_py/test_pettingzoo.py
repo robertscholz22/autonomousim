@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from pettingzoo.test import parallel_api_test, parallel_seed_test
 
+from autonomousim import STATE_DIM
 from autonomousim.pettingzoo import parallel_env
 from autonomousim.tasks import CarWaypointOffroad, QuadHover
 from autonomousim.tasks.multi import MultiAgentTask, Team
@@ -42,7 +43,7 @@ def test_agents_leave_when_they_stop():
     env = parallel_env(hover_team())
     obs, infos = env.reset(seed=1)
     assert env.agents == ["drones_0", "drones_1", "drones_2", "drones_3"] and set(obs) == set(env.agents)
-    assert env.state().shape == (4, 21)
+    assert env.state().shape == (4, STATE_DIM)
     fly_off = np.array([1.0, 0.0, 0.0, 0.0], np.float32)  # 5 m/s: leaves its goal box
     stopped = None
     for _ in range(200):

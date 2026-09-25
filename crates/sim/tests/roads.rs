@@ -4,9 +4,11 @@
 use autonomousim_core::math::quat::{wrap_angle, yaw};
 use autonomousim_core::rng::Seed;
 use autonomousim_core::terrain::Terrain;
-use autonomousim_sim::lane::{Follow, lane_offset};
-use autonomousim_sim::{CompiledScenario, Scenario, WorldInstance};
+use autonomousim_sim::lane::{Follow, ROAD_REACH, lane_offset, road_state};
+use autonomousim_sim::{CompiledScenario, STATE_DIM, Scenario, WorldInstance};
 use autonomousim_world::NodeKind;
+use glam::DVec2;
+use std::f64::consts::FRAC_PI_2;
 use std::sync::Arc;
 
 fn compile(toml: &str) -> Arc<CompiledScenario> {
@@ -95,6 +97,13 @@ fn road_terms_follow_the_route() {
         }
         assert_eq!(o[14], 1.0);
     }
+    // The state column: the same offset and heading error, on the road.
+    let mut state = vec![0.0; 4 * STATE_DIM];
+    w.write_state(0, &mut state);
+    for (row, o) in state.as_chunks::<STATE_DIM>().0.iter().zip(obs.chunks_exact(dim)) {
+        assert!((row[21] - f64::from(o[0])).abs() < 1e-5 && (row[22] - f64::from(o[1])).abs() < 1e-5);
+        assert_eq!(row[23], 0.0);
+    }
 }
 
 #[test]
@@ -120,7 +129,7 @@ fn road_terms_without_a_route_follow_the_nearest_road() {
     let mut far = None;
     'search: for i in 0..40 {
         for j in 0..40 {
-            let p = lo + (hi - lo) * glam::DVec2::new(i as f64 + 0.5, j as f64 + 0.5) / 40.0;
+            let p = lo + (hi - lo) * DVec2::new(i as f64 + 0.5, j as f64 + 0.5) / 40.0;
             if map.roads().nearest(p, 40.0).is_none() {
                 far = Some(p);
                 break 'search;
@@ -129,6 +138,13 @@ fn road_terms_without_a_route_follow_the_nearest_road() {
     }
     let p = far.expect("a point far from the roads");
     assert!(Follow::new(None, &map, p, 0.0).is_none());
+    assert_eq!(road_state(None, &map, p, 0.0), [0.0, 0.0, ROAD_REACH]);
+    // Beside a road: the distance to its surface.
+    let road = &map.roads().roads()[0];
+    let pr = road.line.project(road.line.point_at(0.5 * road.line.length()).truncate());
+    let beside = pr.point.truncate() + DVec2::from_angle(pr.heading + FRAC_PI_2) * (0.5 * road.width + 4.0);
+    let d = road_state(None, &map, beside, pr.heading)[2];
+    assert!((d - 4.0).abs() < 0.3, "{d}");
 }
 
 #[test]
@@ -141,4 +157,44 @@ fn road_maps_are_required() {
     let drone = RURAL.replace("sedan_like", "cf2x").replace("on_road = true", "on_road = true, on_ground = false");
     let err = Scenario::from_toml(&drone).unwrap().compile().unwrap_err().to_string();
     assert!(err.contains("on_ground"), "{err}");
+}
+
+#[test]
+fn recordings_keep_the_routes() {
+    use autonomousim_sim::BatchSim;
+    use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
+
+    let sc = compile(RURAL);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("routes.mcap");
+    let mut b = BatchSim::from_compiled(sc.clone(), 1, 4, 1).unwrap();
+    b.attach_recorder(0, Recorder::create(&path, RecorderConfig::default()).unwrap());
+    let routes: Vec<_> = b.world(0).agents().iter().map(|a| a.route.clone().unwrap()).collect();
+    b.step(&[&[0.0; 8]]);
+    b.detach_recorder(0).unwrap().finish().unwrap();
+    let rec = Recording::read(&path).unwrap();
+    let ep = &rec.episodes[0];
+    assert_eq!(ep.routes.len(), 4);
+    for (recorded, route) in ep.routes.iter().zip(&routes) {
+        assert_eq!(recorded.as_deref().unwrap().points(), route.points());
+    }
+}
+
+#[test]
+fn maps_without_farms_route_to_a_road_point() {
+    // Map 8 of this pool has roads but no farm.
+    let sc = compile(&RURAL.replace("seed = 3, count = 2", "seed = 1000, count = 9"));
+    assert!(!sc.maps[8].roads().nodes().iter().any(|n| n.kind == NodeKind::Yard));
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(1));
+    let mut episodes = 0;
+    while episodes < 3 {
+        w.reset(None);
+        if w.map_index() != 8 {
+            continue;
+        }
+        episodes += 1;
+        for a in w.agents() {
+            let route = a.route.as_ref().expect("a route to a road point");
+            assert!(route.length() > 100.0 && a.goals.len() > 3, "{}: {} m", a.id, route.length());
+        }
+    }
 }

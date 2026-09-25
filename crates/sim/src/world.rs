@@ -44,8 +44,10 @@ pub const PARALLEL_AGENTS: usize = 32;
 /// `goal_index` equals the number of goals once the last one has been reached; `clearance` is
 /// the distance to the nearest terrain or solid obstacle surface, up to 20 m (for ground
 /// vehicles, which sit on the terrain, to the nearest solid obstacle); `agent_clearance` the
-/// distance between the agent's colliders and the nearest other active agent's, up to 20 m.
-pub const STATE_FIELDS: [(&str, usize); 10] = [
+/// distance between the agent's colliders and the nearest other active agent's, up to 20 m;
+/// `road` the lateral offset from the lane followed, the heading error to it and the distance
+/// to the nearest road's surface ([`lane::road_state`]).
+pub const STATE_FIELDS: [(&str, usize); 11] = [
     ("position", 3),
     ("orientation", 4),
     ("velocity", 3),
@@ -56,10 +58,11 @@ pub const STATE_FIELDS: [(&str, usize); 10] = [
     ("goal_index", 1),
     ("clearance", 1),
     ("agent_clearance", 1),
+    ("road", 3),
 ];
 
 /// Length of a state row.
-pub const STATE_DIM: usize = 21;
+pub const STATE_DIM: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct WorldInstance {
@@ -328,6 +331,8 @@ impl WorldInstance {
                 _ => self.map.clearance(v.position(), CLEARANCE_RANGE),
             };
             row[20] = self.grid.clearance(&self.shapes, g.first_agent + k, CLEARANCE_RANGE);
+            let road = lane::road_state(a.route.as_deref(), &self.map, v.position().truncate(), yaw(q));
+            row[21..24].copy_from_slice(&road);
         };
         let rows = out.as_chunks_mut::<STATE_DIM>().0;
         if g.spec.count >= PARALLEL_AGENTS {

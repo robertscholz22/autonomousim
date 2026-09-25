@@ -7,6 +7,7 @@ from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.hover import QuadHover
 from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.tasks.recover import QuadRecover
+from autonomousim.tasks.road_follow import RoadFollowRural
 from autonomousim.tasks.swarm import FormationHover, SwarmForestDrone, SwarmHover, SwarmWaypointForest
 from autonomousim.tasks.waypoint_forest import QuadWaypointForest
 
@@ -15,13 +16,13 @@ TASKS: dict[str, type[Task]] = {
     "recover": QuadRecover,
     "waypoint_forest": QuadWaypointForest,
     "car_waypoint": CarWaypointOffroad,
+    "road_follow": RoadFollowRural,
 }
 
 
 def make_task(task: str | Task, **kwargs: Any) -> Task:
     """A task instance from its name (``hover``, ``recover``, ``waypoint_forest``,
-    ``car_waypoint``) and keyword
-    arguments, or the instance itself."""
+    ``car_waypoint``, ``road_follow``) and keyword arguments, or the instance itself."""
     if isinstance(task, Task):
         if kwargs:
             raise TypeError("keyword arguments are only accepted with a task name")
@@ -41,6 +42,7 @@ __all__ = [
     "QuadHover",
     "QuadRecover",
     "QuadWaypointForest",
+    "RoadFollowRural",
     "SwarmForestDrone",
     "SwarmHover",
     "SwarmWaypointForest",

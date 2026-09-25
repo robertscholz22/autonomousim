@@ -109,6 +109,14 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
         let line = &road.line;
         let pts = line.points();
         let len = line.length();
+        // Continuous: the road meets its nodes, so no steps at junctions.
+        let (z0, z1) = (net.nodes()[road.start as usize].position.z, net.nodes()[road.end as usize].position.z);
+        assert!(
+            (pts[0].z - z0).abs() < 1e-9 && (pts[pts.len() - 1].z - z1).abs() < 1e-9,
+            "seed {seed} road {k}: ends at {:.2}/{:.2}, nodes at {z0:.2}/{z1:.2}",
+            pts[0].z,
+            pts[pts.len() - 1].z
+        );
         // Grade.
         for w2 in pts.windows(2) {
             let ds = w2[0].truncate().distance(w2[1].truncate());
@@ -138,11 +146,21 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
                 assert!(t.water_level(q.x, q.y).is_none(), "seed {seed} road {k}: water at {q}");
             }
             let q = p.truncate();
-            let dz = t.height(q.x, q.y) - p.z;
-            // Junctions and yards mix neighbouring surfaces; elsewhere the fit is tight.
+            // Junctions and yards mix neighbouring surfaces; elsewhere the fit is tight, across
+            // the crowned surface and 0.5 m beyond its edges (where the wheels of a car at the
+            // edge run), unless another road is nearer there.
             let near_node = s < 8.0 || s > len - 8.0;
             if !near_node {
-                assert!(dz.abs() < 0.08, "seed {seed} road {k}: terrain {dz:+.3} m off the road at {q}");
+                let half = 0.5 * road.width;
+                for off in [-half - 0.5, -half, -0.5 * half, 0.0, 0.5 * half, half, half + 0.5] {
+                    let e = q + off * DVec2::new(-h.sin(), h.cos());
+                    if net.nearest(e, 10.0).is_some_and(|r| r.road as usize != k) {
+                        continue;
+                    }
+                    let dz = t.height(e.x, e.y) - (p.z - class.crown * off.abs().min(half));
+                    let tol = if off.abs() > half { 0.15 } else { 0.08 };
+                    assert!(dz.abs() < tol, "seed {seed} road {k}: terrain {dz:+.3} m off the road at {e} ({off:+} m)");
+                }
                 let m = t.material(q.x, q.y);
                 assert!(m == expected || yard(q) || m == MaterialId::ASPHALT, "seed {seed} road {k}: {m:?} at {q}");
             }

@@ -94,22 +94,39 @@ pub(crate) fn plan_route(world: &StaticWorld, from: DVec2, spec: &GoalSpec, rng:
     if net.is_empty() {
         return None;
     }
-    let mut targets: Vec<DVec2> = match spec.route.destination {
+    let route = match spec.route.destination {
         RouteDestination::Yard => {
-            net.nodes().iter().filter(|n| n.kind == NodeKind::Yard).map(|n| n.position.truncate()).collect()
+            let yards = net.nodes().iter().filter(|n| n.kind == NodeKind::Yard).map(|n| n.position.truncate());
+            best_route(world, from, yards.collect(), spec.distance, rng)
         }
-        RouteDestination::Road => (0..32)
+        RouteDestination::Road => None,
+    };
+    // Some maps have no farm (or none reachable): a road point instead.
+    route.or_else(|| {
+        let points = (0..32)
             .map(|_| {
                 let (k, s) = road_point(net, rng);
                 net.roads()[k].line.point_at(s).truncate()
             })
-            .collect(),
-    };
+            .collect();
+        best_route(world, from, points, spec.distance, rng)
+    })
+}
+
+/// The lane line of the shortest road route from `from` to one of `targets` whose length is in
+/// `[lo, hi]`, or else closest to it.
+fn best_route(
+    world: &StaticWorld,
+    from: DVec2,
+    mut targets: Vec<DVec2>,
+    [lo, hi]: [f64; 2],
+    rng: &mut SimRng,
+) -> Option<Polyline> {
+    let net = world.roads();
     // Fisher–Yates, so that ties in the range go to a random destination.
     for i in (1..targets.len()).rev() {
         targets.swap(i, rng.below(i as u64 + 1) as usize);
     }
-    let [lo, hi] = spec.distance;
     let mut best: Option<(f64, Polyline)> = None;
     for to in targets {
         let Some(route) = net.route(from, to, 50.0) else { continue };
@@ -174,11 +191,8 @@ pub(crate) fn road_spawns(
                     (lane.point_at(0.0).truncate(), lane.heading_at(0.0), Some(lane))
                 }
                 None => {
-                    let mut h = road.line.heading_at(s);
-                    if spawn_rng.uniform() < 0.5 {
-                        h = wrap_angle(h + std::f64::consts::PI);
-                    }
-                    (centre + lane_offset(road) * right(h), h, None)
+                    let (xy, h) = lane_spawn(road, s, spawn_rng);
+                    (xy, h, None)
                 }
             };
             let position = xy.extend(world.terrain().height(xy.x, xy.y) + lift);
@@ -190,11 +204,25 @@ pub(crate) fn road_spawns(
                 break;
             }
         }
-        let (_, s) = best.expect("a network with roads yields spawns");
+        // No route from any draw (only with route goals): a spawn in a lane, and the spawn goal.
+        let s = best.map(|b| b.1).unwrap_or_else(|| {
+            let (k, s) = road_point(net, spawn_rng);
+            let (xy, yaw) = lane_spawn(&net.roads()[k], s, spawn_rng);
+            RoadSpawn { position: xy.extend(world.terrain().height(xy.x, xy.y) + lift), yaw, route: None }
+        });
         placed.push(s.position);
         out.push(s);
     }
     out
+}
+
+/// A point in the lane at station `s` of `road`, facing along it in a random direction.
+fn lane_spawn(road: &Road, s: f64, rng: &mut SimRng) -> (DVec2, f64) {
+    let mut h = road.line.heading_at(s);
+    if rng.uniform() < 0.5 {
+        h = wrap_angle(h + std::f64::consts::PI);
+    }
+    (road.line.point_at(s).truncate() + lane_offset(road) * right(h), h)
 }
 
 /// The line an agent follows in its travel direction: its route's lane, or else the lane of
@@ -248,5 +276,21 @@ impl<'a> Follow<'a> {
     pub fn point(&self, ahead: f64) -> DVec2 {
         let p = self.line.point_at(self.line_station(ahead)).truncate();
         p + self.lane * right(self.heading(ahead))
+    }
+}
+
+/// The `road` state column: lateral offset from the lane followed (m, + left), lane heading −
+/// heading (rad), and distance from `xy` to the nearest road's surface (m; 0 on a road).
+/// Without a lane to follow the first two are 0, without a road within [`ROAD_REACH`] the
+/// distance is `ROAD_REACH`.
+pub fn road_state(route: Option<&Polyline>, world: &StaticWorld, xy: DVec2, yaw: f64) -> [f64; 3] {
+    let net = world.roads();
+    let off_road = match net.nearest(xy, ROAD_REACH) {
+        Some(rp) => (rp.projection.distance - 0.5 * net.roads()[rp.road as usize].width).clamp(0.0, ROAD_REACH),
+        None => ROAD_REACH,
+    };
+    match Follow::new(route, world, xy, yaw) {
+        Some(f) => [f.offset, wrap_angle(f.heading(0.0) - yaw), off_road],
+        None => [0.0, 0.0, off_road],
     }
 }

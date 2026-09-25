@@ -52,7 +52,19 @@ and you can take over any drone from the keyboard.
 - **Training**: a PPO policy for **CarWaypointOffroad-v0** (drive the 4×4 through three
   waypoints between the trees using LiDAR) reaches **82 % success on unseen maps**.
 
-Next up: multi-agent (Milestone 3). The full plan, the design decisions and as-built notes for
+**Milestone 3 (multi-agent) is done**: a native multi-agent vector env with arrays per agent
+group (mixed air and ground teams), a PettingZoo `ParallelEnv`, neighbour observations,
+256-drone swarms faster than 20× real time, IPPO (`examples/ppo_multiagent.py`) and the
+`SwarmHover-v0` and `SwarmWaypointForest-v0` tasks.
+
+**Milestone 4a (rural maps) is done**: generated farmland with a paved road, gravel roads to
+the farms and dirt tracks to the fields, blended into the terrain; fields, farm buildings,
+hedges, fences and tree lines; spawns in a lane and goals along a route over the road network,
+with lane-following observations. In the viewer (`--map rural`) the roads carry lane markings.
+**RoadFollowRural-v0** (a car follows its route to a farm yard, keeping to its lane) reaches
+**83 % success on unseen maps** after 14 minutes of training.
+
+Next up: trucks and trailers (Milestone 4b), then tracked vehicles (4c). The full plan, the design decisions and as-built notes for
 every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
@@ -77,6 +89,9 @@ cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest
 
 # Drive a 4×4 over an off-road map (W/S pedal, A/D steering, Space handbrake).
 cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4
+
+# Farmland: a sedan in its lane with a route to a farm (--demo drives it).
+cargo run -p autonomousim-viewer --release -- --map rural --vehicle sedan_like
 ```
 
 ### Python
@@ -90,8 +105,10 @@ obs, info = envs.reset()
 obs, reward, terminated, truncated, info = envs.step(envs.action_space.sample())
 ```
 
-Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0` and
-`CarWaypointOffroad-v0`. Task options such as `action_mode`, `map_seed` or reward weights are
+Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0`,
+`CarWaypointOffroad-v0` and `RoadFollowRural-v0`; for several agents `SwarmHover-v0` and
+`SwarmWaypointForest-v0` (`autonomousim.multiagent.MultiAgentVectorEnv(num_envs, "swarm_hover")`
+or `autonomousim.pettingzoo.parallel_env`). Task options such as `action_mode`, `map_seed` or reward weights are
 passed as keyword arguments.
 
 ### Train, record, replay

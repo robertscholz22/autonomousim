@@ -18,9 +18,18 @@ from autonomousim.vector_env import AutonomousimVectorEnv
 
 IDS = [f"autonomousim/{name}" for name in autonomousim.ENVS]
 # Small maps for the API tests (the waypoint task defaults to a pool of 16 generated maps).
-KWARGS = {"autonomousim/QuadWaypointForest-v0": {"map": "forest"}, "autonomousim/CarWaypointOffroad-v0": {"map": "flat"}}
-OBS_DIM = {"autonomousim/QuadWaypointForest-v0": 148, "autonomousim/CarWaypointOffroad-v0": 231}
-ACT_DIM = {"autonomousim/CarWaypointOffroad-v0": 2}
+RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
+KWARGS = {
+    "autonomousim/QuadWaypointForest-v0": {"map": "forest"},
+    "autonomousim/CarWaypointOffroad-v0": {"map": "flat"},
+    "autonomousim/RoadFollowRural-v0": {"map": RURAL},
+}
+OBS_DIM = {
+    "autonomousim/QuadWaypointForest-v0": 148,
+    "autonomousim/CarWaypointOffroad-v0": 231,
+    "autonomousim/RoadFollowRural-v0": 97,
+}
+ACT_DIM = {"autonomousim/CarWaypointOffroad-v0": 2, "autonomousim/RoadFollowRural-v0": 2}
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
 FALL = np.array([0.0, 0.0, 0.0, -1.0], np.float32)
@@ -344,6 +353,73 @@ def test_car_waypoint_on_open_ground():
     # progress sums to the path length (at least 3 × 25 m, less the last 3 m) plus 3 bonuses.
     assert success.all() and (reached == 3).all(), (success, reached)
     assert (ret > 3 * 10.0 + 3 * 25.0 - 3.0 - 5.0).all(), ret
+    envs.close()
+
+
+def road_driver(obs: np.ndarray) -> np.ndarray:
+    """``vk`` actions steering at the lane point 5 m ahead (the first point of the ``route``
+    term, scaled by 1/20) at up to 60 % of the 15 m/s speed limit, slower where the lane bends
+    within 20 m (``road`` curvatures 5, 10 and 20 m ahead) for 2 m/s² of lateral acceleration:
+    junctions turn sharply."""
+    ahead = obs[:, 6:8]
+    heading_error = np.arctan2(ahead[:, 1], ahead[:, 0])
+    bend = np.abs(obs[:, 2:5]).max(axis=1)
+    speed = np.minimum(9.0, np.sqrt(2.0 / np.maximum(bend, 1e-3))) / 15.0
+    return np.stack([speed, np.clip(2.0 * heading_error, -1.0, 1.0)], 1).astype(np.float32)
+
+
+def test_road_follow_reaches_the_yard():
+    from autonomousim import Event
+
+    n = 4
+    envs = gym.make_vec(
+        "autonomousim/RoadFollowRural-v0",
+        num_envs=n,
+        num_threads=2,
+        map=RURAL,
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    task = envs.unwrapped.task
+    layout = envs.unwrapped.obs_layout
+    assert [t[0] for t in layout[:3]] == ["road", "route", "on_road"] and layout[-1] == ("lidar_log", 25, 72)
+    obs, _ = envs.reset(seed=1)
+    state = envs.unwrapped.state
+    assert (np.abs(state[:, STATE["road"]][:, 0]) < 0.6).all() and (state[:, STATE["road"]][:, 2] == 0.0).all()
+    ret, offsets, done = np.zeros(n), [], np.zeros(n, bool)
+    success = np.zeros(n, bool)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(road_driver(obs))
+        live = ~done
+        ret[live] += reward[live]
+        offsets.append(np.abs(envs.unwrapped.state[live, STATE["road"]][:, 0]))
+        success |= live & task.success
+        done |= terminated | truncated
+    # The scripted driver keeps to its lane and reaches every yard; it cuts the corners where
+    # the route turns from one road into another (the offsets peak there).
+    assert success.all(), success
+    offsets = np.concatenate(offsets)
+    assert offsets.mean() < 0.3 and np.quantile(offsets, 0.9) < 0.6 and offsets.max() < 3.5, (
+        offsets.mean(),
+        np.quantile(offsets, 0.9),
+        offsets.max(),
+    )
+    assert (ret > task.finish_bonus + 100.0).all(), ret
+    envs.close()
+
+
+def test_road_follow_fails_off_the_road():
+    envs = gym.make_vec(
+        "autonomousim/RoadFollowRural-v0", num_envs=2, map=RURAL, autoreset_mode=AutoresetMode.DISABLED
+    )
+    envs.reset(seed=0)
+    # Full lock to the left: off the road within a few seconds.
+    turn = np.tile(np.array([0.5, 1.0], np.float32), (2, 1))
+    for _ in range(200):
+        _, reward, terminated, truncated, info = envs.step(turn)
+        if terminated.all():
+            break
+    assert terminated.all() and not envs.unwrapped.task.success.any()
+    assert (envs.unwrapped.state[:, STATE["road"]][:, 2] > 3.0).all()
     envs.close()
 
 

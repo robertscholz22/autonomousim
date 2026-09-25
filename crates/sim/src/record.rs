@@ -3,7 +3,7 @@
 //! | Topic | When | Content |
 //! |---|---|---|
 //! | `/meta` | once | scenario, map pool (metadata and content hashes), vehicle definitions, rates, agent list |
-//! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses and goals |
+//! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses, goals and routes (lane points of agents with `route` goals) |
 //! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels and powertrain (ground vehicles) |
 //! | `/agent/<id>/pose` | `state_hz` | the pose as `foxglove.PoseInFrame` (frame `world`) |
 //! | `/agent/<id>/action` | each action | the normalised action |
@@ -24,12 +24,14 @@ use crate::scenario::{CompiledScenario, Goal, Scenario};
 use crate::world::{STATE_FIELDS, WorldInstance};
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::{SharedDef, Vehicle, VehicleDef};
+use autonomousim_world::Polyline;
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Destination of recorded messages (an MCAP file now; a live viewer connection later).
 pub trait TelemetrySink: Send {
@@ -310,11 +312,15 @@ impl Recorder {
             .agents()
             .iter()
             .map(|a| {
-                json!({
+                let mut m = json!({
                     "id": a.id,
                     "spawn": {"position": a.spawn.pos, "orientation": a.spawn.rot},
                     "goals": a.goals,
-                })
+                });
+                if let Some(route) = &a.route {
+                    m["route"] = json!(route.points());
+                }
+                m
             })
             .collect();
         let msg = json!({
@@ -556,6 +562,8 @@ pub struct RecordedEpisode {
     /// Start as time since the recording started (s).
     pub start: f64,
     pub goals: Vec<Vec<Goal>>,
+    /// The lane each agent follows to its goals, if it has `route` goals.
+    pub routes: Vec<Option<Arc<Polyline>>>,
     pub states: Vec<Vec<RecordedState>>,
     pub actions: Vec<Vec<RecordedAction>>,
     pub scans: Vec<Vec<RecordedScan>>,
@@ -625,6 +633,8 @@ impl Recording {
         struct EpisodeAgent {
             id: usize,
             goals: Vec<Goal>,
+            #[serde(default)]
+            route: Option<Vec<DVec3>>,
         }
 
         let mut rec: Option<Recording> = None;
@@ -655,9 +665,11 @@ impl Recording {
             if topic == "/episode" {
                 let e: Episode = parse(topic, &m.data)?;
                 let mut goals = vec![Vec::new(); n];
+                let mut routes = vec![None; n];
                 for a in e.agents {
-                    if let Some(g) = goals.get_mut(a.id) {
-                        *g = a.goals;
+                    if a.id < n {
+                        goals[a.id] = a.goals;
+                        routes[a.id] = a.route.map(|p| Arc::new(Polyline::new(p)));
                     }
                 }
                 r.episodes.push(RecordedEpisode {
@@ -666,6 +678,7 @@ impl Recording {
                     map: e.map,
                     start: m.log_time as f64 * 1e-9,
                     goals,
+                    routes,
                     states: vec![Vec::new(); n],
                     actions: vec![Vec::new(); n],
                     scans: vec![Vec::new(); n],
