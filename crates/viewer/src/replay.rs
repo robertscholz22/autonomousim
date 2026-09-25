@@ -320,6 +320,44 @@ mod tests {
         assert_eq!(shown.powertrain().gear, live.powertrain().gear);
     }
 
+    /// A semitrailer rig replays with its trailer where it was.
+    #[test]
+    fn replayed_rigs_show_their_trailers() {
+        let sc = Scenario {
+            map: MapSource::Testworld(Testworld::Flat { size: 400.0 }),
+            groups: vec![GroupSpec {
+                vehicle: autonomousim_sim::scenario::VehicleRef::Name("truck_6x4".into()),
+                trailers: vec!["semitrailer_3axle".into()],
+                action_mode: Some(GroundActionMode::Raw.into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sc = Arc::new(sc.compile().unwrap());
+        let path = std::env::temp_dir().join(format!("autonomousim-replay-rig-{}.mcap", std::process::id()));
+        let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+        let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+        rec.on_reset(&w);
+        for k in 0..300 {
+            w.set_actions(0, &[0.5, if k < 100 { 0.0 } else { 0.8 }]);
+            rec.on_actions(&w);
+            w.step_with(&mut |w| rec.on_tick(w));
+        }
+        rec.finish().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut r = Replay::new(recording, 0);
+        r.seek(r.duration());
+        r.apply(&mut world);
+        let (live, shown) = (w.agent(0).vehicle.as_wheeled().unwrap(), world.agent(0).vehicle.as_wheeled().unwrap());
+        let art = live.articulation(1).0;
+        assert!(art.abs() > 0.05, "{art}");
+        assert!((shown.articulation(1).0 - art).abs() < 1e-3, "{} vs {art}", shown.articulation(1).0);
+        let (a, b) = (live.unit_pose(1), shown.unit_pose(1));
+        assert!((a.pos - b.pos).length() < 0.05 && a.rot.angle_between(b.rot) < 0.01, "{} {}", a.pos, b.pos);
+    }
+
     /// Plays every episode of a recording as the viewer's `replay` mode does, for recordings
     /// the tests cannot make (`examples/eval_record.py`): `AUTONOMOUSIM_RECORDING=$PWD/recordings/<run>.mcap
     /// cargo test -p autonomousim-viewer --release -- --ignored --nocapture recorded_file`.

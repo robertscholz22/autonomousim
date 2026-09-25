@@ -31,3 +31,8 @@ pub fn mesh(m: &MeshData) -> Mesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, m.colors.clone())
         .with_inserted_indices(Indices::U32(m.indices.clone()))
 }
+
+/// ENU (or FLU) pose → Bevy transform.
+pub fn transform(p: &autonomousim_core::math::Pose) -> Transform {
+    Transform::from_translation(vec(p.pos)).with_rotation(quat(p.rot))
+}

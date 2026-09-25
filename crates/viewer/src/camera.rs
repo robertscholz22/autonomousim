@@ -1,6 +1,7 @@
 //! Cameras following the piloted vehicle: chase (behind it, turning with its heading), orbit
-//! (mouse-controlled around it) and first-person (fixed to the airframe, or from the driver's
-//! seat), and a free-flying camera (W/A/S/D, Space/Shift, mouse drag to look, wheel for speed,
+//! (mouse-controlled around it), first-person (fixed to the airframe, or from the driver's
+//! seat) and, for ground vehicles, a reversing camera at the tail of the last unit (the
+//! trailer's, for a rig) looking back; and a free-flying camera (W/A/S/D, Space/Shift, mouse drag to look, wheel for speed,
 //! Ctrl for 4×). Ground vehicles are chased from lower and closer, relative to their size.
 //!
 //! Angles and positions are computed in ENU and converted once.
@@ -21,15 +22,18 @@ pub enum CameraMode {
     Chase,
     Orbit,
     Fpv,
+    Rear,
     Free,
 }
 
 impl CameraMode {
-    pub fn next(self) -> Self {
+    /// The next mode; `ground`: with the reversing camera.
+    pub fn next(self, ground: bool) -> Self {
         match self {
             CameraMode::Chase => CameraMode::Orbit,
             CameraMode::Orbit => CameraMode::Fpv,
-            CameraMode::Fpv => CameraMode::Free,
+            CameraMode::Fpv if ground => CameraMode::Rear,
+            CameraMode::Fpv | CameraMode::Rear => CameraMode::Free,
             CameraMode::Free => CameraMode::Chase,
         }
     }
@@ -39,6 +43,7 @@ impl CameraMode {
             CameraMode::Chase => "chase",
             CameraMode::Orbit => "orbit",
             CameraMode::Fpv => "first person",
+            CameraMode::Rear => "reversing",
             CameraMode::Free => "free",
         }
     }
@@ -61,6 +66,8 @@ pub struct CameraRig {
     pub focus_height: f64,
     /// First-person eye point in the vehicle frame (m); `None`: ahead of the centre.
     pub eye_offset: Option<DVec3>,
+    /// Reversing camera point in the last unit's frame (m); `None`: not a ground vehicle.
+    pub rear_eye: Option<DVec3>,
     /// Where the camera is (ENU), and the speed of the free camera (m/s).
     pub eye: DVec3,
     pub speed: f64,
@@ -77,19 +84,22 @@ impl CameraRig {
             min_distance: 2.0 * span,
             focus_height: 0.5 * span,
             eye_offset: None,
+            rear_eye: None,
             eye: DVec3::ZERO,
             speed: 10.0,
         }
     }
 
-    /// For a ground vehicle of size `span` with the driver's eye at `eye` (vehicle frame).
-    pub fn ground(span: f64, heading: f64, eye: DVec3) -> Self {
+    /// For a ground vehicle of size `span` with the driver's eye at `eye` (vehicle frame) and
+    /// the reversing camera at `rear_eye` (the last unit's frame).
+    pub fn ground(span: f64, heading: f64, eye: DVec3, rear_eye: DVec3) -> Self {
         Self {
             pitch: 0.2,
             distance: (2.6 * span).max(1.5),
             min_distance: (1.2 * span).max(0.6),
             focus_height: eye.z.max(0.3 * span),
             eye_offset: Some(eye),
+            rear_eye: Some(rear_eye),
             ..Self::new(span, heading)
         }
     }
@@ -116,7 +126,7 @@ pub fn update_camera(
     let egui_busy = egui.ctx_mut().is_ok_and(|c| c.egui_wants_pointer_input() || c.is_pointer_over_egui());
     let typing = egui.ctx_mut().is_ok_and(|c| c.egui_wants_keyboard_input());
     if keys.just_pressed(KeyCode::KeyC) && !typing {
-        rig.mode = rig.mode.next();
+        rig.mode = rig.mode.next(rig.rear_eye.is_some());
         if rig.mode == CameraMode::Free {
             // Start where the first-person camera was, looking the same way.
             let forward = convert::enu(transform.forward().as_vec3());
@@ -173,6 +183,17 @@ pub fn update_camera(
             };
             let camera_rot = pose.rot * DQuat::from_rotation_y(tilt.to_radians());
             let eye = target + pose.rot * offset;
+            (eye, eye + camera_rot * DVec3::X, camera_rot * DVec3::Z)
+        }
+        CameraMode::Rear => {
+            // From the tail, looking back and 20° down; the last unit is posed relative to the
+            // interpolated chassis.
+            let unit = match sim.world.agent(sim.pilot).vehicle.as_wheeled() {
+                Some(w) => pose * (w.unit_pose(0).inverse() * w.unit_pose(w.num_units() - 1)),
+                None => pose,
+            };
+            let camera_rot = unit.rot * DQuat::from_rotation_z(std::f64::consts::PI) * DQuat::from_rotation_y(0.35);
+            let eye = unit.transform_point(rig.rear_eye.unwrap_or_default());
             (eye, eye + camera_rot * DVec3::X, camera_rot * DVec3::Z)
         }
         CameraMode::Free => {

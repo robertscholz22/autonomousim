@@ -228,46 +228,80 @@ pub fn rotor_disc(radius: f32, color: [f32; 4]) -> MeshData {
 /// its spinning link's frame (spin axis y), to be posed from the simulated wheels.
 #[derive(Clone, Debug)]
 pub struct WheeledVisual {
+    /// The towing unit's body, in its frame.
     pub body: MeshData,
+    /// Bodies of the units behind it (unit `u` at `u − 1`), each in its unit's frame.
+    pub units: Vec<MeshData>,
+    /// Per wheel, a mesh about its centre.
     pub wheels: Vec<MeshData>,
-    /// Largest distance of a wheel's outer edge from the chassis origin (m), for cameras.
+    /// Largest distance of a wheel's outer edge or of a body from the chassis origin, all
+    /// units in line (m), for cameras.
     pub span: f32,
     /// Driver's eye point in the chassis frame (m), for the first-person camera.
     pub eye: DVec3,
-    /// Per wheel with suspension: chassis-side ends of the strut and of the lower arm, in the
-    /// chassis frame (m). The other ends follow the wheel centre.
+    /// Reversing camera point in the last unit's frame (m): at its tail, below its top.
+    pub rear_eye: DVec3,
+    /// Per wheel with suspension: body-side ends of the strut and of the lower arm, in the
+    /// frame of the wheel's unit (m). The other ends follow the wheel centre.
     pub links: Vec<Option<[DVec3; 2]>>,
     /// Link (unit cylinder along z, from −0.5 to 0.5) scaled to the links' thickness.
     pub link: MeshData,
 }
 
+/// Box between a unit's wheels: half extents and centre, in the unit's frame.
+struct WheelBox {
+    half: DVec3,
+    centre: DVec3,
+}
+
 /// Build the visual of a wheeled vehicle: a box over the wheelbase and track with a red nose
 /// (and a cabin on cars), dark tyres with a light marker on the rim so that spin is visible,
-/// and a strut and lower arm per suspended wheel.
+/// and a strut and lower arm per suspended wheel. Units behind the towing unit get a box over
+/// their colliders (trailer bodies), a low frame between their wheels (dollies) or a bar to
+/// the next joint (drawbars).
 pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual {
     let n = def.num_wheels();
     let positions: Vec<DVec3> = (0..n).map(|w| def.wheel_position(w)).collect();
     let tire = |w: usize| def.tire(w / 2);
-    let (mut lo, mut hi) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
-    for (w, p) in positions.iter().enumerate() {
-        let r = tire(w).radius();
-        lo = lo.min(*p - DVec3::new(r, 0.0, 0.0));
-        hi = hi.max(*p + DVec3::new(r, 0.0, r));
-    }
+    let on = |u: usize| (0..n).filter(move |&w| def.wheel_unit(w) == u);
     let width = (0..n).map(|w| tire(w).width()).fold(0.0, f64::max);
     let radius = (0..n).map(|w| tire(w).radius()).fold(0.0, f64::max);
     // Between the wheels, from the axle line up to a little above the tyre tops.
-    let half = DVec3::new(0.5 * (hi.x - lo.x), (0.5 * (hi.y - lo.y) - 0.6 * width).max(0.3 * radius), 0.4 * radius);
-    let centre = DVec3::new(0.5 * (hi.x + lo.x), 0.5 * (hi.y + lo.y), lo.z + 0.2 * radius + half.z);
-    let mut body = MeshData::new();
+    let wheel_box = |u: usize| {
+        let (mut lo, mut hi) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+        let mut radius = 0.0f64;
+        for w in on(u) {
+            let (p, r) = (positions[w], tire(w).radius());
+            lo = lo.min(p - DVec3::new(r, 0.0, 0.0));
+            hi = hi.max(p + DVec3::new(r, 0.0, r));
+            radius = radius.max(r);
+        }
+        let half = DVec3::new(0.5 * (hi.x - lo.x), (0.5 * (hi.y - lo.y) - 0.6 * width).max(0.3 * radius), 0.4 * radius);
+        let centre = DVec3::new(0.5 * (hi.x + lo.x), 0.5 * (hi.y + lo.y), lo.z + 0.2 * radius + half.z);
+        WheelBox { half, centre }
+    };
     let h = |v: DVec3| v.as_vec3();
+    let WheelBox { half, centre } = wheel_box(0);
+    let mut body = MeshData::new();
     body.append_transformed(&mesh::cuboid(h(half), srgb([70, 110, 150])), DQuat::IDENTITY, centre);
     let nose = mesh::cuboid(h(DVec3::new(0.08 * half.x, 0.8 * half.y, 0.3 * half.z)), srgb([200, 40, 36]));
     body.append_transformed(&nose, DQuat::IDENTITY, centre + DVec3::new(half.x, 0.0, 0.5 * half.z));
     let top = centre.z + half.z;
-    // Cars (wheels larger than a robot's): a cabin over the middle, a little behind centre.
+    // Trucks and tractors (large wheels) with colliders high above the frame: a cab over the
+    // frontmost. Cars (wheels larger than a robot's): a cabin over the middle, a
+    // little behind centre.
+    let tall = def.colliders.iter().filter(|c| c.center.z + c.radius > top + 1.0);
+    let cab = tall.max_by(|a, b| a.center.x.total_cmp(&b.center.x)).filter(|_| radius >= 0.5);
     let car = radius > 0.2;
-    let eye = if car {
+    let eye = if let Some(c) = cab {
+        let (bottom, roof) = (top - 0.1 * half.z, c.center.z + c.radius);
+        let cab = DVec3::new(0.8 * c.radius, 0.95 * half.y.max(c.radius), 0.5 * (roof - bottom));
+        let at = DVec3::new(c.center.x, centre.y, bottom + cab.z);
+        body.append_transformed(&mesh::cuboid(h(cab), srgb([150, 185, 210])), DQuat::IDENTITY, at);
+        let glass = mesh::cuboid(h(DVec3::new(0.02, 0.9 * cab.y, 0.25 * cab.z)), srgb([40, 50, 60]));
+        body.append_transformed(&glass, DQuat::IDENTITY, at + DVec3::new(cab.x, 0.0, 0.45 * cab.z));
+        DVec3::new(at.x + 0.3 * cab.x, centre.y + 0.4 * cab.y, at.z + 0.5 * cab.z)
+    } else if car {
         let cabin = DVec3::new(0.3 * half.x, 0.85 * half.y, 0.55 * radius.max(0.35));
         let at = DVec3::new(centre.x - 0.1 * half.x, centre.y, top + cabin.z);
         body.append_transformed(&mesh::cuboid(h(cabin), srgb([150, 185, 210])), DQuat::IDENTITY, at);
@@ -275,6 +309,49 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     } else {
         DVec3::new(centre.x + 0.8 * half.x, centre.y, top + 0.3 * half.z)
     };
+    let mut tops = vec![top];
+    let mut halves = vec![half.y];
+    let mut reach = DVec3::new(centre.x - half.x, 0.0, 0.0).length().max((centre + half).length());
+    let units = (1..def.num_units())
+        .map(|u| {
+            let unit = &def.units[u - 1];
+            let origin = def.unit_origin(u);
+            let mut m = MeshData::new();
+            let (lo, hi) = if !unit.colliders.is_empty() {
+                // The body: over the colliders, a panel line at the front.
+                let (mut lo, mut hi) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+                for c in &unit.colliders {
+                    lo = lo.min(c.center - DVec3::splat(c.radius));
+                    hi = hi.max(c.center + DVec3::splat(c.radius));
+                }
+                let (half, centre) = (0.5 * (hi - lo), 0.5 * (hi + lo));
+                m.append_transformed(&mesh::cuboid(h(half), srgb([185, 180, 165])), DQuat::IDENTITY, centre);
+                let stripe = mesh::cuboid(h(DVec3::new(0.02, 1.01 * half.y, 0.06 * half.z)), srgb([200, 40, 36]));
+                m.append_transformed(&stripe, DQuat::IDENTITY, centre - DVec3::new(0.0, 0.0, 0.8 * half.z));
+                (lo, hi)
+            } else if on(u).next().is_some() {
+                let WheelBox { half, centre } = wheel_box(u);
+                m.append_transformed(&mesh::cuboid(h(half), srgb([90, 90, 95])), DQuat::IDENTITY, centre);
+                (centre - half, centre + half)
+            } else {
+                // A bar from the eye to each unit hanging from this one.
+                let r = (0.04 * radius).max(0.03);
+                let mut far = DVec3::ZERO;
+                for child in def.units.iter().filter(|c| c.parent == u) {
+                    let d = child.position;
+                    let rot = DQuat::from_rotation_arc(DVec3::X, d.normalize_or(DVec3::X));
+                    let bar = mesh::cuboid(h(DVec3::new(0.5 * d.length(), r, r)), srgb([60, 60, 65]));
+                    m.append_transformed(&bar, rot, 0.5 * d);
+                    far = if d.length() > far.length() { d } else { far };
+                }
+                (far.min(DVec3::ZERO) - DVec3::splat(r), far.max(DVec3::ZERO) + DVec3::splat(r))
+            };
+            tops.push(hi.z);
+            halves.push(0.5 * (hi.y - lo.y));
+            reach = reach.max((origin + lo).length()).max((origin + DVec3::new(lo.x, hi.y, hi.z)).length());
+            m
+        })
+        .collect();
     let axis = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
     let wheels = (0..n)
         .map(|w| {
@@ -299,13 +376,17 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
             let (p, r) = (positions[w], tire(w).radius());
             let inboard = p.y.signum() * (0.5 * width + 0.25 * r);
             let strut = DVec3::new(p.x, p.y - inboard, p.z + 0.9 * r);
-            let arm = DVec3::new(p.x, (p.y - 2.0 * inboard).abs().min(half.y).copysign(p.y), p.z - 0.2 * r);
+            let side = halves[def.wheel_unit(w)];
+            let arm = DVec3::new(p.x, (p.y - 2.0 * inboard).abs().min(side).copysign(p.y), p.z - 0.2 * r);
             Some([strut, arm])
         })
         .collect();
     let link = mesh::cylinder((0.06 * radius) as f32, 0.5, 8, srgb([90, 90, 95]));
-    let span = positions.iter().enumerate().map(|(w, p)| p.length() + tire(w).radius()).fold(0.0, f64::max) as f32;
-    WheeledVisual { body, wheels, span, eye, links, link }
+    let wheel_reach = (0..n).map(|w| def.wheel_position_in_line(w).length() + tire(w).radius());
+    let span = wheel_reach.fold(0.0, f64::max).max(if def.num_units() > 1 { reach } else { 0.0 }) as f32;
+    let last = def.num_units() - 1;
+    let rear_eye = def.tail() + DVec3::new(0.0, 0.0, 0.9 * tops[last]);
+    WheeledVisual { body, units, wheels, span, eye, rear_eye, links, link }
 }
 
 #[cfg(test)]
@@ -408,5 +489,35 @@ mod tests {
             assert!((v.eye.x as f32) < hi.x && v.eye.z > def.wheel_position(0).z, "{name}: {}", v.eye);
         }
         assert!(wheeled(&presets::wheeled("sedan_like").unwrap()).links.iter().all(Option::is_some));
+    }
+
+    /// Rigs: a body per unit behind the tractor, in its frame, and a span over the whole rig.
+    #[test]
+    fn rig_visuals_cover_every_unit() {
+        for (tractor, trailer) in [("truck_6x4", "semitrailer_3axle"), ("farm_tractor", "farm_trailer")] {
+            let alone = presets::wheeled(tractor).unwrap();
+            let def = alone.with_trailers(&[presets::trailer(trailer).unwrap()]).unwrap();
+            let (v, v0) = (wheeled(&def), wheeled(&alone));
+            assert_eq!(v.units.len(), def.num_units() - 1);
+            assert_eq!(v.wheels.len(), def.num_wheels());
+            // The tractor looks as without the trailer.
+            assert_eq!(v.body.positions, v0.body.positions);
+            let last = &v.units[def.num_units() - 2];
+            let (lo, hi) = last.bounds().unwrap();
+            // The body ends at the tail, the reversing camera looks from there.
+            assert!((lo.x as f64 - def.tail().x).abs() < 1e-3, "{trailer}: {lo} vs {}", def.tail());
+            assert!((v.rear_eye.x - def.tail().x).abs() < 1e-9 && v.rear_eye.z > 0.0 && (v.rear_eye.z as f32) < hi.z);
+            let length = -(def.unit_origin(def.num_units() - 1).x + def.tail().x);
+            assert!(v.span as f64 > length && v.span > 2.0 * v0.span, "{trailer}: {} vs {length}", v.span);
+            for (u, m) in v.units.iter().enumerate() {
+                assert!(m.triangle_count() > 0, "{trailer}: unit {}", u + 1);
+            }
+            if trailer == "farm_trailer" {
+                // The drawbar reaches from the eye to the dolly's hinge.
+                let (lo, hi) = v.units[0].bounds().unwrap();
+                let hinge = def.units[1].position;
+                assert!((hi.x as f64 - hinge.x.max(0.0)).abs() < 0.1 && (lo.x as f64 - hinge.x.min(0.0)).abs() < 0.1);
+            }
+        }
     }
 }

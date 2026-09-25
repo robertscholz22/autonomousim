@@ -4,6 +4,7 @@
 //! ```text
 //! cargo run -p autonomousim-viewer --release -- --preset showcase --seed 0 --vehicle iris_like
 //! cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4 --record drive.mcap
+//! cargo run -p autonomousim-viewer --release -- --map rural --vehicle truck_6x4 --trailer semitrailer_3axle
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
 //! cargo run -p autonomousim-viewer --release -- policy runs/run/policy.json --agents 4
@@ -127,6 +128,9 @@ struct LiveArgs {
     /// Vehicle preset name or TOML file.
     #[arg(long, default_value = "iris_like")]
     vehicle: String,
+    /// Trailer preset name or TOML file towed by a ground vehicle (repeat for a road train).
+    #[arg(long)]
+    trailer: Vec<String>,
     /// Mean wind from the west (m/s).
     #[arg(long, default_value_t = 0.0)]
     wind: f64,
@@ -238,6 +242,9 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
     let config = args.size.map(|s| serde_json::json!({ "size": s }));
     let vehicle = VehicleRef::Name(args.vehicle.clone());
     let ground = matches!(vehicle.resolve()?, VehicleDef::Wheeled(_));
+    if !ground && !args.trailer.is_empty() {
+        bail!("only ground vehicles tow trailers");
+    }
     let rural = args.map == MapKind::Rural;
     let group = if ground {
         // On rural maps: start in a lane with a route to a farm yard.
@@ -251,6 +258,7 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
             name: "driver".into(),
             vehicle,
             action_mode: Some(GroundActionMode::Raw.into()),
+            trailers: args.trailer.clone(),
             spawn,
             goals,
             disable_on_terminal: false,
@@ -505,7 +513,12 @@ fn spawn_camera(mut commands: Commands, sim: Res<sim::Sim>, view: Res<world_view
         }
         Vehicle::Wheeled(w) => {
             let visual = autonomousim_scene::props::wheeled(w.def());
-            (visual.span, CameraRig::ground(f64::from(visual.span), heading, visual.eye))
+            let mut rig = CameraRig::ground(f64::from(visual.span), heading, visual.eye, visual.rear_eye);
+            if w.num_units() > 1 {
+                // Look over the trailers at the tractor.
+                rig.pitch = 0.35;
+            }
+            (visual.span, rig)
         }
     };
     let far = view.view_distance;
@@ -700,6 +713,12 @@ mod tests {
         let cli = Cli::try_parse_from(["viewer", "policy", "p.json", "--agents", "3", "--lidar-view"]).unwrap();
         let Some(Command::Policy { file, map_seed, agents, display, .. }) = cli.command else { panic!() };
         assert_eq!((file, map_seed, agents, display.lidar_view), ("p.json".into(), 1000, Some(3), true));
+        // Trailers for ground vehicles only.
+        let rig = ["viewer", "--vehicle", "truck_6x4", "--trailer", "semitrailer_3axle"];
+        let sc = scenario(&Cli::parse_from(rig).live).unwrap();
+        assert_eq!(sc.groups[0].trailers, ["semitrailer_3axle"]);
+        let drone = ["viewer", "--vehicle", "cf2x", "--trailer", "semitrailer_3axle"];
+        assert!(scenario(&Cli::parse_from(drone).live).is_err());
     }
 
     /// A new map seed is generated in the background, swapped into the simulation, and the

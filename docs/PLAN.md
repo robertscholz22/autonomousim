@@ -1382,7 +1382,7 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
 | 2 ✅ | Truck tyre, multi-axle and forced steering, air-brake lag, presets `truck_6x4`, `semitrailer_3axle`, `truck_8x8`, `farm_tractor`, `farm_trailer` (Chrono extraction) | Presets load, settle and drive straight; static loads against Chrono's |
 | 3 ✅ | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
 | 4 ✅ | Simulation: scenario `trailers`, multi-body agent shapes, `JACKKNIFE`, `articulation` state and terms, `trailer_goal`, recordings with articulation | Rigs spawn, drive and record; replays reproduce them; goldens of existing scenarios unchanged |
-| 5 | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
+| 5 ✅ | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
 | 6 | `TrailerReverse-v0`: `bay` goals, scripted reversing controller, short training, export, viewer, replay | The task trains end to end; the exported policy reverses in the viewer; a recorded episode replays |
 
 #### As built
@@ -1468,6 +1468,20 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
   - **Recordings**: ground-vehicle state messages carry `joints` (`Wheeled::joints`: per unit, a coupling's quaternion or a hinge's or turntable's angle) when there are trailers. `Wheeled::show` takes them, so replays place every unit; the viewer interpolates them element-wise.
   - **Tests** (`sim/tests/trailers.rs`, `tests_py/test_native.py::test_trailers`): both rigs spawn and settle without events, the tail sits behind in line; in a left turn the articulation state and terms go negative and agree; a tight turn with `jackknife_deg = 15` raises `JACKKNIFE` and disables the agent; a car touching the trailer's wheels exchanges equal and opposite forces that act on the trailer's link; a recorded rig replays with identical articulation.
   - **Goldens**: re-blessed. The longer state rows and `state_fields` in `/meta` changed the hashes; with the old 24 columns hashed, the trajectories, observations, events and recorded messages match the previous commit's exactly (checked in a worktree of it).
+- **Step 5** (viewer):
+  - **Visuals** (`scene::props::wheeled`): `WheeledVisual::units` holds a mesh per unit behind the towing unit, in that unit's frame. A unit with colliders gets a box over them (trailer bodies), one with only wheels a low frame between them (dollies), and one with neither a bar to each joint hanging from it (drawbars). The towing unit's body covers its own wheels only. Suspension link mounts are in the frame of the wheel's unit. `span` covers the whole rig in line, so the chase camera stands back far enough.
+  - **Cabs**: trucks and tractors (tyres of radius ≥ 0.5 m) with colliders more than 1 m above the frame box get a cab over the frontmost of them, with the driver's eye in it. Before this, the tractors were 1.7 m tall and hidden behind a semitrailer. Cars and rovers are unchanged.
+  - **Entities** (`viewer::vehicle_view`): each unit is a child of the agent's root (`UnitVisual`), posed from the towing unit to that unit. Wheels and links are children of their unit. Unit and wheel poses both come from the step's start, so they are consistent with each other.
+  - **Reversing camera**: the C key cycles chase → orbit → first person → reversing (ground vehicles only) → free. It looks back from the last unit's tail (`WheeledVisual::rear_eye`, 0.9 × that unit's top), 20° down. Chase starts at a 0.35 rad pitch for rigs to look over the trailer.
+  - **HUD**: one line per coupling or turntable: `name angle (rate)`, turning amber past half and red past 80 % of `jackknife_deg`. The wheel table lists every unit's wheels.
+  - **CLI**: live mode takes `--trailer <preset or TOML>`, repeatable for a road train; drones with trailers are rejected.
+  - **Replay**: needed no change beyond step 4 (the joints are interpolated and shown).
+  - **Performance**: on the Iris Xe at 1280×720 "medium", a rural map with the semitrailer rig runs at 140–160 fps and the farm rig at 155–170 fps.
+  - **Tests**:
+    - `scene`: rig visuals cover every unit, end at the tail, and span the rig.
+    - viewer `vehicle_view`: the farm rig's wheels, composed through their unit entities, land where the simulation has them.
+    - viewer `replay`: a recorded semitrailer rig replays with the same articulation and trailer pose.
+    - viewer `main`: the `--trailer` flag works.
 
 ### M4c: Tracked vehicles and soft soil
 The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.

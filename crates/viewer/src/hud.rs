@@ -265,8 +265,8 @@ fn wheel_name(w: usize, axles: usize) -> String {
     }
 }
 
-/// Gear, engine speed, steering and the driver's pedals, and a table of the wheels: tyre load,
-/// suspension travel, slip, forces and torques.
+/// Gear, engine speed, steering, the trailers' articulation and the driver's pedals, and a
+/// table of the wheels: tyre load, suspension travel, slip, forces and torques.
 fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground::Wheeled) {
     let agent = sim.world.agent(sim.pilot);
     let p = w.powertrain();
@@ -280,6 +280,25 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
         w.steering_angle().to_degrees(),
         p.engine_speed * 30.0 / std::f64::consts::PI
     ));
+    // Articulation of each trailer (and dolly) against the unit ahead, red near a jackknife.
+    let limit = sim.world.scenario().spec.events.ground.jackknife_deg;
+    for u in 1..w.num_units() {
+        let unit = &w.def().units[u - 1];
+        if matches!(unit.joint, autonomousim_vehicles::ground::UnitJoint::Hinge) {
+            continue;
+        }
+        let (angle, rate) = w.articulation(u);
+        let deg = angle.to_degrees();
+        let text = format!("{} {deg:+6.1}° ({:+5.1}°/s)", unit.name, rate.to_degrees());
+        let color = if deg.abs() > 0.8 * limit {
+            egui::Color32::from_rgb(230, 80, 60)
+        } else if deg.abs() > 0.5 * limit {
+            egui::Color32::from_rgb(230, 180, 60)
+        } else {
+            ui.visuals().text_color()
+        };
+        ui.colored_label(color, text);
+    }
     if sim.replay.is_none()
         && let Some(c) = agent.controller.as_ground()
     {
