@@ -259,16 +259,13 @@ impl GroundController {
         let wheel_brake: Vec<f64> = (0..n).map(|w| def.axles[w / 2].brake.max_torque).collect();
         let brake_torque = wheel_brake.iter().sum();
         let steering = def.steering.and_then(|s| {
-            let reference: Vec<f64> = def.axles.iter().filter(|a| a.steer == 0.0).map(|a| a.position.x).collect();
-            let reference = if reference.is_empty() {
-                def.axles.iter().map(|a| a.position.x).sum::<f64>() / def.axles.len() as f64
-            } else {
-                reference.iter().sum::<f64>() / reference.len() as f64
-            };
-            let axle =
-                def.axles.iter().filter(|a| a.steer != 0.0).max_by(|a, b| a.steer.abs().total_cmp(&b.steer.abs()))?;
-            let wheelbase = axle.position.x - reference;
-            (wheelbase.abs() > 1e-6).then_some((wheelbase, axle.steer, s.max_angle))
+            let axle = def
+                .axles
+                .iter()
+                .filter(|a| a.share() != 0.0)
+                .max_by(|a, b| a.share().abs().total_cmp(&b.share().abs()))?;
+            let wheelbase = axle.position.x - def.steer_reference();
+            (wheelbase.abs() > 1e-6).then_some((wheelbase, axle.share(), s.max_angle))
         });
         let track = match &drive {
             Drive::Electric(m) if is_side_drive(m) => {

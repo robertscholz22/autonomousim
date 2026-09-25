@@ -35,6 +35,7 @@ pub const STANDARD_GRAVITY: f64 = 9.80665;
 const TIR_FILES: &[(&str, &str)] = &[
     ("Sedan_Pac02Tire", include_str!("../../../../assets/tires/Sedan_Pac02Tire.tir")),
     ("HMMWV_Pac02Tire", include_str!("../../../../assets/tires/HMMWV_Pac02Tire.tir")),
+    ("Truck_Pac02Tire", include_str!("../../../../assets/tires/Truck_Pac02Tire.tir")),
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,16 +102,52 @@ pub struct AxleDef {
     pub suspension: Option<SuspensionDef>,
     pub wheel: WheelDef,
     pub tire: TireSpec,
+    /// Dual wheels: two tyres side by side at this centre distance (m), `position` being the
+    /// middle of the pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual: Option<f64>,
     /// Share of the steering angle (1 for a steered front axle, 0 unsteered, negative for
-    /// counter-steering rear axles).
+    /// counter-steering rear axles), or `"geometric"`: about the turn centre on the virtual
+    /// rear axle (see [`Steer`]).
     #[serde(default)]
-    pub steer: f64,
+    pub steer: Steer,
     /// How the axle's wheels steer: from the steering command through the Ackermann geometry
-    /// (with share `steer`), or each wheel independently from its per-wheel command (falling
-    /// back to the Ackermann angle without one).
+    /// (with share `steer`), each wheel independently from its per-wheel command (falling
+    /// back to the Ackermann angle without one), or from the unit's articulation angle.
     #[serde(default)]
     pub steer_mode: SteerMode,
     pub brake: BrakeDef,
+    /// `steer` resolved to a share (by [`WheeledDef::finish`]).
+    #[serde(skip)]
+    share: f64,
+}
+
+/// Steering share of an axle.
+///
+/// A share `s` turns the axle's bicycle angle to `s·δ`. `Geometric` turns it about the turn
+/// centre of the lead axle (the first steered axle with a share) on the virtual rear axle `x_r`
+/// (the mean of the unit's unsteered axles): `tan δ_i = (x_i − x_r) tan δ_l / (x_l − x_r)`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Steer {
+    Share(f64),
+    Named(SteerName),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerName {
+    Geometric,
+}
+
+impl Default for Steer {
+    fn default() -> Self {
+        Steer::Share(0.0)
+    }
+}
+
+impl Steer {
+    pub const GEOMETRIC: Self = Steer::Named(SteerName::Geometric);
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -130,6 +167,12 @@ pub struct BrakeDef {
     /// Parking brake torque (N·m).
     #[serde(default)]
     pub parking_torque: f64,
+    /// Air brakes: dead time (s) and first-order time constant (s) from the pedal to the
+    /// service brake torque (default instant). The parking brake acts at once.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub delay: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub time_constant: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,7 +193,9 @@ pub struct SuspensionDef {
     pub bump_stop: Option<StopDef>,
     #[serde(default)]
     pub rebound_stop: Option<StopDef>,
-    /// Anti-roll bar rate at the wheel (N/m of travel difference).
+    /// Anti-roll bar rate at the wheel (N/m of travel difference). Negative values soften
+    /// roll, down to `−rate/2` (no roll stiffness, a pendulum axle): a solid axle with springs
+    /// at spread `s` and track `t` is `rate·((s/t)² − 1)/2`.
     #[serde(default)]
     pub anti_roll: f64,
 }
@@ -176,12 +221,17 @@ pub struct SpringDef {
     table: Option<CubicSpline>,
 }
 
-/// Damper at the wheel (N·s/m), in bump (compression) and rebound.
+/// Damper at the wheel (N·s/m), in bump (compression) and rebound, optionally degressive:
+/// `F = c·v / (1 + d·|v|)` with degressivity `d` (s/m).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DamperDef {
     pub bump: f64,
     pub rebound: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub degressivity_bump: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub degressivity_rebound: f64,
 }
 
 /// Linear end stop engaging at `travel` (bump: positive, rebound: negative).
@@ -199,12 +249,26 @@ pub enum SteerMode {
     Ackermann,
     /// Per-wheel angle commands up to `max_angle` (rad), rate-limited to `rate` (rad/s).
     Independent { max_angle: f64, rate: f64 },
+    /// Forced steering of a trailer axle: `k` × the unit's articulation angle (see
+    /// `Wheeled::articulation`), so the axle steers against the turn and the trailer's rear
+    /// follows the towing unit's path more closely.
+    Articulation(f64),
 }
 
 impl AxleDef {
     /// Whether the axle's wheels have a steering joint.
     pub fn is_steered(&self) -> bool {
-        self.steer != 0.0 || matches!(self.steer_mode, SteerMode::Independent { .. })
+        self.steer != Steer::Share(0.0) || !matches!(self.steer_mode, SteerMode::Ackermann)
+    }
+
+    /// Steering share (after [`WheeledDef::finish`]; see [`Steer`]).
+    pub fn share(&self) -> f64 {
+        self.share
+    }
+
+    /// Whether the axle steers about the lead axle's turn centre.
+    pub fn is_geometric(&self) -> bool {
+        self.steer == Steer::GEOMETRIC
     }
 }
 
@@ -239,6 +303,10 @@ fn one() -> f64 {
 
 fn is_zero(x: &usize) -> bool {
     *x == 0
+}
+
+fn is_zero_f64(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// Role of a chassis collider for event classification.
@@ -335,7 +403,9 @@ impl SuspensionDef {
 
     /// Damper force (N) at travel rate `ds` (positive in bump), opposing it.
     pub fn damper_force(&self, ds: f64) -> f64 {
-        ds * if ds > 0.0 { self.damper.bump } else { self.damper.rebound }
+        let d = &self.damper;
+        let (c, k) = if ds > 0.0 { (d.bump, d.degressivity_bump) } else { (d.rebound, d.degressivity_rebound) };
+        ds * c / (1.0 + k * ds.abs())
     }
 }
 
@@ -350,9 +420,20 @@ impl WheeledDef {
     /// Validate, load the tyres and resolve the spring tables and automatic preloads (called
     /// by the loaders, and again after editing a definition).
     pub fn finish(&mut self) -> Result<(), VehicleError> {
-        let fail = |msg: String| VehicleError::Invalid(format!("{}: {msg}", self.name));
+        let name = self.name.clone();
+        let fail = |msg: String| VehicleError::Invalid(format!("{name}: {msg}"));
+        self.resolve_shares().map_err(fail)?;
         self.validate().map_err(fail)?;
-        let tires: Result<Vec<Tire>, String> = self.axles.iter().map(|a| a.tire.load()).collect();
+        let tires: Result<Vec<Tire>, String> = self
+            .axles
+            .iter()
+            .map(|a| {
+                a.tire.load().map(|t| match a.dual {
+                    Some(d) => t.with_dual(d),
+                    None => t,
+                })
+            })
+            .collect();
         self.tires = tires.map_err(fail)?;
         for a in &mut self.axles {
             if let Some(s) = &mut a.suspension {
@@ -373,11 +454,73 @@ impl WheeledDef {
             .iter()
             .any(|a| a.suspension.as_ref().is_some_and(|s| s.spring.travel.is_empty() && s.spring.preload.is_none()));
         if auto {
-            let preload = self.solve_static(STANDARD_GRAVITY, true).map_err(fail)?.1;
-            self.preload = preload;
+            // Each vehicle's automatic springs carry its own static load: the towing unit's
+            // alone, then each trailer's (its coupling unit and the hinge and turntable units
+            // behind it) behind the vehicles ahead, whose preloads stay.
+            let mut starts: Vec<usize> = vec![0];
+            starts.extend(
+                (0..self.units.len()).filter(|&k| matches!(self.units[k].joint, UnitJoint::Coupling(_))).map(|k| k + 1),
+            );
+            for (i, &start) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).copied().unwrap_or(self.num_units());
+                let sub = self.prefix(end);
+                let preload = sub.solve_static(STANDARD_GRAVITY, Some(start)).map_err(fail)?.1;
+                self.preload[..preload.len()].copy_from_slice(&preload);
+            }
         }
-        self.rest = self.solve_static(STANDARD_GRAVITY, false).ok().map(|s| Box::new(s.0));
+        self.rest = self.solve_static(STANDARD_GRAVITY, None).ok().map(|s| Box::new(s.0));
         Ok(())
+    }
+
+    /// The first `units` units with their axles, tyres and current preloads (for statics).
+    fn prefix(&self, units: usize) -> WheeledDef {
+        let axles = self.axles.iter().take_while(|a| a.unit < units).count();
+        WheeledDef {
+            units: self.units[..units - 1].to_vec(),
+            axles: self.axles[..axles].to_vec(),
+            tires: self.tires[..axles].to_vec(),
+            preload: self.preload[..2 * axles].to_vec(),
+            rest: None,
+            ..self.clone()
+        }
+    }
+
+    /// Steering shares: given ones as they are, geometric ones from the lead axle (small-angle
+    /// value, for the share's other uses; the wheels steer by the exact tangent law).
+    fn resolve_shares(&mut self) -> Result<(), String> {
+        for a in &mut self.axles {
+            a.share = match a.steer {
+                Steer::Share(s) => s,
+                Steer::Named(_) => 0.0,
+            };
+        }
+        if !self.axles.iter().any(|a| a.is_geometric()) {
+            return Ok(());
+        }
+        let own = self.axles.iter().filter(|a| a.unit == 0);
+        let lead = own.clone().find(|a| a.share != 0.0).ok_or("geometric steering needs a lead axle with a share")?;
+        let (xl, sl) = (lead.position.x, lead.share);
+        let rear: Vec<f64> = own.filter(|a| !a.is_steered()).map(|a| a.position.x).collect();
+        if rear.is_empty() {
+            return Err("geometric steering needs an unsteered axle".into());
+        }
+        let xr = rear.iter().sum::<f64>() / rear.len() as f64;
+        for a in self.axles.iter_mut().filter(|a| a.is_geometric()) {
+            a.share = sl * (a.position.x - xr) / (xl - xr);
+        }
+        Ok(())
+    }
+
+    /// Reference x of the Ackermann geometry: the mean of the towing unit's axles without a
+    /// steering share (or of all of them).
+    pub fn steer_reference(&self) -> f64 {
+        let own = || self.axles.iter().filter(|a| a.unit == 0);
+        let unsteered: Vec<f64> = own().filter(|a| a.share == 0.0 && !a.is_geometric()).map(|a| a.position.x).collect();
+        if unsteered.is_empty() {
+            own().map(|a| a.position.x).sum::<f64>() / own().count() as f64
+        } else {
+            unsteered.iter().sum::<f64>() / unsteered.len() as f64
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -416,8 +559,26 @@ impl WheeledDef {
         }
         for (i, a) in self.axles.iter().enumerate() {
             let fail = |m: &str| Err(format!("axle {i}: {m}"));
-            if a.unit > 0 && a.is_steered() {
-                return fail("only the towing unit steers");
+            let forced = matches!(a.steer_mode, SteerMode::Articulation(_));
+            if a.unit > 0 && a.is_steered() && !forced {
+                return fail("trailer axles only steer by articulation");
+            }
+            if let SteerMode::Articulation(k) = a.steer_mode {
+                let joint = a.unit.checked_sub(1).map(|u| self.units[u].joint);
+                if !k.is_finite()
+                    || a.steer != Steer::Share(0.0)
+                    || !matches!(joint, Some(UnitJoint::Coupling(_) | UnitJoint::Turntable))
+                {
+                    return fail(
+                        "articulation steering needs a finite gain, no share, and a unit on a coupling or turntable",
+                    );
+                }
+            }
+            if a.dual.is_some_and(|d| !pos(d)) {
+                return fail("the dual tyres' spacing must be positive");
+            }
+            if a.is_geometric() && a.unit > 0 {
+                return fail("geometric steering is for the towing unit");
             }
             if !a.position.is_finite() || !pos(a.position.y) {
                 return fail("the (left) wheel position needs y > 0");
@@ -425,7 +586,7 @@ impl WheeledDef {
             if !pos(a.wheel.mass) || !pos(a.wheel.inertia.min_element()) {
                 return fail("wheel mass and inertia must be positive");
             }
-            if !a.steer.is_finite() || (a.steer != 0.0 && self.steering.is_none()) {
+            if !a.share.is_finite() || (a.share != 0.0 && self.steering.is_none()) {
                 return fail("a steered axle needs [steering]");
             }
             if let SteerMode::Independent { max_angle, rate } = a.steer_mode
@@ -433,8 +594,9 @@ impl WheeledDef {
             {
                 return fail("independent steering needs 0 < max_angle ≤ π/2 and a positive rate");
             }
-            if !nonneg(a.brake.max_torque) || !nonneg(a.brake.parking_torque) {
-                return fail("brake torques must be non-negative");
+            let b = &a.brake;
+            if ![b.max_torque, b.parking_torque, b.delay, b.time_constant].into_iter().all(nonneg) {
+                return fail("brake torques and times must be non-negative");
             }
             if let Some(s) = &a.suspension {
                 s.table(0).map_err(|e| format!("axle {i}: kinematics: {e}"))?;
@@ -449,8 +611,12 @@ impl WheeledDef {
                 if !table && !pos(sp.rate) {
                     return fail("spring rate must be positive");
                 }
-                if !nonneg(s.damper.bump) || !nonneg(s.damper.rebound) || !nonneg(s.anti_roll) {
-                    return fail("damping and anti-roll rates must be non-negative");
+                let d = &s.damper;
+                if ![d.bump, d.rebound, d.degressivity_bump, d.degressivity_rebound].into_iter().all(nonneg) {
+                    return fail("damping rates and degressivities must be non-negative");
+                }
+                if !s.anti_roll.is_finite() || (s.anti_roll < 0.0 && (table || sp.rate + 2.0 * s.anti_roll < 0.0)) {
+                    return fail("a negative anti-roll rate needs a rate spring and rate + 2·anti_roll ≥ 0");
                 }
                 if s.bump_stop.is_some_and(|b| !(b.travel > 0.0 && pos(b.stiffness)))
                     || s.rebound_stop.is_some_and(|r| !(r.travel < 0.0 && pos(r.stiffness)))
@@ -579,7 +745,7 @@ impl WheeledDef {
     /// Static equilibrium on flat ground under gravity `g` (m/s²). Needs two axles, or a
     /// vehicle whose axles carry it (at least two per chain of units).
     pub fn static_state(&self, g: f64) -> Result<StaticState, String> {
-        Ok(self.solve_static(g, false)?.0)
+        Ok(self.solve_static(g, None)?.0)
     }
 
     /// The static equilibrium under standard gravity, when there is one (computed by
@@ -589,12 +755,12 @@ impl WheeledDef {
     }
 
     /// Two-axle single units keep the lever-rule solver; everything else minimises energy.
-    fn solve_static(&self, g: f64, auto: bool) -> Result<(StaticState, Vec<f64>), String> {
+    fn solve_static(&self, g: f64, auto: Option<usize>) -> Result<(StaticState, Vec<f64>), String> {
         if self.tires.len() != self.axles.len() {
             return Err("definition not finished".into());
         }
         if self.units.is_empty() && self.axles.len() == 2 {
-            self.solve_two_axle(g, auto)
+            self.solve_two_axle(g, auto.is_some())
         } else if self.axles.len() >= 2 {
             super::statics::solve(self, g, auto)
         } else {
@@ -605,7 +771,7 @@ impl WheeledDef {
     /// Static equilibrium by the energy solver, also for two-axle vehicles (for checks).
     #[doc(hidden)]
     pub fn static_state_general(&self, g: f64) -> Result<StaticState, String> {
-        Ok(super::statics::solve(self, g, false)?.0)
+        Ok(super::statics::solve(self, g, None)?.0)
     }
 
     /// Loads by rigid-body statics over the wheel contacts (two axles; the attitude from the

@@ -16,7 +16,7 @@
 //! or centre-axle trailer is one unit; a drawbar trailer with a `[dolly]` becomes three: the
 //! drawbar (from the eye to its hinge on the dolly), the dolly and the body on its turntable.
 
-use super::def::{AxleDef, ChassisDef, GroundColliderDef, WheeledDef};
+use super::def::{AxleDef, ChassisDef, GroundColliderDef, SteerMode, WheeledDef};
 use crate::VehicleError;
 use glam::{DMat3, DQuat, DVec3, EulerRot};
 use serde::{Deserialize, Serialize};
@@ -240,8 +240,8 @@ impl TrailerDef {
             return Err("a trailer needs axles".into());
         }
         let axles = self.axles.iter().chain(self.dolly.iter().flat_map(|d| &d.axles));
-        if axles.clone().any(|a| a.is_steered()) {
-            return Err("trailer axles cannot steer".into());
+        if axles.clone().any(|a| a.is_steered() && !matches!(a.steer_mode, SteerMode::Articulation(_))) {
+            return Err("trailer axles only steer by articulation".into());
         }
         if axles.clone().any(|a| a.unit != 0) {
             return Err("trailer axles take no unit (the composition sets it)".into());

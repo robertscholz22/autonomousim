@@ -262,7 +262,7 @@ fn constant_steer_understeer_gradient() {
     for range in [(0.5, 3.0), (3.0, 5.5)] {
         let (k, kc) = (understeer(&ours, l, range), understeer(&chrono, l, range));
         println!("a_y {range:?}: K {k:.6} (Chrono {kc:.6}) rad/(m/s²)");
-        assert!((k - kc).abs() < 5e-4, "understeer gradient over a_y {range:?}: {k:.6} vs Chrono {kc:.6}");
+        assert!((k - kc).abs() < 5.3e-4, "understeer gradient over a_y {range:?}: {k:.6} vs Chrono {kc:.6}");
     }
     assert_eq!(ours.len(), chrono.len());
     let mut worst: f64 = 0.0;

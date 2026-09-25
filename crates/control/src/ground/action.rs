@@ -148,11 +148,9 @@ impl GroundActionMap {
         let speed = limits.speed.unwrap_or(top.min(20.0));
         let reverse = limits.reverse.unwrap_or(if combustion { 0.3 * speed } else { speed });
         let tightest = def.steering.and_then(|s| {
-            let unsteered: Vec<f64> = def.axles.iter().filter(|a| a.steer == 0.0).map(|a| a.position.x).collect();
-            let axle = def.axles.iter().max_by(|a, b| a.steer.abs().total_cmp(&b.steer.abs()))?;
-            let reference = unsteered.iter().sum::<f64>() / unsteered.len().max(1) as f64;
-            let wheelbase = (axle.position.x - reference).abs();
-            (wheelbase > 0.0).then(|| (s.max_angle * axle.steer.abs()).tan() / wheelbase)
+            let axle = def.axles.iter().max_by(|a, b| a.share().abs().total_cmp(&b.share().abs()))?;
+            let wheelbase = (axle.position.x - def.steer_reference()).abs();
+            (wheelbase > 0.0).then(|| (s.max_angle * axle.share().abs()).tan() / wheelbase)
         });
         let curvature = limits.curvature.unwrap_or(match tightest {
             Some(k) => 0.95 * k,
@@ -177,7 +175,7 @@ impl GroundActionMap {
             if combustion {
                 channels.push(PerWheelChannel::Throttle);
             }
-            if def.axles.iter().any(|a| a.steer != 0.0 && a.steer_mode == SteerMode::Ackermann) {
+            if def.axles.iter().any(|a| a.share() != 0.0 && a.steer_mode == SteerMode::Ackermann) {
                 channels.push(PerWheelChannel::Steering);
             }
             if let PowertrainDef::Electric(e) = &def.powertrain {

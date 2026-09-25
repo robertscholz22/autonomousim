@@ -237,25 +237,30 @@ fn rig_statics() {
         let st = d.rest_state().expect("a static state");
         let total: f64 = st.loads.iter().sum();
         assert!((total / (d.total_mass() * G) - 1.0).abs() < 1e-9, "{}: {total}", d.units[0].name);
-        // Automatic preloads: every spring at zero travel.
-        assert!(st.travel.iter().all(|t| t.abs() < 1e-9), "{:?}", st.travel);
+        // Automatic preloads: each vehicle's springs carry it alone at zero travel, so the
+        // trailer's are at zero and the tractor's rear springs compress under the coupling
+        // load.
+        assert!((4..d.num_wheels()).all(|w| st.travel[w].abs() < 1e-9), "{:?}", st.travel);
+        assert!(st.travel[2] > 1e-4 && st.travel[3] > 1e-4, "{:?}", st.travel);
     }
     let d = semi_rig();
     let st = d.rest_state().unwrap();
     let on = |u: usize| (0..8).filter(|&w| d.wheel_unit(w) == u).map(|w| st.loads[w]).sum::<f64>();
-    // Kingpin load by the lever rule about the tandem's centre (the trailer barely pitches).
+    // Kingpin load by the lever rule about the tandem's centre of load (the trailer barely
+    // pitches).
     let trailer = d.unit_mass(1) * G;
     let com = (d.units[0].chassis.com * d.units[0].chassis.mass
         + (4..8).map(|w| d.wheel_position(w) * d.unsprung_mass(w)).sum::<DVec3>())
         / d.unit_mass(1);
-    let tandem = -9.65;
+    let tandem = (4..8).map(|w| st.loads[w] * d.wheel_position(w).x).sum::<f64>() / on(1);
     let kingpin = trailer * (com.x - tandem) / (0.0 - tandem);
     assert!(((trailer - on(1)) / kingpin - 1.0).abs() < 0.01, "kingpin {} vs {kingpin}", trailer - on(1));
     assert!((on(0) - d.unit_mass(0) * G - kingpin).abs() < 0.01 * kingpin);
-    // The tandem's axles share the load roughly (without load-equalising suspension, the
-    // trailer's pitch shifts load between them).
+    // The tandem's axles share the load roughly: without load-equalising suspension, the
+    // trailer's pitch (nose down, as the tractor's springs, sized for the tractor alone,
+    // compress under the kingpin load) shifts load to the front axle.
     let (a, b) = (st.loads[4] + st.loads[5], st.loads[6] + st.loads[7]);
-    assert!((a / b - 1.0).abs() < 0.2, "tandem {a} / {b}");
+    assert!(a > b && a < 2.0 * b, "tandem {a} / {b}");
     assert!(st.joints[0][0].abs() < 0.02 && st.joints[0][1].abs() < 1e-9, "{:?}", st.joints);
 }
 

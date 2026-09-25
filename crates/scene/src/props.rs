@@ -280,7 +280,13 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
         .map(|w| {
             let (r, b) = (tire(w).radius() as f32, tire(w).width() as f32);
             let mut m = MeshData::new();
-            m.append_transformed(&mesh::cylinder(r, 0.5 * b, 20, srgb([30, 30, 32])), axis, DVec3::ZERO);
+            // Dual wheels: two tyres side by side.
+            let section = tire(w).section_width() as f32;
+            let offsets = tire(w).dual.map_or(vec![0.0], |s| vec![-0.5 * s, 0.5 * s]);
+            for y in offsets {
+                let tyre = mesh::cylinder(r, 0.5 * section, 20, srgb([30, 30, 32]));
+                m.append_transformed(&tyre, axis, DVec3::new(0.0, y, 0.0));
+            }
             let marker = mesh::cuboid(Vec3::new(0.12 * r, 0.52 * b, 0.12 * r), srgb([220, 220, 220]));
             m.append_transformed(&marker, DQuat::IDENTITY, DVec3::new(0.0, 0.0, 0.7 * r as f64));
             m

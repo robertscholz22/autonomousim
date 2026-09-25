@@ -139,8 +139,10 @@ fn settles_at_the_static_state_of_the_definition() {
                 wh.tire.fz,
                 st.loads[k]
             );
+            // The mirrored tyres' lateral shifts (conicity) push the two sides apart a little,
+            // which the suspension geometry turns into a fraction of a millimetre of travel.
             assert!(
-                (wh.travel - st.travel[k]).abs() < 2e-4,
+                (wh.travel - st.travel[k]).abs() < 5e-4,
                 "{name} wheel {k}: travel {} vs {}",
                 wh.travel,
                 st.travel[k]

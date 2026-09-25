@@ -52,6 +52,9 @@ pub struct Tire {
     pub low_speed_damping: [f64; 2],
     /// MF files without rolling-resistance coefficients use the reference coefficient.
     rolling_from_surface: bool,
+    /// Twin tyres (dual wheels) side by side at this centre distance (m): one wheel with two
+    /// identical tyres sharing the load, each evaluated at half of it.
+    pub dual: Option<f64>,
 }
 
 /// Road friction and rolling resistance relative to the reference surface.
@@ -132,6 +135,7 @@ impl Tire {
             pressure,
             low_speed_damping: [0.0; 2],
             rolling_from_surface,
+            dual: None,
         };
         let sigma = tire.initial_state().sigma;
         if !sigma.iter().all(|s| s.is_finite() && *s > 0.0) {
@@ -148,9 +152,33 @@ impl Tire {
             pressure: None,
             low_speed_damping: [0.0; 2],
             rolling_from_surface: false,
+            dual: None,
         };
         tire.low_speed_damping = tire.default_low_speed_damping();
         Ok(tire)
+    }
+
+    /// The tyre as mounted on the vehicle's right (or left) side: Magic Formula tyres measured
+    /// on the other side are mirrored.
+    pub fn on_side(&self, right: bool) -> Self {
+        let mut tire = self.clone();
+        if let TireModel::MagicFormula(p) = &mut tire.model
+            && p.measured_right != right
+        {
+            **p = p.mirrored();
+        }
+        tire
+    }
+
+    /// The same tyre as a dual pair at centre distance `spacing` (m).
+    pub fn with_dual(mut self, spacing: f64) -> Self {
+        self.dual = Some(spacing);
+        self
+    }
+
+    /// Number of tyres on the wheel (2 for duals).
+    pub fn count(&self) -> f64 {
+        if self.dual.is_some() { 2.0 } else { 1.0 }
     }
 
     /// `k_Vlow0` that damps a corner mass (nominal load over g) on the standstill carcass
@@ -158,11 +186,16 @@ impl Tire {
     /// enough for the wheel's spin mode to stay stable with explicit steps of 1 ms.
     fn default_low_speed_damping(&self) -> [f64; 2] {
         let state = self.initial_state();
-        let mass = self.nominal_load() / GRAVITY;
+        let mass = self.single_nominal_load() / GRAVITY;
         [0, 1].map(|i| 2.0 * LOW_SPEED_DAMPING_RATIO * (state.stiffness[i] / state.sigma[i] * mass).sqrt())
     }
 
+    /// Nominal load of the wheel (N; of both tyres for duals).
     pub fn nominal_load(&self) -> f64 {
+        self.count() * self.single_nominal_load()
+    }
+
+    fn single_nominal_load(&self) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => p.fnomin * p.lfzo,
             TireModel::Fiala(p) => p.nominal_load,
@@ -176,7 +209,13 @@ impl Tire {
         }
     }
 
+    /// Section width (m); overall width of both tyres for duals.
     pub fn width(&self) -> f64 {
+        self.section_width() + self.dual.unwrap_or(0.0)
+    }
+
+    /// Section width of one tyre (m).
+    pub fn section_width(&self) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => p.width,
             TireModel::Fiala(p) => p.width,
@@ -194,7 +233,7 @@ impl Tire {
     pub fn initial_state(&self) -> TireState {
         let (sigma, stiffness) = match &self.model {
             TireModel::MagicFormula(p) => {
-                let mut input = MfInput::new(self.nominal_load(), 0.0, 0.0, 0.0, 0.0);
+                let mut input = MfInput::new(self.single_nominal_load(), 0.0, 0.0, 0.0, 0.0);
                 input.pressure = self.pressure;
                 let o = p.eval(&input);
                 ([o.sigma_x, o.sigma_y], [o.kxk, o.kya.abs()])
@@ -211,8 +250,12 @@ impl Tire {
         road_contact(terrain, motion.center, motion.axis, 0.3 * r, 0.5 * self.width(), 2.0 * r)
     }
 
-    /// Vertical force (N) at deflection `rho` (m), without damping.
+    /// Vertical force (N; of both tyres for duals) at deflection `rho` (m), without damping.
     pub fn vertical_force(&self, rho: f64) -> f64 {
+        self.count() * self.single_vertical_force(rho)
+    }
+
+    fn single_vertical_force(&self, rho: f64) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => {
                 let bottom = p.unloaded_radius - p.rim_radius - p.bottom_offst;
@@ -224,7 +267,8 @@ impl Tire {
         }
     }
 
-    /// Advance the transient state by `dt` and return the tyre's wrench on the wheel.
+    /// Advance the transient state by `dt` and return the tyre's wrench on the wheel (both
+    /// tyres' for duals: each tyre sees the same slip and half the deflection force).
     pub fn step(
         &self,
         state: &mut TireState,
@@ -244,7 +288,7 @@ impl Tire {
             TireModel::MagicFormula(p) => p.vertical_damping,
             TireModel::Fiala(p) => p.vertical_damping,
         };
-        let fz = (self.vertical_force(rho) - damping * motion.velocity.dot(c.normal)).max(0.0);
+        let fz = (self.single_vertical_force(rho) - damping * motion.velocity.dot(c.normal)).max(0.0);
         let arm = c.point - motion.center;
         let vc = motion.velocity + motion.carrier_angvel.cross(arm);
         let (vx, vy) = (vc.dot(c.x), vc.dot(c.y));
@@ -291,6 +335,8 @@ impl Tire {
                 (o.fx, o.fy, 0.0, -p.rolling_resistance * fz * r0 * rolling, o.mz)
             }
         };
+        let n = self.count();
+        let (fx, fy, fz, mx, my, mz) = (n * fx, n * fy, n * fz, n * mx, n * my, n * mz);
         let force = c.x * fx + c.y * fy + c.normal * fz;
         let moment = c.x * mx + c.y * my + c.normal * mz;
         TireForces {

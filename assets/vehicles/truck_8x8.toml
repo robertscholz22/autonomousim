@@ -1,0 +1,139 @@
+# 8×8 off-road truck after the Chrono::Vehicle MAN 10t (Kat 1) model (solid three-link axles,
+# two steered front axles, eight driven wheels, SimpleMap engine and 9-speed automatic), fitted
+# with the 315/80 R22.5 PAC2002 truck tyre.
+type = "wheeled"
+name = "truck_8x8"
+source = """
+Masses, inertias, axle positions, springs, dampers, steering lock, brakes, engine maps, gear \
+ratios and shift points from Project Chrono's MAN 10t model (src/chrono_models/vehicle/man, \
+BSD-3-Clause, Copyright (c) 2014 projectchrono.org; data after P. Ocker, "MAN - Die \
+Allrad-Alleskönner", 1999). The chassis frame is Chrono's; wheel positions are its static \
+spindle positions with the truck tyre (tools/gen_chrono_truck_fixtures.py). Solid axles as \
+equivalent independent wheels (see truck_6x4), the progressive springs linearised at the static \
+load. Steering: the first axle's full-lock angles (28.7° / 25.1°) as a bicycle angle with a \
+near-full Ackermann fraction; the second axle steers geometrically about the rear tandem \
+(Chrono's linkage steers it as much as the first, 30.6° / 25.5°). Chrono's driveline has no \
+axle ratio (the gearbox's top gear would run the wheels at engine speed); a 1:6.56 hub and axle \
+reduction is added. Air-brake timing, steering rate, parking brake, drag and colliders are \
+estimates."""
+
+[chassis]
+mass = 10788.2                          # body and both pitman arms
+com = [-2.248, 0.0, 0.744]
+inertia = [5238.0, 43361.0, 44746.0]
+drag_area = [6.0, 18.0, 20.0]           # estimate
+
+[steering]
+max_angle = 0.4677                      # 26.8°
+rate = 0.3
+ackermann = 0.9
+
+[[axles]]
+name = "front 1"
+position = [0.00023, 1.03299, 0.00159]
+steer = 1.0
+wheel = { mass = 98.6, inertia = [6.704, 14.398, 6.704] }       # rim, tyre, axle shaft
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 10000.0, delay = 0.1, time_constant = 0.15 }
+
+[axles.suspension]
+carrier_mass = 546.34
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 233700.0 }
+damper = { bump = 52348.0, rebound = 98392.0, degressivity_bump = 2.995, degressivity_rebound = 4.771 }
+anti_roll = -78730.0
+bump_stop = { travel = 0.163, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.133, stiffness = 2.5e5 }
+
+[[axles]]
+name = "front 2"
+position = [-1.93311, 1.03297, -0.02262]
+steer = "geometric"
+wheel = { mass = 98.6, inertia = [6.704, 14.398, 6.704] }       # rim, tyre, axle shaft
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 10000.0, delay = 0.1, time_constant = 0.15 }
+
+[axles.suspension]
+carrier_mass = 546.34
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 210000.0 }
+damper = { bump = 52348.0, rebound = 98392.0, degressivity_bump = 2.995, degressivity_rebound = 4.771 }
+anti_roll = -70747.0
+bump_stop = { travel = 0.188, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.109, stiffness = 2.5e5 }
+
+[[axles]]
+name = "rear 1"
+position = [-5.58612, 1.03498, -0.06848]
+wheel = { mass = 98.6, inertia = [6.704, 14.398, 6.704] }       # rim, tyre, axle shaft
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 10000.0, parking_torque = 8000.0, delay = 0.1, time_constant = 0.15 }
+
+[axles.suspension]
+carrier_mass = 464.79
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 244900.0 }
+damper = { bump = 50861.0, rebound = 95598.0, degressivity_bump = 2.952, degressivity_rebound = 4.703 }
+anti_roll = -73408.0
+bump_stop = { travel = 0.19, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.082, stiffness = 2.5e5 }
+
+[[axles]]
+name = "rear 2"
+position = [-6.9823, 1.03499, -0.08625]
+wheel = { mass = 98.6, inertia = [6.704, 14.398, 6.704] }       # rim, tyre, axle shaft
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 10000.0, parking_torque = 8000.0, delay = 0.1, time_constant = 0.15 }
+
+[axles.suspension]
+carrier_mass = 464.79
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 223200.0 }
+damper = { bump = 50861.0, rebound = 95598.0, degressivity_bump = 2.952, degressivity_rebound = 4.703 }
+anti_roll = -66903.0
+bump_stop = { travel = 0.208, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.064, stiffness = 2.5e5 }
+
+[powertrain]
+type = "combustion"
+driven = [0, 1, 2, 3]
+final_drive = 0.1524                    # 1:6.56 (see source)
+axle_differential = { limited_slip = { torque = 2000.0 } }   # Chrono: Torsen, bias ratio 2
+center_differential = "open"
+
+[powertrain.engine]
+max_rpm = 2300.0
+full_throttle = [[-100, 0], [0, 300], [400, 500], [800, 700], [981.97, 991.67], [1030.65, 1184.72],
+    [1073.93, 1305.56], [1124.41, 1383.33], [1198.34, 1426.39], [1268.65, 1440.28], [1355.2, 1445.83],
+    [1459.78, 1445.83], [1564.36, 1447.22], [1676.14, 1447.22], [1777.12, 1437.5], [1910.54, 1401.39],
+    [1980.86, 1370.83], [2065.6, 1318.06], [2134.12, 1261.11], [2186.41, 1208.33], [2231.48, 1163.89],
+    [2350, -500]]
+zero_throttle = [[-100, 0], [100, 0], [400, -27.1], [1600, -27.1], [1800, -40.7], [2000, -40.7],
+    [2100, -54.2], [2300, -135.6], [2500, -203.4]]
+
+[powertrain.gearbox]
+forward = [0.077, 0.118, 0.162, 0.221, 0.283, 0.416, 0.573, 0.780, 1.0]
+reverse = -0.089525515
+shift = [[1000, 2200], [1000, 2200], [1000, 2200], [1000, 2200], [1000, 2200], [1000, 2200],
+    [1000, 2200], [1000, 2200], [1000, 2200]]
+
+# Bumper, cab, frame and rear end (the ground is ≈ 0.52 m below the frame origin).
+[[colliders]]
+center = [0.9, 0.0, 0.5]
+radius = 0.6
+
+[[colliders]]
+center = [0.2, 0.0, 1.6]
+radius = 1.0
+
+[[colliders]]
+center = [-3.7, 0.0, 0.3]
+radius = 0.4
+
+[[colliders]]
+center = [-3.7, 0.0, 1.6]
+radius = 1.1
+
+[[colliders]]
+center = [-8.2, 0.0, 0.5]
+radius = 0.5

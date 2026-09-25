@@ -19,4 +19,4 @@ pub use powertrain::{
 pub use units::{
     CouplingDef, CouplingJoint, CouplingKind, DollyDef, HitchDef, TrailerDef, UnitDef, UnitJoint, yaw_pitch_roll,
 };
-pub use wheeled::{GroundStepEnv, WheelState, Wheeled, WheeledInit};
+pub use wheeled::{GroundStepEnv, WheelState, Wheeled, WheeledInit, wheel_angle};

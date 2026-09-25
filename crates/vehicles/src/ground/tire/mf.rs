@@ -28,6 +28,8 @@ macro_rules! mf_params {
         #[derive(Clone, Debug, PartialEq)]
         pub struct MfParams {
             pub version: MfVersion,
+            /// The side the tyre was measured on (`TYRESIDE`): right rather than left.
+            pub measured_right: bool,
             $(pub $field: f64,)*
         }
 
@@ -40,6 +42,7 @@ macro_rules! mf_params {
             fn read_values(version: MfVersion, file: &TirFile) -> Result<Self, TirError> {
                 Ok(Self {
                     version,
+                    measured_right: false,
                     $($field: file.number(&stringify!($field).to_ascii_uppercase())?.unwrap_or($default),)*
                 })
             }
@@ -146,6 +149,7 @@ impl MfParams {
             }
         }
         let mut p = Self::read_values(version, file)?;
+        p.measured_right = file.text("TYRESIDE").is_some_and(|s| s.eq_ignore_ascii_case("RIGHT"));
         if version == MfVersion::V52 {
             // Pressure terms are MF 6.x; PAC2002 files name the pressures IP/IP_NOM.
             p.nompres = file.number("IP_NOM")?.unwrap_or(1.0);
@@ -165,6 +169,37 @@ impl MfParams {
         Ok(p)
     }
 
+    /// The same tyre mounted on the other side: the asymmetric coefficients (conicity and ply
+    /// steer shifts, asymmetric curvatures) change sign, as in Chrono's PAC2002 (which mirrors
+    /// the same set).
+    pub fn mirrored(&self) -> Self {
+        let mut p = self.clone();
+        p.measured_right = !p.measured_right;
+        for c in [
+            &mut p.rhx1,
+            &mut p.qsx1,
+            &mut p.pey3,
+            &mut p.phy1,
+            &mut p.phy2,
+            &mut p.pvy1,
+            &mut p.pvy2,
+            &mut p.rby3,
+            &mut p.rvy1,
+            &mut p.rvy2,
+            &mut p.qbz4,
+            &mut p.qdz3,
+            &mut p.qdz6,
+            &mut p.qdz7,
+            &mut p.qez4,
+            &mut p.qhz1,
+            &mut p.qhz2,
+            &mut p.ssz1,
+        ] {
+            *c = -*c;
+        }
+        p
+    }
+
     pub fn read(path: impl AsRef<std::path::Path>) -> Result<Self, TirError> {
         Self::from_tir(&TirFile::read(path)?)
     }
@@ -177,7 +212,8 @@ impl MfParams {
         };
         let mut s = format!(
             "[UNITS]\nLENGTH = 'meter'\nFORCE = 'newton'\nANGLE = 'radians'\nMASS = 'kg'\nTIME = 'second'\n\
-             [MODEL]\nFITTYP = {fittyp}\n[COEFFICIENTS]\n"
+             [MODEL]\nFITTYP = {fittyp}\nTYRESIDE = '{}'\n[COEFFICIENTS]\n",
+            if self.measured_right { "RIGHT" } else { "LEFT" }
         );
         for (key, v) in self.values() {
             s += &format!("{key} = {v:e}\n");

@@ -1350,7 +1350,7 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
 - **Static equilibrium for any layout**: for chains or more than two axles, minimise the potential energy (tyre and spring energies, gravity, coupling springs) over the towing unit's height, pitch and roll, each trailer's pitch and roll about its coupling, and the suspension travels (Newton with finite differences; at most about 30 unknowns). Automatic preloads fix the travels at zero and read the preloads from the tyre loads, as today. Single-unit two-axle vehicles keep the current solver (so their goldens stay), and a test checks that both solvers agree.
 - **Steering**:
   - Several steered axles: each steered axle turns about the virtual rear axle (the mean of the unsteered axles), `tan δ_i = (x_i − x_r) tan δ / (x_1 − x_r)`, with the Ackermann fraction applied per wheel. `steer` stays the share for a hand-set layout; `steer = "geometric"` computes it.
-  - Trailer axles: `steer_mode = { articulation = k }` steers the axle by `−k` × the unit's articulation angle (forced steering, as on long semitrailers). Passive self-steering axles are deferred.
+  - Trailer axles: `steer_mode = { articulation = k }` steers the axle by `k` × the unit's articulation angle (forced steering, as on long semitrailers; with articulation negative in a left turn, the axle steers right, so the trailer's rear swings out onto the tractor's path). Passive self-steering axles are deferred.
 - **Brakes**: air brakes with a delay and a first-order lag (`brake = { max_torque, delay, time_constant }`, default instant), trailer axles braked from the same pedal.
 - **Presets** (Chrono data where available, extracted by `tools/gen_chrono_truck_fixtures.py` like the sedan):
   - `truck_6x4`: the Kraz 64431 tractor: steered front axle, driven rear tandem, fifth wheel.
@@ -1379,7 +1379,7 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
 | # | Step | Done when |
 |---|---|---|
 | 1 ✅ | Units and couplings in `vehicles::ground` (fifth wheel, drawbar, turntable), per-unit colliders and drag, `MAX_WHEELS` 16, general static equilibrium, `trailers` composition | A test tractor with a semitrailer and a drawbar trailer settles at the static solution; loads and kingpin load match statics; the two solvers agree on two-axle vehicles; existing goldens unchanged |
-| 2 | Truck tyre, multi-axle and forced steering, air-brake lag, presets `truck_6x4`, `semitrailer_3axle`, `truck_8x8`, `farm_tractor`, `farm_trailer` (Chrono extraction) | Presets load, settle and drive straight; static loads against Chrono's |
+| 2 ✅ | Truck tyre, multi-axle and forced steering, air-brake lag, presets `truck_6x4`, `semitrailer_3axle`, `truck_8x8`, `farm_tractor`, `farm_trailer` (Chrono extraction) | Presets load, settle and drive straight; static loads against Chrono's |
 | 3 | Validation: offtracking, 8×8 turning and tractor-semitrailer manoeuvres against Chrono | Tolerances above met or explained |
 | 4 | Simulation: scenario `trailers`, multi-body agent shapes, `JACKKNIFE`, `articulation` state and terms, `trailer_goal`, recordings with articulation | Rigs spawn, drive and record; replays reproduce them; goldens of existing scenarios unchanged |
 | 5 | Viewer: trailers, reversing camera, HUD, `--trailer` | A rig drives by keyboard at ≥ 60 fps on the Iris Xe; recordings replay |
@@ -1403,6 +1403,46 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
     - the rigs roll straight, and turning left gives negative articulation.
   - Existing goldens are unchanged.
   - **Tandem load split**: without load-equalising suspension, a tandem's axles share the load only roughly (the test rig splits 29.2 kN to 25.6 kN), because the trailer's pitch shifts load between them.
+- **Step 2** (truck features and presets):
+  - **Truck tyre**: `assets/tires/Truck_Pac02Tire.tir` is Chrono's `CityBus_Pac02Tire` (315/80 R22.5).
+  - **Tyre mirroring**: Magic Formula tyres now know the side they were measured on (`TYRESIDE`, `MfParams::measured_right`), and a tyre mounted on the other side is mirrored (`MfParams::mirrored`, `Tire::on_side`). The same 18 asymmetric coefficients change sign as in Chrono's PAC2002 (conicity and ply-steer shifts, asymmetric curvatures). `Wheeled` keeps one tyre per wheel. Without mirroring, all tyres pulled the same way, and the Kraz drifted 1° off heading in 100 m.
+    - Only the `cars` golden changed.
+    - The sedan's high-a_y understeer gradient moved from 4.96e-4 to 5.21e-4 from Chrono's. The test bound is now the 5.3e-4 its doc states (10 % of 3°/g); it was 5e-4.
+    - The HMMWV settles 0.3 mm off design travel (the mirrored shifts push the sides apart), so that test's bound went from 0.2 mm to 0.5 mm.
+  - **Dual wheels**: `dual = <spacing>` on an axle gives each wheel two identical tyres (`Tire::dual`). Each tyre is evaluated at half the load and the forces and moments are doubled. `width()` is the pair's overall width and `section_width()` one tyre's. The viewer draws two tyres.
+  - **Solid axles as equivalent independent corners**:
+    - wheel rate = the spring rate (springs at the wheels);
+    - the axle's roll stiffness comes from a negative `anti_roll`, `k((s/t)² − 1)/2` for spring track s and wheel track t (allowed with a rate spring while `rate + 2·anti_roll ≥ 0`; a pendulum axle has `anti_roll = −rate/2`);
+    - dampers scale by the motion ratio: `c·r²`, `d·r`.
+  - **Degressive dampers**: `degressivity_bump`/`_rebound` d gives `F = c·v/(1 + d|v|)` (Chrono's `DegressiveDamperForce`).
+  - **Multi-axle steering**:
+    - `steer` is a share or `"geometric"`, resolved in `finish()` to `share·(x_i − x_r)/(x_lead − x_r)` about `WheeledDef::steer_reference()` (the mean x of the towing unit's unsteered axles).
+    - A geometric axle turns by `atan(ratio·tan(δ_lead))`, then takes the per-wheel Ackermann blend about its own distance from the reference.
+    - Control and the bicycle wheelbase use `steer_reference()` and `share()`.
+  - **Forced steering**: `steer_mode = { articulation = k }` on a trailer axle of a unit on a coupling or turntable. It steers by `k·articulation`, computed in `finish_step`. Trailer axles may steer only this way.
+  - **Air brakes**: `brake = { delay, time_constant }` gives a per-wheel delay line of `round(delay/dt)` ticks, then a first-order lag. The parking brake acts at once.
+  - **Automatic preloads per vehicle**:
+    - `finish()` solves the preloads vehicle by vehicle: the towing unit alone, then each trailer (a coupling unit and the hinge and turntable units behind it) behind the vehicles ahead with their preloads fixed (`statics::solve(.., auto: Some(first unit))`).
+    - So each vehicle's springs carry it at design height, as in Chrono. A tractor squats under the kingpin load rather than being preloaded for it.
+    - Before this, the tractor's springs sat at zero travel with the trailer attached, and the Kraz rig's loads were 7 % off Chrono's.
+    - `rig_statics` now checks the lever rule about the tandem's centre of load. The test rig's tractor squats 4 cm and the tandem splits 1.7 : 1.
+  - **Presets** (`presets::wheeled`; trailers in `presets::trailer`/`trailer_names`, a separate list):
+    - `truck_6x4`: Kraz 64431, 13.2 t, two dual driven rear axles, 0.1 s + 0.15 s air brakes, fifth wheel.
+    - `semitrailer_3axle`: Krone, 22.2 t laden, 0.25 s + 0.25 s brakes.
+    - `truck_8x8`: MAN 10t, 15.6 t, axle 2 geometric, limited-slip axle differentials, 9-speed gearbox.
+    - `farm_tractor`: 6 t, pendulum front axle, Fiala tyres, 4WD 40/60, 8 gears, drawbar hitch.
+    - `farm_trailer`: 9.9 t, dolly on a turntable.
+    - Truck parameters come from Chrono's C++ and JSON sources (`MAN_10t`, `Kraz_tractor*`, `Kraz_trailer*`).
+  - **Fixtures**: `tools/gen_chrono_truck_fixtures.py` (`make fixtures-chrono`) writes `fixtures/chrono/truck_{kraz_tractor,kraz_rig,man_10t}.json`: design masses and spindles, static unit poses, loads and spring lengths, and steering locks. It uses the same truck tyre on every wheel.
+  - **Tests** (`vehicles/tests/trucks.rs`):
+    - The presets load, and the masses match Chrono's within 0.1 %.
+    - Static per-wheel loads match Chrono's within 1 % (actual ≤ 0.1 %) for the Kraz alone and with its trailer, and for the MAN; pitch matches within 1 mrad.
+    - The Kraz and MAN lead-axle locks match Chrono's within 0.4°.
+    - The MAN's geometric second axle follows its law exactly. Chrono's linkage steers that axle by 1.04× the first, not geometrically; step 3 overrides the share for that comparison.
+    - All five rigs settle at the static state, drive straight and brake straight. Heading stays within 0.01 rad and lateral drift within 1 % of the distance.
+    - Air-brake torque follows delay plus lag within 2 %.
+    - Forced steering (k = 0.5 on the rear axle) cuts the Kraz rig's offtracking on a 23 m circle from 1.67 m to 1.11 m.
+    - Dual tyres and degressive dampers follow their laws.
 
 ### M4c: Tracked vehicles and soft soil
 The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.

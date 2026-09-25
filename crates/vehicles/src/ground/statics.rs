@@ -26,10 +26,10 @@ enum Param {
     Travel(usize),
 }
 
-/// Solve with gravity `g`; with `auto`, springs without a given preload stay at zero travel
-/// and their preloads are read from the equilibrium. Returns the state and every wheel's
-/// preload.
-pub(super) fn solve(def: &WheeledDef, g: f64, auto: bool) -> Result<(StaticState, Vec<f64>), String> {
+/// Solve with gravity `g`; with `auto = Some(u)`, the springs without a given preload on units
+/// `u` and later stay at zero travel and their preloads are read from the equilibrium (the
+/// others keep the definition's). Returns the state and every wheel's preload.
+pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(StaticState, Vec<f64>), String> {
     let tree = build(def, &def.spin_inertia());
     let model = &tree.model;
     let n = def.num_wheels();
@@ -38,7 +38,8 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: bool) -> Result<(StaticState
     let automatic: Vec<bool> = def
         .wheels()
         .map(|(a, _)| {
-            auto && a.suspension.as_ref().is_some_and(|s| s.spring.travel.is_empty() && s.spring.preload.is_none())
+            auto.is_some_and(|u| a.unit >= u)
+                && a.suspension.as_ref().is_some_and(|s| s.spring.travel.is_empty() && s.spring.preload.is_none())
         })
         .collect();
     let mut params = vec![Param::Height, Param::Pitch, Param::Roll];
@@ -191,7 +192,7 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: bool) -> Result<(StaticState
             grad[i] += f;
             hess[(i, i)] += k;
             if w % 2 == 0
-                && s.anti_roll > 0.0
+                && s.anti_roll != 0.0
                 && let Some(j) = travel_param(w + 1)
             {
                 let f = s.anti_roll * (x - p[j]);

@@ -1,0 +1,108 @@
+# Three-axle box semitrailer after the Krone trailer that Chrono::Vehicle pairs with its Kraz
+# tractor, fitted with the 315/80 R22.5 PAC2002 truck tyre.
+type = "trailer"
+name = "semitrailer_3axle"
+source = """
+Masses, inertias, kingpin and axle positions, spring and damper rates and brakes from Project \
+Chrono's Kraz trailer (src/chrono_models/vehicle/kraz, BSD-3-Clause, Copyright (c) 2014 \
+projectchrono.org). The frame is Chrono's trailer frame; wheel positions are its static spindle \
+positions behind the Kraz tractor with the truck tyre (tools/gen_chrono_truck_fixtures.py). Solid \
+axles as equivalent independent wheels (see truck_6x4). Chrono couples the trailer with a \
+spherical joint (free in roll); the fifth wheel here has the default roll stiffness. \
+Air-brake timing, drag and colliders are estimates."""
+
+[coupling]
+kind = "fifth_wheel"
+position = [-0.04, 0.0, 0.82]
+
+[chassis]
+mass = 20000.0
+com = [-6.0, 0.0, 2.0]
+inertia = [23904.0, 322240.0, 320011.0]
+drag_area = [1.5, 35.0, 35.0]           # estimate: the box's side and top; the front is shielded
+
+[[axles]]
+name = "front"
+position = [-6.32, 1.0325, -0.02922]
+wheel = { mass = 98.6, inertia = [6.704, 12.174, 6.704] }
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 13000.0, delay = 0.25, time_constant = 0.25 }
+
+[axles.suspension]
+carrier_mass = 264.705                  # half the axle tube and the spindle
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 710611.5 }
+damper = { bump = 99074.0, rebound = 99074.0, degressivity_bump = 2.808, degressivity_rebound = 0.936 }
+anti_roll = -178182.0                   # springs at ±0.729 m on a 2.065 m track
+bump_stop = { travel = 0.109, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.051, stiffness = 2.5e5 }
+
+[[axles]]
+name = "middle"
+position = [-7.63, 1.0325, -0.02627]
+wheel = { mass = 98.6, inertia = [6.704, 12.174, 6.704] }
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 13000.0, delay = 0.25, time_constant = 0.25 }
+
+[axles.suspension]
+carrier_mass = 264.705
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 710611.5 }
+damper = { bump = 99074.0, rebound = 99074.0, degressivity_bump = 2.808, degressivity_rebound = 0.936 }
+anti_roll = -178182.0
+bump_stop = { travel = 0.106, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.054, stiffness = 2.5e5 }
+
+[[axles]]
+name = "rear"
+position = [-8.94, 1.0325, -0.02333]
+wheel = { mass = 98.6, inertia = [6.704, 12.174, 6.704] }
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 13000.0, delay = 0.25, time_constant = 0.25 }
+
+[axles.suspension]
+carrier_mass = 264.705
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 710611.5 }
+damper = { bump = 99074.0, rebound = 99074.0, degressivity_bump = 2.808, degressivity_rebound = 0.936 }
+anti_roll = -178182.0
+bump_stop = { travel = 0.103, stiffness = 2.5e5 }
+rebound_stop = { travel = -0.057, stiffness = 2.5e5 }
+
+# Corners and belly of the box (13.6 × 2.55 × 2.8 m from 0.7 m above the frame origin; the
+# ground is ≈ 0.57 m below it).
+[[colliders]]
+center = [1.3, 0.8, 1.2]
+radius = 0.5
+
+[[colliders]]
+center = [1.3, -0.8, 1.2]
+radius = 0.5
+
+[[colliders]]
+center = [-11.3, 0.8, 1.2]
+radius = 0.5
+
+[[colliders]]
+center = [-11.3, -0.8, 1.2]
+radius = 0.5
+
+[[colliders]]
+center = [-3.0, 0.0, 0.9]
+radius = 0.4
+
+[[colliders]]
+center = [1.3, 0.8, 3.0]
+radius = 0.5
+
+[[colliders]]
+center = [1.3, -0.8, 3.0]
+radius = 0.5
+
+[[colliders]]
+center = [-11.3, 0.8, 3.0]
+radius = 0.5
+
+[[colliders]]
+center = [-11.3, -0.8, 3.0]
+radius = 0.5

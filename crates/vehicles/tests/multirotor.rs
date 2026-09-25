@@ -33,7 +33,17 @@ fn hover_at(q: &mut Multirotor, z: f64, density: f64) -> f64 {
 fn presets_load_with_documented_numbers() {
     assert_eq!(
         presets::names().collect::<Vec<_>>(),
-        ["cf2x", "iris_like", "sedan_like", "offroad_4x4", "rover_diff", "rover_skid"]
+        [
+            "cf2x",
+            "iris_like",
+            "sedan_like",
+            "offroad_4x4",
+            "rover_diff",
+            "rover_skid",
+            "truck_6x4",
+            "truck_8x8",
+            "farm_tractor"
+        ]
     );
     let cf = presets::multirotor("cf2x").unwrap();
     assert!((cf.hover_omega(G, 1.225) - 1515.64).abs() < 0.1);

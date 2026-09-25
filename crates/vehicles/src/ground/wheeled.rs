@@ -11,7 +11,7 @@
 
 use super::def::{SteerMode, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
-use super::tire::{Surface, TireForces, TireState, WheelMotion};
+use super::tire::{Surface, Tire, TireForces, TireState, WheelMotion};
 use super::tree::{UnitLinks, build};
 use super::units::{UnitJoint, yaw_pitch_roll};
 use crate::multirotor::AirData;
@@ -70,17 +70,41 @@ struct Corner {
     travel: Option<(usize, usize)>,
     steer: Option<(usize, usize)>,
     spin: (usize, usize),
-    /// Steering share and the wheel's position for the Ackermann geometry.
-    steer_share: f64,
+    /// How the axle's angle follows the bicycle angle, and the wheel's position for the
+    /// Ackermann geometry.
+    law: SteerLaw,
     /// Lock (rad) and rate (rad/s) of independent steering, and its rate-limited angle.
     independent: Option<(f64, f64)>,
     steer_cmd: f64,
+    /// Forced steering: gain on the articulation angle of the wheel's unit.
+    forced: Option<(f64, usize)>,
     wheelbase: f64,
     lateral: f64,
     preload: f64,
     brake: Coupling,
+    /// Air brake: pedal history over the dead time (ring buffer) and the lagged pedal.
+    brake_delay: Vec<f64>,
+    brake_level: f64,
     tire: TireState,
     out: WheelState,
+}
+
+/// Axle angle for bicycle angle `δ`.
+#[derive(Clone, Copy, Debug)]
+enum SteerLaw {
+    /// `s·δ`.
+    Share(f64),
+    /// `atan(ratio · tan(lead·δ))`, about the lead axle's turn centre.
+    Geometric { ratio: f64, lead: f64 },
+}
+
+impl SteerLaw {
+    fn angle(self, delta: f64) -> f64 {
+        match self {
+            SteerLaw::Share(s) => s * delta,
+            SteerLaw::Geometric { ratio, lead } => (ratio * (lead * delta).tan()).atan(),
+        }
+    }
 }
 
 /// One simulated wheeled vehicle.
@@ -96,6 +120,8 @@ pub struct Wheeled {
     model: MultibodyModel,
     mass: f64,
     corners: Vec<Corner>,
+    /// Each wheel's tyre as mounted on its side.
+    tires: Vec<Tire>,
     units: Vec<UnitLinks>,
     powertrain: Powertrain,
     colliders: Vec<SphereCollider>,
@@ -114,6 +140,8 @@ pub struct Wheeled {
     spin: Vec<f64>,
     drive: Vec<f64>,
     brake: Vec<f64>,
+    /// Write position of the brake delay lines.
+    brake_tick: usize,
     cache: ContactCache,
     scratch: ContactScratch,
     contacts: Vec<ContactPoint>,
@@ -127,15 +155,8 @@ impl Wheeled {
         let inertia = def.spin_inertia();
         let tree = build(&def, &inertia);
         let model = tree.model;
-        // Reference for the Ackermann geometry: the towing unit's axles without a steering
-        // share (or all of them).
-        let own = || def.axles.iter().filter(|a| a.unit == 0);
-        let unsteered: Vec<f64> = own().filter(|a| a.steer == 0.0).map(|a| a.position.x).collect();
-        let reference = if unsteered.is_empty() {
-            own().map(|a| a.position.x).sum::<f64>() / own().count() as f64
-        } else {
-            unsteered.iter().sum::<f64>() / unsteered.len() as f64
-        };
+        let reference = def.steer_reference();
+        let lead = def.axles.iter().find(|a| a.unit == 0 && a.share() != 0.0 && !a.is_geometric()).map(|a| a.share());
         let corners = tree
             .corners
             .iter()
@@ -149,16 +170,25 @@ impl Wheeled {
                     travel: links.travel,
                     steer: links.steer,
                     spin: links.spin,
-                    steer_share: axle.steer,
+                    law: match lead {
+                        Some(lead) if axle.is_geometric() => SteerLaw::Geometric { ratio: axle.share() / lead, lead },
+                        _ => SteerLaw::Share(axle.share()),
+                    },
                     independent: match axle.steer_mode {
                         SteerMode::Independent { max_angle, rate } => Some((max_angle, rate)),
-                        SteerMode::Ackermann => None,
+                        _ => None,
                     },
                     steer_cmd: 0.0,
+                    forced: match axle.steer_mode {
+                        SteerMode::Articulation(k) => Some((k, axle.unit)),
+                        _ => None,
+                    },
                     wheelbase: p.x - reference,
                     lateral: p.y,
                     preload: def.preload(w),
                     brake: Coupling::new(&[w], &[], &inertia, dt),
+                    brake_delay: vec![0.0; (axle.brake.delay / dt).round() as usize],
+                    brake_level: 0.0,
                     tire: def.tire(w / 2).initial_state(),
                     out: WheelState::default(),
                 }
@@ -175,12 +205,14 @@ impl Wheeled {
             spin: vec![0.0; def.num_wheels()],
             drive: vec![0.0; def.num_wheels()],
             brake: vec![0.0; def.num_wheels()],
+            brake_tick: 0,
             powertrain: Powertrain::new(&def.powertrain, &inertia, dt),
             colliders: def.sphere_colliders(),
             contact: def.contact.model(mass, dt),
             model,
             mass,
             corners,
+            tires: (0..def.num_wheels()).map(|w| def.tire(w / 2).on_side(w % 2 == 1)).collect(),
             units: tree.units,
             steer_angle: 0.0,
             specific_force: DVec3::ZERO,
@@ -258,6 +290,8 @@ impl Wheeled {
             }
             c.tire = self.def.tire(w / 2).initial_state();
             c.brake.reset();
+            c.brake_delay.fill(0.0);
+            c.brake_level = 0.0;
             c.steer_cmd = 0.0;
             c.out = WheelState::default();
         }
@@ -332,7 +366,7 @@ impl Wheeled {
             let target = match &input.wheels {
                 Some(wc) => wc.steer[w] * lock,
                 None => {
-                    wheel_angle(self.steer_angle * c.steer_share, c.wheelbase, c.lateral, ackermann).clamp(-lock, lock)
+                    wheel_angle(c.law.angle(self.steer_angle), c.wheelbase, c.lateral, ackermann).clamp(-lock, lock)
                 }
             };
             c.steer_cmd += (target - c.steer_cmd).clamp(-rate * dt, rate * dt);
@@ -342,7 +376,7 @@ impl Wheeled {
             let (Some((q, v)), Some(susp)) = (c.travel, &self.def.axles[k / 2].suspension) else { continue };
             let (s, ds) = (self.state.q[q], self.state.v[v]);
             self.tau[v] -= susp.spring_force(s, c.preload) + susp.damper_force(ds);
-            if k % 2 == 0 && susp.anti_roll > 0.0 {
+            if k % 2 == 0 && susp.anti_roll != 0.0 {
                 let other = &self.corners[k + 1];
                 if let Some((q2, v2)) = other.travel {
                     let f = susp.anti_roll * (s - self.state.q[q2]);
@@ -358,10 +392,22 @@ impl Wheeled {
         self.drive.fill(0.0);
         self.brake.fill(0.0);
         self.powertrain.step(&input, &self.spin, dt, &mut self.drive);
+        let tick = self.brake_tick;
+        self.brake_tick = self.brake_tick.wrapping_add(1);
         for (w, c) in self.corners.iter_mut().enumerate() {
             let b = &self.def.axles[w / 2].brake;
-            let pedal = (input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w]).min(1.0);
-            let limit = pedal * b.max_torque + if input.parking { b.parking_torque } else { 0.0 };
+            let mut pedal = (input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w]).min(1.0);
+            // Air brakes: the pedal of `delay` ago, through the first-order lag.
+            if !c.brake_delay.is_empty() {
+                let slot = tick % c.brake_delay.len();
+                pedal = std::mem::replace(&mut c.brake_delay[slot], pedal);
+            }
+            c.brake_level = if b.time_constant > 0.0 {
+                c.brake_level + (pedal - c.brake_level) * (1.0 - (-dt / b.time_constant).exp())
+            } else {
+                pedal
+            };
+            let limit = c.brake_level * b.max_torque + if input.parking { b.parking_torque } else { 0.0 };
             c.brake.step(limit, &self.spin, dt, &mut self.brake);
             self.tau[c.spin.1] += self.drive[w] + self.brake[w];
         }
@@ -399,7 +445,7 @@ impl Wheeled {
     pub fn apply_tires(&mut self, scene: &StaticScene) {
         let kin = &self.ws.kin;
         for (w, c) in self.corners.iter_mut().enumerate() {
-            let tire = self.def.tire(w / 2);
+            let tire = &self.tires[w];
             let pose = kin.pose[c.wheel];
             let motion = WheelMotion {
                 center: pose.pos,
@@ -445,14 +491,15 @@ impl Wheeled {
     pub fn finish_step(&mut self, gravity: DVec3) -> Result<(), DynamicsError> {
         let dt = self.dt;
         let ackermann = self.def.steering.map_or(0.0, |s| s.ackermann);
-        for c in &self.corners {
-            if let Some((q, v)) = c.steer {
-                let target = match c.independent {
-                    Some(_) => c.steer_cmd,
-                    None => wheel_angle(self.steer_angle * c.steer_share, c.wheelbase, c.lateral, ackermann),
-                };
-                self.ws.qdd[v] = ((target - self.state.q[q]) / dt - self.state.v[v]) / dt;
-            }
+        for i in 0..self.corners.len() {
+            let c = &self.corners[i];
+            let Some((q, v)) = c.steer else { continue };
+            let target = match (c.independent, c.forced) {
+                (Some(_), _) => c.steer_cmd,
+                (_, Some((k, unit))) => k * self.articulation(unit).0,
+                _ => wheel_angle(c.law.angle(self.steer_angle), c.wheelbase, c.lateral, ackermann),
+            };
+            self.ws.qdd[v] = ((target - self.state.q[q]) / dt - self.state.v[v]) / dt;
         }
         aba_with_kinematics(&self.model, &self.tau, &self.f_ext, gravity, &mut self.ws)?;
         // Classical acceleration of the chassis origin: spatial acceleration plus ω × v.
