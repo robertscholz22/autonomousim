@@ -26,17 +26,25 @@
 //! | `range` | 1 | rangefinder distance / max range (no return: 1) |
 //! | `lidar` / `lidar_log` | beams | range / max range, or ln(1 + r)/ln(1 + max) (no return: 1) |
 //! | `neighbors` | 7 × `count` | the `count` (default 3) nearest other active agents with centres within `range` (default 20 m), nearest first (ties by agent index): position and velocity relative to this agent in the heading frame (m, m/s), then 1; empty slots are all 0. The 1 is neither scaled nor clipped |
+//! | `road` | 6 | lateral offset from the lane centre (m, + left), lane heading − heading (rad), lane curvature 5, 10, 20 and 40 m ahead (1/m, + left) |
+//! | `route` | 8 | lane centre 5, 10, 20 and 40 m ahead in the heading frame (x, y; m) |
+//! | `on_road` | 1 | 1 on a road's surface, else 0 |
 //! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
+//!
+//! `road` and `route` follow the lane of the agent's route (`route` goals), or else the lane
+//! of the nearest road within 30 m in the direction closer to the heading (keep right; see
+//! [`lane`](crate::lane)); with neither they read 0.
 //!
 //! Sensor terms name their sensor (`sensor = "imu"`) and read zeros until its first reading
 //! arrives. Non-finite values are written as 0.
 
 use crate::interaction::{AgentGrid, AgentShape};
+use crate::lane::Follow;
 use crate::scenario::Goal;
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
 use autonomousim_vehicles::ground::Wheeled;
-use autonomousim_world::StaticWorld;
+use autonomousim_world::{Polyline, StaticWorld};
 use glam::{DQuat, DVec3, EulerRot};
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +99,13 @@ pub enum TermKind {
     LidarLog,
     Neighbors,
     NearestAgent,
+    Road,
+    Route,
+    OnRoad,
 }
+
+/// Distances ahead at which the `road` and `route` terms look (m).
+pub const LOOKAHEAD: [f64; 4] = [5.0, 10.0, 20.0, 40.0];
 
 impl TermKind {
     /// Sensor kind the term reads, if any.
@@ -218,6 +232,8 @@ pub struct ObsInput<'a> {
     pub me: usize,
     /// Neighbour index over `agents`.
     pub grid: &'a AgentGrid,
+    /// The lane line of the agent's route, if it has one.
+    pub route: Option<&'a Polyline>,
 }
 
 impl CompiledObs {
@@ -270,9 +286,12 @@ impl CompiledObs {
                     | TermKind::BaroAltitude
                     | TermKind::Speed
                     | TermKind::Sideslip
-                    | TermKind::Steering,
+                    | TermKind::Steering
+                    | TermKind::OnRoad,
                     _,
                 ) => (1, 0.0),
+                (TermKind::Road, _) => (2 + LOOKAHEAD.len(), 0.0),
+                (TermKind::Route, _) => (2 * LOOKAHEAD.len(), 0.0),
                 (TermKind::NearestAgent, _) => (1, range),
                 (TermKind::Neighbors, _) => (7 * count, range),
                 (TermKind::WheelSpeeds | TermKind::WheelSlip, _) => (num_wheels, 0.0),
@@ -426,6 +445,34 @@ impl CompiledObs {
                         slot[6] = 1.0;
                     }
                 }
+                TermKind::Road | TermKind::Route => {
+                    let y = yaw(q);
+                    let Some(f) = Follow::new(inp.route, inp.world, k.position.truncate(), y) else {
+                        dst.fill(0.0);
+                        continue;
+                    };
+                    if t.kind == TermKind::Road {
+                        let mut v = [0.0; 2 + LOOKAHEAD.len()];
+                        v[0] = f.offset;
+                        v[1] = wrap_angle(f.heading(0.0) - y);
+                        for (d, &a) in v[2..].iter_mut().zip(&LOOKAHEAD) {
+                            *d = f.curvature(a);
+                        }
+                        put(dst, &v, t)
+                    } else {
+                        let mut v = [0.0; 2 * LOOKAHEAD.len()];
+                        let to_heading = heading.inverse();
+                        for (d, &a) in v.as_chunks_mut::<2>().0.iter_mut().zip(&LOOKAHEAD) {
+                            let r = to_heading * (f.point(a) - k.position.truncate()).extend(0.0);
+                            *d = [r.x, r.y];
+                        }
+                        put(dst, &v, t)
+                    }
+                }
+                TermKind::OnRoad => {
+                    let on = inp.world.roads().on_road(k.position.truncate()).is_some();
+                    put(dst, &[f64::from(u8::from(on))], t)
+                }
                 _ => write_sensor(t, &inp.sensors[t.sensor], inp.goal, dst),
             }
         }
@@ -559,6 +606,7 @@ mod tests {
             agents: &[],
             me: 0,
             grid: &AgentGrid::default(),
+            route: None,
         };
         let mut out = vec![f32::NAN; obs.dim()];
         obs.write(&inp, &mut out);

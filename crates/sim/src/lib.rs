@@ -14,6 +14,7 @@ pub mod batch;
 pub mod drive;
 pub mod events;
 pub mod interaction;
+pub mod lane;
 pub mod obs;
 pub mod policy;
 pub mod record;

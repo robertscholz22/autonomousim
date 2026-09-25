@@ -1213,7 +1213,7 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
 | 1 | `world::roads`: network type, segment grid and queries, routes; map file version 2 (done 2026-09-25) | Queries match brute force on random networks; routes are shortest; old map files still load; map files round-trip with roads |
 | 2 | `procgen::rural` terrain, farm sites, road routing, terrain blending, road materials; `RuralConfig` and presets (done 2026-09-25) | Every farm is connected; grades and curvatures stay within the class limits; roads stay out of water; the hash is identical with 1 and 12 threads; golden hashes committed; 512 m in < 1.5 s, 2 km in < 20 s |
 | 3 | Fields, new materials (meadow, crop, plowed soil), buildings, hedges, fences, tree lines, woods (done 2026-09-25) | Parcels cover the farmland; no obstacle on a road or in a yard; gates connect tracks to fields; invariants tested; goldens re-blessed |
-| 4 | Simulation: `MapSource::Rural`, `on_road` spawns, `route` goals, `road`/`route`/`on_road` terms, road cost in `DriveGrid`; Python `map="rural"` | A car spawned `on_road` sits in its lane; routes follow the roads; terms match references; the Python env runs on rural maps |
+| 4 | Simulation: `MapSource::Rural`, `on_road` spawns, `route` goals, `road`/`route`/`on_road` terms, road cost in `DriveGrid` (deferred); Python `map="rural"` (done 2026-09-25) | A car spawned `on_road` sits in its lane; routes follow the roads; terms match references; the Python env runs on rural maps |
 | 5 | Viewer: road ribbons, buildings, hedges and fences, `--map rural`, route display | A rural showcase renders at ≥ 60 fps at 1080p "medium" on the Iris Xe; the car drives on the roads by keyboard |
 | 6 | `RoadFollowRural-v0`, a short training run, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
@@ -1265,6 +1265,29 @@ Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is spl
   - the statistics match the obstacle tags;
   - the scatter configuration is validated.
 - `autonomousim mapgen` prints the farmland statistics, and its preview draws hedges, fences, buildings and silos.
+
+**As built in step 4** (`sim::lane`, `MapSource::Rural`, spawn `on_road`, goal kind `route`, terms `road`/`route`/`on_road`):
+- **Maps**: `MapSource::Rural(RuralMaps { seed, count, preset, config, cache })` builds the pool like `Wild`, through `MapCache::rural`. `MapSource::{seed, set_seed, set_pool}` replace the viewer's wild-only matches. Python `map="rural"` gives a pool of 512 m training maps.
+- **Lanes** (`sim::lane`): traffic keeps right. On paved roads the lane centre lies 0.25 × width right of the centre line; gravel roads and tracks are single-lane. `lane_line` moves a centre-line route onto the lanes of the roads it follows.
+- **Spawns**: with `spawn.on_road` (it needs `on_ground`, which ground vehicles always have), each agent draws a road point uniformly by length, 8 m from the road ends. It keeps the best of up to 64 draws for `min_separation`. Without route goals it faces along the road in a random direction, in its lane. `layout`, `region`, `cluster` and `yaw_deg` are ignored.
+- **Route goals** (`goals.kind = "route"`, `goals.route = { destination = "yard" | "road", step = 25 }`):
+  - Candidate destinations are every farm yard, or 32 random road points, in a random order. The route (`RoadNetwork::route`) whose length is in `distance`, or else closest to it, wins.
+  - Goals lie every `step` m along its lane line, the last at the end, at the ride height above the terrain. `count` is ignored.
+  - With an `on_road` spawn the route starts at the spawn point and fixes its heading; otherwise it is planned from the spawn position. With no route found, the agent gets the spawn goal.
+  - The agent keeps the lane line (`Agent::route`, `Arc<Polyline>`); `set_goals` clears it.
+  - Small maps have few yards, so routes may miss the range: 186–445 m for `[150, 400]` in the test.
+- **Terms**: `road` (6 values: lateral offset from the lane, positive left; lane heading − heading; lane curvature 5/10/20/40 m ahead), `route` (8 values: lane points 5/10/20/40 m ahead in the heading frame) and `on_road` (1).
+  - `road` and `route` follow the route's lane, or else (`Follow`) the lane of the nearest road within 30 m in the travel direction closer to the heading. They read 0 with neither.
+  - Projecting onto the whole route can jump where a route passes close to itself; rural routes do not, so this is left alone.
+- **Validation**: `on_road` without `on_ground` fails, and so do `on_road` spawns or `route` goals on a pool with a map without roads.
+- **Deferred**: the road preference in `DriveGrid` (per-material A* cost). No step-4 goal kind routes over the drive grid: `route` goals follow the road network itself, and `random` goals keep the terrain-only cost. It comes back if a task needs off-road goals that prefer roads.
+- **Goldens**: the trajectories are unchanged (checked with the recorder output left out of the hash). The scenario JSON in the recorded `/meta` gained the new fields, so `golden_trajectories.toml` and `recordings/hover.mcap` were re-blessed.
+- **Tests** (`crates/sim/tests/roads.rs`, `tests_py/test_envs.py`):
+  - Over 4 episodes on 2 maps, sedans spawned `on_road` sit on the road, facing along it, in their lane (within 0.6 m).
+  - Routes start at the spawn and every metre of them lies on a road. They end at a yard; the goals lie on them every 20 m at the ride height.
+  - The terms match `Follow` and read the lane at the start of a route. Without a route they follow the road in the travel direction. Far from roads there is no reference.
+  - The validation errors fire.
+  - The Python `BatchSim` builds and caches a rural pool with these terms.
 
 ### M4b: Trucks and trailers (outline, detailed when it starts)
 - **Articulated vehicles**: a wheeled vehicle becomes a chain of units (tractor, then trailers), each a body in the same tree. A fifth wheel is a Spherical joint with roll stiffness and pitch stops; a drawbar is two revolute joints (a dolly). Axles, colliders and forces attach to their unit's link instead of link 0.

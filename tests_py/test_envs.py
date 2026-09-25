@@ -10,9 +10,10 @@ from gymnasium.utils.env_checker import check_env
 from gymnasium.vector import AutoresetMode
 
 import autonomousim
-from autonomousim import STATE
+from autonomousim import STATE, _native
 from autonomousim.scenario import load_scenario, normalize, quat_up_z
 from autonomousim.tasks import QuadHover, make_task
+from autonomousim.tasks.base import map_source
 from autonomousim.vector_env import AutonomousimVectorEnv
 
 IDS = [f"autonomousim/{name}" for name in autonomousim.ENVS]
@@ -192,6 +193,26 @@ def test_wild_map_pool(tmp_path, monkeypatch):
     for _ in range(5):
         envs.step(np.zeros((4, 4), np.float32))
     assert {sim.map_index(i) for i in range(4)} <= {0, 1}
+
+
+def test_rural_map_pool_with_road_terms(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTONOMOUSIM_MAP_CACHE", str(tmp_path))
+    group = {
+        "name": "cars",
+        "count": 2,
+        "vehicle": "sedan_like",
+        "spawn": {"on_road": True, "min_separation": 10.0},
+        "goals": {"kind": "route", "distance": [100.0, 300.0], "radius": 5.0},
+        "obs": [{"term": "road"}, {"term": "route"}, {"term": "on_road"}],
+    }
+    config = {"name": "rural", "map": map_source("rural", 4, 2), "groups": [group]}
+    sim = _native.BatchSim(json.dumps(config), 3, 0, 2)
+    assert len(sim.map_hashes) == 2 and len(list(tmp_path.rglob("*.map"))) == 2
+    obs = sim.obs(0)
+    assert obs.shape == (3, 2, 15)
+    # In the lane, facing along the route, on the road.
+    assert np.all(np.abs(obs[..., 0]) < 0.6) and np.all(np.abs(obs[..., 1]) < 0.3)
+    assert np.all(obs[..., 6] > 0.0) and np.all(obs[..., 14] == 1.0)
 
 
 def test_hover_scenario_file_matches_the_task():

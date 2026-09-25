@@ -13,14 +13,15 @@ from autonomousim._native import TERMINAL_EVENTS
 from autonomousim.scenario import deep_merge
 
 #: Map shortcuts accepted by ``map=``. A dict is used as the map source itself.
-MAPS = ("flat", "forest", "wild", "offroad")
+MAPS = ("flat", "forest", "wild", "offroad", "rural")
 
 
 def map_source(name: str | dict[str, Any], seed: int, count: int) -> dict[str, Any]:
     """Map source of the scenario for a shortcut: ``flat`` (200 m grass plane), ``forest``
     (200 m hilly test forest, 150 trees/ha), ``wild`` (a pool of ``count`` generated 512 m
-    training maps, one per episode) or ``offroad`` (the same with the drivable ``offroad``
-    preset: low relief, open forest with clearings)."""
+    training maps, one per episode), ``offroad`` (the same with the drivable ``offroad``
+    preset: low relief, open forest with clearings) or ``rural`` (a pool of 512 m farmland
+    maps with a paved road, gravel roads to the farms and dirt tracks to the fields)."""
     if isinstance(name, dict):
         return name
     if name == "flat":
@@ -29,6 +30,8 @@ def map_source(name: str | dict[str, Any], seed: int, count: int) -> dict[str, A
         return {"type": "testworld", "kind": "forest_patch", "size": 200.0, "density": 150.0, "seed": seed}
     if name in ("wild", "offroad"):
         return {"type": "wild", "seed": seed, "count": count, "preset": "training" if name == "wild" else "offroad"}
+    if name == "rural":
+        return {"type": "rural", "seed": seed, "count": count, "preset": "training"}
     raise ValueError(f"unknown map {name!r}; use one of {MAPS} or a map source dict")
 
 

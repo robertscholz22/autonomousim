@@ -267,9 +267,7 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
 /// in the policy's group.
 fn policy_scenario(file: &PolicyFile, map_seed: u64, agents: Option<usize>, cache: bool) -> anyhow::Result<Scenario> {
     let mut sc = file.scenario.clone();
-    if let MapSource::Wild(w) = &mut sc.map {
-        (w.seed, w.count, w.cache) = (map_seed, 1, cache);
-    }
+    sc.map.set_pool(map_seed, 1, cache);
     let group = sc.groups.iter_mut().find(|g| g.name == file.group);
     let group = group.with_context(|| format!("the scenario has no agent group {:?}", file.group))?;
     if let Some(n) = agents {
@@ -305,18 +303,13 @@ pub struct Regenerate {
 impl Regenerate {
     /// The seed of generated maps, if the scenario generates them.
     pub fn map_seed(&self) -> Option<u64> {
-        match &self.scenario.map {
-            MapSource::Wild(w) => Some(w.seed),
-            _ => None,
-        }
+        self.scenario.map.seed()
     }
 
     /// Start generating the maps of `seed` on a background thread.
     pub fn start(&mut self, seed: u64) {
         let mut sc = self.scenario.clone();
-        if let MapSource::Wild(w) = &mut sc.map {
-            w.seed = seed;
-        }
+        sc.map.set_seed(seed);
         self.seed = seed;
         self.error = None;
         self.pending = Some(std::thread::spawn(move || Ok(sc.compile()?)));
@@ -332,9 +325,7 @@ fn finish_regenerate(mut regen: ResMut<Regenerate>, mut sim: ResMut<sim::Sim>) {
     match handle.join().map_err(|_| anyhow::anyhow!("map generation panicked")).and_then(|r| r) {
         Ok(compiled) => {
             let seed = regen.seed;
-            if let MapSource::Wild(w) = &mut regen.scenario.map {
-                w.seed = seed;
-            }
+            regen.scenario.map.set_seed(seed);
             let world = WorldInstance::new(Arc::new(compiled), Seed::from_u64(sim.episodes));
             sim.set_world(world);
         }

@@ -24,10 +24,11 @@ use autonomousim_sensors::{BodyKinematics, Sensor, SensorEnv};
 use autonomousim_vehicles::ground::WheeledInit;
 use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
 use autonomousim_vehicles::{Family, Vehicle};
-use autonomousim_world::StaticWorld;
 use autonomousim_world::environment::{Dryden, EnvironmentConfig, MagneticField};
+use autonomousim_world::{Polyline, StaticWorld};
 use glam::{DVec2, DVec3};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// Heights above the surface (m) below which rotors see ground effect.
 const GROUND_EFFECT_RANGE: f64 = 5.0;
@@ -73,6 +74,8 @@ pub struct Agent {
     pub goals: Vec<Goal>,
     /// Index of the current goal; `goals.len()` once the last one has been reached.
     pub goal_index: usize,
+    /// The lane line of a `route` goal, followed by the `road` and `route` observation terms.
+    pub route: Option<Arc<Polyline>>,
     /// Reach radius of the goals (0: advanced explicitly only).
     goal_radius: f64,
     /// Events since the start of the current policy step.
@@ -108,6 +111,7 @@ impl Agent {
             sensors,
             goals: vec![Goal::default()],
             goal_index: 0,
+            route: None,
             goal_radius: group.spec.goals.radius,
             events: Events::NONE,
             disabled: false,
@@ -532,6 +536,7 @@ impl Agent {
                 agents,
                 me,
                 grid,
+                route: self.route.as_deref(),
             },
             out,
         );

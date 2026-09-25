@@ -22,11 +22,12 @@ use crate::agent::{Agent, EnvState};
 use crate::drive::ground_pose;
 use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
+use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, Goal, GoalKind};
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
-use autonomousim_core::math::quat::yaw;
+use autonomousim_core::math::quat::{from_yaw, yaw};
 use autonomousim_core::rng::Seed;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
@@ -143,7 +144,27 @@ impl WorldInstance {
         for g in &sc.groups {
             let spawn = &g.spec.spawn;
             let ground = g.ground(pick);
-            let positions = spawn.sample_positions(world, g.spec.count, g.bottom, ground, &mut placed, &mut spawn_rng);
+            let route_goals = g.spec.goals.kind == GoalKind::Route;
+            // Height of the centre of mass (the chassis frame for ground vehicles) above the
+            // terrain on roads and at route goals.
+            let lift = ground.map_or(g.bottom, |gs| gs.ride);
+            let (positions, mut road_spawns) = if spawn.on_road {
+                let rs = lane::road_spawns(
+                    world,
+                    spawn,
+                    route_goals.then_some(&g.spec.goals),
+                    g.spec.count,
+                    lift,
+                    &mut placed,
+                    &mut spawn_rng,
+                    &mut goal_rng,
+                );
+                (rs.iter().map(|r| r.position).collect(), rs.into_iter().map(Some).collect())
+            } else {
+                let p = spawn.sample_positions(world, g.spec.count, g.bottom, ground, &mut placed, &mut spawn_rng);
+                let n = p.len();
+                (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            };
             let mut formation = match g.spec.goals.kind {
                 GoalKind::Formation => g.spec.goals.formation(world, &positions, ground, &mut goal_rng),
                 _ => Vec::new(),
@@ -154,12 +175,21 @@ impl WorldInstance {
                 let density = self.env.config.atmosphere.density(self.env.origin_altitude + p.z);
                 let hover = g.def.as_multirotor().map_or(0.0, |d| d.hover_omega(self.env.config.gravity, density));
                 let mut placement = spawn.sample_state(p, hover, &mut spawn_rng);
+                let road_spawn = road_spawns[k].take();
+                if let Some(rs) = &road_spawn {
+                    placement.pose.rot = from_yaw(rs.yaw);
+                }
                 if let Some(d) = g.def.as_wheeled() {
                     placement.pose = ground_pose(world, d, &g.rest, p.truncate(), yaw(placement.pose.rot));
                 }
-                let goals = match formation.next() {
-                    Some(slot) => vec![slot],
-                    None => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),
+                let mut route = road_spawn.and_then(|rs| rs.route);
+                if route_goals && route.is_none() {
+                    route = lane::plan_route(world, p.truncate(), &g.spec.goals, &mut goal_rng);
+                }
+                let goals = match (formation.next(), &route) {
+                    (Some(slot), _) => vec![slot],
+                    (None, Some(lane)) => lane::route_goals(world, lane, g.spec.goals.route.step, lift),
+                    (None, None) => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),
                 };
                 let seed = agent_seed.child_index(id as u64);
                 let scales = g
@@ -168,6 +198,7 @@ impl WorldInstance {
                     .map(|d| g.spec.randomize.sample(d.rotors.len(), &mut seed.child("vehicle").rng()));
                 let agent = &mut self.agents[id];
                 agent.reset(g, &placement, scales.as_ref(), goals, seed, &self.env, world);
+                agent.route = route.map(Arc::new);
                 let contact = g.def.contact_model(agent.vehicle.mass(), sc.dt());
                 self.shapes[id].set_contact(&contact.solid);
                 agent.update_shape(&mut self.shapes[id]);
@@ -404,6 +435,7 @@ impl WorldInstance {
         let a = &mut self.agents[agent];
         a.goals = goals;
         a.goal_index = 0;
+        a.route = None;
     }
 
     /// Advance the goal of `agent`; false if it was at its last goal.

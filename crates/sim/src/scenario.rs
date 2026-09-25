@@ -39,6 +39,7 @@
 
 use crate::SimError;
 use crate::drive::{self, DrivableSpec, DriveGrid};
+use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
@@ -51,6 +52,7 @@ use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_procgen::MapCache;
+use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
 use autonomousim_sensors::{Sensor, SensorSpec};
 use autonomousim_vehicles::ground::Wheeled;
@@ -150,6 +152,8 @@ pub enum MapSource {
     Testworld(Testworld),
     /// A pool of generated wild maps.
     Wild(WildMaps),
+    /// A pool of generated rural maps (farmland with roads).
+    Rural(RuralMaps),
 }
 
 /// `count` wild maps with the seeds `seed, seed + 1, …`; each episode draws one of them.
@@ -200,6 +204,54 @@ impl WildMaps {
     }
 }
 
+/// `count` rural maps with the seeds `seed, seed + 1, …`; each episode draws one of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuralMaps {
+    pub seed: u64,
+    pub count: u32,
+    pub preset: RuralPreset,
+    /// Values that override the preset, in the layout of
+    /// [`RuralConfig`](autonomousim_procgen::RuralConfig), e.g. `{ size = 256.0 }`.
+    pub config: Option<serde_json::Value>,
+    /// Keep generated maps in the user's map cache and load them from there.
+    pub cache: bool,
+}
+
+impl Default for RuralMaps {
+    fn default() -> Self {
+        Self { seed: 0, count: 1, preset: RuralPreset::Training, config: None, cache: true }
+    }
+}
+
+impl RuralMaps {
+    pub fn config(&self) -> Result<RuralConfig, SimError> {
+        RuralConfig::from_preset(self.preset, self.config.as_ref()).map_err(|e| SimError::Scenario(format!("map: {e}")))
+    }
+
+    fn build(&self) -> Result<Vec<(StaticWorld, MapHash)>, SimError> {
+        if !(1..=256).contains(&self.count) {
+            return Err(SimError::Scenario("map: count must be in 1..=256".into()));
+        }
+        let config = self.config()?;
+        let cache = if self.cache { MapCache::user() } else { None };
+        (0..self.count as u64)
+            .into_par_iter()
+            .map(|k| {
+                let seed = self.seed.wrapping_add(k);
+                match &cache {
+                    Some(c) => c.rural(&config, seed).map(|m| (m.world, m.hash)),
+                    None => rural::generate(&config, seed).map(|(w, _)| {
+                        let h = w.content_hash();
+                        (w, h)
+                    }),
+                }
+                .map_err(|e| SimError::Scenario(format!("map (seed {seed}): {e}")))
+            })
+            .collect()
+    }
+}
+
 impl Default for MapSource {
     fn default() -> Self {
         MapSource::Testworld(Testworld::Flat { size: 200.0 })
@@ -216,6 +268,34 @@ impl MapSource {
                 Ok(vec![(w, h)])
             }
             MapSource::Wild(w) => w.build(),
+            MapSource::Rural(r) => r.build(),
+        }
+    }
+
+    /// Seed of the first generated map (`None` for test worlds).
+    pub fn seed(&self) -> Option<u64> {
+        match self {
+            MapSource::Testworld(_) => None,
+            MapSource::Wild(w) => Some(w.seed),
+            MapSource::Rural(r) => Some(r.seed),
+        }
+    }
+
+    /// Generate `count` maps from `seed` (test worlds are left as they are).
+    pub fn set_pool(&mut self, seed: u64, count: u32, cache: bool) {
+        match self {
+            MapSource::Testworld(_) => {}
+            MapSource::Wild(w) => (w.seed, w.count, w.cache) = (seed, count, cache),
+            MapSource::Rural(r) => (r.seed, r.count, r.cache) = (seed, count, cache),
+        }
+    }
+
+    /// Generate from `seed`, keeping the pool size.
+    pub fn set_seed(&mut self, seed: u64) {
+        match self {
+            MapSource::Testworld(_) => {}
+            MapSource::Wild(w) => w.seed = seed,
+            MapSource::Rural(r) => r.seed = seed,
         }
     }
 }
@@ -570,6 +650,10 @@ pub struct SpawnSpec {
     /// Start resting on the ground (motors idle unless set otherwise); ignores `agl`. Ground
     /// vehicles always do.
     pub on_ground: bool,
+    /// Start in a lane of a random road of the map, facing along it (along the route with
+    /// `route` goals); ignores `layout`, `region`, `cluster` and `yaw_deg`. Needs a map with
+    /// roads and a vehicle on the ground.
+    pub on_road: bool,
     /// Free radius around the vehicle (m).
     pub clearance: f64,
     /// Smallest distance between agents (m).
@@ -596,6 +680,7 @@ impl Default for SpawnSpec {
             cluster: None,
             agl: [1.0, 3.0],
             on_ground: false,
+            on_road: false,
             clearance: 1.0,
             min_separation: 1.0,
             avoid_water: true,
@@ -620,6 +705,11 @@ pub enum GoalKind {
     /// whole group, centred on the centroid of the group's spawns and turned by a heading
     /// from `yaw_deg` (also every slot's goal heading); `agl` above the surface at each slot.
     Formation,
+    /// A route along the roads to a destination (see [`RouteGoals`]) whose length lies in
+    /// `distance`, with goals every `route.step` m along its lane (`count` is ignored). The
+    /// agent keeps the route for the `road` and `route` observation terms. Needs a map with
+    /// roads.
+    Route,
 }
 
 /// Slot layout of `GoalKind::Formation`.
@@ -656,6 +746,8 @@ pub struct GoalSpec {
     pub formation: FormationShape,
     /// Distance between neighbouring formation slots (m).
     pub spacing: f64,
+    /// Settings of `GoalKind::Route`.
+    pub route: RouteGoals,
 }
 
 impl Default for GoalSpec {
@@ -671,6 +763,7 @@ impl Default for GoalSpec {
             radius: 0.0,
             formation: FormationShape::Grid,
             spacing: 2.0,
+            route: RouteGoals::default(),
         }
     }
 }
@@ -832,6 +925,15 @@ impl CompiledScenario {
             groups.push(CompiledGroup::new(g.clone(), def, &clock, first_agent)?);
             first_agent += g.count;
         }
+        for g in &groups {
+            let roads = g.spec.spawn.on_road || g.spec.goals.kind == GoalKind::Route;
+            if roads && let Some(k) = maps.iter().position(|m| m.roads().is_empty()) {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: `on_road` spawns and `route` goals need roads, map {k} has none",
+                    g.spec.name
+                )));
+            }
+        }
         build_drive_grids(&mut groups, &maps);
         // Defaults that depend on the vehicle, filled in.
         for (s, g) in spec.groups.iter_mut().zip(&groups) {
@@ -918,6 +1020,9 @@ impl CompiledGroup {
         if !spawn_ok {
             return Err(fail(format!("invalid spawn {sp:?}")));
         }
+        if sp.on_road && !sp.on_ground {
+            return Err(fail("`spawn.on_road` needs `spawn.on_ground`".into()));
+        }
         let gl = &spec.goals;
         if !(valid_range(gl.distance)
             && gl.distance[0] >= 0.0
@@ -926,6 +1031,7 @@ impl CompiledGroup {
             && gl.clearance >= 0.0
             && gl.radius >= 0.0
             && gl.spacing > 0.0
+            && gl.route.step > 0.0
             && gl.count >= 1)
         {
             return Err(fail(format!("invalid goals {gl:?}")));
@@ -1231,7 +1337,10 @@ impl GoalSpec {
     ) -> Vec<Goal> {
         use autonomousim_core::math::quat::yaw;
         match self.kind {
-            GoalKind::Spawn | GoalKind::Formation => vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }],
+            // Route goals come from `lane`; this is the fallback when no route is found.
+            GoalKind::Spawn | GoalKind::Formation | GoalKind::Route => {
+                vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }]
+            }
             GoalKind::Random => {
                 let [lo, hi] = region(world, None, self.margin);
                 let mut prev = spawn.pos.truncate();
