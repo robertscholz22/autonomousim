@@ -1166,12 +1166,76 @@ Planned 2026-09-25. Scope from the roadmap: a PettingZoo `ParallelEnv` and a nat
 
   A from-scratch run (hidden 256, 15M agent steps) reached 67 % with 7 % agent crashes. The policy targets are left to the user's own training.
 
+## Milestone 4: Rural maps, trucks and trailers, tracked vehicles
+
+Planned 2026-09-25. The roadmap's M4 is about three M2-sized parts, so it is split into sub-milestones. Each closes with its own tests, a demo task trained just far enough to exercise the new features, a commit and a push. Decided with the user at the start:
+- **Split and order**: M4a rural maps → M4b trucks and trailers (they drive and reverse on the rural roads) → M4c tracked vehicles and soft soil (they cross the rural fields and mud).
+- **Demos**, one per part: `RoadFollowRural-v0` (a car follows the road network to a farm), `TrailerReverse-v0` (reverse a truck and trailer into a farmyard bay), `TrackedCrossCountry-v0` (an APC crosses soft fields and ditches to waypoints).
+- **Training**: only enough to test what was built (export, viewer, replay); the user trains the agents.
+
+**Already in place**: the `wild` generator (terrain noise, erosion, Priority-Flood lakes, moisture, materials, scatter, cache and hashes), 15 materials including asphalt, gravel, dirt and concrete, cuboid obstacles, `DriveGrid` with A*, wheeled vehicles as Featherstone trees on a Free chassis (`KcTravel` suspension, per-axle steer shares, independent steering), and multi-agent support.
+
+### M4a: Rural maps
+
+#### Design
+- **Road network** (`world::roads`, part of `StaticWorld`, stored in map files and hashed):
+  - Roads are polylines resampled every 1 m from smoothed splines. Each has a class (`paved` 6 m, `gravel` 4 m, `track` 3 m), a width, and nodes at junctions and ends. Farm yards and field gates are node kinds.
+  - Queries use a segment grid: nearest road point (station along the road, signed lateral offset, heading, curvature), whether a point is on a road, and routes over the graph (Dijkstra by length) as polylines.
+  - `FORMAT_VERSION` 2; maps without roads read back with an empty network.
+- **Rural generator** (`procgen::rural`, `RuralConfig`, presets `training` 512 m and `showcase` 2 km; `RURAL_VERSION` 1):
+  1. **Terrain**: the wild pipeline's noise, erosion and hydrology with gentle relief (0–60 m), broad valleys and a few lakes or ponds.
+  2. **Farm sites**: Poisson-disc samples on flat, dry, low ground (slope < 5°, not near water), 3–6 per km².
+  3. **Road routing**:
+     - A main paved road crosses the map edge to edge. Gravel roads join each farm to the nearest existing road. Tracks run from the roads to field gates.
+     - A* runs on a 4 m cost grid (length, grade above the class's limit, side slope, water forbidden, turning cost from 16 directions), reusing edges already built so roads merge.
+     - The paths are smoothed into centripetal Catmull–Rom splines, limited in curvature per class, and resampled.
+  4. **Terrain blending**: along each road the cross-section is flattened to the centreline height with a crown, and shoulders are blended with a smooth falloff over 3 m (cut and fill). The centreline profile is smoothed until the grade stays below the class limit (paved 8 %, gravel 12 %, track 20 %). The blend runs on the final grid and hydrology is not rerun, so roads never cross water; there are no bridges in M4a.
+  5. **Materials**: road cells get asphalt, gravel or dirt. Farm yards get concrete. Fields are parcels of 1–6 ha, cut from the land between roads by a jittered Voronoi partition, each with a crop material: meadow, crop, or plowed soil (new; plowed soil is the soft soil of M4c). Grass verges and forest floor in the woods.
+  6. **Scatter**, as obstacles with tags:
+     - Farm buildings (cuboids: house, barn, shed; cylinders: silos) around a concrete yard facing its road.
+     - Hedgerows (soft foliage, like canopies, with a woody core) and wire fences (thin solid cuboids with gaps at the gates) along parcel edges.
+     - Tree lines along some roads; small woods from the wild tree scatter on steep or wet parcels; scattered field trees and rocks.
+  7. Map hash, cache and golden hashes as for `wild`.
+- **Simulation and Python**:
+  - `MapSource::Rural(RuralMaps { seed, count, preset, config })`; Python `map="rural"`.
+  - `DriveGrid` gains a road preference: an optional per-material cost in A*.
+  - **Spawns and goals**: spawn option `on_road` (on a road, heading along it, in the right-hand lane when the road is paved). Goal kind `route`: a destination (a farm yard or a random road point, at a given route length), with goals every `spacing` m along the route polyline.
+  - **Observation terms**: `road` (signed lateral offset and heading error to the route's lane, plus curvature samples at 5, 10, 20 and 40 m ahead), `route` (the next route points in the heading frame), and `on_road` (1 when on the road surface).
+- **Viewer**:
+  - Road ribbons drawn from the network (slightly above the terrain, with crisp edges and a centre line on paved roads) over the per-cell colours.
+  - Box and cylinder meshes with roofs for the buildings; hedge and fence meshes; field colours.
+  - `--map rural` for live mode, a rural `showcase`, and the route drawn in `policy` mode.
+- **Demo**, `RoadFollowRural-v0`: the sedan (`vk` actions) starts on a road and follows its route to a farm yard 150–400 m away. Reward: progress along the route, minus lateral deviation and heading error, minus a penalty off the road surface; success on reaching the yard; terminal on leaving the road by more than 3 m, a crash or a rollover. Observations: `road`, `route`, speed and yaw rate, and `rl64` LiDAR for the obstacles.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | `world::roads`: network type, segment grid and queries, routes; map file version 2 | Queries match brute force on random networks; routes are shortest; old map files still load; map files round-trip with roads |
+| 2 | `procgen::rural` terrain, farm sites, road routing, terrain blending, road materials; `RuralConfig` and presets | Every farm is connected; grades and curvatures stay within the class limits; roads stay out of water; the hash is identical with 1 and 12 threads; golden hashes committed; 512 m in < 1.5 s, 2 km in < 20 s |
+| 3 | Fields, new materials (meadow, crop, plowed soil), buildings, hedges, fences, tree lines, woods | Parcels cover the farmland; no obstacle on a road or in a yard; gates connect tracks to fields; invariants tested; goldens re-blessed |
+| 4 | Simulation: `MapSource::Rural`, `on_road` spawns, `route` goals, `road`/`route`/`on_road` terms, road cost in `DriveGrid`; Python `map="rural"` | A car spawned `on_road` sits in its lane; routes follow the roads; terms match references; the Python env runs on rural maps |
+| 5 | Viewer: road ribbons, buildings, hedges and fences, `--map rural`, route display | A rural showcase renders at ≥ 60 fps at 1080p "medium" on the Iris Xe; the car drives on the roads by keyboard |
+| 6 | `RoadFollowRural-v0`, a short training run, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
+
+### M4b: Trucks and trailers (outline, detailed when it starts)
+- **Articulated vehicles**: a wheeled vehicle becomes a chain of units (tractor, then trailers), each a body in the same tree. A fifth wheel is a Spherical joint with roll stiffness and pitch stops; a drawbar is two revolute joints (a dolly). Axles, colliders and forces attach to their unit's link instead of link 0.
+- **Lifting the 4-axle limit**: per-wheel commands and arrays become `Vec`s, the per-wheel action mask grows beyond 8 bits, and the static equilibrium solves any number of axles (a linear system in the axle loads).
+- **Multi-axle steering**: several steered axles with Ackermann about a virtual rear axle; passive and command-steered trailer axles; air-brake lag.
+- **Agents with several bodies**: collider spheres carry their link; agent contacts and shapes follow each body.
+- **Presets**: a 6×4 tractor with a 3-axle semitrailer, an 8×8 rigid truck, and a farm tractor with a 2-axle drawbar trailer.
+- **Validation**: low-speed offtracking against the analytic steady-state formula; high-speed offtracking and rearward amplification against published values or Chrono's semitrailer.
+- **Viewer**: trailer bodies and articulation, and a reversing camera.
+- **Demo**: `TrailerReverse-v0`, reversing into a farm-yard bay.
+
+### M4c: Tracked vehicles and soft soil
+The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
 | M2 | (Detailed above.) Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
 | M3 | (Detailed above.) Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations | pettingzoo API tests; 256 drones at ≥ 20× real time |
-| M4 | Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
+| M4 | (Detailed above; split into M4a/b/c.) Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
 | M5 | Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
 | M6 | Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
