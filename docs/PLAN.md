@@ -1542,7 +1542,7 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
 | 1 ✅ | Track running gear: `[track]` table, trailing-arm road wheels, track patches with shear state (rigid ground), side-locked road wheels, sprocket and idler colliders; a test vehicle | It rests at the static solution (road-wheel loads); drives straight with slip ≈ 0 at constant speed; holds on a slope below `atan μ` and slides above it; skid-steers in a circle |
 | 2 ✅ | Tracked drivelines (braked differential, electric sides; see as built), controller and action modes for tracks, presets `tracked_apc` (Chrono extraction) and `rover_tracked` | Presets load, settle and drive; `vw` holds speed and yaw rate; static loads against Chrono's |
 | 3 ✅ | Validation: Chrono M113 fixtures (static loads, straight acceleration, steady turn at a fixed sprocket speed ratio, braked hold on a 30 % slope) and analytic rigid-ground checks (gradeability, Wong's skid-steer turning) | Tolerances above met or explained |
-| 4 | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
+| 4 ✅ | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
 | 5 | Simulation and viewer: tracked agents in scenarios, drive grids with soil cost, track visuals (band around sprocket, road wheels and idler), HUD per side (band speed, slip, sinkage), rural ditches | An APC drives by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay; ditch invariants hold |
 | 6 | `TrackedCrossCountry-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
@@ -1616,6 +1616,28 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
     - **Brake steering**: at steering 0.3 the yaw rates over 2.5–5 s are within a factor 2 (ours 0.008, Chrono's 0.010 rad/s). At 0.6 both nearly stall (speed < 0.15 m/s, yaw rate < 0.05 rad/s). Chrono's turning moves by a factor 2 with the solver's iterations, so it cannot be a 15 % reference; turning is checked analytically instead.
     - **Gradeability (analytic)**: `sin θ + f cos θ = F/W` with first-gear tractive force `T/(g₁·i_f·r)` and the rotating masses in `m_eff`. The accelerations at 0, 0.5 and 0.9 of the limiting grade are within 5 %; above the limit the APC does not climb.
     - **Pivot turn (analytic, Wong and Chiang)**: `rover_tracked` turning on the spot. Given the measured yaw rate and slips, the outer and inner thrusts match the numerical Wong–Chiang integral over the contact patches within 3 %, and the turning moment within 5 % (3.4 %), below the `μWl/4` of fully sliding tracks.
+- **Step 4 (soft soil)**:
+  - **Soil parameters** (`core::material::Soil`): `n`, `k_c`, `k_φ`, `c`, `φ`, `K` and a bulk density for bulldozing. They are a built-in property of the material's name (`Soil::of_material`), `#[serde(skip)]` in `Material` and restored by name when a table is read. So map files, their content hashes and all golden map hashes are unchanged. Values from Wong's Table 2.3:
+    - sand: dry sand (LLL);
+    - mud: clayey soil (Thailand), φ 13°;
+    - snow: U.S. snow;
+    - meadow: Grenville loam;
+    - crop: Rubicon sandy loam;
+    - plowed: upland sandy loam.
+    `K` (1–4 cm) and the densities are estimates. Grass, forest floor, dirt, gravel and paved surfaces stay rigid. Wild maps' sand, mud and snow are soft too, for tracks. Tyres keep their rigid-ground model.
+  - **Patch on soil** (`track.rs`):
+    - **Sinkage**: the pads and the soil act in series, `k_v(ρ − z) = b·L·(k_c/b + k_φ)·z^n`, solved by safeguarded Newton. Only on soil; rigid ground takes the old code path bit for bit.
+    - **Plastic rut** (`TireState::sinkage`): the soil holds, as rigid, up to the pressure that made the rut, and yields along Bekker's law beyond it. The ground's motion carries the rut away (rate `|v_x|/L`) and replaces it with the rut the patch ahead left (`TireState::rut_in`, set by `Wheeled` like the shear inflow). The rear patches therefore ride in the front ones' rut.
+    - **Resistance**: compaction `b(k_c/b + k_φ)(z^(n+1) − z_in^(n+1))/(n+1)` and Rankine's passive bulldozing `b(2cz√K_p + ½ρgz²K_p)`, each counted from the rut depth `z_in` ahead, so a track pays them once, to its deepest rut. There is **no sinkage threshold** for bulldozing (it is small at small sinkage). The resistance acts on the road wheel's centre, not at the contact point: applied at the contact it braked the band, and the patch's own shear cancelled it without any drive torque.
+    - **Shear**: Mohr–Coulomb per cell, `c·A_cell + F_z·tan φ`, with the soil's `K`.
+  - **Sinkage state and term**: `Wheeled::sinkage()` is the mean over the loaded patches. It feeds state column `sinkage` (`STATE_DIM` 30) and obs term `sinkage`. The goldens were re-blessed after an A/B check against the last commit (states without the new column, obs, events and world hashes identical); `hover.mcap` changed with the column.
+  - **Tests** (`vehicles/tests/soil.rs`):
+    - **Patch chain** (5 APC patches, plowed soil) at slips from −5 % to 30 %: sinkage is Bekker's to 1e-6, and pull equals Janosi–Hanamoto's integral less compaction and bulldozing to 1 %.
+    - **Motion resistance**: the APC at 2 m/s on plowed soil and on sand; drive torque less internal resistance equals the compaction and bulldozing of the deepest Bekker rut within 1 % (1704 vs 1694 N, 1910 vs 1910 N). Each patch sinks by Bekker's law under its load, or rides in a deeper rut ahead (5 %).
+    - **Parked**: gravity is ramped over 2 s. The patches sink by Bekker's law up to 8 % deeper (the rut keeps the peak load while the end road wheels take up load), and the hull sits lower by about as much. Dropped from the rigid-ground pose instead, it overshoots by up to 30 %.
+    - **Drawbar pull**: the rover on plowed soil at 10, 25 and 40 % of its weight. Pull matches the integral under the actual loads within 5 %, and slip grows with the load.
+    - `sim/tests/ground.rs`: the state column and the obs term read the APC's sinkage on sand, and 0 on rigid ground.
+  - **Limitation**: sprocket and idler colliders (and the hull's) meet the rigid terrain surface. A vehicle sunk deeper than their clearance rests on them: the rover in snow sinks 5 cm, and its sprocket and idler carry about a quarter of its weight.
 
 ## Roadmap after M1
 | M | Content | Validation |

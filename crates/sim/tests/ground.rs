@@ -242,3 +242,39 @@ fn ground_recordings_read_back() {
     assert!(car.motors.is_empty() && drone.wheels.is_empty() && drone.motors.len() == 4);
     rec.compile().unwrap();
 }
+
+/// A tracked vehicle sinks into soft soil: the `sinkage` state column and observation term
+/// read its patches' mean sinkage, and 0 on rigid ground.
+#[test]
+fn tracked_vehicles_report_their_sinkage() {
+    let col = autonomousim_sim::STATE_FIELDS.iter().take_while(|(n, _)| *n != "sinkage").map(|(_, d)| d).sum::<usize>();
+    let run = |map: &str| {
+        let sc = compile(&format!(
+            r#"
+            name = "soil"
+            physics_hz = 1000
+            map = {map}
+            [[groups]]
+            vehicle = "tracked_apc"
+            action_mode = "vw"
+            obs = [ {{ term = "sinkage", scale = 10.0 }} ]
+            "#
+        ));
+        let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+        for _ in 0..100 {
+            step(&mut w, &[&[0.0, 0.0]]);
+        }
+        let mut state = vec![0.0; autonomousim_sim::STATE_DIM];
+        w.write_state(0, &mut state);
+        let mut obs = vec![0.0f32; 1];
+        w.observe(0, &mut obs);
+        (state[col], obs[0])
+    };
+    let (rigid, rigid_obs) = run(r#"{ type = "testworld", kind = "flat", size = 200.0 }"#);
+    assert_eq!((rigid, rigid_obs), (0.0, 0.0));
+    // Sand (material 3): the loaded patches sink by some 6 cm.
+    let (sand, sand_obs) =
+        run(r#"{ type = "testworld", kind = "incline", size = 200.0, angle_deg = 0.0, material = 3 }"#);
+    assert!(sand > 0.03 && sand < 0.1, "sinkage {sand}");
+    assert!((f64::from(sand_obs) - 10.0 * sand).abs() < 1e-5);
+}

@@ -39,6 +39,7 @@
 
 use super::model::{Surface, TireForces, TireState, WheelMotion};
 use super::road::RoadContact;
+use autonomousim_core::material::Soil;
 use serde::{Deserialize, Serialize};
 
 /// Shear cells per patch.
@@ -140,24 +141,44 @@ impl TrackPatch {
         dt: f64,
     ) -> TireForces {
         let rho = self.radius - c.loaded_radius;
-        let fz = (self.vertical_stiffness * rho - self.vertical_damping * motion.velocity.dot(c.normal)).max(0.0);
         let arm = c.point - motion.center;
         let vc = motion.velocity + motion.carrier_angvel.cross(arm);
         let (vx, vy) = (vc.dot(c.x), vc.dot(c.y));
         let yaw_rate = motion.carrier_angvel.dot(c.normal);
-        let re = c.loaded_radius.max(0.5 * self.radius);
+        let f0 = self.vertical_stiffness * rho - self.vertical_damping * motion.velocity.dot(c.normal);
+        // Upstream in the soil's flow past the patch: the front neighbour when moving forward.
+        let up = usize::from(vx < 0.0);
+        let (fz, sinkage) = match surface.soil {
+            None => {
+                state.sinkage = 0.0;
+                (f0.max(0.0), 0.0)
+            }
+            Some(soil) => {
+                let z = self.sink(&soil, f0, state.sinkage, state.rut_in[up].unwrap_or(0.0), dt * vx.abs());
+                state.sinkage = z;
+                ((f0 - self.vertical_stiffness * z).max(0.0), z)
+            }
+        };
+        let re = (c.loaded_radius + sinkage).max(0.5 * self.radius);
         let band = motion.spin * re;
         let vsx = vx - band;
 
         let n = TRACK_CELLS;
         let h = self.length / n as f64;
         let rate = dt * band.abs() / h;
-        let k = self.shear_modulus;
+        let (k, cell_limit, mu) = match surface.soil {
+            None => (self.shear_modulus, self.mu * surface.mu_scale * fz / n as f64, self.mu),
+            // Mohr–Coulomb over the cell: c·A + F_z·tan φ.
+            Some(soil) if fz > 0.0 => {
+                let limit = soil.cohesion * self.width * h + fz * soil.friction_angle.tan() / n as f64;
+                (soil.shear_modulus, limit, limit * n as f64 / fz)
+            }
+            Some(soil) => (soil.shear_modulus, 0.0, soil.friction_angle.tan()),
+        };
         let speed = vx.abs().max(band.abs());
         let k_low =
             if speed < self.vxlow { 0.5 * (1.0 + (std::f64::consts::PI * speed / self.vxlow).cos()) } else { 0.0 };
-        let damping = k_low * 2.0 * LOW_SPEED_DAMPING_RATIO * (k / (self.mu * GRAVITY)).sqrt();
-        let cell_limit = self.mu * surface.mu_scale * fz / n as f64;
+        let damping = k_low * 2.0 * LOW_SPEED_DAMPING_RATIO * (k / (mu * GRAVITY)).sqrt();
         let limit = SHEAR_LIMIT * k;
 
         let forward = band >= 0.0;
@@ -206,13 +227,27 @@ impl TrackPatch {
         state.u = su / n as f64;
         state.v = sv / n as f64;
 
+        // Soil: the patch compacts the rut the patches ahead left, and pushes soil ahead of it,
+        // from their depth to its own. The resistance acts on the running gear, not on the
+        // band: the sprocket overcomes it through the shear.
+        let mut resistance = 0.0;
+        if let Some(soil) = surface.soil
+            && fz > 0.0
+        {
+            let z_in = state.rut_in[up].unwrap_or(0.0);
+            let bulldozing = soil.bulldozing(self.width, sinkage, GRAVITY) - soil.bulldozing(self.width, z_in, GRAVITY);
+            resistance =
+                (soil.compaction(self.width, z_in, sinkage) + bulldozing.max(0.0)) * (vx / ROLLING_SMOOTHING).tanh();
+        }
         let my = -self.rolling_resistance * fz * re * (band / ROLLING_SMOOTHING).tanh();
-        let force = c.x * fx + c.y * fy + c.normal * fz;
+        let point = c.point - c.normal * sinkage;
+        let shear = c.x * fx + c.y * fy + c.normal * fz;
         let moment = c.y * my + c.normal * mz;
+        fx -= resistance;
         TireForces {
-            force,
-            torque: moment + arm.cross(force),
-            point: c.point,
+            force: shear - c.x * resistance,
+            torque: moment + (point - motion.center).cross(shear),
+            point,
             fx,
             fy,
             fz,
@@ -221,10 +256,46 @@ impl TrackPatch {
             mz,
             kappa: -vsx / vx.abs().max(band.abs()).max(0.1),
             tan_alpha: vy / vx.abs().max(0.1),
-            deflection: rho,
+            deflection: rho - sinkage,
             vx,
             vy,
             vsx,
+            sinkage,
         }
+    }
+
+    /// Sinkage (m) of the patch into `soil` under the force `f0` its pads would carry on rigid
+    /// ground (N), in series with the pads. The rut under the patch, `rut` of the last step,
+    /// is carried away by the ground's motion (`travel` m in this step) and replaced by the rut
+    /// `rut_in` the patches ahead left. The soil holds up to the pressure that compacted the rut
+    /// (unloading and reloading are taken as rigid), and yields along Bekker's law beyond it.
+    fn sink(&self, soil: &Soil, f0: f64, rut: f64, rut_in: f64, travel: f64) -> f64 {
+        let r = travel / self.length;
+        let floor = (rut + r * rut_in) / (1.0 + r);
+        let (kv, kz, n) = (self.vertical_stiffness, self.width * self.length * soil.modulus(self.width), soil.n);
+        if f0 - kv * floor <= kz * floor.powf(n) {
+            return floor;
+        }
+        // k_v·z + k_z·z^n = f0, increasing in z: safeguarded Newton.
+        let (mut lo, mut hi) = (floor, f0 / kv);
+        let mut z = (f0 / kz).powf(1.0 / n).clamp(lo, hi);
+        for _ in 0..40 {
+            let zn = z.powf(n);
+            let g = kv * z + kz * zn - f0;
+            if g > 0.0 {
+                hi = z;
+            } else {
+                lo = z;
+            }
+            let mut next = z - g / (kv + kz * n * zn / z.max(1e-12));
+            if !(next > lo && next < hi) {
+                next = 0.5 * (lo + hi);
+            }
+            if (next - z).abs() < 1e-10 {
+                return next;
+            }
+            z = next;
+        }
+        z
     }
 }

@@ -30,6 +30,7 @@
 //! | `route` | 8 | lane centre 5, 10, 20 and 40 m ahead in the heading frame (x, y; m) |
 //! | `on_road` | 1 | 1 on a road's surface, else 0 |
 //! | `articulation` | 4 | ground vehicles: yaw of the first two trailers (or dollies) relative to the unit ahead (rad, positive pointing left), then their rates (rad/s); 0 without |
+//! | `sinkage` | 1 | ground vehicles: mean sinkage of the loaded track patches into soft soil (m); 0 on rigid ground and for tyres |
 //! | `trailer_goal` | 4 | goal − tail of the last unit, in that unit's heading frame (x, y; m), then sin, cos of goal heading − the unit's heading (see `Wheeled::tail_pose`) |
 //! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
 //!
@@ -106,6 +107,7 @@ pub enum TermKind {
     OnRoad,
     Articulation,
     TrailerGoal,
+    Sinkage,
 }
 
 /// Distances ahead at which the `road` and `route` terms look (m).
@@ -129,7 +131,7 @@ impl TermKind {
     /// Whether the term reads a ground vehicle's wheels, steering or powertrain.
     fn needs_wheels(self) -> bool {
         use TermKind::*;
-        matches!(self, WheelSpeeds | WheelSlip | Steering | GearRpm | Articulation | TrailerGoal)
+        matches!(self, WheelSpeeds | WheelSlip | Steering | GearRpm | Articulation | TrailerGoal | Sinkage)
     }
 }
 
@@ -291,6 +293,7 @@ impl CompiledObs {
                     | TermKind::Speed
                     | TermKind::Sideslip
                     | TermKind::Steering
+                    | TermKind::Sinkage
                     | TermKind::OnRoad,
                     _,
                 ) => (1, 0.0),
@@ -396,7 +399,8 @@ impl CompiledObs {
                 | TermKind::Steering
                 | TermKind::GearRpm
                 | TermKind::Articulation
-                | TermKind::TrailerGoal => {
+                | TermKind::TrailerGoal
+                | TermKind::Sinkage => {
                     let v = inp.wheeled.expect("ground terms are checked when the spec is compiled");
                     match t.kind {
                         TermKind::Articulation => {
@@ -424,6 +428,7 @@ impl CompiledObs {
                             }
                         }
                         TermKind::Steering => put(dst, &[v.steering_angle()], t),
+                        TermKind::Sinkage => put(dst, &[v.sinkage()], t),
                         _ => {
                             let p = v.powertrain();
                             let krpm = p.engine_speed * 60.0 / std::f64::consts::TAU / 1000.0;

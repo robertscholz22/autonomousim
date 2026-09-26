@@ -24,6 +24,7 @@ workspace = true
 proptest.workspace = true
 approx.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
 criterion.workspace = true
 
 [[bench]]

@@ -50,8 +50,9 @@ pub const PARALLEL_AGENTS: usize = 32;
 /// two trailers (or dollies) relative to the unit ahead (rad, positive pointing left; 0
 /// without); `tail` the x, y and heading of the last unit's tail, the reference point for
 /// reversing ([`Wheeled::tail_pose`](autonomousim_vehicles::ground::Wheeled::tail_pose); the
-/// position and heading for other vehicles).
-pub const STATE_FIELDS: [(&str, usize); 13] = [
+/// position and heading for other vehicles); `sinkage` the mean sinkage of a tracked
+/// vehicle's loaded patches into soft soil (m; 0 otherwise).
+pub const STATE_FIELDS: [(&str, usize); 14] = [
     ("position", 3),
     ("orientation", 4),
     ("velocity", 3),
@@ -65,10 +66,11 @@ pub const STATE_FIELDS: [(&str, usize); 13] = [
     ("road", 3),
     ("articulation", 2),
     ("tail", 3),
+    ("sinkage", 1),
 ];
 
 /// Length of a state row.
-pub const STATE_DIM: usize = 29;
+pub const STATE_DIM: usize = 30;
 
 #[derive(Clone, Debug)]
 pub struct WorldInstance {
@@ -371,6 +373,7 @@ impl WorldInstance {
             };
             row[24..26].copy_from_slice(&art);
             row[26..29].copy_from_slice(&[tail.pos.x, tail.pos.y, yaw(tail.rot)]);
+            row[29] = v.as_wheeled().map_or(0.0, |w| w.sinkage());
         };
         let rows = out.as_chunks_mut::<STATE_DIM>().0;
         if g.spec.count >= PARALLEL_AGENTS {

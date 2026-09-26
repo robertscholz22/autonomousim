@@ -21,7 +21,7 @@ use super::fiala::FialaParams;
 use super::mf::{MfInput, MfParams};
 use super::road::{RoadContact, road_contact};
 use super::track::{TRACK_CELLS, TrackPatch};
-use autonomousim_core::material::Material;
+use autonomousim_core::material::{Material, Soil};
 use autonomousim_core::terrain::Terrain;
 use glam::DVec3;
 
@@ -65,15 +65,18 @@ pub struct Tire {
 pub struct Surface {
     pub mu_scale: f64,
     pub rolling_scale: f64,
+    /// Deformable soil (track patches only; tyres keep their rigid-ground model).
+    pub soil: Option<Soil>,
 }
 
 impl Surface {
-    pub const REFERENCE: Self = Self { mu_scale: 1.0, rolling_scale: 1.0 };
+    pub const REFERENCE: Self = Self { mu_scale: 1.0, rolling_scale: 1.0, soil: None };
 
     pub fn of(material: &Material) -> Self {
         Self {
             mu_scale: material.friction / REFERENCE_FRICTION,
             rolling_scale: material.rolling_resistance / REFERENCE_ROLLING_RESISTANCE,
+            soil: material.soil,
         }
     }
 }
@@ -92,6 +95,10 @@ pub struct TireState {
     /// `None` at the track's ends), set by the vehicle before each step.
     pub shear: [[f64; 2]; TRACK_CELLS],
     pub inflow: [Option<[f64; 2]>; 2],
+    /// Track patches on soil: the depth of the rut under the patch (m), and the neighbouring
+    /// patches' (front, rear; `None` at the track's ends), set by the vehicle before each step.
+    pub sinkage: f64,
+    pub rut_in: [Option<f64>; 2],
 }
 
 /// Motion of a wheel, all in world coordinates.
@@ -131,6 +138,8 @@ pub struct TireForces {
     pub vx: f64,
     pub vy: f64,
     pub vsx: f64,
+    /// Track patches: sinkage into the soil (m).
+    pub sinkage: f64,
 }
 
 impl Tire {
@@ -274,7 +283,16 @@ impl Tire {
             // Shear stiffness per wheel at nominal load, μF_z/K per metre over half the patch.
             TireModel::Track(p) => ([0.5 * p.length; 2], [0.5 * p.length * p.mu * p.nominal_load / p.shear_modulus; 2]),
         };
-        TireState { u: 0.0, v: 0.0, sigma, stiffness, shear: [[0.0; 2]; TRACK_CELLS], inflow: [None; 2] }
+        TireState {
+            u: 0.0,
+            v: 0.0,
+            sigma,
+            stiffness,
+            shear: [[0.0; 2]; TRACK_CELLS],
+            inflow: [None; 2],
+            sinkage: 0.0,
+            rut_in: [None; 2],
+        }
     }
 
     /// The road plane below the wheel, sampled over ±0.3 R ahead and behind (a track patch:
@@ -401,6 +419,7 @@ impl Tire {
             vx,
             vy,
             vsx,
+            sinkage: 0.0,
         }
     }
 }

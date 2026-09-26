@@ -491,14 +491,16 @@ impl Wheeled {
     /// Tyre forces on terrain `scene.terrain`, with friction and rolling resistance from the
     /// material under each wheel.
     pub fn apply_tires(&mut self, scene: &StaticScene) {
-        // Track patches take their neighbours' end cells of the last step.
+        // Track patches take their neighbours' end cells and ruts of the last step.
         for (w, nb) in self.track_neighbours.iter().enumerate() {
             if nb.iter().any(Option::is_some) {
                 let inflow = [
                     nb[0].map(|f| self.corners[f].tire.shear[TRACK_CELLS - 1]),
                     nb[1].map(|r| self.corners[r].tire.shear[0]),
                 ];
+                let rut_in = [nb[0].map(|f| self.corners[f].tire.sinkage), nb[1].map(|r| self.corners[r].tire.sinkage)];
                 self.corners[w].tire.inflow = inflow;
+                self.corners[w].tire.rut_in = rut_in;
             }
         }
         let kin = &self.ws.kin;
@@ -725,6 +727,14 @@ impl Wheeled {
 
     pub fn wheels(&self) -> impl Iterator<Item = &WheelState> {
         self.corners.iter().map(|c| &c.out)
+    }
+
+    /// Mean sinkage into soft soil of the loaded road wheels' track patches (m); 0 on rigid
+    /// ground and for tyres.
+    pub fn sinkage(&self) -> f64 {
+        let (sum, count) =
+            self.wheels().filter(|w| w.tire.fz > 0.0).fold((0.0, 0usize), |(s, c), w| (s + w.tire.sinkage, c + 1));
+        if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
     /// World pose of wheel `w`'s spinning link (centre and orientation).
