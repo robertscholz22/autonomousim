@@ -1540,7 +1540,7 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
 | # | Step | Done when |
 |---|---|---|
 | 1 ✅ | Track running gear: `[track]` table, trailing-arm road wheels, track patches with shear state (rigid ground), side-locked road wheels, sprocket and idler colliders; a test vehicle | It rests at the static solution (road-wheel loads); drives straight with slip ≈ 0 at constant speed; holds on a slope below `atan μ` and slides above it; skid-steers in a circle |
-| 2 | Tracked drivelines (`clutch_brake`, `controlled_differential`, electric sides), controller and action modes for tracks, presets `tracked_apc` (Chrono extraction) and `rover_tracked` | Presets load, settle and drive; `vw` holds speed and yaw rate; static loads against Chrono's |
+| 2 ✅ | Tracked drivelines (braked differential, electric sides; see as built), controller and action modes for tracks, presets `tracked_apc` (Chrono extraction) and `rover_tracked` | Presets load, settle and drive; `vw` holds speed and yaw rate; static loads against Chrono's |
 | 3 | Validation: Chrono M113 fixtures (static loads, straight acceleration, steady turn at a fixed sprocket speed ratio, braked hold on a 30 % slope) and analytic rigid-ground checks (gradeability, Wong's skid-steer turning) | Tolerances above met or explained |
 | 4 | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
 | 5 | Simulation and viewer: tracked agents in scenarios, drive grids with soil cost, track visuals (band around sprocket, road wheels and idler), HUD per side (band speed, slip, sinkage), rural ditches | An APC drives by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay; ditch invariants hold |
@@ -1571,6 +1571,37 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
     - holds at 38° without creep and slides at 50° at `g(sin θ − μ cos θ)` (5 %);
     - skid-steers a steady circle wider than the kinematic radius (the outer track drives, the inner brakes) and turns on the spot;
     - steady chain shear against the integral.
+- **Step 2 (drivelines, controller, `tracked_apc`)**:
+  - **Band**: `Wheeled` ties each side's neighbouring road wheels with locked couplings (the band), so any drive or brake on one road wheel reaches the side. `rover_tracked`'s motors lost their own `coupling = "locked"`.
+  - **Steering by braking**: for a vehicle with a `[track]`, `DriveInput::steering > 0` adds service brake on the left (inner) track and `< 0` on the right, as Chrono's tracked drivelines do (`CombineDriverInputs`). With the combustion powertrain's per-axle open differentials, which the bands turn into one open differential between the sides, this is **Chrono's braked differential steering (BDS)**. It replaces the planned `clutch_brake` and `controlled_differential`: Chrono's M113 uses BDS. Electric side drives steer through `yaw` as before.
+  - **Controller**:
+    - Tracked vehicles with an engine get the speed loop plus a PI on the yaw-rate error that sets the steering (`brake_steer_gain` 1 s/rad, integral `yaw_integral` times it), its sign flipped in reverse.
+    - While the speed builds up, the yaw-rate target follows the commanded path curvature (at most the pivot's `2/B`), and the steering's authority grows with the speed up to half the target. Without this, a turn asked from standstill braked a track at once, and the turn's resistance stalled the vehicle on its brakes for good.
+    - A turn on the spot becomes a pivot turn about the inner track, its centre at `|ω|B/2`.
+    - `vw` is allowed for tracked vehicles. `yaw_rate` defaults to 0.8·speed/track as for side drives.
+    - Per-wheel traction braking is off for brake-steered tracks.
+  - **Statics**: a wheel may hang clear of the ground at rest if its spring has a given preload, as the end road wheels do under the band.
+  - **`tracked_apc`**, from Chrono's M113 via `tools/gen_chrono_tracked_fixtures.py` (NSC contact: with SMC the braked vehicle crept at 0.5 m/s on chattering shoes). The script records:
+    - design (masses and inertias, the lumped chassis);
+    - the settled pose, road-wheel positions and arm angles, averaged over the last 2 s of a 5 s braked settle;
+    - the **vertical ground reaction per road wheel**, by binning contact forces on the ground plane (`ReportAllContacts`);
+    - the conical gear ratio.
+  - **Chrono's M113 findings**:
+    - **Suspension forces are not ground loads.** The track's tension loads the springs to about twice the weight in total. The first and last road wheels ride 3–5 cm above the ground run and carry no ground load at rest. The preset keeps this: those two hang (given preload −608 N, their unsprung weight), and the middle three carry the vehicle.
+    - **Conical gear ratio**: 0.504 ± 0.04 averaged over 3 s of driving (single samples scatter ±0.1: the iterative solver leaves the shaft constraints loose), so the JSON's 0.5.
+    - **Weak launch**: Chrono's full-throttle map falls to 0 N·m at −100 rpm, and the clutchless SimpleMap driveline turns the engine with the tracks, so the M113 needs 2 s to reach 0.3 m/s. The preset holds 610 N·m down to standstill instead (standing in for a launch clutch). Step 3 must give Chrono the same map by JSON.
+  - **Preset values**:
+    - Chassis: hull + sprockets + idlers + their carriers + shoes + the arms' mass not carried with the wheels (the arm's `I/L²` about the pivot, 26.45 kg, is carrier mass).
+    - Road-wheel spin inertia 33.3 = wheel + band (shoes' mass × r²/5) + rollers.
+    - Wheel rates and dampers are the torsion rates over `(L cos θ)²` at the settled arm angles.
+    - Patch: radius 0.374, `k_z` 2e6, 0.38 × 0.667 m, `K` 1 cm, `μ` 0.8.
+    - Brakes per road wheel: 10 kN·m × (0.364/0.245)/5.
+    - `final_drive` 0.5 × 0.245/0.364.
+    - Chrono's gear ratios and shift points; our own zero-throttle map (Chrono's repeats the full-throttle one).
+  - **Turning is weak, and the reference model's own**. Braking the inner track takes drive away rather than passing it to the outer track, and the M113's forward gears (no torque converter) leave about 21 kN (1st) and 12 kN (2nd) of tractive force. The patches' turning resistance, an effective lateral coefficient of about 0.16 at R ≈ 110 m, then allows only gentle forward turns: 4 m/s at 0.05 rad/s holds, and 6 m/s at 0.1 rad/s does not. The reverse gear is lower, so −2 m/s at −0.1 rad/s holds. Pivot turns are out of reach. A torque converter, or a regenerative steering differential, would lift this; both are left open.
+  - **Tests**:
+    - `tracks.rs`: the APC's mass and static height (1 cm), pitch (0.005 rad) and per-road-wheel ground-load shares (3 points of the total) against Chrono; parked, it settles there. Actual: height 0.602 vs 0.604 m, pitch 0.0142 vs 0.0134 rad, shares within 1.2 points.
+    - `control/tests/ground_loop.rs`: `rover_tracked` tracks `vw` (straight, turning, on the spot, reverse) like the other robots. The APC tracks (8, 0), (4, 0.05) and (−2, −0.1) to within 5 %, holds on its brakes, and survives an impossible spot-turn command, rolling instead of stalling, then drives off straight.
 
 ## Roadmap after M1
 | M | Content | Validation |

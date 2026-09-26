@@ -1,0 +1,131 @@
+# 11.3 t tracked armoured personnel carrier after the Chrono::Vehicle M113 model: five road
+# wheels per side on torsion-bar trailing arms, a front sprocket and a rear idler, a SimpleMap
+# engine with a 4-speed automatic, and a braked-differential steering driveline.
+type = "wheeled"
+name = "tracked_apc"
+source = """
+Masses, inertias, road-wheel, arm, sprocket and idler geometry, torsion-spring and damper \
+rates, brakes, engine map, gear ratios, shift points and the conical gear ratio from Project \
+Chrono's M113 model (src/chrono_models/vehicle/m113 and data/vehicle/M113, BSD-3-Clause, \
+Copyright (c) 2014 projectchrono.org); static pose and road-wheel positions measured on it \
+(tools/gen_chrono_tracked_fixtures.py, which also checks the conical ratio). The chassis \
+frame is Chrono's (origin on the sprocket axis). The chassis lumps the hull with everything that does not move relative to it in this \
+model: sprockets, idlers and their carriers, the track shoes, and the arms' mass not carried \
+with the wheels. Road-wheel spin inertia includes the band (the shoes' circulating mass) and \
+the rollers referred to the road wheels. Axle positions are Chrono's settled road-wheel \
+positions, left and right averaged (Chrono staggers the right side 8.5 cm back): at rest the \
+band lifts the first and last road wheels clear of the ground, so these hang on their springs \
+(given preload) while the others' preloads carry the static load. The torsion springs' and \
+dampers' rates are referred to the wheels at the settled arm angles. The full-throttle torque \
+below 500 rpm and the zero-throttle map (Chrono's repeats the full-throttle one), track shear modulus, internal rolling \
+resistance, bump and rebound stops, drag and colliders are estimates."""
+
+[chassis]
+mass = 10722.8
+com = [-1.9956, 0.0, 0.2581]
+inertia = [18260.0, 33430.0, 37490.0]
+drag_area = [5.0, 10.0, 12.0]           # estimate
+
+# Road wheels: 35.56 kg, the arm's 26.45 kg equivalent at the wheel (I/L² about the pivot) as
+# carrier mass. Spin inertia 33.26 = wheel 2.16 + band 1135 kg·(0.365 m)²/5 + sprocket and
+# idler 0.85.
+[[axles]]
+name = "road_wheel_1"
+position = [-0.6995, 1.0795, -0.2095]
+wheel = { mass = 35.56, inertia = [1.14, 33.26, 1.14] }
+brake = { max_torque = 2970.0, parking_torque = 2970.0 }   # 10 kN·m per sprocket, ×(0.364/0.245)/5
+suspension = { trailing_arm = { length = 0.3176, angle = 0.4172 }, carrier_mass = 26.45, carrier_inertia = [0.37, 0.77, 0.77], spring = { rate = 296433.0, preload = -608.0 }, damper = { bump = 5929.0, rebound = 5929.0 }, bump_stop = { travel = 0.12, stiffness = 5e6 }, rebound_stop = { travel = -0.10, stiffness = 5e6 } }
+
+[[axles]]
+name = "road_wheel_2"
+position = [-1.3412, 1.0795, -0.2566]
+wheel = { mass = 35.56, inertia = [1.14, 33.26, 1.14] }
+brake = { max_torque = 2970.0, parking_torque = 2970.0 }
+suspension = { trailing_arm = { length = 0.3176, angle = 0.5857 }, carrier_mass = 26.45, carrier_inertia = [0.37, 0.77, 0.77], spring = { rate = 356819.0 }, damper = { bump = 7136.0, rebound = 7136.0 }, bump_stop = { travel = 0.16, stiffness = 5e6 }, rebound_stop = { travel = -0.10, stiffness = 5e6 } }
+
+[[axles]]
+name = "road_wheel_3"
+position = [-2.0013, 1.0795, -0.2665]
+wheel = { mass = 35.56, inertia = [1.14, 33.26, 1.14] }
+brake = { max_torque = 2970.0, parking_torque = 2970.0 }
+suspension = { trailing_arm = { length = 0.3176, angle = 0.6237 }, carrier_mass = 26.45, carrier_inertia = [0.37, 0.77, 0.77], spring = { rate = 376021.0 }, damper = { bump = 7520.0, rebound = 7520.0 }, bump_stop = { travel = 0.16, stiffness = 5e6 }, rebound_stop = { travel = -0.10, stiffness = 5e6 } }
+
+[[axles]]
+name = "road_wheel_4"
+position = [-2.6616, 1.0795, -0.2748]
+wheel = { mass = 35.56, inertia = [1.14, 33.26, 1.14] }
+brake = { max_torque = 2970.0, parking_torque = 2970.0 }
+suspension = { trailing_arm = { length = 0.3176, angle = 0.6565 }, carrier_mass = 26.45, carrier_inertia = [0.37, 0.77, 0.77], spring = { rate = 394879.0 }, damper = { bump = 7898.0, rebound = 7898.0 }, bump_stop = { travel = 0.16, stiffness = 5e6 }, rebound_stop = { travel = -0.10, stiffness = 5e6 } }
+
+[[axles]]
+name = "road_wheel_5"
+position = [-3.3380, 1.0795, -0.2611]
+wheel = { mass = 35.56, inertia = [1.14, 33.26, 1.14] }
+brake = { max_torque = 2970.0, parking_torque = 2970.0 }
+suspension = { trailing_arm = { length = 0.3176, angle = 0.6032 }, carrier_mass = 26.45, carrier_inertia = [0.37, 0.77, 0.77], spring = { rate = 365346.0, preload = -608.0 }, damper = { bump = 7307.0, rebound = 7307.0 }, bump_stop = { travel = 0.14, stiffness = 5e6 }, rebound_stop = { travel = -0.10, stiffness = 5e6 } }
+
+[track]
+sprocket = { position = [0.0, 1.0795, 0.0], radius = 0.305 }     # 0.245 + shoe 0.06
+idler = { position = [-3.95, 1.0795, -0.12], radius = 0.315 }    # 0.255 + shoe 0.06
+
+[track.patch]
+radius = 0.374                          # road wheel 0.305 + shoe; 0.364 loaded, as in Chrono
+width = 0.38
+length = 0.667                          # road-wheel pitch
+vertical_stiffness = 2.0e6
+vertical_damping = 1.0e4
+shear_modulus = 0.01
+mu = 0.8
+nominal_load = 18500.0                  # weight over the six loaded road wheels
+
+# Braked differential steering: an open differential between the sprockets (here the axles'
+# open differentials, the bands locking each side's road wheels together); `steering` brakes
+# the inner track.
+[powertrain]
+type = "combustion"
+driven = [0, 1, 2, 3, 4]
+final_drive = 0.3365                    # conical gear 0.5 × sprocket 0.245 / road wheel 0.364
+driveline_inertia = 5.7                 # driveshaft 0.5 and differential box 0.6, referred to the road wheels
+axle_differential = "open"
+center_differential = "open"
+
+# Chrono's full-throttle map falls to zero from 500 to −100 rpm: with the clutchless SimpleMap
+# driveline that leaves the vehicle almost without torque from standstill (Chrono's M113 takes
+# 2 s to reach 0.3 m/s). Here the torque holds down to standstill, standing in for a launch
+# clutch.
+[powertrain.engine]
+max_rpm = 3500.0
+full_throttle = [[-100, 610], [500, 610], [1000, 610], [1500, 603], [2000, 590], [2500, 556],
+    [2800, 535], [3000, 515], [3200, -135]]
+zero_throttle = [[-100, 0], [500, -20], [1000, -25], [1500, -30], [2000, -40], [2500, -50],
+    [3000, -65], [3500, -600]]
+
+[powertrain.gearbox]
+forward = [0.240, 0.427, 0.685, 0.962]
+reverse = -0.151
+shift = [[750, 1500], [750, 1500], [750, 1500], [750, 1500]]
+
+# Hull: belly (0.43 m clearance), glacis and rear (the ground is ≈ 0.6 m below the origin).
+[[colliders]]
+center = [-0.8, 0.0, 0.33]
+radius = 0.5
+
+[[colliders]]
+center = [-2.0, 0.0, 0.33]
+radius = 0.5
+
+[[colliders]]
+center = [-3.2, 0.0, 0.33]
+radius = 0.5
+
+[[colliders]]
+center = [0.1, 0.0, 0.55]
+radius = 0.5
+
+[[colliders]]
+center = [-4.1, 0.0, 0.7]
+radius = 0.6
+
+[[colliders]]
+center = [-2.0, 0.0, 1.1]
+radius = 0.8

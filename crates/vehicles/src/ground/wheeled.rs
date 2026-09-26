@@ -8,6 +8,12 @@
 //! generalised forces on the joint coordinates, so their reactions reach the bodies through
 //! the joints. Steering angles are prescribed trajectories: each step drives the knuckle exactly
 //! to its target angle, and the joint torque this needs is reported.
+//!
+//! Tracked vehicles: each road wheel stands on a track patch (see [`super::tire`]), and the
+//! band ties the road wheels of a side together, a locked coupling between neighbours, so the
+//! sprocket's drive reaches all of them. They steer by braking: `DriveInput::steering > 0`
+//! adds service brake on the left (inner) track, `< 0` on the right, as Chrono's tracked
+//! drivelines do.
 
 use super::def::{SteerMode, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
@@ -56,7 +62,7 @@ pub struct WheelState {
     /// Spin angle (rad) and rate (rad/s) relative to the carrier.
     pub spin_angle: f64,
     pub spin: f64,
-    /// Drive torque (powertrain and differentials) and brake torque on the wheel (N·m).
+    /// Drive torque (powertrain, differentials and band) and brake torque on the wheel (N·m).
     pub drive_torque: f64,
     pub brake_torque: f64,
     pub tire: TireForces,
@@ -129,6 +135,8 @@ pub struct Wheeled {
     colliders: Vec<SphereCollider>,
     /// Per wheel on a track, the neighbouring road wheels (front, rear).
     track_neighbours: Vec<[Option<usize>; 2]>,
+    /// The bands: locked couplings between neighbouring road wheels.
+    bands: Vec<Coupling>,
     contact: ContactModel,
     // State.
     pub state: MbState,
@@ -213,6 +221,12 @@ impl Wheeled {
             powertrain: Powertrain::new(&def.powertrain, &inertia, dt),
             colliders: def.sphere_colliders(),
             track_neighbours: def.track_neighbours(),
+            bands: def
+                .track_neighbours()
+                .iter()
+                .enumerate()
+                .filter_map(|(w, nb)| nb[1].map(|r| Coupling::new(&[w], &[r], &inertia, dt)))
+                .collect(),
             contact: def.contact.model(mass, dt),
             model,
             mass,
@@ -301,11 +315,14 @@ impl Wheeled {
             c.steer_cmd = 0.0;
             c.out = WheelState::default();
         }
+        for b in &mut self.bands {
+            b.reset();
+        }
         // Wheels rolling with their unit: the towing unit's from the chassis motion, the others
         // from their centres' velocities along their heading.
         forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut self.ws.kin);
         for (w, c) in self.corners.iter().enumerate() {
-            let radius = self.def.tire(w / 2).radius() - st.map_or(0.0, |s| s.deflection[w]);
+            let radius = self.def.tire(w / 2).radius() - st.map_or(0.0, |s| s.deflection[w].max(0.0));
             let forward = if self.def.wheel_unit(w) == 0 {
                 (v_body + init.ang_vel_body.cross(self.def.wheel_position(w))).x
             } else {
@@ -414,11 +431,20 @@ impl Wheeled {
         self.drive.fill(0.0);
         self.brake.fill(0.0);
         self.powertrain.step(&input, &self.spin, dt, &mut self.drive);
+        for b in &mut self.bands {
+            b.step(f64::INFINITY, &self.spin, dt, &mut self.drive);
+        }
+        let tracked = self.def.track.is_some();
         let tick = self.brake_tick;
         self.brake_tick = self.brake_tick.wrapping_add(1);
         for (w, c) in self.corners.iter_mut().enumerate() {
             let b = &self.def.axles[w / 2].brake;
-            let mut pedal = (input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w]).min(1.0);
+            let mut pedal = input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w];
+            if tracked && input.wheels.is_none() {
+                // Brake steering: the inner track.
+                pedal += if w % 2 == 0 { input.steering.max(0.0) } else { (-input.steering).max(0.0) };
+            }
+            let mut pedal = pedal.min(1.0);
             // Air brakes: the pedal of `delay` ago, through the first-order lag.
             if !c.brake_delay.is_empty() {
                 let slot = tick % c.brake_delay.len();

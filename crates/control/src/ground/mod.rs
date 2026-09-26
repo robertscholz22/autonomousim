@@ -5,6 +5,7 @@
 //! speed ─PI→ acceleration demand ─inverse powertrain→ throttle / motor commands / brake
 //! curvature ─bicycle model + ∫ curvature error→ steering
 //! (v, ω) ─kinematics + ∫ yaw-rate error→ side wheel speeds ─PI→ motor commands   (side drives)
+//! (v, ω) ─speed loop→ throttle / brake;  yaw-rate error ─PI→ brake steering        (tracks, engine)
 //! ```
 //!
 //! The speed loop commands an acceleration. The allocator inverts the nominal powertrain to
@@ -19,6 +20,15 @@
 //! slip of skid steering, held while a motor saturates. Gains follow from time constants in
 //! [`GroundConfig`] and the vehicle's nominal mass and inertia, so one configuration fits cars
 //! and robots.
+//!
+//! Tracked vehicles with an engine steer by braking the inner track (see
+//! [`Wheeled`](autonomousim_vehicles::ground::Wheeled)): a PI on the yaw-rate error sets the
+//! steering, with its sign flipped in reverse; while the speed builds up, the yaw-rate target
+//! follows the commanded path curvature (at most a pivot turn's `2/B`), and the steering's
+//! authority grows with the speed up to half the target. A turn on the spot becomes a pivot
+//! turn about the inner track, its centre moving at `|ω|·B/2`. Braking the inner track takes
+//! drive away rather than passing it to the outer one, so how tight a turn is reachable
+//! depends on the engine's reserve.
 //!
 //! Automatic gear selection (combustion) engages reverse only near standstill: a negative
 //! speed request brakes a vehicle still rolling forward first.
@@ -123,6 +133,9 @@ pub struct GroundConfig {
     /// the slip of skid steering.
     pub yaw_integral: f64,
     pub side_speed_integral: f64,
+    /// Brake steering of tracked vehicles with an engine: steering command per yaw-rate error
+    /// (s/rad); the integral gain is `yaw_integral` times it.
+    pub brake_steer_gain: f64,
     /// Wheel-speed loop time constant of side drives (s).
     pub wheel_time_constant: f64,
 }
@@ -142,6 +155,7 @@ impl Default for GroundConfig {
             curvature_correction: 0.15,
             yaw_integral: 2.0,
             side_speed_integral: 2.0,
+            brake_steer_gain: 1.0,
             wheel_time_constant: 0.05,
         }
     }
@@ -188,6 +202,8 @@ pub struct GroundController {
     steering: Option<(f64, f64, f64)>,
     /// Track of a side drive (m).
     track: Option<f64>,
+    /// Track of a tracked vehicle steered by its brakes (m).
+    brake_steer: Option<f64>,
     // Loop state.
     speed_i: f64,
     curvature_i: f64,
@@ -218,6 +234,7 @@ impl GroundController {
             && c.curvature_correction >= 0.0
             && c.yaw_integral >= 0.0
             && c.side_speed_integral >= 0.0
+            && c.brake_steer_gain >= 0.0
             && pos(c.wheel_time_constant))
         {
             return Err(ControlError::InvalidConfig("ground controller gains must be positive".into()));
@@ -267,12 +284,12 @@ impl GroundController {
             let wheelbase = axle.position.x - def.steer_reference();
             (wheelbase.abs() > 1e-6).then_some((wheelbase, axle.share(), s.max_angle))
         });
-        let track = match &drive {
-            Drive::Electric(m) if is_side_drive(m) => {
-                let ys: Vec<f64> = driven.iter().map(|&w| def.wheel_position(w).y.abs()).collect();
-                Some(2.0 * ys.iter().sum::<f64>() / ys.len() as f64)
-            }
-            _ => None,
+        let ys: Vec<f64> = driven.iter().map(|&w| def.wheel_position(w).y.abs()).collect();
+        let width = 2.0 * ys.iter().sum::<f64>() / ys.len() as f64;
+        let (track, brake_steer) = match &drive {
+            Drive::Electric(m) if is_side_drive(m) => (Some(width), None),
+            Drive::Combustion(_) if def.track.is_some() => (None, Some(width)),
+            _ => (None, None),
         };
         let motors = match &drive {
             Drive::Electric(m) => m.len(),
@@ -290,6 +307,7 @@ impl GroundController {
             wheel_brake,
             steering,
             track,
+            brake_steer,
             speed_i: 0.0,
             curvature_i: 0.0,
             yaw_i: 0.0,
@@ -324,6 +342,11 @@ impl GroundController {
     /// diff-drive).
     pub fn is_side_drive(&self) -> bool {
         self.track.is_some()
+    }
+
+    /// Whether the vehicle is tracked and steers by braking a track.
+    pub fn is_brake_steered(&self) -> bool {
+        self.brake_steer.is_some()
     }
 
     /// Clear the loop state.
@@ -422,7 +445,8 @@ impl GroundController {
         // Spinning wheels under drive (not under braking) are braked in proportion to their
         // excess slip, up to their share of the drive torque, as an open differential would
         // otherwise waste that torque on them.
-        if (self.reverse && accel < 0.0) || (!self.reverse && accel > 0.0) {
+        // (Not for brake-steered tracks, whose outer track runs ahead of the vehicle in a turn.)
+        if self.brake_steer.is_none() && ((self.reverse && accel < 0.0) || (!self.reverse && accel > 0.0)) {
             let share = force.abs() * self.radius / self.driven.len() as f64;
             for &w in &self.driven {
                 let excess = (slip(w) - allowed) / allowed;
@@ -541,6 +565,9 @@ impl GroundController {
 
     /// Side drives: wheel speeds from speed and yaw rate, per-motor wheel-speed PI.
     fn side_drive(&mut self, v_ref: f64, yaw_ref: f64, est: &GroundEstimate) -> DriveInput {
+        if let Some(width) = self.brake_steer {
+            return self.brake_steered(v_ref, yaw_ref, width, est);
+        }
         let (Some(track), Drive::Electric(motors)) = (self.track, &self.drive) else {
             // Not a side drive: speed only.
             return self.longitudinal(v_ref, est);
@@ -585,6 +612,39 @@ impl GroundController {
             }
         }
         DriveInput { wheels: Some(WheelCommands { drive: commands, ..Default::default() }), ..Default::default() }
+    }
+
+    /// Tracked vehicles with an engine: speed loop, and a yaw-rate PI on the brake steering.
+    fn brake_steered(&mut self, v_ref: f64, yaw_ref: f64, width: f64, est: &GroundEstimate) -> DriveInput {
+        let (v_ref, yaw_ref) = (finite(v_ref), finite(yaw_ref));
+        // On the spot: a pivot turn about the braked inner track.
+        let v_ref = if v_ref == 0.0 { 0.5 * yaw_ref.abs() * width } else { v_ref };
+        let mut input = self.longitudinal(v_ref, est);
+        let c = &self.config;
+        if yaw_ref == 0.0 && input.brake >= 1.0 {
+            self.yaw_i = 0.0;
+            return input;
+        }
+        // The commanded path curvature (at most a pivot about the stopped inner track) while
+        // the speed builds up: turning at the full yaw rate from standstill would ask for a
+        // turn so tight that its resistance stalls the vehicle.
+        let curvature = (yaw_ref / v_ref.abs().max(1e-3)).clamp(-2.0 / width, 2.0 / width);
+        let reachable = (curvature * est.speed().abs()).abs();
+        let yaw_ref = yaw_ref.clamp(-reachable, reachable);
+        // Braking the left track turns left going forward, right in reverse.
+        let direction = if self.reverse { -1.0 } else { 1.0 };
+        let e = direction * (yaw_ref - est.yaw_rate);
+        let kp = c.brake_steer_gain;
+        let raw = kp * e + self.yaw_i;
+        let steering = raw.clamp(-1.0, 1.0);
+        if steering == raw || (raw > steering) != (e > 0.0) {
+            self.yaw_i = (self.yaw_i + c.yaw_integral * kp * e * self.dt).clamp(-1.0, 1.0);
+        }
+        // Steering authority grows with the speed up to half the target: a vehicle stalled in a
+        // turn too tight for it lets go of the brake and gets rolling again.
+        let authority = (est.speed().abs() / (0.5 * v_ref.abs()).max(1e-3)).min(1.0);
+        input.steering = steering * authority;
+        input
     }
 }
 

@@ -1,6 +1,6 @@
 //! Closed-loop checks of the ground vehicle controller and action modes on the full vehicle
 //! models over flat asphalt: speed steps (accelerating, braking, holding, reversing), curvature
-//! tracking on a circle, (v, ω) tracking of the robots, and the `per_wheel` channels (torque
+//! tracking on a circle, (v, ω) tracking of the robots and the tracked carrier, and the `per_wheel` channels (torque
 //! vectoring, one-wheel braking, crab and counter-phase steering) on an electric four-motor,
 //! four-wheel-steered variant of the sedan.
 
@@ -144,7 +144,7 @@ fn curvature_tracking_on_a_circle() {
 /// least) of the command.
 #[test]
 fn robots_track_speed_and_yaw_rate() {
-    for name in ["rover_diff", "rover_skid"] {
+    for name in ["rover_diff", "rover_skid", "rover_tracked"] {
         let map = GroundActionMap::new(GroundActionMode::Vw, &GroundActionLimits::default(), &def(name)).unwrap();
         let (vmax, wmax) = (map.speed(), map.yaw_rate());
         for (speed, yaw_rate) in
@@ -169,6 +169,38 @@ fn robots_track_speed_and_yaw_rate() {
         let k = k.iter().sum::<f64>() / k.len() as f64;
         assert!((k - 1.0).abs() < 0.05, "{name}: curvature {k}");
     }
+}
+
+/// The tracked carrier (engine, braked differential steering) follows (v, ω) commands within
+/// its means, to 5 % (0.02 at least): straight, turning, and turning in reverse; then stops and
+/// holds on its brakes. Braking the inner track takes drive away, and Chrono's M113 gearing
+/// (no torque converter) leaves little reserve in the forward gears, so forward turns are
+/// gentle (the reverse gear is lower). Asked to turn on the spot, which it cannot, it keeps
+/// rolling in a left turn instead of stalling on its brakes, and drives off straight after.
+#[test]
+fn tracked_carrier_tracks_speed_and_yaw_rate() {
+    let name = "tracked_apc";
+    let map = GroundActionMap::new(GroundActionMode::Vw, &GroundActionLimits::default(), &def(name)).unwrap();
+    assert!((map.yaw_rate() - 0.8 * map.speed() / (2.0 * 1.0795)).abs() < 1e-9);
+    let mean = |x: &[f64]| x.iter().sum::<f64>() / x.len() as f64;
+    for (speed, yaw_rate) in [(8.0, 0.0), (4.0, 0.05), (-2.0, -0.1)] {
+        let mut rig = Rig::new(name);
+        let sp = GroundSetpoint::SpeedYawRate { speed, yaw_rate };
+        rig.run(&sp, 20.0, |_| 0.0);
+        let v = mean(&rig.run(&sp, 3.0, |r| r.v.speed()));
+        let w = mean(&rig.run(&sp, 3.0, |r| r.v.ang_vel_body().z));
+        println!("{name}: v {v:.3} for {speed:.3}, ω {w:.3} for {yaw_rate:.3}");
+        assert!((v - speed).abs() < (0.05 * speed.abs()).max(0.02), "{name}: v {v} for {speed}");
+        assert!((w - yaw_rate).abs() < (0.05 * yaw_rate.abs()).max(0.02), "{name}: ω {w} for {yaw_rate}");
+        rig.run(&GroundSetpoint::SpeedYawRate { speed: 0.0, yaw_rate: 0.0 }, 10.0, |_| 0.0);
+        assert!(rig.v.speed().abs() < 0.02 && rig.v.ang_vel_body().z.abs() < 0.01, "{name}: not held");
+    }
+    let mut rig = Rig::new(name);
+    rig.run(&GroundSetpoint::SpeedYawRate { speed: 0.0, yaw_rate: 0.3 }, 20.0, |_| 0.0);
+    assert!(rig.v.speed() > 0.02 && rig.v.ang_vel_body().z > 0.0, "{name}: stalled");
+    let sp = GroundSetpoint::SpeedYawRate { speed: 4.0, yaw_rate: 0.0 };
+    rig.run(&sp, 20.0, |_| 0.0);
+    assert!((rig.v.speed() - 4.0).abs() < 0.1 && rig.v.ang_vel_body().z.abs() < 0.01, "{name}: not recovered");
 }
 
 // ------------------------------------------------------------------------------ per_wheel

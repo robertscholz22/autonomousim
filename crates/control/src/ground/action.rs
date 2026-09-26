@@ -5,7 +5,7 @@
 //! | `raw` | drive, steering (steered vehicles) | pedal: full throttle (+1), full brake then full reverse throttle (−1); full lock |
 //! | `raw` | left, right (side drives) | full motor command per side |
 //! | `vk` | speed, curvature | `speed` forward (+1) or `reverse` backward (−1); ±`curvature` (1/m, + left) |
-//! | `vw` | speed, yaw rate (side drives only) | as `vk`; ±`yaw_rate` (rad/s) |
+//! | `vw` | speed, yaw rate (side drives and tracks only) | as `vk`; ±`yaw_rate` (rad/s) |
 //! | `per_wheel` | the vehicle's own channels, see below | full command per channel |
 //!
 //! `per_wheel` exposes only channels the vehicle has, in this order: `throttle` (combustion
@@ -123,7 +123,8 @@ impl GroundActionMap {
     /// Defaults of omitted limits: `speed` the top speed (engine or motor no-load speed in the
     /// top gear) up to 20 m/s; `reverse` 0.3·`speed` for engines and `speed` for electric drives;
     /// `curvature` 95 % of the tightest bicycle-model curvature, or 2/track for side drives;
-    /// `yaw_rate` 0.8·`speed`/track for side drives, `speed`·`curvature` otherwise.
+    /// `yaw_rate` 0.8·`speed`/track for side drives and tracked vehicles, `speed`·`curvature`
+    /// otherwise.
     pub fn new(mode: GroundActionMode, limits: &GroundActionLimits, def: &WheeledDef) -> Result<Self, ControlError> {
         let n = def.num_wheels();
         let radius = def.tire(0).radius();
@@ -156,7 +157,8 @@ impl GroundActionMap {
             Some(k) => 0.95 * k,
             None => 2.0 / track,
         });
-        let yaw_rate = limits.yaw_rate.unwrap_or(if side_drive { 0.8 * speed / track } else { speed * curvature });
+        let skid = side_drive || def.track.is_some();
+        let yaw_rate = limits.yaw_rate.unwrap_or(if skid { 0.8 * speed / track } else { speed * curvature });
         let pos = |x: f64| x > 0.0 && x.is_finite();
         if !(pos(speed) && pos(reverse) && pos(curvature) && pos(yaw_rate)) {
             return Err(ControlError::InvalidConfig(format!(
@@ -164,9 +166,9 @@ impl GroundActionMap {
                 def.name
             )));
         }
-        if mode == GroundActionMode::Vw && !side_drive {
+        if mode == GroundActionMode::Vw && !skid {
             return Err(ControlError::InvalidConfig(format!(
-                "{}: vw needs a skid-steer or diff-drive vehicle",
+                "{}: vw needs a skid-steer, diff-drive or tracked vehicle",
                 def.name
             )));
         }

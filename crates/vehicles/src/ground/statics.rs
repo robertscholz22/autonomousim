@@ -210,7 +210,9 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
             for w in (0..n).filter(|&w| automatic[w]) {
                 out[w] = -grad[travel_param(w).expect("sprung")];
             }
-            if let Some(w) = (0..n).find(|&w| deflection[w] <= 0.0) {
+            // A wheel may hang clear of the ground only with a given preload (as the end road
+            // wheels of a track, lifted by the band): an automatic one would be meaningless.
+            if let Some(w) = (0..n).find(|&w| deflection[w] <= 0.0 && automatic[w]) {
                 return Err(format!("wheel {w} does not touch the ground at rest"));
             }
             let mut joints = vec![[0.0; 2]; def.units.len()];

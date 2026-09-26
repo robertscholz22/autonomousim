@@ -268,3 +268,38 @@ fn steady_shear_matches_janosi_hanamoto() {
         assert!((total / integral - 1.0).abs() < 0.01, "slip {slip}: {total} vs {integral}");
     }
 }
+
+fn m113() -> serde_json::Value {
+    let path = format!("{}/../../fixtures/chrono/tracked_m113.json", env!("CARGO_MANIFEST_DIR"));
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The M113-based preset has Chrono's mass, and its static solution Chrono's pose and ground
+/// loads (fixtures/chrono/tracked_m113.json): the band lifts the end road wheels clear of the
+/// ground, the middle three carry the weight in Chrono's shares. Parked, it settles there.
+#[test]
+fn apc_rests_at_chronos_static_pose_and_loads() {
+    let f = m113();
+    let d = presets::wheeled("tracked_apc").unwrap();
+    assert!((d.total_mass() / f["design"]["total_mass"].as_f64().unwrap() - 1.0).abs() < 1e-4);
+    let st = d.static_state(G).unwrap();
+    let s = &f["static"];
+    let (height, pitch) = (s["height"].as_f64().unwrap(), s["pitch"].as_f64().unwrap());
+    assert!((st.height - height).abs() < 0.01, "height {} vs Chrono {height}", st.height);
+    assert!((st.pitch - pitch).abs() < 0.005, "pitch {} vs Chrono {pitch}", st.pitch);
+    let ground: Vec<f64> = s["wheels"].as_array().unwrap().iter().map(|w| w["ground_load"].as_f64().unwrap()).collect();
+    let chrono_total: f64 = ground.iter().sum();
+    for a in 0..5 {
+        let ours = (st.loads[2 * a] + st.loads[2 * a + 1]) / (d.total_mass() * G);
+        let chrono = (ground[a] + ground[5 + a]) / chrono_total;
+        assert!((ours - chrono).abs() < 0.03, "road wheel {}: load share {ours:.3} vs Chrono {chrono:.3}", a + 1);
+    }
+
+    let mut v = Wheeled::new(Arc::new(d), DT);
+    World::flat().run(&mut v, &DriveInput { parking: true, ..Default::default() }, 3.0);
+    assert!(v.lin_vel_world().length() < 1e-3 && v.contacts().is_empty());
+    assert!((v.position().z - st.height).abs() < 1e-3, "height {} vs {}", v.position().z, st.height);
+    for (k, wh) in v.wheels().enumerate() {
+        assert!((wh.tire.fz - st.loads[k]).abs() < 0.01 * 18500.0, "wheel {k}: {} vs {}", wh.tire.fz, st.loads[k]);
+    }
+}
