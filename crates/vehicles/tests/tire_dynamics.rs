@@ -132,6 +132,7 @@ fn transient_slip_settles_on_the_steady_state() {
                 let o = p.eval(f.fz, kappa, tan_alpha, p.half_length(f.deflection), 1.0);
                 (o.fx, o.fy)
             }
+            TireModel::Track(_) => unreachable!("tyres only"),
         };
         assert!((f.fx - fx).abs() < 1e-9 * f.fz && (f.fy - fy).abs() < 1e-9 * f.fz, "{name}");
     }

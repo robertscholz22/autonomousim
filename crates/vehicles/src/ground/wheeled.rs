@@ -11,7 +11,7 @@
 
 use super::def::{SteerMode, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
-use super::tire::{Surface, Tire, TireForces, TireState, WheelMotion};
+use super::tire::{Surface, TRACK_CELLS, Tire, TireForces, TireState, WheelMotion};
 use super::tree::{UnitLinks, build};
 use super::units::{UnitJoint, yaw_pitch_roll};
 use crate::multirotor::AirData;
@@ -127,6 +127,8 @@ pub struct Wheeled {
     tail: DVec3,
     powertrain: Powertrain,
     colliders: Vec<SphereCollider>,
+    /// Per wheel on a track, the neighbouring road wheels (front, rear).
+    track_neighbours: Vec<[Option<usize>; 2]>,
     contact: ContactModel,
     // State.
     pub state: MbState,
@@ -210,6 +212,7 @@ impl Wheeled {
             brake_tick: 0,
             powertrain: Powertrain::new(&def.powertrain, &inertia, dt),
             colliders: def.sphere_colliders(),
+            track_neighbours: def.track_neighbours(),
             contact: def.contact.model(mass, dt),
             model,
             mass,
@@ -462,6 +465,16 @@ impl Wheeled {
     /// Tyre forces on terrain `scene.terrain`, with friction and rolling resistance from the
     /// material under each wheel.
     pub fn apply_tires(&mut self, scene: &StaticScene) {
+        // Track patches take their neighbours' end cells of the last step.
+        for (w, nb) in self.track_neighbours.iter().enumerate() {
+            if nb.iter().any(Option::is_some) {
+                let inflow = [
+                    nb[0].map(|f| self.corners[f].tire.shear[TRACK_CELLS - 1]),
+                    nb[1].map(|r| self.corners[r].tire.shear[0]),
+                ];
+                self.corners[w].tire.inflow = inflow;
+            }
+        }
         let kin = &self.ws.kin;
         for (w, c) in self.corners.iter_mut().enumerate() {
             let tire = &self.tires[w];
@@ -677,6 +690,11 @@ impl Wheeled {
 
     pub fn wheel(&self, w: usize) -> &WheelState {
         &self.corners[w].out
+    }
+
+    /// Transient state of wheel `w`'s tyre or track patch.
+    pub fn tire_state(&self, w: usize) -> &TireState {
+        &self.corners[w].tire
     }
 
     pub fn wheels(&self) -> impl Iterator<Item = &WheelState> {

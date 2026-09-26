@@ -20,6 +20,7 @@
 use super::fiala::FialaParams;
 use super::mf::{MfInput, MfParams};
 use super::road::{RoadContact, road_contact};
+use super::track::{TRACK_CELLS, TrackPatch};
 use autonomousim_core::material::Material;
 use autonomousim_core::terrain::Terrain;
 use glam::DVec3;
@@ -40,6 +41,8 @@ const GRAVITY: f64 = 9.80665;
 pub enum TireModel {
     MagicFormula(Box<MfParams>),
     Fiala(FialaParams),
+    /// A track patch under a road wheel (see [`super::track`]).
+    Track(TrackPatch),
 }
 
 /// A tyre and its fixed operating conditions.
@@ -84,6 +87,11 @@ pub struct TireState {
     /// Relaxation lengths (m) and slip stiffnesses `K_xκ`, `|K_yα|` (N) of the last step.
     pub sigma: [f64; 2],
     pub stiffness: [f64; 2],
+    /// Track patches: the shear vectors of the cells, front to rear (m), and the shear flowing
+    /// in from the neighbouring patches (the front one's rear cell, the rear one's front cell;
+    /// `None` at the track's ends), set by the vehicle before each step.
+    pub shear: [[f64; 2]; TRACK_CELLS],
+    pub inflow: [Option<[f64; 2]>; 2],
 }
 
 /// Motion of a wheel, all in world coordinates.
@@ -158,6 +166,23 @@ impl Tire {
         Ok(tire)
     }
 
+    /// A track patch (its own low-speed damping; no tyre-style damping).
+    pub fn track(params: TrackPatch) -> Result<Self, String> {
+        params.validate()?;
+        Ok(Self {
+            model: TireModel::Track(params),
+            pressure: None,
+            low_speed_damping: [0.0; 2],
+            rolling_from_surface: false,
+            dual: None,
+        })
+    }
+
+    /// Whether this is a track patch rather than a tyre.
+    pub fn is_track(&self) -> bool {
+        matches!(self.model, TireModel::Track(_))
+    }
+
     /// The tyre as mounted on the vehicle's right (or left) side: Magic Formula tyres measured
     /// on the other side are mirrored.
     pub fn on_side(&self, right: bool) -> Self {
@@ -185,6 +210,9 @@ impl Tire {
     /// spring `K/σ` with ratio 0.25: enough to settle a parked vehicle in a few cycles, small
     /// enough for the wheel's spin mode to stay stable with explicit steps of 1 ms.
     fn default_low_speed_damping(&self) -> [f64; 2] {
+        if self.is_track() {
+            return [0.0; 2];
+        }
         let state = self.initial_state();
         let mass = self.single_nominal_load() / GRAVITY;
         [0, 1].map(|i| 2.0 * LOW_SPEED_DAMPING_RATIO * (state.stiffness[i] / state.sigma[i] * mass).sqrt())
@@ -199,6 +227,7 @@ impl Tire {
         match &self.model {
             TireModel::MagicFormula(p) => p.fnomin * p.lfzo,
             TireModel::Fiala(p) => p.nominal_load,
+            TireModel::Track(p) => p.nominal_load,
         }
     }
 
@@ -206,6 +235,7 @@ impl Tire {
         match &self.model {
             TireModel::MagicFormula(p) => p.unloaded_radius,
             TireModel::Fiala(p) => p.radius,
+            TireModel::Track(p) => p.radius,
         }
     }
 
@@ -219,6 +249,7 @@ impl Tire {
         match &self.model {
             TireModel::MagicFormula(p) => p.width,
             TireModel::Fiala(p) => p.width,
+            TireModel::Track(p) => p.width,
         }
     }
 
@@ -226,6 +257,7 @@ impl Tire {
         match &self.model {
             TireModel::MagicFormula(p) => p.vxlow,
             TireModel::Fiala(p) => p.vxlow,
+            TireModel::Track(p) => p.vxlow,
         }
     }
 
@@ -239,15 +271,22 @@ impl Tire {
                 ([o.sigma_x, o.sigma_y], [o.kxk, o.kya.abs()])
             }
             TireModel::Fiala(p) => ([p.relaxation_x, p.relaxation_y], [p.slip_stiffness, p.cornering_stiffness]),
+            // Shear stiffness per wheel at nominal load, μF_z/K per metre over half the patch.
+            TireModel::Track(p) => ([0.5 * p.length; 2], [0.5 * p.length * p.mu * p.nominal_load / p.shear_modulus; 2]),
         };
-        TireState { u: 0.0, v: 0.0, sigma, stiffness }
+        TireState { u: 0.0, v: 0.0, sigma, stiffness, shear: [[0.0; 2]; TRACK_CELLS], inflow: [None; 2] }
     }
 
-    /// The road plane below the wheel, sampled over ±0.3 R ahead and behind and the tyre's
-    /// half width to the sides; `None` when the wheel is more than 2 R above the ground.
+    /// The road plane below the wheel, sampled over ±0.3 R ahead and behind (a track patch:
+    /// its half length) and the tyre's half width to the sides; `None` when the wheel is more
+    /// than 2 R above the ground.
     pub fn contact<T: Terrain + ?Sized>(&self, terrain: &T, motion: &WheelMotion) -> Option<RoadContact> {
         let r = self.radius();
-        road_contact(terrain, motion.center, motion.axis, 0.3 * r, 0.5 * self.width(), 2.0 * r)
+        let half_length = match &self.model {
+            TireModel::Track(p) => 0.5 * p.length,
+            _ => 0.3 * r,
+        };
+        road_contact(terrain, motion.center, motion.axis, half_length, 0.5 * self.width(), 2.0 * r)
     }
 
     /// Vertical force (N; of both tyres for duals) at deflection `rho` (m), without damping.
@@ -264,6 +303,7 @@ impl Tire {
                 p.vertical_force(rho, self.pressure) + bottoming
             }
             TireModel::Fiala(p) => p.vertical_stiffness * rho.max(0.0),
+            TireModel::Track(p) => p.vertical_stiffness * rho.max(0.0),
         }
     }
 
@@ -281,12 +321,17 @@ impl Tire {
         let Some(c) = contact.filter(|c| c.loaded_radius < r0) else {
             state.u = 0.0;
             state.v = 0.0;
+            state.shear = [[0.0; 2]; TRACK_CELLS];
             return TireForces::default();
         };
+        if let TireModel::Track(p) = &self.model {
+            return p.step(state, c, motion, surface, dt);
+        }
         let rho = r0 - c.loaded_radius;
         let damping = match &self.model {
             TireModel::MagicFormula(p) => p.vertical_damping,
             TireModel::Fiala(p) => p.vertical_damping,
+            TireModel::Track(_) => unreachable!("track patches step on their own"),
         };
         let fz = (self.single_vertical_force(rho) - damping * motion.velocity.dot(c.normal)).max(0.0);
         let arm = c.point - motion.center;
@@ -294,7 +339,7 @@ impl Tire {
         let (vx, vy) = (vc.dot(c.x), vc.dot(c.y));
         let re = match &self.model {
             TireModel::MagicFormula(p) => p.effective_radius(fz, motion.spin, self.pressure),
-            TireModel::Fiala(_) => r0 - rho / 3.0,
+            _ => r0 - rho / 3.0,
         };
         let vsx = vx - motion.spin * re;
         let avx = vx.abs();
@@ -334,6 +379,7 @@ impl Tire {
                 let o = p.eval(fz, kappa, tan_alpha, p.half_length(rho), surface.mu_scale);
                 (o.fx, o.fy, 0.0, -p.rolling_resistance * fz * r0 * rolling, o.mz)
             }
+            TireModel::Track(_) => unreachable!("track patches step on their own"),
         };
         let n = self.count();
         let (fx, fy, fz, mx, my, mz) = (n * fx, n * fy, n * fz, n * mx, n * my, n * mz);

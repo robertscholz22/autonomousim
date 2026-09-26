@@ -97,7 +97,7 @@ fn sedan_with(speed: f64, camber: bool) -> Wheeled {
     if !camber {
         let file = tir_without_camber();
         for a in &mut d.axles {
-            a.tire = TireSpec::Tir { file: file.clone(), pressure: None };
+            a.tire = Some(TireSpec::Tir { file: file.clone(), pressure: None });
         }
         d.finish().unwrap();
     }

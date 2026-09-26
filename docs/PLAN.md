@@ -1539,7 +1539,7 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
 #### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | Track running gear: `[track]` table, trailing-arm road wheels, track patches with shear state (rigid ground), side-locked road wheels, sprocket and idler colliders; a test vehicle | It rests at the static solution (road-wheel loads); drives straight with slip ≈ 0 at constant speed; holds on a slope below `atan μ` and slides above it; skid-steers in a circle |
+| 1 ✅ | Track running gear: `[track]` table, trailing-arm road wheels, track patches with shear state (rigid ground), side-locked road wheels, sprocket and idler colliders; a test vehicle | It rests at the static solution (road-wheel loads); drives straight with slip ≈ 0 at constant speed; holds on a slope below `atan μ` and slides above it; skid-steers in a circle |
 | 2 | Tracked drivelines (`clutch_brake`, `controlled_differential`, electric sides), controller and action modes for tracks, presets `tracked_apc` (Chrono extraction) and `rover_tracked` | Presets load, settle and drive; `vw` holds speed and yaw rate; static loads against Chrono's |
 | 3 | Validation: Chrono M113 fixtures (static loads, straight acceleration, steady turn at a fixed sprocket speed ratio, braked hold on a 30 % slope) and analytic rigid-ground checks (gradeability, Wong's skid-steer turning) | Tolerances above met or explained |
 | 4 | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
@@ -1547,6 +1547,30 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
 | 6 | `TrackedCrossCountry-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
 #### As built
+- **Step 1 (track running gear)**:
+  - **Patches** (`vehicles::ground::tire::track`): a `TireModel::Track(TrackPatch)` next to the tyre models, so a road wheel steps like a tyre.
+    - Parameters: radius to the track's ground side, width, length (the road-wheel pitch), pad stiffness and damping, shear modulus `K`, `μ` on the reference surface, internal rolling resistance (default 0.03), optional design load.
+    - Each patch has 8 shear cells (`TireState::shear`). The band carries the shoes through them, `dm/dt = −V_s − (|V_b|/h)(m − m_in)`, integrated implicitly in flow order. The inflow comes from the neighbouring patch's end cell (`TireState::inflow`, set by `Wheeled` from `WheeledDef::track_neighbours`); at the track's leading end it is a mirror cell, so fresh shoes arrive unsheared. **Shear therefore accumulates along the whole track** (Wong's theory), not per road wheel as first planned.
+    - In steady slip, the cells sit at `j = i·x` and a side sums to Janosi–Hanamoto's integral over the contact length (within 1 % with 8 cells per patch; a test drives a 4-patch chain).
+    - The lateral slip per cell includes the yaw rate's share at the cell, so the skid-steer turning moment comes out of the cells.
+    - Low-speed damping inside the shear uses a **ratio of 0.7, not the tyres' 0.25**: close to the friction limit the saturating law leaves little damping, and at 0.25 a rover parked at 38° rocked for seconds.
+    - Shear is capped at `10 K`. The internal resistance is a moment on the road wheel, independent of the surface.
+  - **Definition**:
+    - `[track]` has a `patch` table and optional `sprocket` and `idler` (left position, radius). The towing unit's axles without a `tire` (now optional) get the patch, and a patch without a design load shares the vehicle's weight.
+    - Sprockets and idlers are `Skid` sphere colliders on both sides.
+    - `TireSpec::Track` also allows a patch per axle.
+    - Road wheels must be on the towing unit, unsteered and single.
+  - **Trailing arms**: `suspension.trailing_arm = { length, angle }` generates the KC table of the arc (`z = s`, `x = L(cos θ₀ − cos θ)`; a negative length is a leading arm).
+  - **Test vehicle `rover_tracked`** (56 kg):
+    - 4 road wheels per side on trailing arms, 0.2 m pitch, rubber track `μ` 0.9, `K` 1 cm.
+    - Electric side motors with locked couplings over the side's road wheels (the band); the road wheels' spin inertia carries the band.
+  - **Tests** (`vehicles/tests/tracks.rs`):
+    - rests at the static solution (loads 0.5 %);
+    - runs straight on the level with slip < 0.1 %;
+    - climbs 15° at constant speed with traction equal to the grade pull (1 %), at the slip the patch integral predicts under the actual road-wheel loads (5 %), shear rising front to rear;
+    - holds at 38° without creep and slides at 50° at `g(sin θ − μ cos θ)` (5 %);
+    - skid-steers a steady circle wider than the kinematic radius (the outer track drives, the inner brakes) and turns on the spot;
+    - steady chain shear against the integral.
 
 ## Roadmap after M1
 | M | Content | Validation |

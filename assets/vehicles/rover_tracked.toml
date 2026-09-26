@@ -1,0 +1,91 @@
+# 60 kg rubber-tracked field robot: four road wheels per side on trailing arms, a rear sprocket
+# and a front idler, one electric motor per side.
+type = "wheeled"
+name = "rover_tracked"
+source = """
+A generic rubber-tracked UGV of the size of small commercial tracked robots (about 1 m long, \
+0.6 m wide, 1.5 m/s). All values are estimates: rubber on asphalt friction 0.9 and a shear \
+modulus of 1 cm for the track on rigid ground; the road wheels' spin inertias carry the \
+band's (4 kg per side at 0.1 m), the sprocket's and the idler's. The chassis frame origin is \
+at the road-wheel centres, midway between the tracks."""
+
+[chassis]
+mass = 44.0
+com = [0.0, 0.0, 0.08]
+inertia = [1.65, 4.0, 5.0]
+drag_area = [0.2, 0.3, 0.5]
+
+# Road wheels at a 0.2 m pitch: the four patches tile 0.8 m of track on the ground.
+[[axles]]
+name = "road_wheel_1"
+position = [0.3, 0.25, 0.0]
+wheel = { mass = 1.0, inertia = [0.004, 0.016, 0.004] }
+brake = { max_torque = 20.0, parking_torque = 20.0 }
+suspension = { trailing_arm = { length = 0.15, angle = 0.4 }, carrier_mass = 0.5, spring = { rate = 6000.0 }, damper = { bump = 150.0, rebound = 200.0 }, bump_stop = { travel = 0.04, stiffness = 1e5 }, rebound_stop = { travel = -0.04, stiffness = 1e5 } }
+
+[[axles]]
+name = "road_wheel_2"
+position = [0.1, 0.25, 0.0]
+wheel = { mass = 1.0, inertia = [0.004, 0.016, 0.004] }
+brake = { max_torque = 20.0, parking_torque = 20.0 }
+suspension = { trailing_arm = { length = 0.15, angle = 0.4 }, carrier_mass = 0.5, spring = { rate = 6000.0 }, damper = { bump = 150.0, rebound = 200.0 }, bump_stop = { travel = 0.04, stiffness = 1e5 }, rebound_stop = { travel = -0.04, stiffness = 1e5 } }
+
+[[axles]]
+name = "road_wheel_3"
+position = [-0.1, 0.25, 0.0]
+wheel = { mass = 1.0, inertia = [0.004, 0.016, 0.004] }
+brake = { max_torque = 20.0, parking_torque = 20.0 }
+suspension = { trailing_arm = { length = 0.15, angle = 0.4 }, carrier_mass = 0.5, spring = { rate = 6000.0 }, damper = { bump = 150.0, rebound = 200.0 }, bump_stop = { travel = 0.04, stiffness = 1e5 }, rebound_stop = { travel = -0.04, stiffness = 1e5 } }
+
+[[axles]]
+name = "road_wheel_4"
+position = [-0.3, 0.25, 0.0]
+wheel = { mass = 1.0, inertia = [0.004, 0.016, 0.004] }
+brake = { max_torque = 20.0, parking_torque = 20.0 }
+suspension = { trailing_arm = { length = 0.15, angle = 0.4 }, carrier_mass = 0.5, spring = { rate = 6000.0 }, damper = { bump = 150.0, rebound = 200.0 }, bump_stop = { travel = 0.04, stiffness = 1e5 }, rebound_stop = { travel = -0.04, stiffness = 1e5 } }
+
+[track]
+sprocket = { position = [-0.44, 0.25, 0.05], radius = 0.1 }
+idler = { position = [0.44, 0.25, 0.05], radius = 0.1 }
+
+[track.patch]
+radius = 0.1                            # road wheel 0.08 + track 0.02
+width = 0.12
+length = 0.2
+vertical_stiffness = 2.0e5
+vertical_damping = 300.0
+shear_modulus = 0.01
+mu = 0.9
+
+# One motor per side, driving the sprocket; the band locks the side's road wheels together.
+[powertrain]
+type = "electric"
+
+[[powertrain.motors]]
+wheels = [0, 2, 4, 6]
+side = "left"
+max_torque = 3.0                        # stall
+max_power = 600.0
+ratio = 0.05
+no_load_speed = 320.0                   # 1.6 m/s unloaded
+time_constant = 0.02
+coupling = "locked"
+
+[[powertrain.motors]]
+wheels = [1, 3, 5, 7]
+side = "right"
+max_torque = 3.0
+max_power = 600.0
+ratio = 0.05
+no_load_speed = 320.0
+time_constant = 0.02
+coupling = "locked"
+
+# Belly (ground at z ≈ −0.1 at rest; 0.1 m clearance).
+[[colliders]]
+center = [0.25, 0.0, 0.1]
+radius = 0.1
+
+[[colliders]]
+center = [-0.25, 0.0, 0.1]
+radius = 0.1

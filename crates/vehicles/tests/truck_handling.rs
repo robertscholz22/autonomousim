@@ -69,7 +69,7 @@ fn chrono_like(mut d: WheeledDef) -> WheeledDef {
     }
     let file = tir_without_camber();
     for a in &mut d.axles {
-        a.tire = TireSpec::Tir { file: file.clone(), pressure: None };
+        a.tire = Some(TireSpec::Tir { file: file.clone(), pressure: None });
     }
     d.finish().unwrap();
     d

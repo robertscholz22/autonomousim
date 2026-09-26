@@ -18,7 +18,7 @@
 //! their unit's frame.
 
 use super::powertrain::{MAX_WHEELS, PowertrainDef};
-use super::tire::{FialaParams, MfParams, TirFile, Tire};
+use super::tire::{FialaParams, MfParams, TirFile, Tire, TireModel, TrackPatch};
 use super::units::{HitchDef, UnitDef, UnitJoint};
 use crate::VehicleError;
 use crate::multirotor::ContactDef;
@@ -54,6 +54,10 @@ pub struct WheeledDef {
     pub colliders: Vec<GroundColliderDef>,
     #[serde(default)]
     pub contact: ContactDef,
+    /// Tracks instead of tyres: the towing unit's axles without a `tire` are road wheels on a
+    /// track on each side (see [`TrackDef`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<TrackDef>,
     /// Coupling point for a trailer at the rear of the towing unit (fifth wheel or pintle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hitch: Option<HitchDef>,
@@ -101,7 +105,9 @@ pub struct AxleDef {
     #[serde(default)]
     pub suspension: Option<SuspensionDef>,
     pub wheel: WheelDef,
-    pub tire: TireSpec,
+    /// The tyre; omitted for the road wheels of a [`TrackDef`] track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire: Option<TireSpec>,
     /// Dual wheels: two tyres side by side at this centre distance (m), `position` being the
     /// middle of the pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +188,9 @@ pub struct SuspensionDef {
     /// a straight vertical guide).
     #[serde(default)]
     pub kinematics: KcTableSpec,
+    /// A trailing arm instead of `kinematics`: the wheel swings about a lateral pivot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailing_arm: Option<TrailingArmDef>,
     /// Non-rotating unsprung mass at the wheel centre (upright, hub, share of the links; kg)
     /// and its principal moments of inertia (kg·m²).
     pub carrier_mass: f64,
@@ -198,6 +207,30 @@ pub struct SuspensionDef {
     /// at spread `s` and track `t` is `rate·((s/t)² − 1)/2`.
     #[serde(default)]
     pub anti_roll: f64,
+}
+
+/// A road wheel's arm: the pivot lies `length` ahead of the wheel (negative: behind it, a
+/// leading arm), the arm dropping at `angle` below the horizontal at zero travel (rad). The
+/// wheel moves on the arc: `z(s) = s` and `x(s) = L·(cos θ₀ − cos θ)` with
+/// `sin θ = sin θ₀ − s/|L|`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrailingArmDef {
+    pub length: f64,
+    pub angle: f64,
+}
+
+impl TrailingArmDef {
+    /// The arc as a kinematics table (17 knots over the travel where the arm stays within
+    /// ±72° of the horizontal).
+    pub fn kinematics(&self) -> KcTableSpec {
+        let (l, s0) = (self.length.abs(), self.angle.sin());
+        let limit = 0.95;
+        let (lo, hi) = (l * (s0 - limit), l * (s0 + limit));
+        let travel: Vec<f64> = (0..17).map(|i| lo + (hi - lo) * i as f64 / 16.0).collect();
+        let x = travel.iter().map(|s| self.length * (self.angle.cos() - (1.0 - (s0 - s / l).powi(2)).sqrt())).collect();
+        KcTableSpec { z: travel.clone(), x, travel, ..Default::default() }
+    }
 }
 
 /// Suspension spring at the wheel: `force(s)` pushes the wheel away from the body. Either a
@@ -309,6 +342,44 @@ fn is_zero_f64(x: &f64) -> bool {
     *x == 0.0
 }
 
+/// Tracks on both sides of the towing unit. Every axle without a `tire` is a pair of road
+/// wheels, each carrying a track patch ([`TrackPatch`]) in place of a tyre. Tie a side's road
+/// wheels to its drive by a locked coupling (the band): their common spin times the patch
+/// radius is the band speed, and their spin inertias carry the band's, sprocket's and idler's.
+/// The sprocket and idler are colliders on the hull (mirrored to the right side), so the
+/// track's ends meet steps and banks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrackDef {
+    pub patch: TrackPatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprocket: Option<RollerDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idler: Option<RollerDef>,
+}
+
+/// A sprocket or idler: its left centre in the chassis frame and its radius over the track (m).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollerDef {
+    pub position: DVec3,
+    pub radius: f64,
+}
+
+impl TrackDef {
+    /// Sprocket and idler of both sides as running-gear colliders (left, then right).
+    fn colliders(&self) -> impl Iterator<Item = GroundColliderDef> + '_ {
+        self.sprocket.iter().chain(&self.idler).flat_map(|r| {
+            [1.0, -1.0].map(|s| GroundColliderDef {
+                center: DVec3::new(r.position.x, s * r.position.y, r.position.z),
+                radius: r.radius,
+                friction: 1.0,
+                part: GroundPart::Skid,
+            })
+        })
+    }
+}
+
 /// Role of a chassis collider for event classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -332,6 +403,8 @@ pub enum TireSpec {
         pressure: Option<f64>,
     },
     Fiala(FialaParams),
+    /// A track patch (normally given once in [`TrackDef`]).
+    Track(TrackPatch),
 }
 
 impl TireSpec {
@@ -347,6 +420,7 @@ impl TireSpec {
                 Tire::magic_formula(params, *pressure).map_err(|e| format!("tyre {file}: {e}"))
             }
             TireSpec::Fiala(p) => Tire::fiala(p.clone()),
+            TireSpec::Track(p) => Tire::track(p.clone()),
         }
     }
 }
@@ -377,7 +451,11 @@ impl StaticState {
 impl SuspensionDef {
     /// Kinematics of the left (`side` 0) or right (1) wheel.
     pub fn table(&self, side: usize) -> Result<KcTable, String> {
-        let mut spec = self.kinematics.clone();
+        let mut spec = match self.trailing_arm {
+            Some(arm) if self.kinematics.travel.is_empty() => arm.kinematics(),
+            Some(_) => return Err("give either kinematics or a trailing arm".into()),
+            None => self.kinematics.clone(),
+        };
         if spec.travel.is_empty() {
             spec.travel = vec![-0.1, 0.1];
         }
@@ -424,17 +502,30 @@ impl WheeledDef {
         let fail = |msg: String| VehicleError::Invalid(format!("{name}: {msg}"));
         self.resolve_shares().map_err(fail)?;
         self.validate().map_err(fail)?;
+        let track = self.track.as_ref().map(|t| TireSpec::Track(t.patch.clone()));
         let tires: Result<Vec<Tire>, String> = self
             .axles
             .iter()
-            .map(|a| {
-                a.tire.load().map(|t| match a.dual {
+            .enumerate()
+            .map(|(i, a)| {
+                let spec = a.tire.as_ref().or(track.as_ref()).ok_or(format!("axle {i} needs a tire or [track]"))?;
+                spec.load().map(|t| match a.dual {
                     Some(d) => t.with_dual(d),
                     None => t,
                 })
             })
             .collect();
         self.tires = tires.map_err(fail)?;
+        // Track patches without a design load share the vehicle's weight.
+        let patches = self.tires.iter().filter(|t| t.is_track()).count();
+        let share = self.total_mass() * STANDARD_GRAVITY / (2 * patches.max(1)) as f64;
+        for t in &mut self.tires {
+            if let TireModel::Track(p) = &mut t.model
+                && p.nominal_load == 0.0
+            {
+                p.nominal_load = share;
+            }
+        }
         for a in &mut self.axles {
             if let Some(s) = &mut a.suspension {
                 s.spring.table = if s.spring.travel.is_empty() {
@@ -577,6 +668,10 @@ impl WheeledDef {
             if a.dual.is_some_and(|d| !pos(d)) {
                 return fail("the dual tyres' spacing must be positive");
             }
+            let track = a.tire.is_none() || matches!(a.tire, Some(TireSpec::Track(_)));
+            if track && (a.unit > 0 || a.is_steered() || a.dual.is_some()) {
+                return fail("road wheels are on the towing unit, unsteered and single");
+            }
             if a.is_geometric() && a.unit > 0 {
                 return fail("geometric steering is for the towing unit");
             }
@@ -599,6 +694,9 @@ impl WheeledDef {
                 return fail("brake torques and times must be non-negative");
             }
             if let Some(s) = &a.suspension {
+                if s.trailing_arm.is_some_and(|a| !(a.length.is_finite() && a.length != 0.0 && a.angle.abs() < 1.2)) {
+                    return fail("a trailing arm needs a non-zero length and |angle| < 1.2 rad");
+                }
                 s.table(0).map_err(|e| format!("axle {i}: kinematics: {e}"))?;
                 if !pos(s.carrier_mass) || !nonneg(s.carrier_inertia.min_element()) {
                     return fail("carrier mass must be positive and its inertia non-negative");
@@ -624,6 +722,11 @@ impl WheeledDef {
                     return fail("stops need positive stiffness, bump travel > 0 and rebound travel < 0");
                 }
             }
+        }
+        if let Some(t) = &self.track
+            && t.sprocket.iter().chain(&t.idler).any(|r| !pos(r.radius) || !r.position.is_finite())
+        {
+            return Err("sprocket and idler need finite positions and positive radii".into());
         }
         if let Some(s) = &self.steering
             && !(pos(s.max_angle) && s.max_angle < 1.5 && pos(s.rate) && (0.0..=1.0).contains(&s.ackermann))
@@ -769,16 +872,40 @@ impl WheeledDef {
     }
 
     /// Sphere colliders on their units' links (the towing unit's first).
+    /// Sphere colliders on their units' links (the towing unit's first, then its sprockets and
+    /// idlers).
     pub fn sphere_colliders(&self) -> Vec<SphereCollider> {
-        let units = std::iter::once(&self.colliders).chain(self.units.iter().map(|u| &u.colliders));
+        let rollers: Vec<GroundColliderDef> = self.track.iter().flat_map(|t| t.colliders()).collect();
+        let own = self.colliders.iter().chain(&rollers).collect::<Vec<_>>();
+        let units = std::iter::once(own).chain(self.units.iter().map(|u| u.colliders.iter().collect()));
         units
             .enumerate()
             .flat_map(|(u, cs)| {
                 let link = self.unit_link(u);
-                cs.iter().map(move |c| SphereCollider {
+                cs.into_iter().map(move |c| SphereCollider {
                     friction: c.friction,
                     ..SphereCollider::new(link, c.center, c.radius, c.part as u8)
                 })
+            })
+            .collect()
+    }
+
+    /// Per wheel on a track, its neighbours along the track (front, rear): the next road
+    /// wheels on the same side by design position.
+    pub fn track_neighbours(&self) -> Vec<[Option<usize>; 2]> {
+        let n = self.num_wheels();
+        let on_track = |w: usize| self.tires[w / 2].is_track() && self.wheel_unit(w) == 0;
+        (0..n)
+            .map(|w| {
+                if !on_track(w) {
+                    return [None; 2];
+                }
+                let x = self.wheel_position(w).x;
+                let side = (0..n).filter(|&o| o != w && o % 2 == w % 2 && on_track(o));
+                let front = side.clone().filter(|&o| self.wheel_position(o).x > x);
+                let rear = side.filter(|&o| self.wheel_position(o).x < x);
+                let by_x = |a: &usize, b: &usize| self.wheel_position(*a).x.total_cmp(&self.wheel_position(*b).x);
+                [front.min_by(by_x), rear.max_by(by_x)]
             })
             .collect()
     }
