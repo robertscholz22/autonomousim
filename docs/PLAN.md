@@ -1510,7 +1510,43 @@ Planned 2026-09-26. Decisions taken at the start (the user asked to go on; open 
   - **Tests**: Rust `trailers.rs` (bay placement, errors, trailer sensors, bay episodes skipping yard-less maps); Python: the scripted driver parks at least 3 of 4 rigs and the parked ones meet the success conditions; driving away fails; spaces and `check_env`.
 
 ### M4c: Tracked vehicles and soft soil
-The design is below ("Tracked vehicles"). The rural fields and mud supply the soft ground: materials gain Bekker–Wong parameters, and plowed soil and mud get soft values. **Demo**: `TrackedCrossCountry-v0`, an APC crossing soft fields and ditches to waypoints.
+Planned 2026-09-26. The user asked to go on; the decisions below were taken at the start and are open to change. The design notes below ("Tracked vehicles", added 2026-09-24) still hold for the physics. **This section replaces their structure**: tracked vehicles are built into the wheeled ground model, not added as a separate `vehicles::tracked` family.
+
+#### Decisions
+- **Tracks as a running gear of `WheeledDef`**, not a new vehicle family. A tracked vehicle is a hull (unit 0) with road wheels on trailing-arm suspension, one "axle" per road-wheel pair. A `[track]` table replaces the tyres: every road wheel carries a **track patch** instead of a tyre, and all road wheels on a side are tied to the band by a locked coupling. Everything built for wheeled vehicles then works unchanged: suspension joints and `KcTravel` arm tables, the powertrain, brakes and couplings, chassis contacts, statics, the controller's side drives, simulation, observations, recordings and the viewer.
+- **Band**: the band speed on each side is the common spin of its road wheels (times their radius). The band's, sprocket's and idler's inertia is lumped onto them. The sprocket drives the band through the powertrain's side output. There is no extra DoF.
+- **Patch force** (per road wheel, an aux state per patch like the tyre's carcass deflection):
+  - normal load from the road wheel's suspension, spread over the patch (the road-wheel pitch × track width);
+  - shear displacement `j` integrated from the patch's slip velocity (longitudinal from band speed against ground speed, lateral from side-slip);
+  - shear stress by Janosi–Hanamoto, `τ = τ_max·(1 − e^(−|j|/K))` along `j`, with `τ_max = c + p·tan φ` on soil and `μ·p` on rigid ground;
+  - skid steering's turning resistance then comes from the patches' lateral shear (no separate moment term).
+- **Soft soil** (Bekker–Wong): materials gain optional soil parameters `(k_c, k_φ, n, c, φ, K)`. Plowed soil, mud, crop, meadow, sand and snow get values from Wong's tables; paved and rock surfaces stay rigid.
+  - Each patch sinks by `z = (p / (k_c/b + k_φ))^(1/n)`, which lowers its effective surface.
+  - Each patch pays the compaction resistance `R_c = b·(k_c/b + k_φ)·z^(n+1)/(n+1)`. Bulldozing resistance applies at the front road wheel above a sinkage threshold.
+  - Tyres on soft soil are deferred; they keep their rigid-ground model.
+  - The soil parameters are left out of the map hash (materials hash as before), so existing golden hashes stay.
+- **Steering and drivelines**:
+  - `clutch_brake` (combustion): steering brakes the inner sprocket and cuts its drive.
+  - `controlled_differential` (combustion, like Chrono's `SimpleTrackDriveline`): a steering differential biases torque between the sides.
+  - The electric side drives of `rover_skid` also drive tracks.
+  - Action modes: `raw` (throttle, brake and steering as the side difference), `vw` (speed and yaw rate; the controller's side-drive loops) and `per_side`.
+- **Presets**:
+  - `tracked_apc`: the M113 from Chrono's `data/vehicle/M113` (BSD-3), extracted by `tools/gen_chrono_tracked_fixtures.py`: hull, 5 road wheels per side on torsion arms, sprocket, idler, track, engine and transmission maps.
+  - `rover_tracked`: a rubber-tracked UGV of about 60 kg with electric side motors.
+- **Oracle**: Chrono's M113 with single-pin shoes on rigid terrain. The track models differ, so tolerances are loose (static loads 5 %, acceleration and turns within 15 %). Soft soil is checked analytically, because Chrono's SCM would need its own fixtures and has different physics.
+- **Demo**, `TrackedCrossCountry-v0`: the APC crosses a rural map's fields (plowed soil, mud, crops) and ditches between waypoints off the roads. The rural generator gains drainage ditches along some parcel edges.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Track running gear: `[track]` table, trailing-arm road wheels, track patches with shear state (rigid ground), side-locked road wheels, sprocket and idler colliders; a test vehicle | It rests at the static solution (road-wheel loads); drives straight with slip ≈ 0 at constant speed; holds on a slope below `atan μ` and slides above it; skid-steers in a circle |
+| 2 | Tracked drivelines (`clutch_brake`, `controlled_differential`, electric sides), controller and action modes for tracks, presets `tracked_apc` (Chrono extraction) and `rover_tracked` | Presets load, settle and drive; `vw` holds speed and yaw rate; static loads against Chrono's |
+| 3 | Validation: Chrono M113 fixtures (static loads, straight acceleration, steady turn at a fixed sprocket speed ratio, braked hold on a 30 % slope) and analytic rigid-ground checks (gradeability, Wong's skid-steer turning) | Tolerances above met or explained |
+| 4 | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
+| 5 | Simulation and viewer: tracked agents in scenarios, drive grids with soil cost, track visuals (band around sprocket, road wheels and idler), HUD per side (band speed, slip, sinkage), rural ditches | An APC drives by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay; ditch invariants hold |
+| 6 | `TrackedCrossCountry-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
+
+#### As built
 
 ## Roadmap after M1
 | M | Content | Validation |
