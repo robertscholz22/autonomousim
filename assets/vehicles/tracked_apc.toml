@@ -17,8 +17,9 @@ positions, left and right averaged (Chrono staggers the right side 8.5 cm back):
 band lifts the first and last road wheels clear of the ground, so these hang on their springs \
 (given preload) while the others' preloads carry the static load. The torsion springs' and \
 dampers' rates are referred to the wheels at the settled arm angles. The full-throttle torque \
-below 500 rpm and the zero-throttle map (Chrono's repeats the full-throttle one), track shear modulus, internal rolling \
-resistance, bump and rebound stops, drag and colliders are estimates."""
+below 500 rpm and the zero-throttle map (Chrono's repeats the full-throttle one), track shear modulus, bump and rebound \
+stops, drag and colliders are estimates. The internal rolling resistance is the M113's at \
+launch, measured on Chrono's model (fixtures/chrono/tracked_m113.json)."""
 
 [chassis]
 mass = 10722.8
@@ -76,6 +77,7 @@ vertical_stiffness = 2.0e6
 vertical_damping = 1.0e4
 shear_modulus = 0.01
 mu = 0.8
+rolling_resistance = 0.045              # Chrono's M113 at launch (fixtures: accel, climb)
 nominal_load = 18500.0                  # weight over the six loaded road wheels
 
 # Braked differential steering: an open differential between the sprockets (here the axles'

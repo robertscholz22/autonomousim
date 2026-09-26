@@ -637,12 +637,13 @@ impl GroundController {
         let kp = c.brake_steer_gain;
         let raw = kp * e + self.yaw_i;
         let steering = raw.clamp(-1.0, 1.0);
-        if steering == raw || (raw > steering) != (e > 0.0) {
+        // Steering authority grows with the speed up to half the target: a vehicle stalled in a
+        // turn too tight for it lets go of the brake and gets rolling again. The integral
+        // holds meanwhile (it would wind up).
+        let authority = (est.speed().abs() / (0.5 * v_ref.abs()).max(1e-3)).min(1.0);
+        if authority == 1.0 && (steering == raw || (raw > steering) != (e > 0.0)) {
             self.yaw_i = (self.yaw_i + c.yaw_integral * kp * e * self.dt).clamp(-1.0, 1.0);
         }
-        // Steering authority grows with the speed up to half the target: a vehicle stalled in a
-        // turn too tight for it lets go of the brake and gets rolling again.
-        let authority = (est.speed().abs() / (0.5 * v_ref.abs()).max(1e-3)).min(1.0);
         input.steering = steering * authority;
         input
     }

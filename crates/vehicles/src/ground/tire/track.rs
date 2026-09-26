@@ -21,7 +21,14 @@
 //! cells then sit at `j = i·x` of their centres, `x` the distance from the leading end, and
 //! the patches sum to Wong's integral `F = A·τ_max·(1 − K/(iℓ)·(1 − e^(−iℓ/K)))` over the
 //! track's contact length `ℓ`; skid steering's turning resistance comes from the cells'
-//! lateral shear without a separate moment. The transport term is integrated implicitly (in
+//! lateral shear without a separate moment.
+//!
+//! A cell's stress acts along its shear while the shoes stick, and against its sliding velocity
+//! once they slide (Wong and Chiang's skid-steering theory, Wong §7.3): a braked track sliding
+//! longitudinally then carries little lateral stress, which a stress along the shear, whose
+//! longitudinal part saturates, would overstate. The direction blends between the two over
+//! shears of 0.5–1.5 `K` and sliding speeds of 1–5 cm/s, so that a parked vehicle's shear
+//! spring keeps holding. The transport term is integrated implicitly (in
 //! flow order), so any band speed is stable. At standstill the shear acts as a spring and a
 //! parked vehicle holds without creep; below `vxlow` a damping `−k·V_s` (a corner mass on the
 //! shear spring at ratio 0.7) is added to the shear, as the tyres' low-speed damping. The
@@ -38,6 +45,12 @@ use serde::{Deserialize, Serialize};
 pub const TRACK_CELLS: usize = 8;
 /// Cap of the shear displacement, in shear moduli `K`.
 const SHEAR_LIMIT: f64 = 10.0;
+/// Shears (in `K`) and sliding speeds (m/s) over which a cell's stress turns from the shear's
+/// direction (sticking) to against the sliding velocity (sliding); both must be exceeded.
+const STICKING_SHEAR: f64 = 0.5;
+const SLIDING_SHEAR: f64 = 1.5;
+const STICKING_SPEED: f64 = 0.01;
+const SLIDING_SPEED: f64 = 0.05;
 /// Band speed (m/s) over which the internal resistance changes sign.
 const ROLLING_SMOOTHING: f64 = 0.05;
 /// Damping ratio of a corner mass on the shear spring at standstill: higher than the tyres'
@@ -174,10 +187,20 @@ impl TrackPatch {
             let e = [new[0] - damping * vsx, new[1] - damping * vy_cell];
             let j = e[0].hypot(e[1]);
             if j > 0.0 {
-                let f = cell_limit * (1.0 - (-j / k).exp()) / j;
-                fx += f * e[0];
-                fy += f * e[1];
-                mz += f * e[1] * offset;
+                // Along the shear when sticking, against the sliding velocity when sliding.
+                let slide = vsx.hypot(vy_cell);
+                let w = ((slide - STICKING_SPEED) / (SLIDING_SPEED - STICKING_SPEED)).clamp(0.0, 1.0)
+                    * ((j / k - STICKING_SHEAR) / (SLIDING_SHEAR - STICKING_SHEAR)).clamp(0.0, 1.0);
+                let mut d = [(1.0 - w) * e[0] / j, (1.0 - w) * e[1] / j];
+                if slide > 0.0 {
+                    d = [d[0] - w * vsx / slide, d[1] - w * vy_cell / slide];
+                }
+                let norm = d[0].hypot(d[1]);
+                let d = if norm > 1e-9 { [d[0] / norm, d[1] / norm] } else { [e[0] / j, e[1] / j] };
+                let f = cell_limit * (1.0 - (-j / k).exp());
+                fx += f * d[0];
+                fy += f * d[1];
+                mz += f * d[1] * offset;
             }
         }
         state.u = su / n as f64;

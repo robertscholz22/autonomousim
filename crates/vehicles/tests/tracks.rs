@@ -1,6 +1,8 @@
 //! Tracked running gear on rigid ground: the static solution, straight running, holding and
 //! sliding on slopes around `atan μ`, skid steering, and the track patches' steady shear
-//! against Janosi–Hanamoto's integral.
+//! against Janosi–Hanamoto's integral; the analytic checks, gradeability and Wong and Chiang's
+//! pivot turn; and the `tracked_apc` against Chrono's M113 (fixtures/chrono/tracked_m113.json:
+//! static pose and loads, launch, crawling up 15 %, holding on 30 %, brake steering).
 
 use autonomousim_core::contact::StaticScene;
 use autonomousim_core::geometry::NoObstacles;
@@ -302,4 +304,264 @@ fn apc_rests_at_chronos_static_pose_and_loads() {
     for (k, wh) in v.wheels().enumerate() {
         assert!((wh.tire.fz - st.loads[k]).abs() < 0.01 * 18500.0, "wheel {k}: {} vs {}", wh.tire.fz, st.loads[k]);
     }
+}
+
+/// A sample of an APC run, as the Chrono fixture's.
+#[derive(Debug)]
+struct Sample {
+    t: f64,
+    speed: f64,
+    yaw_rate: f64,
+    gear: i32,
+    /// Band speeds, left and right (m/s).
+    bands: [f64; 2],
+    /// Along the slope, uphill positive (m).
+    displacement: f64,
+}
+
+/// The APC on a grade (uphill along +x), starting at `speed`: settled braked for `settle` s,
+/// then driven by `input(t, vehicle)` for `seconds`, sampled every `every` s.
+fn apc_run(
+    grade: f64,
+    speed: f64,
+    settle: f64,
+    seconds: f64,
+    every: f64,
+    mut input: impl FnMut(f64, &Wheeled) -> DriveInput,
+) -> Vec<Sample> {
+    let angle = grade.atan();
+    let w = World::new(PlaneTerrain::incline(angle, MaterialId::ASPHALT));
+    let mut v = Wheeled::new(Arc::new(presets::wheeled("tracked_apc").unwrap()), DT);
+    let rest = v.rest(DVec3::ZERO, 0.0, speed);
+    let tilt = DQuat::from_rotation_y(-angle);
+    v.reset(&WheeledInit { pose: Pose::new(tilt * rest.pose.pos, tilt * rest.pose.rot), ..rest });
+    w.run(&mut v, &DriveInput { brake: 1.0, ..Default::default() }, settle);
+    let x0 = v.position();
+    let slope = tilt * DVec3::X;
+    let mut out = Vec::new();
+    let (n, k) = ((seconds / DT).round() as usize, (every / DT).round() as usize);
+    for i in 1..=n {
+        let u = input((i - 1) as f64 * DT, &v);
+        w.run(&mut v, &u, DT);
+        if i % k == 0 {
+            out.push(Sample {
+                t: i as f64 * DT,
+                speed: v.lin_vel_body().x,
+                yaw_rate: v.ang_vel_body().z,
+                gear: v.powertrain().gear,
+                bands: [band(&v, 0), band(&v, 1)],
+                displacement: (v.position() - x0).dot(slope),
+            });
+        }
+    }
+    out
+}
+
+/// A Chrono run's samples.
+fn chrono_run(name: &str) -> (serde_json::Value, Vec<Sample>) {
+    let f = m113()[name].clone();
+    let samples = f["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            let x = |k: &str| s[k].as_f64().unwrap();
+            let sp = s["sprockets"].as_array().unwrap();
+            let d: Vec<f64> = s["displacement"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+            Sample {
+                t: x("t"),
+                speed: x("speed"),
+                yaw_rate: x("yaw_rate"),
+                gear: s["gear"].as_i64().unwrap() as i32,
+                // Sprocket pitch radius.
+                bands: [sp[0].as_f64().unwrap() * 0.245, sp[1].as_f64().unwrap() * 0.245],
+                // Chrono tilts gravity, not the ground: x is along the slope.
+                displacement: d[0],
+            }
+        })
+        .collect();
+    (f, samples)
+}
+
+/// Our run of the Chrono fixture's run `name`, with the same inputs, and Chrono's.
+fn same_run(
+    name: &str,
+    input: impl FnMut(f64, &Wheeled) -> DriveInput,
+) -> (serde_json::Value, Vec<Sample>, Vec<Sample>) {
+    let (f, chrono) = chrono_run(name);
+    let x = |k: &str| f[k].as_f64().unwrap();
+    // Chrono's turns start faster (its tracks start at rest, and drag the hull down), and
+    // settle at the held speed before the steering.
+    let speed = if f.get("launch").is_some() { x("speed") } else { 0.0 };
+    let grade = f["grade"].as_f64().unwrap_or(0.0);
+    let ours = apc_run(grade, speed, x("settle"), chrono.last().unwrap().t, x("sample"), input);
+    assert_eq!(ours.len(), chrono.len());
+    (f, ours, chrono)
+}
+
+/// Mean of `f` over the samples in `[from, to]` s.
+fn mean(s: &[Sample], from: f64, to: f64, f: impl Fn(&Sample) -> f64) -> f64 {
+    let v: Vec<f64> = s.iter().filter(|s| s.t >= from - 1e-9 && s.t <= to + 1e-9).map(f).collect();
+    v.iter().sum::<f64>() / v.len() as f64
+}
+
+/// The Chrono runs are at 600 solver iterations: at Chrono's usual 150, its loose contact and
+/// brake constraints show as extra running resistance, brake creep and slip (see the fixture
+/// generator), and 600 only reduce these.
+///
+/// Full throttle from rest on flat ground against Chrono's M113 with our engine map: the same
+/// launch (the first 0.5 s, in which Chrono's running gear resists with `f ≈ 0.045`, the
+/// preset's). Beyond it Chrono's resistance grows with speed, to about 0.115·W at 2 m/s
+/// (0.14·W at 150 iterations), far above measured tracked vehicles' (Wong, §6.3: the running
+/// gear's `(133 + 2.5·V[km/h])` N/t, ≈ 0.015–0.03·W): its rigid shoes' impacts on the NSC
+/// contacts dissipate at every road wheel and sprocket tooth. After 4 s it runs at 2.8 m/s,
+/// ours at 4.5 m/s.
+#[test]
+fn apc_launches_like_chronos_m113() {
+    let full = DriveInput { throttle: 1.0, ..Default::default() };
+    let (_, ours, chrono) = same_run("accel", |_, _| full);
+    let a = |s: &[Sample]| s[1].speed / s[1].t;
+    assert!((a(&ours) / a(&chrono) - 1.0).abs() < 0.15, "launch {} vs Chrono {} m/s²", a(&ours), a(&chrono));
+    assert!(ours.iter().zip(&chrono).all(|(o, c)| o.speed > c.speed - 0.05));
+}
+
+/// At full throttle on a 15 % grade both crawl at the limit of their gradeability: the launch
+/// thrust is 0.186·W against `sin θ + f·cos θ = 0.19`. Ours creeps at 7 cm/s, where the
+/// internal resistance fades towards standstill; Chrono's at 15 cm/s (at 150 iterations it
+/// stalled), its resistance at a crawl a little under the preset's 0.045.
+#[test]
+fn apc_crawls_up_15_percent_like_chronos_m113() {
+    let full = DriveInput { throttle: 1.0, ..Default::default() };
+    let (f, ours, chrono) = same_run("climb", |_, _| full);
+    assert_eq!(f["grade"].as_f64().unwrap(), 0.15);
+    for (s, who) in [(&ours, "ours"), (&chrono, "Chrono")] {
+        let v = mean(s, 4.0, 6.0, |s| s.speed);
+        assert!(v > 0.0 && v < 0.25, "{who} climbs at {v} m/s");
+        assert!(s.iter().all(|s| s.displacement > -0.05), "{who} rolls back");
+    }
+}
+
+/// Braked on a 30 % grade: the brakes' 10 kN·m per sprocket are 2.5 times the grade's torque,
+/// and the tracks' friction 0.8 far above the grade. Ours holds; Chrono's creeps down at
+/// 2 cm/s (5 cm/s at 150 iterations), its sprockets turning with it: its iterative solver
+/// leaves the brakes' constraints loose under the shoes' chatter.
+#[test]
+fn apc_holds_on_30_percent_like_chronos_m113() {
+    let (f, ours, chrono) = same_run("hold", |_, _| DriveInput { brake: 1.0, ..Default::default() });
+    assert_eq!(f["grade"].as_f64().unwrap(), 0.3);
+    let crept = |s: &[Sample]| s.last().unwrap().displacement - s[3].displacement;
+    assert!(crept(&ours).abs() < 0.005, "ours crept {} m", crept(&ours));
+    let creep = crept(&chrono) / (chrono.last().unwrap().t - chrono[3].t);
+    let sprockets = mean(&chrono, 1.0, 4.0, |s| 0.5 * (s.bands[0] + s.bands[1]));
+    assert!(
+        creep < 0.0 && creep > -0.1 && (sprockets / creep - 1.0).abs() < 0.5,
+        "Chrono creep {creep}, sprockets {sprockets}"
+    );
+}
+
+/// The Chrono fixture's turn: speed held by its PI throttle, steering from `turn_at`.
+fn held_turn(f: &serde_json::Value) -> impl FnMut(f64, &Wheeled) -> DriveInput {
+    let x = |k: &str| f[k].as_f64().unwrap();
+    let (speed, kp, ki, turn_at, steering) = (x("speed"), x("kp"), x("ki"), x("turn_at"), x("steering"));
+    let (mut i, mut last) = (0.0, 0.0);
+    move |t, v| {
+        let e = speed - v.lin_vel_body().x;
+        let raw = kp * e + i;
+        if (0.0..1.0).contains(&raw) && raw > 0.0 || (raw >= 1.0) != (e > 0.0) {
+            i = f64::clamp(i + ki * e * (t - last), 0.0, 1.0);
+        }
+        last = t;
+        let steering = if t >= turn_at { steering } else { 0.0 };
+        DriveInput { throttle: raw.clamp(0.0, 1.0), steering, ..Default::default() }
+    }
+}
+
+/// Brake steering against Chrono's M113: from 1.2 m/s, the speed held by the same PI throttle,
+/// steering from 1 s. Both lose most of their speed to the braked inner track at once. With
+/// steering 0.3 they then turn at the same order of yaw rate (ours 0.008, Chrono 0.010 rad/s),
+/// and with 0.6 both stall into a slow pivot about the braked track. Closer agreement is not
+/// to be had from Chrono here: its turning moves with the solver's convergence (the pivot's
+/// yaw rate halves from 150 to 600 iterations, the lighter turn's early response too), and
+/// its speed with its running resistance. The turning physics is checked against Wong and
+/// Chiang's theory instead (`pivot_turn_follows_wong_and_chiang`).
+#[test]
+fn apc_brake_steers_like_chronos_m113() {
+    let light = m113()["turn"].clone();
+    let (_, ours, chrono) = same_run("turn", held_turn(&light));
+    let (a, b) = (mean(&ours, 2.5, 5.0, |s| s.yaw_rate), mean(&chrono, 2.5, 5.0, |s| s.yaw_rate));
+    assert!(a > 0.0 && b > 0.0 && a / b > 0.5 && a / b < 2.0, "turning at {a} vs Chrono {b} rad/s");
+
+    let hard = m113()["turn_hard"].clone();
+    let (_, ours, chrono) = same_run("turn_hard", held_turn(&hard));
+    for (s, who) in [(&ours, "ours"), (&chrono, "Chrono")] {
+        let (v, w) = (mean(s, 2.5, 5.0, |s| s.speed), mean(s, 2.5, 5.0, |s| s.yaw_rate));
+        assert!(v.abs() < 0.15 && w > 0.0 && w < 0.05, "{who} at {v} m/s, {w} rad/s");
+    }
+}
+
+/// Gradeability on rigid ground: at full throttle in first gear, the APC's thrust is the
+/// engine's launch torque through the gearbox, `F = T/(g₁·i_f·r)`, against the grade and the
+/// running gear's internal resistance `f·W·cos θ`, accelerating the vehicle and its spinning
+/// parts `m_eff = m + ΣJ/r²`. It climbs grades up to `sin θ + f cos θ = F/W`, and stalls above
+/// (creeping at a few cm/s, where the internal resistance fades towards standstill).
+#[test]
+fn apc_climbs_up_to_its_gradeability() {
+    let d = presets::wheeled("tracked_apc").unwrap();
+    let TireModel::Track(p) = &d.tire(0).model else { panic!("track expected") };
+    let PowertrainDef::Combustion(c) = &d.powertrain else { panic!("combustion expected") };
+    let r = p.radius - p.nominal_load / p.vertical_stiffness;
+    let thrust = c.engine.full_throttle.eval(0.0) / (c.gearbox.forward[0] * c.final_drive * r);
+    let weight = d.total_mass() * G;
+    let spin: f64 = d.axles.iter().map(|a| 2.0 * a.wheel.inertia.y).sum::<f64>() + c.driveline_inertia;
+    let m_eff = d.total_mass() + spin / (r * r);
+    let f = p.rolling_resistance;
+    // sin θ + f cos θ = F/W.
+    let limit = (thrust / weight / f.hypot(1.0)).asin() - f.atan();
+    let full = DriveInput { throttle: 1.0, ..Default::default() };
+    for angle in [0.0, 0.5 * limit, 0.9 * limit] {
+        let s = apc_run(angle.tan(), 0.0, 1.0, 3.0, 0.5, |_, _| full);
+        assert!(s.iter().all(|s| s.gear == 1));
+        let a = (s[5].speed - s[0].speed) / 2.5;
+        let expected = (thrust - weight * (angle.sin() + f * angle.cos())) / m_eff;
+        assert!((a - expected).abs() < 0.05 * expected + 0.005, "grade {:.3}: {a} vs {expected} m/s²", angle.tan());
+    }
+    let s = apc_run((1.1 * limit).tan(), 0.0, 1.0, 3.0, 0.5, |_, _| full);
+    assert!(s.iter().all(|s| s.speed < 0.1), "climbs {:.3} beyond its gradeability {:.3}", s[5].speed, limit.tan());
+}
+
+/// Wong and Chiang's theory of skid steering on firm ground (Wong, *Theory of Ground
+/// Vehicles*, §7.3.3): each track element carries `μp` against its sliding velocity, the
+/// shear being well developed. In a pivot turn at yaw rate `ω` with band speeds `±V`, the
+/// elements at `(x, ±B/2)` slide at `(ω·B/2 − V, ω·x)` (outer track); per track of length `ℓ`
+/// and load `W/2` the thrust is `μp·∫ s/√(s² + ω²x²) dx` and the turning resistance moment
+/// `μp·∫ ωx²/√(s² + ω²x²) dx`, `s = V − ω·B/2`, `p = W/(2ℓ)`: less than the classic `μWℓ/4`
+/// (no longitudinal slip), which the rover's motors cannot reach. At steady yaw the tracks'
+/// thrusts balance the resistance.
+#[test]
+fn pivot_turn_follows_wong_and_chiang() {
+    let w = World::flat();
+    let mut v = rover(false);
+    w.run(&mut v, &DriveInput { yaw: 1.0, ..Default::default() }, 4.0);
+    let r = v.ang_vel_body().z;
+    let fx = |side: usize| v.wheels().enumerate().filter(|(w, _)| w % 2 == side).map(|(_, s)| s.tire.fx).sum::<f64>();
+    let (tread, p) = (2.0 * v.def().axles[0].position.y, patch(&v));
+    let l = 4.0 * p.length;
+    let weight = v.def().total_mass() * G;
+    let mu = p.mu * MaterialTable::standard().get(MaterialId::ASPHALT).friction / 0.8;
+    let slip = 0.5 * (band(&v, 1) - band(&v, 0)) - 0.5 * r * tread;
+    assert!(slip > 0.0);
+    let mup = mu * weight / (2.0 * l);
+    let n = 10_000;
+    let (mut thrust, mut moment) = (0.0, 0.0);
+    for i in 0..n {
+        let x = -0.5 * l + (i as f64 + 0.5) * l / n as f64;
+        let speed = slip.hypot(r * x);
+        thrust += mup * slip / speed * l / n as f64;
+        moment += 2.0 * mup * r * x * x / speed * l / n as f64;
+    }
+    assert!((fx(1) / thrust - 1.0).abs() < 0.03, "outer thrust {} vs {thrust}", fx(1));
+    assert!((-fx(0) / thrust - 1.0).abs() < 0.03, "inner thrust {} vs {thrust}", -fx(0));
+    let resistance = 0.5 * tread * (fx(1) - fx(0));
+    assert!((resistance / moment - 1.0).abs() < 0.05, "turning moment {resistance} vs {moment}");
+    assert!(moment < mu * weight * l / 4.0);
 }

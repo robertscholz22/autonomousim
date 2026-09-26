@@ -193,7 +193,12 @@ fn tracked_carrier_tracks_speed_and_yaw_rate() {
         assert!((v - speed).abs() < (0.05 * speed.abs()).max(0.02), "{name}: v {v} for {speed}");
         assert!((w - yaw_rate).abs() < (0.05 * yaw_rate.abs()).max(0.02), "{name}: ω {w} for {yaw_rate}");
         rig.run(&GroundSetpoint::SpeedYawRate { speed: 0.0, yaw_rate: 0.0 }, 10.0, |_| 0.0);
-        assert!(rig.v.speed().abs() < 0.02 && rig.v.ang_vel_body().z.abs() < 0.01, "{name}: not held");
+        assert!(
+            rig.v.speed().abs() < 0.02 && rig.v.ang_vel_body().z.abs() < 0.01,
+            "{name}: not held, v {} ω {}",
+            rig.v.speed(),
+            rig.v.ang_vel_body().z
+        );
     }
     let mut rig = Rig::new(name);
     rig.run(&GroundSetpoint::SpeedYawRate { speed: 0.0, yaw_rate: 0.3 }, 20.0, |_| 0.0);

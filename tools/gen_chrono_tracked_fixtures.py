@@ -5,8 +5,9 @@ NSC contact, as in its demos: with SMC contact at 0.5 ms the braked vehicle cree
 on its chattering shoes. Even with NSC the shoes chatter (the hull rocks by ±0.1 m/s), so
 static values are averaged over the last seconds.
 
-    make fixtures-chrono      (slow: Chrono runs the M113 at ~1/60 real time)
-    python tools/gen_chrono_tracked_fixtures.py [design] [static]
+    make fixtures-chrono      (slow: Chrono runs the M113 at ~1/50 real time)
+    python tools/gen_chrono_tracked_fixtures.py [design] [static] [driveline] [accel] [turn]
+        [turn_hard] [hold] [climb]
 
 Writes fixtures/chrono/tracked_m113.json, consumed by crates/vehicles/tests/tracks.rs and used
 to build assets/vehicles/tracked_apc.toml:
@@ -18,12 +19,26 @@ to build assets/vehicles/tracked_apc.toml:
   positions in the chassis frame and above the ground, arm angles and torsion-spring torques
   (which include the track tension: the springs carry about twice the weight), and the
   vertical ground reaction under each road wheel (see `GroundLoads`);
-* `driveline`: the conical gear ratio of the BDS driveline.
+* `driveline`: the conical gear ratio of the BDS driveline;
+* `accel`, `turn`, `turn_hard`, `hold`, `climb`: runs with our engine map (`ENGINE`, written to
+  a JSON file for Chrono; Chrono's own map has no torque at standstill and a zero-throttle map
+  equal to the full-throttle one) and Chrono's gearbox, at `ITERATIONS` solver iterations:
+  - after settling braked for `SETTLE` s: the launch at full throttle; braked on a 30 % grade;
+    climbing a 15 % grade at full throttle (slopes tilt gravity);
+  - turns, started at `TURN_LAUNCH` m/s (Chrono gives the hull its speed but not the tracks,
+    which drag it down to about 1.1 m/s at once), the speed held at `TURN_SPEED` by a PI
+    throttle, steering (braking the inner track) by 0.3 and 0.6 from `TURN_AT` s.
+  Time histories every `SAMPLE` s after the settling: speed (forward, of the chassis reference
+  frame), yaw rate, gear, sprocket speeds, displacement along the slope.
+
+At about 1/50 of real time (150 iterations; 600 take 4 times as long), the runs are kept short.
 """
 
 import json
+import math
 import pathlib
 import sys
+import tempfile
 
 import pychrono as ch
 import pychrono.vehicle as veh
@@ -33,6 +48,31 @@ OUT = ROOT / "fixtures" / "chrono" / "tracked_m113.json"
 MU0 = 0.8
 DT = 5e-4
 Z0 = 0.66  # chassis reference frame, 3 cm above its rest height
+SETTLE = 1.0
+SAMPLE = 0.25
+# Solver iterations for the runs: with Chrono's usual 150, the loose contact and brake
+# constraints add a speed-dependent running resistance, brake creep and slip that doubles the
+# turning response.
+ITERATIONS = 600
+TURN_LAUNCH = 2.0
+TURN_AT = 1.0
+TURN_SECONDS = 5.0
+TURN_SPEED = 1.2
+SPEED_KP, SPEED_KI = 0.5, 0.3
+# The `tracked_apc` preset's engine (assets/vehicles/tracked_apc.toml).
+ENGINE = {
+    "Name": "tracked_apc engine", "Type": "Engine", "Template": "EngineSimpleMap",
+    "Maximal Engine Speed RPM": 3500.0,
+    "Map Full Throttle": [[-100, 610], [500, 610], [1000, 610], [1500, 603], [2000, 590], [2500, 556],
+                          [2800, 535], [3000, 515], [3200, -135]],
+    "Map Zero Throttle": [[-100, 0], [500, -20], [1000, -25], [1500, -30], [2000, -40], [2500, -50],
+                          [3000, -65], [3500, -600]],
+}
+TRANSMISSION = {
+    "Name": "M113 Simple Map Transmission", "Type": "Transmission", "Template": "AutomaticTransmissionSimpleMap",
+    "Gear Box": {"Reverse Gear Ratio": -0.151, "Forward Gear Ratios": [0.240, 0.427, 0.685, 0.962],
+                 "Shift Points Map RPM": [[750, 1500]] * 4},
+}
 
 
 def vec(v) -> list[float]:
@@ -42,7 +82,7 @@ def vec(v) -> list[float]:
 class M113:
     """Chrono's M113 on flat rigid ground."""
 
-    def __init__(self):
+    def __init__(self, ours: bool = False, grade: float = 0.0, iterations: int = 150, init_speed: float = 0.0):
         m = veh.M113()
         m.SetContactMethod(ch.ChContactMethod_NSC)
         m.SetTrackShoeType(veh.TrackShoeType_SINGLE_PIN)
@@ -51,13 +91,18 @@ class M113:
         m.SetTransmissionType(veh.TransmissionModelType_AUTOMATIC_SIMPLE_MAP)
         m.SetBrakeType(veh.BrakeType_SIMPLE)
         m.SetInitPosition(ch.ChCoordsysd(ch.ChVector3d(0, 0, Z0), ch.QUNIT))
+        m.SetInitFwdVel(init_speed)
         m.Initialize()
         self.m = m
         self.v = m.GetVehicle()
         sys_ = self.v.GetSystem()
-        sys_.SetGravitationalAcceleration(ch.ChVector3d(0, 0, -9.81))
+        theta = math.atan(grade)  # uphill along +x
+        sys_.SetGravitationalAcceleration(ch.ChVector3d(-9.81 * math.sin(theta), 0, -9.81 * math.cos(theta)))
+        if ours:
+            self.v.InitializePowertrain(veh.ChPowertrainAssembly(read(ENGINE, veh.ReadEngineJSON),
+                                                                 read(TRANSMISSION, veh.ReadTransmissionJSON)))
         sys_.SetSolverType(ch.ChSolver.Type_BARZILAIBORWEIN)
-        sys_.GetSolver().AsIterative().SetMaxIterations(150)
+        sys_.GetSolver().AsIterative().SetMaxIterations(iterations)
         self.terrain = veh.RigidTerrain(sys_)
         mat = ch.ChContactMaterialNSC()
         mat.SetFriction(MU0)
@@ -80,6 +125,12 @@ class M113:
 
     def track(self, side):
         return self.v.GetTrackAssembly(veh.LEFT if side == 0 else veh.RIGHT)
+
+
+def read(spec: dict, reader):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(spec, f)
+    return reader(f.name)
 
 
 def lumped(bodies) -> dict:
@@ -229,16 +280,77 @@ def driveline(sim: M113, seconds: float = 3.0, every: int = 100) -> dict:
             "speed": sim.v.GetSpeed()}
 
 
+def run(sim: M113, seconds: float, inputs, settle: float = SETTLE) -> dict:
+    """Settle braked for `settle` s, then drive with `inputs(t)` → (throttle, steering, braking)
+    for `seconds`, sampling every `SAMPLE` s."""
+    sim.inputs.m_braking = 1.0
+    while sim.t < settle - 1e-9:
+        sim.step()
+    d = sim.v.GetDriveline()
+    x0 = ch.ChVector3d(sim.frame().GetPos())
+    rows = []
+    k, every = 0, round(SAMPLE / DT)
+    while sim.t < settle + seconds - 1e-9:
+        sim.inputs.m_throttle, sim.inputs.m_steering, sim.inputs.m_braking = inputs(sim.t - settle)
+        sim.step()
+        k += 1
+        if k % every:
+            continue
+        rows.append({
+            "t": k * DT,
+            "speed": sim.v.GetSpeed(),
+            "yaw_rate": sim.v.GetChassisBody().GetAngVelParent().z,
+            "gear": sim.v.GetTransmission().GetCurrentGear(),
+            "sprockets": [d.GetSprocketSpeed(veh.LEFT), d.GetSprocketSpeed(veh.RIGHT)],
+            "displacement": vec(sim.frame().GetPos() - x0),
+        })
+    return {"samples": rows, "settle": settle}
+
+
+def held_turn(steering: float):
+    """Speed held at `TURN_SPEED` by a PI throttle, steering from `TURN_AT` s."""
+    state = {"i": 0.0, "t": 0.0}
+
+    def inputs(sim):
+        def f(t):
+            e = TURN_SPEED - sim.v.GetSpeed()
+            dt, state["t"] = t - state["t"], t
+            raw = SPEED_KP * e + state["i"]
+            if 0.0 < raw < 1.0 or (raw >= 1.0) != (e > 0):
+                state["i"] = min(max(state["i"] + SPEED_KI * e * dt, 0.0), 1.0)
+            return min(max(raw, 0.0), 1.0), steering if t >= TURN_AT else 0.0, 0.0
+        return f
+
+    sim = M113(ours=True, iterations=ITERATIONS, init_speed=TURN_LAUNCH)
+    return run(sim, TURN_SECONDS, inputs(sim), settle=0.0) | {
+        "turn_at": TURN_AT, "steering": steering, "speed": TURN_SPEED, "launch": TURN_LAUNCH,
+        "kp": SPEED_KP, "ki": SPEED_KI}
+
+
+RUNS = {
+    "accel": lambda: run(M113(ours=True, iterations=ITERATIONS), 4.0, lambda t: (1.0, 0.0, 0.0)),
+    "turn": lambda: held_turn(0.3),
+    "turn_hard": lambda: held_turn(0.6),
+    "hold": lambda: run(M113(ours=True, grade=0.3, iterations=ITERATIONS), 4.0, lambda t: (0.0, 0.0, 1.0)) | {"grade": 0.3},
+    "climb": lambda: run(M113(ours=True, grade=0.15, iterations=ITERATIONS), 6.0, lambda t: (1.0, 0.0, 0.0)) | {"grade": 0.15},
+}
+
+
 def main():
-    out = json.loads(OUT.read_text()) if OUT.exists() else {}
-    which = sys.argv[1:] or ["design", "static", "driveline"]
+    which = sys.argv[1:] or ["design", "static", "driveline", *RUNS]
+    new = {}
     if "design" in which:
-        out["design"] = design(M113())
+        new["design"] = design(M113())
     if "static" in which:
-        out["static"] = settle(M113())
+        new["static"] = settle(M113())
     if "driveline" in which:
-        out["driveline"] = driveline(M113())
-    OUT.write_text(json.dumps(out, indent=1))
+        new["driveline"] = driveline(M113())
+    for name, f in RUNS.items():
+        if name in which:
+            new[name] = f() | {"sample": SAMPLE, "iterations": ITERATIONS}
+    # Read last: runs of different parts may go in parallel.
+    out = json.loads(OUT.read_text()) if OUT.exists() else {}
+    OUT.write_text(json.dumps(out | new, indent=1))
     print(f"wrote {OUT}")
 
 
