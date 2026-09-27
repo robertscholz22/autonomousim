@@ -31,7 +31,8 @@ pub struct DrivableSpec {
     /// Steepest drivable slope (degrees).
     pub max_slope_deg: f64,
     /// Steepest slope to start on (degrees): standing on rough, steep ground, unevenly loaded
-    /// tyres can slide.
+    /// tyres can slide. Two-wheelers start on no steeper ground than their feet's
+    /// `max_slope_deg`.
     pub spawn_slope_deg: f64,
     /// Room kept between obstacles and the vehicle's sides (m), for turning and steering errors.
     pub margin: f64,

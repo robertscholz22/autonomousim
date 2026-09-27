@@ -81,10 +81,11 @@ damping = 100.0
 max_torque = 2000.0
 
 [feet]
-down = [0.45, 0.42, 0.08]
+down = [0.62, 0.45, 0.08]
 up = [0.30, 0.20, 0.33]
 radius = 0.06
 speed = 1.5
+max_slope_deg = 15.0
 
 [powertrain]
 type = "combustion"

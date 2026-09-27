@@ -1152,7 +1152,12 @@ impl CompiledGroup {
             grid,
             ride: self.rest.pos.z,
             radius: self.radius,
-            max_slope: self.spec.drivable.spawn_slope_deg.to_radians(),
+            max_slope: self
+                .def
+                .as_wheeled()
+                .and_then(|d| d.feet)
+                .map_or(self.spec.drivable.spawn_slope_deg, |f| f.max_slope_deg.min(self.spec.drivable.spawn_slope_deg))
+                .to_radians(),
         })
     }
 }

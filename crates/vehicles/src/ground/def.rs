@@ -503,10 +503,19 @@ pub struct FeetDef {
     pub radius: f64,
     #[serde(default = "default_feet_speed")]
     pub speed: f64,
+    /// Steepest ground (degrees) the vehicle stands on, leaning onto a foot; scenarios spawn
+    /// it on no steeper ground. The feet are rigid on the frame, where a rider's leg would
+    /// reach down a slope, so this is below what a real rider manages.
+    #[serde(default = "default_stance_slope")]
+    pub max_slope_deg: f64,
 }
 
 fn default_feet_speed() -> f64 {
     1.5
+}
+
+fn default_stance_slope() -> f64 {
+    10.0
 }
 
 /// Tracks on both sides of the towing unit. Every axle without a `tire` is a pair of road
@@ -1009,10 +1018,12 @@ impl WheeledDef {
                 && pos(f.down.y)
                 && pos(f.up.y)
                 && pos(f.radius)
-                && nonneg(f.speed))
+                && nonneg(f.speed)
+                && f.max_slope_deg > 0.0
+                && f.max_slope_deg < 90.0)
         {
             return Err(
-                "the feet need finite positions left of the centreline (y > 0), a positive radius and speed".into()
+                "the feet need finite positions left of the centreline (y > 0), a positive radius and speed, and max_slope_deg in (0, 90)".into()
             );
         }
         self.powertrain.validate(&self.axle_ranges())?;

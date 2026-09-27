@@ -12,13 +12,48 @@ fn compile(toml: &str) -> Arc<CompiledScenario> {
     Arc::new(Scenario::from_toml(toml).unwrap().compile().unwrap())
 }
 
+/// On rural maps, spawned on the roads and anywhere off them (on slopes up to their feet's
+/// `max_slope_deg`), both presets stand on their feet for 3 s without a terminal event.
+#[test]
+fn spawn_on_rural_maps() {
+    for vehicle in ["motorcycle_sport", "bicycle_city"] {
+        for spawn in ["on_road = true", "margin = 20.0"] {
+            let sc = compile(&format!(
+                r#"
+                name = "rural"
+                physics_hz = 1000
+                policy_hz = 20
+                map = {{ type = "rural", seed = 0, count = 2, cache = false }}
+                [[groups]]
+                vehicle = "{vehicle}"
+                spawn = {{ {spawn} }}
+                "#
+            ));
+            for seed in 0..8 {
+                let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(seed));
+                let mut seen = Events::NONE;
+                for _ in 0..3 * sc.spec.policy_hz {
+                    w.set_actions(0, &[0.0, 0.0]);
+                    w.step();
+                    seen = Events(seen.0 | events(&w).0);
+                }
+                let r = roll(&w);
+                assert!(
+                    !seen.intersects(Events::TERMINAL) && r.abs() < 0.4,
+                    "{vehicle} {spawn} seed {seed}: {seen:?}, roll {r:.3}"
+                );
+            }
+        }
+    }
+}
+
 /// Drive grids clear the feet, which stick out beyond the handlebars.
 #[test]
 fn drive_grid_width_includes_the_feet() {
-    for (vehicle, half) in [("motorcycle_sport", 0.48), ("bicycle_city", 0.41)] {
+    for (vehicle, half) in [("motorcycle_sport", 0.51), ("bicycle_city", 0.45)] {
         let def = autonomousim_vehicles::SharedDef::from(autonomousim_vehicles::presets::get(vehicle).unwrap());
         let w = autonomousim_sim::drive::half_width(def.as_wheeled().unwrap());
-        assert!((w - half).abs() < 0.03, "{vehicle}: {w}");
+        assert!((w - half).abs() < 1e-9, "{vehicle}: {w}");
     }
 }
 
@@ -41,8 +76,6 @@ fn scenario(vehicle: &str, map: &str, yaw: f64) -> Arc<CompiledScenario> {
 }
 
 const FLAT: &str = r#"{ type = "testworld", kind = "flat", size = 1000.0 }"#;
-/// 10° up towards +x.
-const INCLINE: &str = r#"{ type = "testworld", kind = "incline", size = 200.0, angle_deg = 10.0 }"#;
 
 const OBS_DIM: usize = 2 + 2 + 2 + 1 + 1;
 
@@ -56,15 +89,20 @@ fn roll(w: &WorldInstance) -> f64 {
     w.agent(0).vehicle.pose().rot.to_euler(EulerRot::ZYX).2
 }
 
-/// Standing still on flat ground and across a 10° slope, both presets stay on their feet
-/// without a terminal event (the feet are gear): upright on the flat, leaning downhill across the slope.
+/// Standing still for 3 s on flat ground and on a slope as steep as their feet's
+/// `max_slope_deg` (across it and diagonally up and down it), both presets stay on their feet
+/// without a terminal event (the feet are gear): upright on the flat, leaning downhill on the
+/// slope.
 #[test]
 fn spawn_upright_on_their_feet() {
-    for vehicle in ["motorcycle_sport", "bicycle_city"] {
-        // Across the slope heading +y, uphill (+x) is to the right: the bike leans left.
-        for (map, yaw, lean) in
-            [(FLAT, 0.0, [-0.1, 0.1]), (INCLINE, 90.0, [-0.5, -0.02]), (INCLINE, -90.0, [0.02, 0.5])]
-        {
+    for (vehicle, slope) in [("motorcycle_sport", 15.0), ("bicycle_city", 12.0)] {
+        let def = autonomousim_vehicles::SharedDef::from(autonomousim_vehicles::presets::get(vehicle).unwrap());
+        assert_eq!(def.as_wheeled().unwrap().feet.unwrap().max_slope_deg, slope);
+        // Up towards +x. Heading +y, uphill is to the right: the bike leans left.
+        let incline = format!(r#"{{ type = "testworld", kind = "incline", size = 200.0, angle_deg = {slope} }}"#);
+        let cases = [(FLAT, 0.0, -1.0), (FLAT, 90.0, -1.0), (&incline, 90.0, -1.0), (&incline, -90.0, 1.0)];
+        let diagonal = [45.0, 135.0, -45.0, -135.0].map(|yaw: f64| (incline.as_str(), yaw, -yaw.signum()));
+        for (map, yaw, side) in cases.into_iter().chain(diagonal) {
             let sc = scenario(vehicle, map, yaw);
             assert_eq!(sc.groups[0].obs_dim(), OBS_DIM);
             let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(1));
@@ -78,10 +116,15 @@ fn spawn_upright_on_their_feet() {
             }
             let r = roll(&w);
             let moved = (w.agent(0).vehicle.pose().pos - start).length();
-            let msg = format!("{vehicle} yaw {yaw}: spawned at {initial:.3} rad, now {r:.3} rad, moved {moved:.3} m");
+            let msg =
+                format!("{vehicle} {map} yaw {yaw}: spawned at {initial:.3} rad, now {r:.3} rad, moved {moved:.3} m");
             assert!(!seen.intersects(Events::TERMINAL), "{msg}: {seen:?}");
-            assert!((lean[0]..lean[1]).contains(&r), "{msg}");
-            assert!((r - initial).abs() < 0.1 && moved < 0.3, "{msg}");
+            if map == FLAT {
+                assert!(r.abs() < 1e-3 && moved < 0.01, "{msg}");
+            } else {
+                assert!(side * r > 0.05 && side * r < 0.45, "{msg}");
+            }
+            assert!((r - initial).abs() < 0.12 && moved < 0.1, "{msg}");
             let mut obs = [0.0f32; OBS_DIM];
             w.observe(0, &mut obs);
             assert_eq!(obs[6], 1.0, "{msg}: feet down");
@@ -99,6 +142,8 @@ fn motorcycle_rides_observes_and_records() {
     b.attach_recorder(0, Recorder::create(&path, RecorderConfig { state_hz: 20, ..Default::default() }).unwrap());
     let hz = sc.spec.policy_hz as usize;
     let mut leaned = 0.0f64;
+    // The lean term's rate against the change of its angle (trapezoidal rule over a step).
+    let (mut prev, mut fastest, mut rate_error) = ([0.0f32; 2], 0.0f64, 0.0f64);
     for k in 0..16 * hz {
         // 10 m/s, then a left turn at a fifth of the full curvature.
         let turn = if k >= 8 * hz { 0.2 } else { 0.0 };
@@ -107,7 +152,16 @@ fn motorcycle_rides_observes_and_records() {
         let e = events(w);
         assert!(!e.intersects(Events::TERMINAL), "{e:?} at {:.2} s", k as f64 / hz as f64);
         leaned = leaned.min(roll(w));
+        let mut obs = [0.0f32; OBS_DIM];
+        w.observe(0, &mut obs);
+        if k > 0 {
+            let change = f64::from(obs[0] - prev[0]) * hz as f64;
+            rate_error = rate_error.max((change - 0.5 * f64::from(obs[1] + prev[1])).abs());
+            fastest = fastest.max(f64::from(obs[1]).abs());
+        }
+        prev = [obs[0], obs[1]];
     }
+    assert!(fastest > 0.2 && rate_error < 0.05 * fastest, "roll rates up to {fastest}, error {rate_error}");
     let w = b.world(0);
     let bike = w.agent(0).vehicle.as_wheeled().unwrap();
     let v = &w.agent(0).vehicle;
@@ -128,11 +182,6 @@ fn motorcycle_rides_observes_and_records() {
     for (i, (&o, e)) in obs.iter().zip(expected).enumerate() {
         assert!((f64::from(o) - e).abs() < 1e-5 * (1.0 + e.abs()), "term value {i}: {o} against {e}");
     }
-    // The roll rate agrees with the roll's change over the next policy step.
-    b.step(&[&[0.5, 0.2]]);
-    let next = roll(b.world(0));
-    assert!((next - r - rate / hz as f64).abs() < 0.01, "{next} after {r} at {rate} rad/s");
-
     b.detach_recorder(0).unwrap().finish().unwrap();
     let rec = Recording::read(&path).unwrap();
     let last = rec.episodes[0].states[0].last().unwrap();

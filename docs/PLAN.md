@@ -1846,7 +1846,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
   - The feet are symmetric and flat asphalt is perfect, so launches and stops stay exactly upright; cross slopes and one-footed stances come with step 6's spawns.
 - **Step 6 (simulation)**:
   - **Spawns** (`drive::ground_pose`, single-track branch): the wheels' contacts are collinear, so the plane fit would roll the vehicle to the terrain normal. Instead a line is fitted along the heading through the ground under the wheels and the spawn point; the vehicle stands upright, pitched to it, lifted so that no wheel starts below the ground. Ground spawns are at rest, so the feet are down. Where a foot would start inside the ground (a cross slope), the vehicle leans towards the lower side, rolling on its tyres' crowns (about the line through the crown centres), until the lower foot touches (bisection, at most 0.5 rad).
-  - **Drive grids**: `half_width` already included the feet (motorcycle 0.48 m, bicycle 0.41 m).
+  - **Drive grids**: `half_width` already included the feet (motorcycle 0.51 m, bicycle 0.45 m).
   - **Events**: unchanged. The feet are gear, so standing on them raises `GROUND_CONTACT`/`LANDED` (not terminal); the frame, rider or handlebar touching the ground is `CRASH_TERRAIN`.
   - **Observation terms**:
     - `lean` (2): the yaw–pitch–roll angles' roll and its rate `p + (q sin φ + r cos φ) tan θ`. It needs no wheels, so it works for any vehicle.
@@ -1855,12 +1855,19 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
     - `steering` has 2 values (angle and rate) on vehicles with a steering head, 1 otherwise. `CompiledObs::new` takes a new `steering_head` flag.
   - **Recording**: two-wheelers' state messages add `steer_torque` (the rider's plus the damper's, N·m) and `feet`. The rider's lean was already the last of `joints`. `RecordedState` gains both, with serde defaults. Other vehicles' messages are unchanged, so goldens are unchanged.
   - **Python**: `vehicle="motorcycle_sport"` (or `bicycle_city`) works in any ground task; the docstring lists the two-wheelers and their terms.
-  - **Preset change**: `bicycle_city`'s feet moved from (0.30, ±0.30) to (0.45, ±0.36). Standing across a 10° slope, the old stance was behind the combined centre of mass and too narrow, and the bicycle toppled over its downhill foot.
+  - **Stance** (revised after the first commit, when a test on rural maps found a bicycle toppling over its downhill foot on a 12.8° slope):
+    - The feet are rigid on the frame and the rider's lower body is lumped into it, so the whole vehicle and rider lean onto one foot. A real rider's weight goes down the leg, which reaches down a slope. The stance is a triangle: the two tyre contacts and the downhill foot.
+    - Feet moved beside the centres of mass (along the vehicle), where the triangle is widest: `motorcycle_sport` from (0.45, ±0.42) to (0.62, ±0.45) m (centre of mass about 0.72 m ahead of the rear axle); `bicycle_city` from (0.30, ±0.30) to (0.38, ±0.40) m (centre of mass 0.38 m ahead).
+    - A sweep over slopes and headings (across, and diagonally up and down) with the new feet: the motorcycle stands on up to 16° at all headings tried, the bicycle on up to 12°. The bicycle's front wheel carries little on its foot, and heading diagonally uphill it tips back over the line from the rear contact to the foot from 13°.
+    - New `FeetDef::max_slope_deg` (default 10°; `motorcycle_sport` 15°, `bicycle_city` 12°): the steepest ground the vehicle stands on. Spawns use the smaller of it and `drivable.spawn_slope_deg`. The limit scores candidates, as the slope limit always did, so a steeper spot is taken only where no other is found.
+    - Tried and dropped: the rider straightening the upper body while standing (the lean servo against the frame's roll). Snapping upright threw the bicycle off its wheels. Rate-limited to 0.5 rad/s it helped straight across the slope but not diagonally, and the bicycle rocked between foot and wheels.
+    - Stopping on steeper ground than `max_slope_deg` can still tip a two-wheeler over; agents meet that as a crash.
   - **Tests** (`sim/tests/two_wheelers.rs`, `tests_py/test_envs.py::test_motorcycle_rides_off_its_feet`):
     - Both presets standing still for 3 s on flat ground stay exactly upright.
-    - Across a 10° slope they spawn leaning downhill and stay there without a terminal event. The motorcycle spawns at 0.198 rad and settles at 0.285 rad (tyre and suspension compliance, 5 cm). The bicycle spawns at 0.215 rad and settles at 0.226 rad.
+    - On a slope of their `max_slope_deg`, heading across it and diagonally up and down it, they spawn leaning downhill and stay there (lean change < 0.12 rad, < 10 cm) without a terminal event. On 10° the motorcycle settled 0.087 rad beyond its spawn lean: its suspension extends once the foot takes about 40 % of the weight, in about 1 s, briefly unloading the rear wheel. The bicycle rocks gently on its foot for some seconds (its tyres are lightly damped and it has no suspension).
+    - On rural maps (2 maps, 8 seeds, spawned on roads and off them) both stand for 3 s without a terminal event.
     - The motorcycle launches off its feet, rides at 10 m/s and turns left, leaning left 0.26 rad.
-    - The terms equal the vehicle's state, and the roll rate matches the roll's change over the next policy step.
+    - The terms equal the vehicle's state. Over the whole ride the lean rate matches the change of the lean angle (trapezoidal rule over each policy step) within 0.026 rad/s, against rates up to 0.76 rad/s.
     - The recording's last state has the position, steering, steering torque, joints (rider lean last) and feet of the vehicle.
     - A constant steering torque without balance ends in `CRASH_TERRAIN`.
 

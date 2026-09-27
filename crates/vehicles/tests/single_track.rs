@@ -116,8 +116,13 @@ fn feet_hold_it_up_and_lift_when_riding() {
         [p.slip_stiffness, p.cornering_stiffness, p.relaxation_x, p.relaxation_y, p.vxlow] =
             [8000.0, 6000.0, 0.03, 0.05, 1.0];
     }
-    d.feet =
-        Some(FeetDef { down: DVec3::new(0.45, 0.3, 0.07), up: DVec3::new(0.45, 0.12, 0.3), radius: 0.05, speed: 1.5 });
+    d.feet = Some(FeetDef {
+        down: DVec3::new(0.45, 0.3, 0.07),
+        up: DVec3::new(0.45, 0.12, 0.3),
+        radius: 0.05,
+        speed: 1.5,
+        max_slope_deg: 10.0,
+    });
     d.finish().unwrap();
     let mut v = Wheeled::new(Arc::new(d), DT);
     assert!(v.feet_down());
