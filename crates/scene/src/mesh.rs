@@ -163,6 +163,42 @@ pub fn tube(radius: f32, half_height: f32, segments: usize, color: [f32; 4]) -> 
     m
 }
 
+/// Torus about the z axis: a tube of radius `minor` around the circle of radius `major` in the
+/// xy plane, with smooth normals.
+pub fn torus(major: f32, minor: f32, segments: usize, sides: usize, color: [f32; 4]) -> MeshData {
+    let mut m = MeshData::new();
+    for k in 0..segments {
+        let a = std::f32::consts::TAU * k as f32 / segments as f32;
+        let radial = Vec3::new(a.cos(), a.sin(), 0.0);
+        for j in 0..sides {
+            let b = std::f32::consts::TAU * j as f32 / sides as f32;
+            let n = radial * b.cos() + Vec3::Z * b.sin();
+            m.push_vertex(radial * major + n * minor, n, color);
+        }
+    }
+    let (s, n) = (sides as u32, segments as u32);
+    for k in 0..n {
+        let k1 = (k + 1) % n;
+        for j in 0..s {
+            let j1 = (j + 1) % s;
+            let (a, b, c, d) = (k * s + j, k1 * s + j, k1 * s + j1, k * s + j1);
+            m.push_triangle(a, b, c);
+            m.push_triangle(a, c, d);
+        }
+    }
+    m
+}
+
+/// Ellipsoid with semi-axes `h` (a smooth icosphere scaled per axis).
+pub fn ellipsoid(h: Vec3, subdivisions: u32, color: [f32; 4]) -> MeshData {
+    let mut m = icosphere(1.0, subdivisions, true, color);
+    for (p, n) in m.positions.iter_mut().zip(&mut m.normals) {
+        *p = (Vec3::from_array(*p) * h).to_array();
+        *n = (Vec3::from_array(*n) / h).normalize().to_array();
+    }
+    m
+}
+
 /// Box with half extents `h`.
 pub fn cuboid(h: Vec3, color: [f32; 4]) -> MeshData {
     let mut m = MeshData::new();
@@ -318,6 +354,7 @@ mod tests {
             (icosphere(2.0, 3, true, c), 4.0 / 3.0 * pi * 8.0, 0.02),
             (cylinder(1.0, 2.0, 64, c), pi * 4.0, 0.01),
             (cone(1.0, 1.5, 64, c), pi * 3.0 / 3.0, 0.01),
+            (ellipsoid(Vec3::new(1.0, 2.0, 0.5), 3, c), 4.0 / 3.0 * pi, 0.02),
         ];
         for (m, expected, tol) in cases {
             assert!(outward(&m));
@@ -334,6 +371,15 @@ mod tests {
         assert!((volume(&hull) - 8.0).abs() < 1e-4);
         assert_eq!(icosphere(1.0, 1, false, c).triangle_count(), 80);
         assert_eq!(icosphere(1.0, 1, true, c).vertex_count(), 42);
+        // A torus faces away from its core circle and holds 2π²Rr².
+        let t = torus(2.0, 0.5, 64, 32, c);
+        assert!((volume(&t) / (2.0 * pi * pi * 2.0 * 0.25) - 1.0).abs() < 0.01, "{}", volume(&t));
+        assert!(t.indices.as_chunks::<3>().0.iter().all(|f| {
+            let p = |i: u32| Vec3::from_array(t.positions[i as usize]);
+            let centre = (p(f[0]) + p(f[1]) + p(f[2])) / 3.0;
+            let core = Vec3::new(centre.x, centre.y, 0.0).normalize() * 2.0;
+            Vec3::from_array(t.normals[f[0] as usize]).dot(centre - core) > 0.0
+        }));
         let t = tube(1.0, 1.0, 6, c);
         assert_eq!((t.vertex_count(), t.triangle_count()), (12, 12));
     }

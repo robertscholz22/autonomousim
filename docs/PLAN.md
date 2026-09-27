@@ -1754,7 +1754,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 | 4 ✅ | Presets and powertrains: `bicycle_city` (pedal drive, freewheel), `motorcycle_sport` (engine, gearbox, chain, fork, swing arm, steering damper, brakes) | Static sag and loads as specified; acceleration, top speed and braking plausible against published figures; steady turning roll angle vs lateral acceleration within 1° of the analytic value with tyre widths; weave and wobble modes present with frequencies and damping trends in Sharp et al.'s ranges |
 | 5 ✅ | Rider controller and action modes: gain-scheduled LQR from the linear model, `vk`/`vw`/`raw`, rider lean servo, feet, launch from rest | Straight-line hold under a lateral impulse at 3, 10 and 25 m/s; curvature steps settle without falls; the initial countersteer has the right sign; launch from rest and stop with feet down; the bicycle stays up at walking speed |
 | 6 ✅ | Simulation: upright spawns with feet down (also on cross slopes), drive grid width, events, the `lean`/`rider_lean`/`feet` terms, recorded steer, lean and feet; Python `vehicle="motorcycle_sport"` | Scenarios with two-wheelers compile, spawn, ride and record; existing goldens unchanged; terms match references |
-| 7 | Viewer: two-wheeler visuals (frame, tank, fork, handlebar, toroidal tyres, rider with a leaning torso), HUD (roll, steer angle and torque, rider lean, feet, gear), keyboard riding in `vk`, replay | A motorcycle rides by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay |
+| 7 ✅ | Viewer: two-wheeler visuals (frame, tank, fork, handlebar, toroidal tyres, rider with a leaning torso), HUD (roll, steer angle and torque, rider lean, feet, gear), keyboard riding in `vk`, replay | A motorcycle rides by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay |
 | 8 | `MotorcycleRoadRural-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy rides in the viewer; a recorded episode replays |
 
 **To confirm while building**:
@@ -1870,6 +1870,25 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
     - The terms equal the vehicle's state. Over the whole ride the lean rate matches the change of the lean angle (trapezoidal rule over each policy step) within 0.026 rad/s, against rates up to 0.76 rad/s.
     - The recording's last state has the position, steering, steering torque, joints (rider lean last) and feet of the vehicle.
     - A constant steering torque without balance ends in `CRASH_TERRAIN`.
+- **Step 7 (viewer)**:
+  - **Visuals** (`scene::single_track`, used by `props::wheeled` for any single-track vehicle with a steering head):
+    - New mesh primitives `torus` and `ellipsoid`.
+    - Motorcycles (combustion powertrain): twin spars, engine, lower fairing, tank, seat, tail, front fairing, screen, headlight, exhaust, swing arm and shock. Bicycles: a tube frame from the bottom bracket, saddle, crank and rack.
+    - Wheels: toroidal tyre and rim, hub and spokes (brake discs on the motorcycle).
+    - The steered part (fork legs, triple clamp, handlebar, front fairing) turns about the head axis; the fork sliders follow the fork's travel.
+    - The rider: pelvis on the frame; torso, head and helmet on the lean joint; arms reach from the leaning shoulders to the steered grips, legs from the hips to the pegs, or to the ground while the feet are down (two-bone IK, `single_track::bend`).
+    - `WheeledVisual::single_track` carries the geometry. The viewer's `sync_riders` poses the parts every frame from the state (live and replay).
+  - **HUD**: roll (amber past 30°, red past 45°), rider lean, feet, steer angle and rate, a steer-torque bar against the head's `max_torque`, gear and rpm, the `vk` speed and turn setpoints.
+  - **Keyboard riding** (single-track vehicles in live mode use `vk`):
+    - W/S raise/lower a speed setpoint (0.15/0.4 of full scale per second), Space brings it to zero, A/D turn at 1 of full scale per second.
+    - Full stick leans at most 0.35 rad on the motorcycle and 0.2 rad on the bicycle (`sim::RIDE_LEAN`, capping the group's `lean` limit). The turn fades in below 4 m/s.
+    - With the `vk` default of 0.7 rad, a full-stick turn crashed the bicycle at every speed and the motorcycle at 4, 12 and 16 m/s. The rider regulator overshoots a sudden lean by about a third to a half. The bicycle rolls over from about 0.35 rad of steady lean: the front tyre's slip angle diverges and the steering runs to its lock, with torque to spare. Treated as a limit of the scripted rider, not of the model; a policy may lean further.
+  - **Demo** (`--demo`): riders' curvature is eased (τ 0.5 s) and capped at 1.5× the lateral acceleration allowed at the current speed (2 m/s² motorcycle, 1 m/s² bicycle). The speed setpoint follows `√(a/|κ|)`, with a 3 m/s floor, and is slewed (+1.5/−2.5 m/s²). Lookahead is `max(1.5 v, 8)` m, with the bend sampled to 60 m ahead. Over 10 simulated minutes on the rural showcase map, the motorcycle rode without a terminal event. The bicycle rolled over 4 times, each at crawling speed or on 8–22° slopes.
+  - **Replay** restores the steer torque and the feet (`Wheeled::show_feet`) alongside the joints.
+  - **Performance**: motorcycle on the rural showcase map at 1920×1080 medium: 114 fps on the Iris Xe (car: 122 fps).
+  - **Tests**:
+    - Scene: torus volume and normals, ellipsoid volume, two-bone IK keeps segment lengths, both presets assembled around their geometry.
+    - Viewer: rider parts follow the state (`rider_parts_follow_the_state`); the keys ride a motorcycle (launch, lean into a turn, stop on the feet); full-stick turns at 20–60 % of full speed stay up on both bikes; a replayed motorcycle leans, steers and stands.
 
 ## Roadmap after M1
 | M | Content | Validation |

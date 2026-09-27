@@ -5,6 +5,7 @@
 //! cargo run -p autonomousim-viewer --release -- --preset showcase --seed 0 --vehicle iris_like
 //! cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4 --record drive.mcap
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle truck_6x4 --trailer semitrailer_3axle
+//! cargo run -p autonomousim-viewer --release -- --map rural --vehicle motorcycle_sport
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
 //! cargo run -p autonomousim-viewer --release -- policy runs/run/policy.json --agents 4
@@ -241,7 +242,10 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
     }
     let config = args.size.map(|s| serde_json::json!({ "size": s }));
     let vehicle = VehicleRef::Name(args.vehicle.clone());
-    let ground = matches!(vehicle.resolve()?, VehicleDef::Wheeled(_));
+    let def = vehicle.resolve()?;
+    let ground = matches!(def, VehicleDef::Wheeled(_));
+    // Single-track vehicles are ridden in `vk` (the rider balances them).
+    let single_track = matches!(&def, VehicleDef::Wheeled(w) if w.is_single_track());
     if !ground && !args.trailer.is_empty() {
         bail!("only ground vehicles tow trailers");
     }
@@ -257,7 +261,7 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
         GroupSpec {
             name: "driver".into(),
             vehicle,
-            action_mode: Some(GroundActionMode::Raw.into()),
+            action_mode: Some(if single_track { GroundActionMode::Vk } else { GroundActionMode::Raw }.into()),
             trailers: args.trailer.clone(),
             spawn,
             goals,
@@ -487,6 +491,7 @@ fn main() -> anyhow::Result<()> {
                 world_view::sync_map,
                 vehicle_view::sync_vehicles,
                 vehicle_view::sync_tracks,
+                vehicle_view::sync_riders,
                 camera::update_camera,
                 world_view::update_lod,
                 overlay::draw,
@@ -585,9 +590,20 @@ fn demo_pilot(capture: Res<Capture>, mut sim: ResMut<sim::Sim>, mut route: ResMu
 struct DemoRoute {
     path: Vec<glam::DVec2>,
     rng: u64,
+    /// Riders: the speed and curvature commands, eased towards the pursuit's, and the
+    /// simulated time they were last eased at.
+    speed: f64,
+    curvature: f64,
+    eased_at: f64,
 }
 
 impl DemoRoute {
+    /// Forget the path and the eased commands, for a new episode.
+    fn restart(&mut self) {
+        self.path.clear();
+        (self.speed, self.curvature, self.eased_at) = (0.0, 0.0, 0.0);
+    }
+
     /// Uniform in [0, 1) (xorshift).
     fn uniform(&mut self) -> f64 {
         self.rng ^= self.rng << 13;
@@ -597,24 +613,56 @@ impl DemoRoute {
     }
 }
 
-/// Pure pursuit of a point 8 m ahead along a drivable grid path to a random place 80 m or more
-/// away, at 8 m/s (4 m/s while turning); a new episode after a terminal event or getting
-/// stuck.
+/// Lookahead of the demo's pure pursuit (m): 8 m, and for riders at least 1.5 s ahead, since
+/// a single-track vehicle turns only once it leans.
+fn lookahead(sim: &sim::Sim) -> f64 {
+    let v = sim.world.agent(sim.pilot).vehicle.lin_vel_body().x;
+    if sim.riding() { (1.5 * v).max(8.0) } else { 8.0 }
+}
+
+/// The demo's command at `speed` and pursuit curvature `curvature`. Riders ease the curvature
+/// in with a time constant of 0.5 s, ride the turn at no more than 2 m/s² of lateral
+/// acceleration (but at 3 m/s at least), and change speed by at most 1.5 m/s² up and 2.5 m/s² down (all in simulated
+/// time), so that they never brake hard in a lean.
+fn demo_command(sim: &mut sim::Sim, route: &mut DemoRoute, speed: f64, curvature: f64) {
+    let (speed, curvature) = if sim.riding() {
+        // The lateral acceleration of a bend (m/s²): a bicycle's rider leans less.
+        let lateral = if sim.ride_lean() < 0.3 { 1.0 } else { 2.0 };
+        let dt = (sim.time() - route.eased_at).max(0.0);
+        route.eased_at = sim.time();
+        // Not turning much harder than the speed allows, nor slowing below 3 m/s, clear of
+        // where the feet come down.
+        let v = sim.world.agent(sim.pilot).vehicle.lin_vel_body().x.max(3.0);
+        let curvature = curvature.clamp(-1.5 * lateral / (v * v), 1.5 * lateral / (v * v));
+        route.curvature += (curvature - route.curvature) * (dt / 0.5_f64).min(1.0);
+        let target =
+            speed.min((lateral / route.curvature.abs().max(1e-3)).sqrt()).max(if speed > 0.0 { 3.0 } else { 0.0 });
+        route.speed += (target - route.speed).clamp(-2.5 * dt, 1.5 * dt);
+        (route.speed, route.curvature)
+    } else {
+        (speed, curvature)
+    };
+    sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed, curvature });
+}
+
+/// Pure pursuit of a point 8 m ahead (see [`lookahead`]) along a drivable grid path to a random
+/// place 80 m or more away, at 8 m/s (4 m/s while turning); a new episode after a terminal
+/// event or getting stuck.
 fn drive_demo(sim: &mut sim::Sim, route: &mut DemoRoute) {
-    const LOOKAHEAD: f64 = 8.0;
     let i = sim.pilot;
     if sim.latched[i].intersects(Events(Events::TERMINAL.0 | Events::STUCK.0)) {
         sim.reset();
-        route.path.clear();
+        route.restart();
     }
+    let lookahead = lookahead(sim);
     let agent = sim.world.agent(i);
     let p = agent.vehicle.position().truncate();
     if let Some(lane) = agent.route.clone() {
-        drive_route(sim, &lane);
+        drive_route(sim, route, &lane, lookahead);
         return;
     }
     let grid = sim.world.scenario().groups[agent.group].drive[sim.world.map_index()].clone();
-    if route.path.len() <= 1 && route.path.first().is_none_or(|q| q.distance(p) < LOOKAHEAD) {
+    if route.path.len() <= 1 && route.path.first().is_none_or(|q| q.distance(p) < lookahead) {
         if route.rng == 0 {
             route.rng = 0x9e37_79b9_7f4a_7c15;
         }
@@ -626,7 +674,7 @@ fn drive_demo(sim: &mut sim::Sim, route: &mut DemoRoute) {
             })
             .unwrap_or_default();
     }
-    while route.path.len() > 1 && route.path[0].distance(p) < LOOKAHEAD {
+    while route.path.len() > 1 && route.path[0].distance(p) < lookahead {
         route.path.remove(0);
     }
     let Some(&target) = route.path.first() else {
@@ -636,25 +684,30 @@ fn drive_demo(sim: &mut sim::Sim, route: &mut DemoRoute) {
     let rel = glam::DVec2::from_angle(-yaw(agent.vehicle.orientation())).rotate(target - p);
     let curvature = 2.0 * rel.y / rel.length_squared().max(1.0);
     let speed = if rel.x > rel.y.abs() { 8.0 } else { 4.0 };
-    sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed, curvature });
+    demo_command(sim, route, speed, curvature);
 }
 
-/// Pure pursuit along the pilot's route lane, 8 m ahead, at up to 12 m/s (slower in bends,
-/// for 2 m/s² of lateral acceleration); a new episode at the end of the route.
-fn drive_route(sim: &mut sim::Sim, lane: &autonomousim_world::Polyline) {
-    const LOOKAHEAD: f64 = 8.0;
+/// Pure pursuit along the pilot's route lane, `lookahead` ahead, at up to 12 m/s (slower in
+/// bends, for 2 m/s² of lateral acceleration); a new episode at the end of the route.
+fn drive_route(sim: &mut sim::Sim, route: &mut DemoRoute, lane: &autonomousim_world::Polyline, lookahead: f64) {
     let agent = sim.world.agent(sim.pilot);
     if agent.goal_index >= agent.goals.len() {
         sim.reset();
+        route.restart();
         return;
     }
     let (p, y) = (agent.vehicle.position().truncate(), yaw(agent.vehicle.orientation()));
     let follow = autonomousim_sim::lane::Follow::new(Some(lane), sim.world.map(), p, y).expect("a route");
-    let rel = glam::DVec2::from_angle(-y).rotate(follow.point(LOOKAHEAD) - p);
+    let rel = glam::DVec2::from_angle(-y).rotate(follow.point(lookahead) - p);
     let curvature = 2.0 * rel.y / rel.length_squared().max(1.0);
-    let bend = [0.0, 10.0, 20.0, 40.0].map(|a| follow.curvature(a).abs()).into_iter().fold(0.0, f64::max);
+    // Riders look further ahead, more closely, since they slow down gently.
+    let bend = if sim.riding() {
+        (0..=30).map(|k| follow.curvature(2.0 * k as f64).abs()).fold(0.0, f64::max)
+    } else {
+        [0.0, 10.0, 20.0, 40.0].map(|a| follow.curvature(a).abs()).into_iter().fold(0.0, f64::max)
+    };
     let speed = (2.0 / bend.max(1e-3)).sqrt().min(12.0);
-    sim.drive_command = Some(GroundSetpoint::SpeedCurvature { speed, curvature });
+    demo_command(sim, route, speed, curvature);
 }
 
 fn capture(

@@ -820,6 +820,12 @@ impl Wheeled {
         self.feet.is_some() && self.feet_down
     }
 
+    /// Put the feet down or up, e.g. as recorded, when showing a state (see
+    /// [`show`](Self::show), which sets them from the speed).
+    pub fn show_feet(&mut self, down: bool) {
+        self.set_feet(down);
+    }
+
     fn set_feet(&mut self, down: bool) {
         let (Some(k), Some(f)) = (self.feet, self.def.feet) else { return };
         self.feet_down = down;

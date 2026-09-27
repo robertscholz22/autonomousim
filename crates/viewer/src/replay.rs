@@ -138,10 +138,17 @@ impl Replay {
             let agent = world.agent_mut(i);
             if let Some(v) = agent.vehicle.as_wheeled_mut() {
                 let init = WheeledInit { pose: s.pose, lin_vel_world: s.velocity, ang_vel_body: s.rates };
-                let wheels: Vec<WheelState> = s.wheels.iter().map(wheel_state).collect();
+                let mut wheels: Vec<WheelState> = s.wheels.iter().map(wheel_state).collect();
+                // A steering head's torque is recorded with the vehicle.
+                if let Some(w) = v.def().steering_head().and_then(|(_, k)| wheels.get_mut(k)) {
+                    w.steer_torque = s.last.steer_torque;
+                }
                 let powertrain =
                     PowertrainStatus { gear: s.last.gear, engine_speed: s.last.engine_speed, engine_torque: f64::NAN };
                 v.show(&init, &s.joints, s.steering, &wheels, powertrain);
+                if v.def().feet.is_some() {
+                    v.show_feet(s.last.feet);
+                }
             } else {
                 agent.vehicle.place(s.pose, s.velocity, s.rates);
             }
@@ -398,6 +405,51 @@ mod tests {
         assert!((shown.articulation(1).0 - art).abs() < 1e-3, "{} vs {art}", shown.articulation(1).0);
         let (a, b) = (live.unit_pose(1), shown.unit_pose(1));
         assert!((a.pos - b.pos).length() < 0.05 && a.rot.angle_between(b.rot) < 0.01, "{} {}", a.pos, b.pos);
+    }
+
+    /// A motorcycle replays leaning into a turn with its steering head, the torque on it and
+    /// its rider's lean as they were, feet up; at the start it stood on its feet.
+    #[test]
+    fn replayed_motorcycles_lean_steer_and_stand() {
+        let sc = Scenario::from_toml(
+            r#"
+            name = "ride"
+            physics_hz = 1000
+            policy_hz = 20
+            map = { type = "testworld", kind = "flat", size = 1000.0 }
+            [[groups]]
+            vehicle = "motorcycle_sport"
+            action_mode = "vk"
+            ground_action_limits = { speed = 20.0 }
+            "#,
+        )
+        .unwrap();
+        let sc = Arc::new(sc.compile().unwrap());
+        let path = std::env::temp_dir().join(format!("autonomousim-replay-bike-{}.mcap", std::process::id()));
+        let mut rec = Recorder::create(&path, RecorderConfig { state_hz: 20, ..Default::default() }).unwrap();
+        let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+        rec.on_reset(&w);
+        for k in 0..200 {
+            w.set_actions(0, &[0.5, if k < 120 { 0.0 } else { 0.2 }]);
+            rec.on_actions(&w);
+            w.step_with(&mut |w| rec.on_tick(w));
+        }
+        rec.finish().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut r = Replay::new(recording, 0);
+        r.apply(&mut world);
+        assert!(world.agent(0).vehicle.as_wheeled().unwrap().feet_down());
+        r.seek(r.duration());
+        r.apply(&mut world);
+        let (live, shown) = (w.agent(0).vehicle.as_wheeled().unwrap(), world.agent(0).vehicle.as_wheeled().unwrap());
+        let k = live.def().steering_head().unwrap().1;
+        assert!(live.rider_lean().0.abs() > 1e-4 && live.steering_head().unwrap().0.abs() > 1e-3);
+        assert_eq!(shown.rider_lean().0, live.rider_lean().0);
+        assert_eq!(shown.steering_head().unwrap().0, live.steering_head().unwrap().0);
+        assert_eq!(shown.wheel(k).steer_torque, live.wheel(k).steer_torque);
+        assert!(!shown.feet_down() && shown.pose().rot.angle_between(live.pose().rot) < 1e-9);
     }
 
     /// Plays every episode of a recording as the viewer's `replay` mode does, for recordings

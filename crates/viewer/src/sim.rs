@@ -8,12 +8,13 @@ use crate::autopilot::{self, Autopilot};
 use crate::camera::{CameraMode, CameraRig};
 use crate::replay::Replay;
 use autonomousim_control::Command;
-use autonomousim_control::ground::GroundSetpoint;
+use autonomousim_control::ground::{GroundActionMap, GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::Family;
+use autonomousim_vehicles::ground::PowertrainDef;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
 use glam::{DVec2, DVec3};
@@ -27,6 +28,22 @@ const MAX_FRAME_STEP: f64 = 0.1;
 /// as `1/(1 + (v/v₀)²)`, so that a tap of the key does not spin the car at speed).
 const STEER_RATE: f64 = 2.5;
 const STEER_FADE_SPEED: f64 = 12.0;
+
+/// Keyboard riding of single-track vehicles in `vk`: the rates (of the full-scale speed per
+/// second) at which W raises the speed setpoint and S (or Space, faster) lowers it.
+const RIDE_ACCEL: f64 = 0.15;
+const RIDE_DECEL: f64 = 0.4;
+const RIDE_STOP: f64 = 1.0;
+/// The rate of a rider's turn command (of the full scale per second): a turn builds up over
+/// a second, as the rider leans into it.
+const RIDE_STEER_RATE: f64 = 1.0;
+/// The lean of a full-stick turn (rad) on a motorcycle and on a bicycle: at the `vk` full
+/// scale of 0.7 rad the rider regulator overshoots a sudden turn and the tyres lose grip; the
+/// bicycle's regulator falls from about 0.35 rad of steady lean.
+pub const RIDE_LEAN: [f64; 2] = [0.35, 0.2];
+/// Below this speed (m/s) a rider's turn command fades in proportion: the bike hardly
+/// balances itself there.
+const RIDE_TURN_SPEED: f64 = 4.0;
 
 /// How the keys fly the pilot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,6 +91,8 @@ pub struct Sim {
     /// the fade with speed.
     pub handbrake: bool,
     pub steer: f64,
+    /// Single-track vehicles: the speed setpoint as a fraction of the `vk` full scale.
+    pub ride_speed: f64,
     /// Drives the followed ground vehicle instead of the keys (`--demo`).
     pub drive_command: Option<GroundSetpoint>,
     /// Horizontal and vertical speed at full stick (m/s), yaw rate (rad/s).
@@ -113,6 +132,7 @@ impl Sim {
             stick: [0.0; 4],
             handbrake: false,
             steer: 0.0,
+            ride_speed: 0.0,
             drive_command: None,
             max_speed: 8.0,
             max_climb: 3.0,
@@ -166,6 +186,7 @@ impl Sim {
             warn!("finishing the recording: {e:#}");
         }
         self.world = world;
+        self.ride_speed = 0.0;
         self.pilot = self.pilot.min(self.world.agents().len() - 1);
         self.latched = vec![Events::NONE; self.world.agents().len()];
         self.accumulator = 0.0;
@@ -188,6 +209,7 @@ impl Sim {
             return;
         }
         self.world.reset(None);
+        self.ride_speed = 0.0;
         if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
             r.on_reset(&self.world);
         }
@@ -245,9 +267,39 @@ impl Sim {
         }
     }
 
+    /// Whether the followed vehicle is a single-track vehicle, ridden in `vk`.
+    pub fn riding(&self) -> bool {
+        self.world.agent(self.pilot).vehicle.as_wheeled().is_some_and(|w| w.def().is_single_track())
+    }
+
+    /// The lean of a full-stick turn of the followed single-track vehicle (see [`RIDE_LEAN`]).
+    pub fn ride_lean(&self) -> f64 {
+        let motorcycle = self
+            .world
+            .agent(self.pilot)
+            .vehicle
+            .as_wheeled()
+            .is_some_and(|w| matches!(w.def().powertrain, PowertrainDef::Combustion(_)));
+        RIDE_LEAN[usize::from(!motorcycle)]
+    }
+
+    /// The `vk` action map with which the keys ride the followed single-track vehicle: from
+    /// its group's limits, leaning at most [`RIDE_LEAN`].
+    pub fn ride_map(&self) -> Option<GroundActionMap> {
+        let agent = self.world.agent(self.pilot);
+        let group = &self.world.scenario().groups[agent.group];
+        let def = agent.vehicle.as_wheeled()?.def();
+        let lean = self.ride_lean();
+        let mut limits = group.spec.ground_action_limits.clone();
+        limits.lean = Some(limits.lean.map_or(lean, |l| l.min(lean)));
+        GroundActionMap::new(GroundActionMode::Vk, &limits, def).ok()
+    }
+
     /// The pilot's command for the followed vehicle: [`setpoint`](Self::setpoint) for a
     /// multirotor. For a ground vehicle, forward/back is the pedal (brake, then reverse) and
-    /// the steering follows left/right; side drives turn by driving their sides apart.
+    /// the steering follows left/right; side drives turn by driving their sides apart. A
+    /// single-track vehicle is ridden in `vk`: the speed setpoint and the curvature (left/right,
+    /// at most what the lean allows at the speed).
     pub fn pilot_command(&self) -> Command {
         let agent = self.world.agent(self.pilot);
         match agent.vehicle.family() {
@@ -255,6 +307,12 @@ impl Sim {
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();
+                }
+                if self.riding()
+                    && let Some(map) = self.ride_map()
+                {
+                    let fade = (agent.vehicle.lin_vel_body().x / RIDE_TURN_SPEED).clamp(0.0, 1.0);
+                    return map.setpoint(&[self.ride_speed, self.steer * fade]).into();
                 }
                 let forward = self.stick[0];
                 if agent.controller.as_ground().is_some_and(|c| c.is_side_drive()) {
@@ -269,8 +327,20 @@ impl Sim {
         }
     }
 
-    /// Move the steering command toward the keys by `dt` of simulated time.
+    /// Move the steering command toward the keys by `dt` of simulated time (and a rider's
+    /// speed setpoint).
     fn update_steering(&mut self, dt: f64) {
+        if self.riding() {
+            let rate = match (self.handbrake, self.stick[0]) {
+                (true, _) => -RIDE_STOP,
+                (false, f) if f > 0.0 => f * RIDE_ACCEL,
+                (false, f) => f * RIDE_DECEL,
+            };
+            self.ride_speed = (self.ride_speed + rate * dt).clamp(0.0, 1.0);
+            let step = RIDE_STEER_RATE * dt;
+            self.steer += (self.stick[1] - self.steer).clamp(-step, step);
+            return;
+        }
         let agent = self.world.agent(self.pilot);
         let steered = agent.controller.as_ground().is_some_and(|c| c.has_steering());
         let fade =
@@ -375,8 +445,8 @@ impl Sim {
 /// Keys common to both modes: P pause, `[`/`]` time scale, R reset (live) or restart
 /// (replay), Tab next agent. Live only: W/S forward/back, A/D left/right, Space/Shift up/down,
 /// Q/E yaw, M pilot mode, `-`/`=` speed, T take over from the autopilot. Ground vehicles:
-/// W/S pedal (brake, then reverse), A/D steering, Space handbrake. The free camera takes the
-/// flight keys.
+/// W/S pedal (brake, then reverse), A/D steering, Space handbrake; single-track vehicles: W/S
+/// speed setpoint up/down, A/D curvature, Space stop. The free camera takes the flight keys.
 ///
 /// A gamepad flies as a mode-2 transmitter: left stick climb and yaw, right stick forward and
 /// sideways; Start pauses, Select changes the pilot mode, East (B) resets. It drives with the
@@ -588,6 +658,51 @@ mod tests {
         let (moved, _) = drive(&mut s, [0.0; 4], 2.0);
         assert!(moved.abs() < 0.01, "moved {moved}");
         assert!(!s.latched[0].intersects(Events::TERMINAL), "{:?}", s.latched[0]);
+    }
+
+    /// The keys ride a motorcycle in `vk`: W raises the speed setpoint, A turns it left (it
+    /// leans into the turn), Space stops it on its feet.
+    #[test]
+    fn keys_ride_a_motorcycle() {
+        let mut s = ground_sim("motorcycle_sport");
+        assert!(s.riding());
+        let full = s.ride_map().unwrap().speed();
+        drive(&mut s, [0.0; 4], 0.5);
+        drive(&mut s, [1.0, 0.0, 0.0, 0.0], 4.0);
+        assert!((s.ride_speed - 4.0 * RIDE_ACCEL).abs() < 0.01, "setpoint {}", s.ride_speed);
+        let (forward, turn) = drive(&mut s, [0.0; 4], 4.0);
+        let speed = s.world.agent(0).vehicle.lin_vel_body().x;
+        assert!((speed - s.ride_speed * full).abs() < 1.0 && forward > 20.0, "speed {speed}, moved {forward}");
+        assert!(turn.abs() < 0.1, "turn {turn}");
+        let bike = |s: &Sim| s.world.agent(0).vehicle.as_wheeled().unwrap().feet_down();
+        assert!(!bike(&s));
+        let (_, turn) = drive(&mut s, [0.0, 0.5, 0.0, 0.0], 3.0);
+        let roll = s.world.agent(0).vehicle.orientation().to_euler(glam::EulerRot::ZYX).2;
+        assert!(turn > 0.3 && roll < -0.1, "turn {turn}, roll {roll}");
+        drive(&mut s, [0.0; 4], 2.0);
+        s.handbrake = true;
+        drive(&mut s, [0.0; 4], 6.0);
+        assert_eq!(s.ride_speed, 0.0);
+        assert!(s.world.agent(0).vehicle.lin_vel_body().x.abs() < 0.3 && bike(&s));
+        assert!(!s.latched[0].intersects(Events::TERMINAL), "{:?}", s.latched[0]);
+    }
+
+    /// Full-stick turns from the keys, at several speeds, lean both bikes within reach of
+    /// their riders: no crash.
+    #[test]
+    fn full_stick_turns_stay_upright() {
+        for vehicle in ["motorcycle_sport", "bicycle_city"] {
+            for speed in [0.2, 0.4, 0.6] {
+                let mut s = ground_sim(vehicle);
+                s.ride_speed = speed;
+                drive(&mut s, [0.0; 4], 6.0);
+                drive(&mut s, [0.0, 1.0, 0.0, 0.0], 6.0);
+                drive(&mut s, [0.0, -1.0, 0.0, 0.0], 4.0);
+                let roll = s.world.agent(0).vehicle.orientation().to_euler(glam::EulerRot::ZYX).2;
+                assert!(roll.abs() < 0.6, "{vehicle} at {speed}: roll {roll}");
+                assert!(!s.latched[0].intersects(Events::TERMINAL), "{vehicle} at {speed}: {:?}", s.latched[0]);
+            }
+        }
     }
 
     #[test]

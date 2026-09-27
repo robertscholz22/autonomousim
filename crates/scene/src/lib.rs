@@ -8,6 +8,7 @@
 pub mod mesh;
 pub mod props;
 pub mod roads;
+pub mod single_track;
 pub mod terrain;
 
 pub use mesh::MeshData;

@@ -11,6 +11,7 @@ use crate::sim::Sim;
 use autonomousim_core::math::Pose;
 use autonomousim_scene::mesh::srgb;
 use autonomousim_scene::props;
+use autonomousim_scene::single_track::{Limb, SingleTrackVisual};
 use autonomousim_vehicles::Vehicle;
 use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_vehicles::ground::tire::TireModel;
@@ -46,6 +47,24 @@ pub struct LinkVisual {
     agent: usize,
     wheel: usize,
     mount: glam::DVec3,
+}
+
+/// A posed part of a single-track vehicle or its rider, in the chassis frame.
+#[derive(Component)]
+pub struct RiderPart {
+    agent: usize,
+    kind: PartKind,
+}
+
+#[derive(Clone, Copy)]
+enum PartKind {
+    /// Fork tubes, clamps and handlebar, turned about the steering axis.
+    Steered,
+    /// The rider's upper body, leaned about the hip.
+    Torso,
+    /// A limb on a side (+1 left, −1 right).
+    Limb(Limb, f64),
+    Boot(f64),
 }
 
 /// The band of a track (side 0: left, 1: right), rebuilt in the chassis frame every frame.
@@ -127,6 +146,9 @@ pub fn spawn_vehicles(
                 let v = props::wheeled(w.def());
                 let link = meshes.add(convert::mesh(&v.link));
                 let root = commands.spawn(root).id();
+                if let Some(s) = &v.single_track {
+                    commands.entity(root).insert(SingleTrack(Box::new(s.clone())));
+                }
                 let mut parents = vec![root];
                 commands
                     .entity(root)
@@ -163,6 +185,31 @@ pub fn spawn_vehicles(
                         Transform::IDENTITY,
                         TrackVisual { agent: i, side, mesh },
                     ));
+                }
+                if let Some(s) = &v.single_track {
+                    let mut part = |kind: PartKind, mesh: &autonomousim_scene::MeshData| {
+                        commands.entity(root).with_child((
+                            Mesh3d(meshes.add(convert::mesh(mesh))),
+                            MeshMaterial3d(body_material.clone()),
+                            part_transform(s, w, kind),
+                            RiderPart { agent: i, kind },
+                        ));
+                    };
+                    part(PartKind::Steered, &s.steered);
+                    if w.def().rider.is_some() {
+                        part(PartKind::Torso, &s.torso);
+                    }
+                    let limbs = [Limb::ForkSlider, Limb::UpperArm, Limb::Forearm, Limb::Thigh, Limb::Shin];
+                    for side in [1.0, -1.0] {
+                        for limb in limbs {
+                            if limb == Limb::ForkSlider || w.def().rider.is_some() {
+                                part(PartKind::Limb(limb, side), &s.limbs[limb as usize]);
+                            }
+                        }
+                        if w.def().rider.is_some() {
+                            part(PartKind::Boot(side), &s.boot);
+                        }
+                    }
                 }
                 for (k, mesh) in v.wheels.iter().enumerate() {
                     commands.entity(parents[w.def().wheel_unit(k)]).with_child((
@@ -256,6 +303,52 @@ pub fn sync_vehicles(
     }
 }
 
+/// The posable parts of a single-track vehicle, on its root.
+#[derive(Component)]
+pub struct SingleTrack(Box<SingleTrackVisual>);
+
+/// Transform (chassis frame) of part `kind` of single-track vehicle `w`.
+fn part_transform(s: &SingleTrackVisual, w: &Wheeled, kind: PartKind) -> Transform {
+    let steer = w.steering_head().map_or(0.0, |(angle, _)| angle);
+    let lean = w.rider_lean().0;
+    match kind {
+        PartKind::Steered => convert::transform(&Pose::new(s.pivot, s.steer_rotation(steer))),
+        PartKind::Torso => convert::transform(&Pose::new(s.hip, SingleTrackVisual::lean_rotation(lean))),
+        PartKind::Limb(limb, side) => {
+            let [a, b] = match limb {
+                Limb::ForkSlider => s.fork_slider(side, wheel_local(w, s.front_wheel).pos, steer),
+                Limb::UpperArm | Limb::Forearm => {
+                    let [shoulder, elbow, hand] = s.arm_joints(side, steer, lean);
+                    if limb == Limb::UpperArm { [shoulder, elbow] } else { [elbow, hand] }
+                }
+                Limb::Thigh | Limb::Shin => {
+                    let [hip, knee, foot] = s.leg_joints(side, w.feet_down());
+                    if limb == Limb::Thigh { [hip, knee] } else { [knee, foot] }
+                }
+            };
+            link_transform(a, b)
+        }
+        PartKind::Boot(side) => {
+            let [.., foot] = s.leg_joints(side, w.feet_down());
+            Transform::from_translation(convert::vec(foot))
+        }
+    }
+}
+
+/// Pose the fork, the rider's upper body and limbs from the steering angle, lean and feet.
+pub fn sync_riders(
+    sim: Res<Sim>,
+    roots: Query<&SingleTrack>,
+    mut parts: Query<(&RiderPart, &ChildOf, &mut Transform)>,
+) {
+    for (p, parent, mut t) in &mut parts {
+        let (Ok(s), Some(w)) = (roots.get(parent.parent()), sim.world.agent(p.agent).vehicle.as_wheeled()) else {
+            continue;
+        };
+        *t = part_transform(&s.0, w, p.kind);
+    }
+}
+
 /// Rebuild the track bands from the road wheels' travel and spin.
 pub fn sync_tracks(sim: Res<Sim>, tracks: Query<&TrackVisual>, mut meshes: ResMut<Assets<Mesh>>) {
     for t in &tracks {
@@ -275,6 +368,88 @@ mod tests {
     use autonomousim_sim::{Scenario, WorldInstance};
     use bevy::ecs::system::RunSystemOnce;
     use std::sync::Arc;
+
+    /// A motorcycle in a turn, shown steered and leaned: the fork turns with the steering head, the torso
+    /// leans with the rider, the fork sliders stand beside the front wheel and the hands and
+    /// feet stay where the handlebar and pegs are.
+    #[test]
+    fn rider_parts_follow_the_state() {
+        let sc = Scenario {
+            map: MapSource::Testworld(Testworld::Flat { size: 1000.0 }),
+            groups: vec![GroupSpec { vehicle: VehicleRef::Name("motorcycle_sport".into()), ..Default::default() }],
+            ..Default::default()
+        };
+        let mut world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1));
+        for k in 0..(8.0 / world.scenario().policy_dt()) as usize {
+            let curvature = if k > 80 { 0.03 } else { 0.0 };
+            world.set_command(0, GroundSetpoint::SpeedCurvature { speed: 10.0, curvature });
+            world.step();
+        }
+        // Shown with more steering and lean than the turn needs.
+        let v = world.agent_mut(0).vehicle.as_wheeled_mut().unwrap();
+        let init = autonomousim_vehicles::ground::WheeledInit {
+            pose: v.pose(),
+            lin_vel_world: v.lin_vel_world(),
+            ang_vel_body: v.ang_vel_body(),
+        };
+        let mut wheels: Vec<autonomousim_vehicles::ground::WheelState> = v.wheels().copied().collect();
+        let front = v.def().steering_head().unwrap().1;
+        wheels[front].steer = 0.2;
+        let powertrain = v.powertrain();
+        v.show(&init, &[0.25], 0.2, &wheels, powertrain);
+        let mut app = World::new();
+        app.insert_resource(Sim::new(world));
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.run_system_once(spawn_vehicles).unwrap();
+        app.run_system_once(sync_riders).unwrap();
+        let parts: Vec<(PartKind, Transform)> =
+            app.query::<(&RiderPart, &Transform)>().iter(&app).map(|(p, t)| (p.kind, *t)).collect();
+        let sim = app.resource::<Sim>();
+        let w = sim.world.agent(0).vehicle.as_wheeled().unwrap();
+        let (steer, lean) = (w.steering_head().unwrap().0, w.rider_lean().0);
+        assert!((steer - 0.2).abs() < 1e-12 && (lean - 0.25).abs() < 1e-12, "steer {steer}, lean {lean}");
+        let s = props::wheeled(w.def()).single_track.unwrap();
+        let pose = |t: &Transform| {
+            Pose::new(
+                convert::enu(t.translation),
+                autonomousim_core::math::frames::bevy_to_enu_quat(t.rotation.to_array()),
+            )
+        };
+        let mut kinds = 0;
+        for (kind, t) in parts {
+            let p = pose(&t);
+            match kind {
+                PartKind::Steered => {
+                    assert!((p.pos - s.pivot).length() < 1e-5);
+                    assert!((p.rot * s.axis - s.axis).length() < 1e-5);
+                    assert!(((p.rot * glam::DVec3::X).y - steer.sin() * s.axis.z).abs() < 1e-3);
+                }
+                PartKind::Torso => {
+                    assert!((p.pos - s.hip).length() < 1e-5);
+                    assert!(((p.rot * glam::DVec3::Z).y + lean.sin()).abs() < 1e-5);
+                }
+                PartKind::Limb(Limb::ForkSlider, side) => {
+                    let wheel = wheel_local(w, s.front_wheel).pos;
+                    let bottom = p.pos - p.rot * glam::DVec3::Z * (0.5 * s.fork_leg);
+                    assert!(((bottom - wheel).length() - s.fork_offset).abs() < 1e-4, "{side}");
+                }
+                PartKind::Limb(Limb::Forearm, side) => {
+                    let [.., hand] = s.arm_joints(side, steer, lean);
+                    let end = p.pos + p.rot * glam::DVec3::Z * (0.5 * f64::from(t.scale.y));
+                    assert!((end - hand).length() < 1e-4);
+                }
+                PartKind::Boot(side) => {
+                    let foot = if w.feet_down() { s.foot_down } else { s.foot_up };
+                    assert!((p.pos - foot * glam::DVec3::new(1.0, side, 1.0)).length() < 1e-5);
+                }
+                _ => {}
+            }
+            kinds += 1;
+        }
+        // The fork and the torso; per side a slider, four limbs and a boot.
+        assert_eq!(kinds, 2 + 2 * 6);
+    }
 
     /// A farm rig: the drawbar, dolly and trailer are children of the tractor posed from the
     /// joints, the wheels children of their units; composed, every wheel sits where the

@@ -41,6 +41,14 @@ const GROUND_HELP: &str = "W/S  throttle / brake, reverse   A/D  steer\n\
                            H  hide HUD   F1  help   Esc  quit\n\
                            gamepad: RT/LT pedals, left stick steers, A handbrake";
 
+const RIDE_HELP: &str = "W/S  speed setpoint up/down (vk)   A/D  turn\n\
+                         Space  stop           R  reset episode\n\
+                         Tab  next agent       P  pause   [/]  time scale\n\
+                         C  camera             mouse drag  look   wheel  zoom\n\
+                         O  goals/trails       G  plots\n\
+                         L  LiDAR hits         V  LiDAR view\n\
+                         H  hide HUD   F1  help   Esc  quit";
+
 /// Shown above [`HELP`] while a policy flies.
 const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
 
@@ -190,6 +198,14 @@ fn status_window(
                 if sim.replay.is_none() && sim.manual_agent().is_none() {
                     let a: Vec<String> = agent.action.iter().map(|x| format!("{x:+.2}")).collect();
                     row(ui, "policy", a.join(" "));
+                } else if sim.replay.is_none() && sim.riding() && sim.drive_command.is_none() {
+                    let full = sim.ride_map().map_or((0.0, 0.0), |m| (m.speed(), m.curvature()));
+                    let speed = sim.ride_speed * full.0;
+                    row(
+                        ui,
+                        "rider",
+                        format!("keys  vk  {speed:4.1} m/s  turn {:+.2} (≤ {:.2} 1/m)", sim.steer, full.1),
+                    );
                 } else if sim.replay.is_none() && v.as_wheeled().is_some() {
                     let hb = if sim.handbrake { "  handbrake" } else { "" };
                     let who = if sim.drive_command.is_some() { "demo" } else { "keys" };
@@ -247,6 +263,7 @@ fn status_window(
                 }
                 let help = match (sim.replay.is_some(), v.as_wheeled().is_some()) {
                     (true, _) => REPLAY_HELP,
+                    (false, true) if sim.riding() => RIDE_HELP,
                     (false, true) => GROUND_HELP,
                     (false, false) => HELP,
                 };
@@ -281,11 +298,12 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
         -1 => "R".to_owned(),
         g => g.to_string(),
     };
-    ui.label(format!(
-        "steering {:+5.1}° · gear {gear} · {:5.0} rpm",
-        w.steering_angle().to_degrees(),
-        p.engine_speed * 30.0 / std::f64::consts::PI
-    ));
+    let rpm = p.engine_speed * 30.0 / std::f64::consts::PI;
+    if let Some((head, k)) = w.def().steering_head().filter(|_| w.def().is_single_track()) {
+        single_track_status(ui, w, head, k, &gear, rpm);
+    } else {
+        ui.label(format!("steering {:+5.1}° · gear {gear} · {rpm:5.0} rpm", w.steering_angle().to_degrees()));
+    }
     // Articulation of each trailer (and dolly) against the unit ahead, red near a jackknife.
     let limit = sim.world.scenario().spec.events.ground.jackknife_deg;
     for u in 1..w.num_units() {
@@ -338,6 +356,47 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
             ui.end_row();
         }
     });
+}
+
+/// Roll (amber beyond 30°, red beyond 45°), the steering head's angle, rate and
+/// torque (the rider's and the damper's, against the rider's limit), the rider's lean, the
+/// feet and the gear.
+fn single_track_status(
+    ui: &mut egui::Ui,
+    w: &autonomousim_vehicles::ground::Wheeled,
+    head: &autonomousim_vehicles::ground::SteeringHeadDef,
+    k: usize,
+    gear: &str,
+    rpm: f64,
+) {
+    let (_, _, roll) = w.pose().rot.to_euler(glam::EulerRot::ZYX);
+    let (steer, rate) = w.steering_head().unwrap_or((0.0, 0.0));
+    let torque = w.wheel(k).steer_torque;
+    let deg = roll.to_degrees();
+    let color = match deg.abs() {
+        d if d > 45.0 => egui::Color32::from_rgb(230, 80, 60),
+        d if d > 30.0 => egui::Color32::from_rgb(230, 180, 60),
+        _ => ui.visuals().text_color(),
+    };
+    ui.horizontal(|ui| {
+        ui.label("roll");
+        ui.colored_label(color, egui::RichText::new(format!("{deg:+5.1}°")).monospace());
+        let (lean, _) = w.rider_lean();
+        if w.def().rider.is_some() {
+            ui.label("rider lean");
+            ui.monospace(format!("{:+5.1}°", lean.to_degrees()));
+        }
+        ui.label(if w.feet_down() { "feet down" } else { "feet up" });
+    });
+    ui.horizontal(|ui| {
+        ui.label("steer");
+        ui.monospace(format!("{:+5.1}° {:+6.1}°/s", steer.to_degrees(), rate.to_degrees()));
+        ui.label("torque");
+        let share = (torque / head.max_torque).clamp(-1.0, 1.0) as f32;
+        ui.add(egui::ProgressBar::new(share.abs()).desired_width(50.0));
+        ui.monospace(format!("{torque:+5.1} N·m"));
+    });
+    ui.label(format!("gear {gear} · {rpm:5.0} rpm"));
 }
 
 /// Tracked vehicles, per side: band speed (the road wheels' mean rim speed), slip (mean κ of

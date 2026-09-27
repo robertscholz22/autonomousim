@@ -247,6 +247,8 @@ pub struct WheeledVisual {
     pub links: Vec<Option<[DVec3; 2]>>,
     /// Link (unit cylinder along z, from −0.5 to 0.5) scaled to the links' thickness.
     pub link: MeshData,
+    /// Single-track vehicles: the steered parts and the rider, posed from the state.
+    pub single_track: Option<crate::single_track::SingleTrackVisual>,
 }
 
 /// Box between a unit's wheels: half extents and centre, in the unit's frame.
@@ -261,6 +263,11 @@ struct WheelBox {
 /// their colliders (trailer bodies), a low frame between their wheels (dollies) or a bar to
 /// the next joint (drawbars).
 pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual {
+    if def.is_single_track()
+        && let Some((head, front)) = def.steering_head()
+    {
+        return crate::single_track::visual(def, head, front);
+    }
     let n = def.num_wheels();
     let positions: Vec<DVec3> = (0..n).map(|w| def.wheel_position(w)).collect();
     let tire = |w: usize| def.wheel_tire(w);
@@ -391,7 +398,7 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     let span = wheel_reach.fold(0.0, f64::max).max(if def.num_units() > 1 { reach } else { 0.0 }) as f32;
     let last = def.num_units() - 1;
     let rear_eye = def.tail() + DVec3::new(0.0, 0.0, 0.9 * tops[last]);
-    WheeledVisual { body, units, wheels, span, eye, rear_eye, links, link }
+    WheeledVisual { body, units, wheels, span, eye, rear_eye, links, link, single_track: None }
 }
 
 /// Thickness of a track's band (m) around road wheels whose track patch has this radius
