@@ -575,3 +575,25 @@ def test_car_waypoint_fails_when_stuck():
     assert terminated.all() and not envs.unwrapped.task.success.any() and 38 <= k <= 42, k
     assert (info["events"] & autonomousim.Event.STUCK).all() and (reward < -40.0).all()
     envs.close()
+
+
+def test_motorcycle_rides_off_its_feet():
+    """``vehicle="motorcycle_sport"`` in a ground task: it spawns upright on its feet, lifts
+    them and rides at 10 m/s in ``vk`` without an event; the two-wheeler terms read along."""
+    terms = ["lean", "steering", "rider_lean", "feet", "speed"]
+    env = gym.make(
+        "autonomousim/CarWaypointOffroad-v0",
+        map="flat",
+        vehicle="motorcycle_sport",
+        max_speed=20.0,
+        obs=[{"term": t} for t in terms],
+    )
+    layout = env.unwrapped.obs_layout
+    assert [(name, dim) for name, _, dim in layout] == list(zip(terms, [2, 2, 2, 1, 1]))
+    obs, _ = env.reset(seed=3)
+    assert obs[6] == 1.0 and abs(obs[0]) < 0.05 and obs[7] < 0.1
+    for _ in range(200):
+        obs, _, terminated, truncated, info = env.step(np.array([0.5, 0.0], np.float32))
+        assert not terminated, info
+    assert obs[6] == 0.0 and abs(obs[7] - 10.0) < 0.5 and abs(obs[0]) < 0.05, obs
+    env.close()

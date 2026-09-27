@@ -351,6 +351,9 @@ pub fn half_width(def: &WheeledDef) -> f64 {
 /// rest pose on flat ground at the origin, heading +x) carried into the plane fitted through
 /// the ground under its wheels and lifted so that no wheel starts below the ground.
 pub fn ground_pose(world: &StaticWorld, def: &WheeledDef, rest: &Pose, xy: DVec2, yaw: f64) -> Pose {
+    if def.is_single_track() {
+        return single_track_pose(world, def, rest, xy, yaw);
+    }
     let terrain = world.terrain();
     let heading = DQuat::from_rotation_z(yaw);
     let contacts: Vec<DVec2> = (0..def.num_wheels())
@@ -380,6 +383,67 @@ pub fn ground_pose(world: &StaticWorld, def: &WheeledDef, rest: &Pose, xy: DVec2
     let frame = DQuat::from_mat3(&DMat3::from_cols(x, normal.cross(x), normal));
     let ground = xy.extend(a + lift);
     Pose::new(ground + frame * rest.pos, (frame * rest.rot).normalize())
+}
+
+/// [`ground_pose`] of a single-track vehicle, which stands still on its feet: upright,
+/// pitched to the line fitted through the ground under its wheels (and `xy`) and lifted so
+/// that no wheel starts below it. Where the ground falls away to one side, so that a foot
+/// would start inside the ground, it leans towards the lower side, rolling on its tyres'
+/// crowns, until the lower foot touches.
+fn single_track_pose(world: &StaticWorld, def: &WheeledDef, rest: &Pose, xy: DVec2, yaw: f64) -> Pose {
+    let terrain = world.terrain();
+    let heading = DQuat::from_rotation_z(yaw);
+    let forward = heading * DVec3::X;
+    // Least squares z = a + b·s along the heading.
+    let along: Vec<f64> = (0..def.num_wheels()).map(|w| def.wheel_position_in_line(w).x).chain([0.0]).collect();
+    let heights: Vec<f64> = along.iter().map(|&s| terrain.height(xy.x + s * forward.x, xy.y + s * forward.y)).collect();
+    let n = along.len() as f64;
+    let (ms, mz) = (along.iter().sum::<f64>() / n, heights.iter().sum::<f64>() / n);
+    let sxx: f64 = along.iter().map(|s| (s - ms).powi(2)).sum();
+    let sxz: f64 = along.iter().zip(&heights).map(|(s, z)| (s - ms) * (z - mz)).sum();
+    let b = if sxx > 1e-9 { sxz / sxx } else { 0.0 };
+    let a = mz - b * ms;
+    let lift = along.iter().zip(&heights).map(|(s, z)| z - (a + b * s)).fold(0.0, f64::max);
+    let x = (forward + DVec3::Z * b).normalize();
+    let y = DVec3::Z.cross(x).normalize();
+    let frame = DQuat::from_mat3(&DMat3::from_cols(x, y, x.cross(y)));
+    let ground = xy.extend(a + lift);
+    let upright = Pose::new(ground + frame * rest.pos, (frame * rest.rot).normalize());
+    let Some(feet) = def.feet else { return upright };
+    // Rolled by `phi` (positive right) about the line through the tyres' crown centres, on
+    // which toroidal tyres roll sideways.
+    let crown = (0..def.num_wheels()).map(|w| def.wheel_tire(w).crown_radius).sum::<f64>() / def.num_wheels() as f64;
+    let pivot = ground + x.cross(y) * crown;
+    let rolled = |phi: f64| {
+        let r = DQuat::from_axis_angle(x, phi);
+        Pose::new(pivot + r * (upright.pos - pivot), (r * upright.rot).normalize())
+    };
+    // Height of each foot's bottom above the ground below it (left, right).
+    let clearance = |p: &Pose| {
+        [feet.down, DVec3::new(feet.down.x, -feet.down.y, feet.down.z)].map(|c| {
+            let c = p.pos + p.rot * c;
+            c.z - feet.radius - terrain.height(c.x, c.y)
+        })
+    };
+    let [left, right] = clearance(&upright);
+    if left.min(right) >= 0.0 {
+        return upright;
+    }
+    // Lean away from the buried foot until the other one touches (bisection; at most 0.5 rad).
+    let side = if left < right { 1.0 } else { -1.0 };
+    let other = |phi: f64| {
+        let c = clearance(&rolled(side * phi));
+        if side > 0.0 { c[1] } else { c[0] }
+    };
+    let (mut lo, mut hi) = (0.0, 0.5);
+    if other(hi) > 0.0 {
+        return rolled(side * hi);
+    }
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if other(mid) > 0.0 { lo = mid } else { hi = mid }
+    }
+    rolled(side * hi)
 }
 
 /// Slope (radians) of the ground at `xy`: the steeper of the surface normal there and the

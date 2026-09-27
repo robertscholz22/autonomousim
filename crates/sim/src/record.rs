@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `/meta` | once | scenario, map pool (metadata and content hashes), vehicle definitions, rates, agent list |
 //! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses, goals and routes (lane points of agents with `route` goals, planned paths of `path` goals) |
-//! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels, powertrain and the joints of trailers (ground vehicles) |
+//! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels, powertrain and the joints of trailers and the rider's lean (ground vehicles); two-wheelers add `steer_torque` and `feet` |
 //! | `/agent/<id>/pose` | `state_hz` | the pose as `foxglove.PoseInFrame` (frame `world`) |
 //! | `/agent/<id>/action` | each action | the normalised action |
 //! | `/agent/<id>/lidar` | each scan, if enabled | sensor pose and ranges |
@@ -445,6 +445,12 @@ impl Recorder {
                     if !joints.is_empty() {
                         m.insert("joints".into(), json!(joints));
                     }
+                    if let Some((_, w)) = v.def().steering_head() {
+                        m.insert("steer_torque".into(), json!(v.wheel(w).steer_torque));
+                    }
+                    if v.def().feet.is_some() {
+                        m.insert("feet".into(), json!(v.feet_down()));
+                    }
                 }
             }
             self.send(ch.state, &msg);
@@ -498,9 +504,17 @@ pub struct RecordedState {
     pub gear: i32,
     #[serde(default)]
     pub engine_speed: f64,
-    /// Ground vehicles with trailers: the units' joint coordinates (`Wheeled::joints`).
+    /// Ground vehicles with trailers or a rider: the units' joint coordinates, then the
+    /// rider's lean (`Wheeled::joints`).
     #[serde(default)]
     pub joints: Vec<f64>,
+    /// Two-wheelers: the torque on the steering head, the rider's plus the damper's (N·m,
+    /// positive left).
+    #[serde(default)]
+    pub steer_torque: f64,
+    /// Two-wheelers: whether the feet are down.
+    #[serde(default)]
+    pub feet: bool,
     pub wind: DVec3,
     pub goal: DVec3,
     pub goal_yaw: f64,

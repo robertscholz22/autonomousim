@@ -1073,7 +1073,8 @@ impl CompiledGroup {
         let terms = if spec.obs.is_empty() { default_obs() } else { spec.obs.clone() };
         let num_rotors = def.as_multirotor().map_or(0, |d| d.rotors.len());
         let num_wheels = def.as_wheeled().map_or(0, |d| d.num_wheels());
-        let obs = CompiledObs::new(&terms, &spec.sensors, action_map.dim(), num_rotors, num_wheels)
+        let steering_head = def.as_wheeled().is_some_and(|d| d.steering_head().is_some());
+        let obs = CompiledObs::new(&terms, &spec.sensors, action_map.dim(), num_rotors, num_wheels, steering_head)
             .map_err(|e| fail(e.to_string()))?;
         let sp = &spec.spawn;
         let spawn_ok = valid_range(sp.agl)

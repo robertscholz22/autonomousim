@@ -43,7 +43,11 @@ class Task:
 
     Keyword arguments (all tasks):
         vehicle: preset name (``cf2x``, ``iris_like``; ground vehicles ``sedan_like``,
-            ``offroad_4x4``, ``rover_diff``, ``rover_skid``) or path to a vehicle TOML file.
+            ``offroad_4x4``, ``rover_diff``, ``rover_skid``; two-wheelers ``motorcycle_sport``,
+            ``bicycle_city``) or path to a vehicle TOML file. Two-wheelers spawn standing on
+            their feet and ride balanced by the controller in ``vk`` and ``vw``; add the
+            ``lean``, ``rider_lean`` and ``feet`` observation terms (``steering`` reads the
+            steering head's angle and rate).
         action_mode: how the normalised actions in [−1, 1] command the vehicle. Multirotors
             (full-scale values are the scenario's ``action_limits``):
 
@@ -57,8 +61,9 @@ class Task:
               (±5, ±5, ±2 m), heading change (±π).
 
             Ground vehicles (full-scale values are the group's ``ground_action_limits``):
-            ``raw`` (pedal and steering), ``vk`` (speed and path curvature), ``vw`` (speed
-            and yaw rate) and ``per_wheel``.
+            ``raw`` (pedal and steering; two-wheelers: throttle or brake, steering torque and
+            rider lean, unbalanced), ``vk`` (speed and path curvature), ``vw`` (speed and yaw
+            rate) and ``per_wheel``.
         map, map_seed, map_count: see ``map_source``.
         physics_hz, policy_hz: simulation and action rates (the policy rate must divide the
             physics rate); ``physics_hz=None`` lets the scenario choose (500 Hz for aerial

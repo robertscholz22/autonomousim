@@ -13,8 +13,11 @@
 //! | `ang_vel_body` | 3 | body rates (rad/s) |
 //! | `speed` / `sideslip` | 1 | forward speed (body x, m/s) / sideslip angle atan2(v_y, max(\|v_x\|, 1 m/s)) (rad) |
 //! | `pitch_roll` | 2 | pitch and roll (rad; Z-Y-X Euler angles) |
+//! | `lean` | 2 | roll (rad, positive right; Z-Y-X Euler angles, so about the pitched heading) and its rate (rad/s) |
 //! | `wheel_speeds` / `wheel_slip` | wheels | ground vehicles: wheel spin × tyre radius (m/s) / longitudinal slip κ |
-//! | `steering` | 1 | ground vehicles: steering angle of the equivalent bicycle (rad) |
+//! | `steering` | 1 / 2 | ground vehicles: steering angle of the equivalent bicycle (rad); with a free steering head (two-wheelers) its angle (rad, positive left) and rate (rad/s) |
+//! | `rider_lean` | 2 | ground vehicles: the rider's upper-body lean relative to the frame (rad, positive right) and its rate (rad/s); 0 without a rider |
+//! | `feet` | 1 | ground vehicles: 1 while a two-wheeler's feet are down, else 0 |
 //! | `gear_rpm` | 2 | ground vehicles: gear (1… forward, −1 reverse, 0 electric) and engine (first motor) speed (1000 rpm) |
 //! | `motor_speeds` | rotors | rotor speeds mapped to [−1, 1] over their range |
 //! | `last_action` | action | the action held during the last step |
@@ -108,6 +111,9 @@ pub enum TermKind {
     Articulation,
     TrailerGoal,
     Sinkage,
+    Lean,
+    RiderLean,
+    Feet,
 }
 
 /// Distances ahead at which the `road` and `route` terms look (m).
@@ -131,7 +137,10 @@ impl TermKind {
     /// Whether the term reads a ground vehicle's wheels, steering or powertrain.
     fn needs_wheels(self) -> bool {
         use TermKind::*;
-        matches!(self, WheelSpeeds | WheelSlip | Steering | GearRpm | Articulation | TrailerGoal | Sinkage)
+        matches!(
+            self,
+            WheelSpeeds | WheelSlip | Steering | GearRpm | Articulation | TrailerGoal | Sinkage | RiderLean | Feet
+        )
     }
 }
 
@@ -249,6 +258,7 @@ impl CompiledObs {
         act_dim: usize,
         num_rotors: usize,
         num_wheels: usize,
+        steering_head: bool,
     ) -> Result<Self, String> {
         let mut out = Vec::with_capacity(terms.len());
         let mut dim = 0;
@@ -285,6 +295,8 @@ impl CompiledObs {
             }
             let (d, max_range) = match (t.term, spec) {
                 (TermKind::GoalYaw | TermKind::Yaw | TermKind::PitchRoll | TermKind::GearRpm, _) => (2, 0.0),
+                (TermKind::Lean | TermKind::RiderLean, _) => (2, 0.0),
+                (TermKind::Steering, _) if steering_head => (2, 0.0),
                 (
                     TermKind::Height
                     | TermKind::Agl
@@ -294,6 +306,7 @@ impl CompiledObs {
                     | TermKind::Sideslip
                     | TermKind::Steering
                     | TermKind::Sinkage
+                    | TermKind::Feet
                     | TermKind::OnRoad,
                     _,
                 ) => (1, 0.0),
@@ -394,13 +407,22 @@ impl CompiledObs {
                     let (_, pitch, roll) = q.to_euler(EulerRot::ZYX);
                     put(dst, &[pitch, roll], t)
                 }
+                TermKind::Lean => {
+                    // The yaw–pitch–roll angles' roll and its rate from the body rates.
+                    let (_, pitch, roll) = q.to_euler(EulerRot::ZYX);
+                    let w = k.rates;
+                    let rate = w.x + (w.y * roll.sin() + w.z * roll.cos()) * pitch.tan();
+                    put(dst, &[roll, rate], t)
+                }
                 TermKind::WheelSpeeds
                 | TermKind::WheelSlip
                 | TermKind::Steering
                 | TermKind::GearRpm
                 | TermKind::Articulation
                 | TermKind::TrailerGoal
-                | TermKind::Sinkage => {
+                | TermKind::Sinkage
+                | TermKind::RiderLean
+                | TermKind::Feet => {
                     let v = inp.wheeled.expect("ground terms are checked when the spec is compiled");
                     match t.kind {
                         TermKind::Articulation => {
@@ -427,7 +449,15 @@ impl CompiledObs {
                                 *d = value(s.tire.kappa, t);
                             }
                         }
-                        TermKind::Steering => put(dst, &[v.steering_angle()], t),
+                        TermKind::Steering => match v.steering_head() {
+                            Some((angle, rate)) => put(dst, &[angle, rate], t),
+                            None => put(dst, &[v.steering_angle()], t),
+                        },
+                        TermKind::RiderLean => {
+                            let (angle, rate) = v.rider_lean();
+                            put(dst, &[angle, rate], t)
+                        }
+                        TermKind::Feet => put(dst, &[f64::from(u8::from(v.feet_down()))], t),
                         TermKind::Sinkage => put(dst, &[v.sinkage()], t),
                         _ => {
                             let p = v.powertrain();
@@ -595,7 +625,7 @@ mod tests {
             ObsTerm::new(TermKind::ImuAccel, 1.0).sensor("imu"),
             ObsTerm::new(TermKind::LidarLog, 1.0).sensor("lidar"),
         ];
-        let obs = CompiledObs::new(&terms, &sensors, 4, 4, 0).unwrap();
+        let obs = CompiledObs::new(&terms, &sensors, 4, 4, 0, false).unwrap();
         assert_eq!(obs.dim(), 3 + 2 + 4 + 3 + 4 + 4 + 3 + 64);
         let layout = obs.layout();
         assert_eq!(layout[1], ("goal_yaw".to_string(), 3, 2));
@@ -660,7 +690,7 @@ mod tests {
             ObsTerm::new(TermKind::WheelSpeeds, 1.0),
             ObsTerm::new(TermKind::GearRpm, 1.0),
         ] {
-            assert!(CompiledObs::new(&[bad], &sensors, 4, 4, 0).is_err());
+            assert!(CompiledObs::new(&[bad], &sensors, 4, 4, 0, false).is_err());
         }
     }
 }

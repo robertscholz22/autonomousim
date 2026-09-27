@@ -1753,7 +1753,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 | 3 ✅ | Whipple benchmark: `single_track::linear` matrices; numerical linearisation of the full model; integrator fix if needed | The matrices reproduce the published `M`, `C1`, `K0`, `K2` (1e-3); the full model's eigenvalues match the benchmark's over 0–10 m/s within 1 %; weave speed 4.292 m/s and capsize speed 6.024 m/s within 1 % |
 | 4 ✅ | Presets and powertrains: `bicycle_city` (pedal drive, freewheel), `motorcycle_sport` (engine, gearbox, chain, fork, swing arm, steering damper, brakes) | Static sag and loads as specified; acceleration, top speed and braking plausible against published figures; steady turning roll angle vs lateral acceleration within 1° of the analytic value with tyre widths; weave and wobble modes present with frequencies and damping trends in Sharp et al.'s ranges |
 | 5 ✅ | Rider controller and action modes: gain-scheduled LQR from the linear model, `vk`/`vw`/`raw`, rider lean servo, feet, launch from rest | Straight-line hold under a lateral impulse at 3, 10 and 25 m/s; curvature steps settle without falls; the initial countersteer has the right sign; launch from rest and stop with feet down; the bicycle stays up at walking speed |
-| 6 | Simulation: upright spawns with feet down (also on cross slopes), drive grid width, events, the `lean`/`rider_lean`/`feet` terms, recorded steer, lean and feet; Python `vehicle="motorcycle_sport"` | Scenarios with two-wheelers compile, spawn, ride and record; existing goldens unchanged; terms match references |
+| 6 ✅ | Simulation: upright spawns with feet down (also on cross slopes), drive grid width, events, the `lean`/`rider_lean`/`feet` terms, recorded steer, lean and feet; Python `vehicle="motorcycle_sport"` | Scenarios with two-wheelers compile, spawn, ride and record; existing goldens unchanged; terms match references |
 | 7 | Viewer: two-wheeler visuals (frame, tank, fork, handlebar, toroidal tyres, rider with a leaning torso), HUD (roll, steer angle and torque, rider lean, feet, gear), keyboard riding in `vk`, replay | A motorcycle rides by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay |
 | 8 | `MotorcycleRoadRural-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy rides in the viewer; a recorded episode replays |
 
@@ -1844,6 +1844,25 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
     - The bicycle balanced at 2 m/s (well below its self-stable range) after a nudge, and crawling straight on its feet at 1.2 m/s.
     - `vw` 0.2 rad/s at 10 m/s gives 0.02 1/m; `raw` brakes on a negative pedal and passes the lean through.
   - The feet are symmetric and flat asphalt is perfect, so launches and stops stay exactly upright; cross slopes and one-footed stances come with step 6's spawns.
+- **Step 6 (simulation)**:
+  - **Spawns** (`drive::ground_pose`, single-track branch): the wheels' contacts are collinear, so the plane fit would roll the vehicle to the terrain normal. Instead a line is fitted along the heading through the ground under the wheels and the spawn point; the vehicle stands upright, pitched to it, lifted so that no wheel starts below the ground. Ground spawns are at rest, so the feet are down. Where a foot would start inside the ground (a cross slope), the vehicle leans towards the lower side, rolling on its tyres' crowns (about the line through the crown centres), until the lower foot touches (bisection, at most 0.5 rad).
+  - **Drive grids**: `half_width` already included the feet (motorcycle 0.48 m, bicycle 0.41 m).
+  - **Events**: unchanged. The feet are gear, so standing on them raises `GROUND_CONTACT`/`LANDED` (not terminal); the frame, rider or handlebar touching the ground is `CRASH_TERRAIN`.
+  - **Observation terms**:
+    - `lean` (2): the yaw–pitch–roll angles' roll and its rate `p + (q sin φ + r cos φ) tan θ`. It needs no wheels, so it works for any vehicle.
+    - `rider_lean` (2): the rider's lean relative to the frame and its rate; 0 without a rider.
+    - `feet` (1): 1 while the feet are down.
+    - `steering` has 2 values (angle and rate) on vehicles with a steering head, 1 otherwise. `CompiledObs::new` takes a new `steering_head` flag.
+  - **Recording**: two-wheelers' state messages add `steer_torque` (the rider's plus the damper's, N·m) and `feet`. The rider's lean was already the last of `joints`. `RecordedState` gains both, with serde defaults. Other vehicles' messages are unchanged, so goldens are unchanged.
+  - **Python**: `vehicle="motorcycle_sport"` (or `bicycle_city`) works in any ground task; the docstring lists the two-wheelers and their terms.
+  - **Preset change**: `bicycle_city`'s feet moved from (0.30, ±0.30) to (0.45, ±0.36). Standing across a 10° slope, the old stance was behind the combined centre of mass and too narrow, and the bicycle toppled over its downhill foot.
+  - **Tests** (`sim/tests/two_wheelers.rs`, `tests_py/test_envs.py::test_motorcycle_rides_off_its_feet`):
+    - Both presets standing still for 3 s on flat ground stay exactly upright.
+    - Across a 10° slope they spawn leaning downhill and stay there without a terminal event. The motorcycle spawns at 0.198 rad and settles at 0.285 rad (tyre and suspension compliance, 5 cm). The bicycle spawns at 0.215 rad and settles at 0.226 rad.
+    - The motorcycle launches off its feet, rides at 10 m/s and turns left, leaning left 0.26 rad.
+    - The terms equal the vehicle's state, and the roll rate matches the roll's change over the next policy step.
+    - The recording's last state has the position, steering, steering torque, joints (rider lean last) and feet of the vehicle.
+    - A constant steering torque without balance ends in `CRASH_TERRAIN`.
 
 ## Roadmap after M1
 | M | Content | Validation |
