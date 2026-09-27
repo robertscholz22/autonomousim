@@ -344,6 +344,10 @@ pub struct MotorDef {
     /// shaft: equal speed).
     #[serde(default)]
     pub coupling: DifferentialDef,
+    /// Drive forward only (a bicycle's freewheel: pedalling pushes, it never brakes or
+    /// reverses).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub freewheel: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +572,7 @@ struct Motor {
     ratio: f64,
     no_load_speed: Option<f64>,
     time_constant: f64,
+    freewheel: bool,
     torque: f64,
 }
 
@@ -629,6 +634,7 @@ impl Powertrain {
                         ratio: m.ratio,
                         no_load_speed: m.no_load_speed,
                         time_constant: m.time_constant,
+                        freewheel: m.freewheel,
                         torque: 0.0,
                     });
                     if let Some(cap) = m.coupling.capacity() {
@@ -770,6 +776,9 @@ impl Powertrain {
                         Some(w0) => (m.max_torque * (command - speed / w0)).clamp(-m.max_torque, m.max_torque),
                         None => command * m.max_torque,
                     };
+                    if m.freewheel {
+                        demand = demand.max(0.0);
+                    }
                     if demand.abs() * speed.abs() > m.max_power {
                         demand = (m.max_power / speed.abs()).copysign(demand);
                     }

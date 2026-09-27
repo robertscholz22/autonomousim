@@ -45,7 +45,9 @@ fn presets_load_with_documented_numbers() {
             "truck_6x4",
             "truck_8x8",
             "farm_tractor",
-            "bicycle_benchmark"
+            "bicycle_benchmark",
+            "bicycle_city",
+            "motorcycle_sport"
         ]
     );
     let cf = presets::multirotor("cf2x").unwrap();

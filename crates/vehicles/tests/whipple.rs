@@ -112,9 +112,8 @@ fn with_tyres(stiffness: [f64; 2], relaxation: [f64; 2]) -> WheeledDef {
 
 /// Lean, steer angle (both positive to the right, as in the paper) and their rates.
 fn lean_steer(v: &Wheeled) -> DVec4 {
-    let z = v.orientation() * DVec3::Z;
     let (delta, rate) = v.steering_head().unwrap();
-    DVec4::new((-z.y).atan2(z.z), -delta, v.ang_vel_body().x, -rate)
+    DVec4::new(v.orientation().to_euler(glam::EulerRot::ZYX).2, -delta, v.ang_vel_body().x, -rate)
 }
 
 /// Eigenvalues of the lean and steer dynamics of the full model at speed `speed`, from four

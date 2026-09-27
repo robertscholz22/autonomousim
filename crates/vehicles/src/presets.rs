@@ -16,6 +16,8 @@ const PRESETS: &[(&str, &str)] = &[
     ("truck_8x8", include_str!("../../../assets/vehicles/truck_8x8.toml")),
     ("farm_tractor", include_str!("../../../assets/vehicles/farm_tractor.toml")),
     ("bicycle_benchmark", include_str!("../../../assets/vehicles/bicycle_benchmark.toml")),
+    ("bicycle_city", include_str!("../../../assets/vehicles/bicycle_city.toml")),
+    ("motorcycle_sport", include_str!("../../../assets/vehicles/motorcycle_sport.toml")),
 ];
 
 const TRAILERS: &[(&str, &str)] = &[

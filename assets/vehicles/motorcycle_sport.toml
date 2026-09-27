@@ -1,0 +1,138 @@
+# A sport motorcycle and rider after the Suzuki GSX-R1000 (2001–2004) with a leaning rider.
+type = "wheeled"
+name = "motorcycle_sport"
+source = """
+Geometry, power and gearing from Suzuki's published GSX-R1000 K1–K4 data: wheelbase 1.405 m, \
+rake 23.8°, trail 96 mm, about 205 kg ready to ride, 118 N·m at 9000 rpm and about 130 kW at \
+11000 rpm, gears 2.562/2.052/1.714/1.500/1.360/1.269, primary 1.553, final 44/17. Measured \
+values of the same machine from S. Evangelou, PhD thesis, Imperial College London (2004), \
+§9.1 (the parameter set of Sharp, Evangelou & Limebeer, Multibody System Dynamics 12 (2004)): \
+steering damper 6.944 N·m·s/rad; rear spring 55000 N/m plus the damper's 3570 N/m, damping \
+9600 (bump) and 13700 (rebound) N·s/m at the unit, here divided by an estimated linkage \
+ratio of 2.2 squared to give wheel rates; rider 72 kg with 62 % in the upper body, whose lean \
+servo gives the thesis's 11.7 Hz. Tyres: Evangelou's MF-MC 120/70 ZR17 and 180/55 ZR17 fits. \
+Estimates: the mass split between the bodies, all inertias and centres of mass (chosen for \
+about 50/50 static loads and a combined centre of mass 0.62 m high), fork rate and damping, \
+travel, brakes, engine braking and the torque curve's shape, drag area, colliders and feet. \
+A sport bike has no reverse gear; the one here stands for pushing it back."""
+
+# Main frame, engine, tank, seat and the rider's lower body.
+[chassis]
+mass = 176.4
+com = [0.695, 0.0, 0.602]
+inertia = [14.0, 32.0, 22.0]
+drag_area = [0.40, 1.2, 1.0]
+
+# Swing arm and rear wheel.
+[[axles]]
+name = "rear"
+position = [0.0, 0.0, 0.315]
+wheel = { mass = 15.0, inertia = [0.35, 0.65, 0.35] }
+tire = { mc = { file = "Evangelou_180_55_ZR17" } }
+brake = { max_torque = 350.0 }
+
+[axles.suspension]
+trailing_arm = { length = 0.58, angle = 0.17 }
+carrier_mass = 9.0
+carrier_inertia = [0.2, 0.2, 0.2]
+spring = { rate = 12100.0 }
+damper = { bump = 1980.0, rebound = 2830.0 }
+bump_stop = { travel = 0.09, stiffness = 3.0e5 }
+rebound_stop = { travel = -0.04, stiffness = 3.0e5 }
+
+# Front wheel on the telescopic fork.
+[[axles]]
+name = "front"
+position = [1.405, 0.0, 0.300]
+wheel = { mass = 12.0, inertia = [0.28, 0.48, 0.28] }
+tire = { mc = { file = "Evangelou_120_70_ZR17" } }
+brake = { max_torque = 1100.0 }
+
+[axles.suspension]
+carrier_mass = 7.0
+carrier_inertia = [0.1, 0.1, 0.05]
+spring = { rate = 20000.0 }
+damper = { bump = 1200.0, rebound = 2500.0 }
+bump_stop = { travel = 0.09, stiffness = 3.0e5 }
+rebound_stop = { travel = -0.04, stiffness = 3.0e5 }
+
+# Upper fork tubes, triple clamps, handlebars and the rider's hands; trail 0.096 m for the
+# 0.300 m front radius.
+[axles.steering_head]
+angle = 0.41539
+offset = 0.0332
+mass = 13.0
+com = [1.22, 0.0, 0.66]
+inertia = [0.77, 0.9, 0.23]
+products = [0.0, 0.29, 0.0]
+lock = 0.5
+damping = 6.944
+max_torque = 60.0
+
+# Upper body, leaning about the hip.
+[rider]
+mass = 44.6
+com = [0.52, 0.0, 0.98]
+inertia = [1.4, 1.5, 0.7]
+hip = [0.40, 0.0, 0.76]
+max_lean = 0.3
+stiffness = 19000.0
+damping = 100.0
+max_torque = 2000.0
+
+[feet]
+down = [0.45, 0.42, 0.08]
+up = [0.30, 0.20, 0.33]
+radius = 0.06
+speed = 1.5
+
+[powertrain]
+type = "combustion"
+driven = [0]
+final_drive = 0.24883                   # primary 1.553 × chain 44/17
+driveline_inertia = 0.4                 # crank, clutch and gearbox, about third gear
+
+[powertrain.engine]
+max_rpm = 13750.0
+full_throttle = [[0, 60], [2000, 70], [4000, 82], [6000, 96], [8000, 112], [9000, 118],
+    [10000, 116], [11000, 113], [12000, 102], [13000, 88], [13750, 76]]
+zero_throttle = [[0, 0], [1000, -4], [4000, -10], [8000, -18], [13750, -30]]
+
+[powertrain.gearbox]
+forward = [0.39032, 0.48733, 0.58343, 0.66667, 0.73529, 0.78802]
+reverse = -0.39032
+shift = [[1000, 12500], [7000, 12500], [7500, 12500], [8000, 12500], [8500, 12500], [9000, 13750]]
+shift_time = 0.05
+
+# Engine sump, fairing sides, tail, the rider's torso and head, handlebar ends.
+[[colliders]]
+center = [0.75, 0.0, 0.30]
+radius = 0.14
+
+[[colliders]]
+center = [0.95, 0.22, 0.45]
+radius = 0.12
+
+[[colliders]]
+center = [0.95, -0.22, 0.45]
+radius = 0.12
+
+[[colliders]]
+center = [-0.1, 0.0, 0.75]
+radius = 0.12
+
+[[colliders]]
+center = [0.5, 0.0, 1.0]
+radius = 0.2
+
+[[colliders]]
+center = [0.62, 0.0, 1.25]
+radius = 0.12
+
+[[colliders]]
+center = [1.05, 0.33, 0.85]
+radius = 0.05
+
+[[colliders]]
+center = [1.05, -0.33, 0.85]
+radius = 0.05

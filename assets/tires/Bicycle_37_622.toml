@@ -5,12 +5,13 @@ at the nominal load, in the range Dressel & Rahman measured for bicycle tyres ("
 sideslip and camber characteristics of bicycle tyres", Vehicle System Dynamics 50 (2012); \
 A. Dressel, PhD thesis, UW-Milwaukee 2013); a pneumatic trail of about 12 mm; peak friction \
 1.0. The curve shapes and the combined-slip loss functions are those of the Evangelou (2004) \
-motorcycle tyres. Crown radius half the section width; radial stiffness for about 4 bar."""
+motorcycle tyres. Crown radius half the section width; radial stiffness for about 4 bar, radial damping for a \
+damping ratio of about 0.06 under the loaded bicycle."""
 radius = 0.348
 width = 0.037
 crown_radius = 0.0185
 vertical_stiffness = 8.0e4
-vertical_damping = 50.0
+vertical_damping = 250.0
 fzo = 450.0
 relaxation = [1.9e-5, 0.0, 0.0]
 relaxation_x = 0.05

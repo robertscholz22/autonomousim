@@ -215,6 +215,329 @@ impl DenseMatrix {
     pub fn max_abs_diff(&self, o: &DenseMatrix) -> f64 {
         self.data.iter().zip(&o.data).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
     }
+
+    /// Matrix product `self · o`.
+    pub fn mul(&self, o: &DenseMatrix) -> DenseMatrix {
+        assert_eq!(self.cols, o.rows);
+        let mut out = DenseMatrix::zeros(self.rows, o.cols);
+        for r in 0..self.rows {
+            for k in 0..self.cols {
+                let a = self[(r, k)];
+                if a != 0.0 {
+                    for c in 0..o.cols {
+                        out[(r, c)] += a * o[(k, c)];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn transpose(&self) -> DenseMatrix {
+        let mut out = DenseMatrix::zeros(self.cols, self.rows);
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                out[(c, r)] = self[(r, c)];
+            }
+        }
+        out
+    }
+
+    /// `self + s·o`.
+    pub fn add_scaled(&self, o: &DenseMatrix, s: f64) -> DenseMatrix {
+        assert_eq!((self.rows, self.cols), (o.rows, o.cols));
+        DenseMatrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: self.data.iter().zip(&o.data).map(|(a, b)| a + s * b).collect(),
+        }
+    }
+
+    /// Inverse of a square matrix (Gauss–Jordan with partial pivoting).
+    pub fn inverse(&self) -> Result<DenseMatrix, SingularMatrix> {
+        assert_eq!(self.rows, self.cols);
+        let n = self.rows;
+        let mut a = self.clone();
+        let mut inv = DenseMatrix::identity(n);
+        for col in 0..n {
+            let pivot = (col..n).max_by(|&i, &j| a[(i, col)].abs().total_cmp(&a[(j, col)].abs())).expect("rows");
+            let p = a[(pivot, col)];
+            if p == 0.0 || !p.is_finite() {
+                return Err(SingularMatrix);
+            }
+            if pivot != col {
+                for c in 0..n {
+                    a.data.swap(pivot * n + c, col * n + c);
+                    inv.data.swap(pivot * n + c, col * n + c);
+                }
+            }
+            for c in 0..n {
+                a[(col, c)] /= p;
+                inv[(col, c)] /= p;
+            }
+            for r in (0..n).filter(|&r| r != col) {
+                let f = a[(r, col)];
+                if f != 0.0 {
+                    for c in 0..n {
+                        a[(r, c)] -= f * a[(col, c)];
+                        inv[(r, c)] -= f * inv[(col, c)];
+                    }
+                }
+            }
+        }
+        Ok(inv)
+    }
+
+    /// Eigenvalues `(re, im)` of a square matrix, sorted by real part, then imaginary part:
+    /// balancing, reduction to Hessenberg form by elimination and the shifted QR algorithm
+    /// (Press et al., Numerical Recipes, 3rd ed., §11.6–11.7). `None` if QR does not converge.
+    pub fn eigenvalues(&self) -> Option<Vec<(f64, f64)>> {
+        assert_eq!(self.rows, self.cols);
+        let n = self.rows;
+        let mut a = self.clone();
+        balance(&mut a);
+        hessenberg(&mut a);
+        let mut out = hqr(&mut a, n)?;
+        out.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        Some(out)
+    }
+}
+
+/// Scale rows and columns by powers of two towards equal norms (similarity transform).
+fn balance(a: &mut DenseMatrix) {
+    let n = a.rows;
+    let radix = 2.0f64;
+    let mut done = false;
+    while !done {
+        done = true;
+        for i in 0..n {
+            let (mut r, mut c) = (0.0, 0.0);
+            for j in (0..n).filter(|&j| j != i) {
+                c += a[(j, i)].abs();
+                r += a[(i, j)].abs();
+            }
+            if c != 0.0 && r != 0.0 {
+                let s = c + r;
+                let mut f = 1.0;
+                let mut g = r / radix;
+                while c < g {
+                    f *= radix;
+                    c *= radix * radix;
+                }
+                g = r * radix;
+                while c > g {
+                    f /= radix;
+                    c /= radix * radix;
+                }
+                if (c + r) / f < 0.95 * s {
+                    done = false;
+                    for j in 0..n {
+                        a[(i, j)] /= f;
+                        a[(j, i)] *= f;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reduce to upper Hessenberg form by stabilised elementary similarity transforms.
+fn hessenberg(a: &mut DenseMatrix) {
+    let n = a.rows;
+    for m in 1..n.saturating_sub(1) {
+        let mut x = 0.0f64;
+        let mut i = m;
+        for j in m..n {
+            if a[(j, m - 1)].abs() > x.abs() {
+                x = a[(j, m - 1)];
+                i = j;
+            }
+        }
+        if i != m {
+            for j in (m - 1)..n {
+                a.data.swap(i * n + j, m * n + j);
+            }
+            for j in 0..n {
+                a.data.swap(j * n + i, j * n + m);
+            }
+        }
+        if x != 0.0 {
+            for i in (m + 1)..n {
+                let y = a[(i, m - 1)] / x;
+                if y != 0.0 {
+                    for j in m..n {
+                        let v = a[(m, j)];
+                        a[(i, j)] -= y * v;
+                    }
+                    for j in 0..n {
+                        let v = a[(j, i)];
+                        a[(j, m)] += y * v;
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        for j in 0..i.saturating_sub(1) {
+            a[(i, j)] = 0.0;
+        }
+    }
+}
+
+/// Eigenvalues of an upper Hessenberg matrix (destroyed) by the Francis double-shift QR
+/// algorithm.
+#[allow(clippy::many_single_char_names, unused_assignments)]
+fn hqr(a: &mut DenseMatrix, n: usize) -> Option<Vec<(f64, f64)>> {
+    let eps = f64::EPSILON;
+    let mut w = vec![(0.0, 0.0); n];
+    let mut anorm = 0.0;
+    for i in 0..n {
+        for j in i.saturating_sub(1)..n {
+            anorm += a[(i, j)].abs();
+        }
+    }
+    let at = |a: &DenseMatrix, i: isize, j: isize| a[(i as usize, j as usize)];
+    let mut nn = n as isize - 1;
+    let mut t = 0.0;
+    let (mut p, mut q, mut r) = (0.0f64, 0.0f64, 0.0f64);
+    while nn >= 0 {
+        let mut its = 0;
+        loop {
+            let mut l = nn;
+            while l > 0 {
+                let mut s = at(a, l - 1, l - 1).abs() + at(a, l, l).abs();
+                if s == 0.0 {
+                    s = anorm;
+                }
+                if at(a, l, l - 1).abs() <= eps * s {
+                    a[(l as usize, l as usize - 1)] = 0.0;
+                    break;
+                }
+                l -= 1;
+            }
+            let mut x = at(a, nn, nn);
+            if l == nn {
+                w[nn as usize] = (x + t, 0.0);
+                nn -= 1;
+            } else {
+                let mut y = at(a, nn - 1, nn - 1);
+                let mut ww = at(a, nn, nn - 1) * at(a, nn - 1, nn);
+                if l == nn - 1 {
+                    p = 0.5 * (y - x);
+                    q = p * p + ww;
+                    let mut z = q.abs().sqrt();
+                    x += t;
+                    if q >= 0.0 {
+                        z = p + z.copysign(p);
+                        let (hi, lo) = (x + z, if z != 0.0 { x - ww / z } else { x + z });
+                        w[nn as usize - 1] = (hi, 0.0);
+                        w[nn as usize] = (lo, 0.0);
+                    } else {
+                        w[nn as usize] = (x + p, -z);
+                        w[nn as usize - 1] = (x + p, z);
+                    }
+                    nn -= 2;
+                } else {
+                    if its == 60 {
+                        return None;
+                    }
+                    if its == 10 || its == 20 || its == 40 {
+                        t += x;
+                        for i in 0..=nn {
+                            a[(i as usize, i as usize)] -= x;
+                        }
+                        let s = at(a, nn, nn - 1).abs() + at(a, nn - 1, nn - 2).abs();
+                        x = 0.75 * s;
+                        y = x;
+                        ww = -0.4375 * s * s;
+                    }
+                    its += 1;
+                    let mut m = nn - 2;
+                    loop {
+                        let z = at(a, m, m);
+                        let rr = x - z;
+                        let ss = y - z;
+                        p = (rr * ss - ww) / at(a, m + 1, m) + at(a, m, m + 1);
+                        q = at(a, m + 1, m + 1) - z - rr - ss;
+                        r = at(a, m + 2, m + 1);
+                        let s = p.abs() + q.abs() + r.abs();
+                        p /= s;
+                        q /= s;
+                        r /= s;
+                        if m == l {
+                            break;
+                        }
+                        let u = at(a, m, m - 1).abs() * (q.abs() + r.abs());
+                        let v = p.abs() * (at(a, m - 1, m - 1).abs() + z.abs() + at(a, m + 1, m + 1).abs());
+                        if u <= eps * v {
+                            break;
+                        }
+                        m -= 1;
+                    }
+                    for i in m..nn - 1 {
+                        a[(i as usize + 2, i as usize)] = 0.0;
+                        if i != m {
+                            a[(i as usize + 2, i as usize - 1)] = 0.0;
+                        }
+                    }
+                    let mut k = m;
+                    while k < nn {
+                        if k != m {
+                            p = at(a, k, k - 1);
+                            q = at(a, k + 1, k - 1);
+                            r = if k + 1 != nn { at(a, k + 2, k - 1) } else { 0.0 };
+                            x = p.abs() + q.abs() + r.abs();
+                            if x != 0.0 {
+                                p /= x;
+                                q /= x;
+                                r /= x;
+                            }
+                        }
+                        let s = (p * p + q * q + r * r).sqrt().copysign(p);
+                        if s != 0.0 {
+                            if k == m {
+                                if l != m {
+                                    a[(k as usize, k as usize - 1)] = -at(a, k, k - 1);
+                                }
+                            } else {
+                                a[(k as usize, k as usize - 1)] = -s * x;
+                            }
+                            p += s;
+                            x = p / s;
+                            y = q / s;
+                            let z = r / s;
+                            q /= p;
+                            r /= p;
+                            for j in k..=nn {
+                                let mut pp = at(a, k, j) + q * at(a, k + 1, j);
+                                if k + 1 != nn {
+                                    pp += r * at(a, k + 2, j);
+                                    a[(k as usize + 2, j as usize)] -= pp * z;
+                                }
+                                a[(k as usize + 1, j as usize)] -= pp * y;
+                                a[(k as usize, j as usize)] -= pp * x;
+                            }
+                            let mmin = if nn < k + 3 { nn } else { k + 3 };
+                            for i in l..=mmin {
+                                let mut pp = x * at(a, i, k) + y * at(a, i, k + 1);
+                                if k + 1 != nn {
+                                    pp += z * at(a, i, k + 2);
+                                    a[(i as usize, k as usize + 2)] -= pp * r;
+                                }
+                                a[(i as usize, k as usize + 1)] -= pp * q;
+                                a[(i as usize, k as usize)] -= pp;
+                            }
+                        }
+                        k += 1;
+                    }
+                }
+            }
+            if l + 1 >= nn {
+                break;
+            }
+        }
+    }
+    Some(w)
 }
 
 impl std::ops::Index<(usize, usize)> for DenseMatrix {
@@ -235,6 +558,69 @@ impl std::ops::IndexMut<(usize, usize)> for DenseMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dense(rows: &[&[f64]]) -> DenseMatrix {
+        let n = rows.len();
+        DenseMatrix { rows: n, cols: rows[0].len(), data: rows.iter().flat_map(|r| r.iter().copied()).collect() }
+    }
+
+    #[test]
+    fn eigenvalues_of_known_matrices() {
+        // Companion matrix of (s + 1)(s − 2)(s² + 2s + 5)(s + 7) = s⁵ + 8s⁴ + 8s³ − 2s² − 73s − 70.
+        let c = [8.0, 8.0, -2.0, -73.0, -70.0];
+        let mut m = DenseMatrix::zeros(5, 5);
+        for j in 0..5 {
+            m[(0, j)] = -c[j];
+        }
+        for i in 1..5 {
+            m[(i, i - 1)] = 1.0;
+        }
+        let e = m.eigenvalues().unwrap();
+        let want = [(-7.0, 0.0), (-1.0, -2.0), (-1.0, 2.0), (-1.0, 0.0), (2.0, 0.0)];
+        for want in want {
+            assert!(e.iter().any(|got| (got.0 - want.0).abs() < 1e-9 && (got.1 - want.1).abs() < 1e-9), "{e:?}");
+        }
+        // Upper triangular: the diagonal; a 1×1 and an empty matrix.
+        let tri = dense(&[&[3.0, 1.0, 4.0], &[0.0, -2.0, 5.0], &[0.0, 0.0, 0.5]]);
+        assert_eq!(tri.eigenvalues().unwrap(), vec![(-2.0, 0.0), (0.5, 0.0), (3.0, 0.0)]);
+        assert_eq!(dense(&[&[4.0]]).eigenvalues().unwrap(), vec![(4.0, 0.0)]);
+    }
+
+    proptest! {
+        #[test]
+        fn eigenvalues_keep_trace_and_determinant(v in proptest::collection::vec(-3.0f64..3.0, 64)) {
+            let n = 8;
+            let m = DenseMatrix { rows: n, cols: n, data: v };
+            let e = m.eigenvalues().unwrap();
+            let trace: f64 = (0..n).map(|i| m[(i, i)]).sum();
+            let sum: f64 = e.iter().map(|x| x.0).sum();
+            prop_assert!((sum - trace).abs() < 1e-8 * (1.0 + trace.abs()));
+            // The product of the eigenvalues against the determinant from the inverse's LU.
+            let mut prod = (1.0f64, 0.0f64);
+            for &(re, im) in &e {
+                prod = (prod.0 * re - prod.1 * im, prod.0 * im + prod.1 * re);
+            }
+            prop_assert!(prod.1.abs() < 1e-6 * (1.0 + prod.0.abs()));
+            let inv = m.inverse().unwrap();
+            let id = m.mul(&inv);
+            prop_assert!(id.max_abs_diff(&DenseMatrix::identity(n)) < 1e-6);
+            // Each eigenvalue makes A − λI singular: its smallest singular value, via the
+            // determinant of the 2n×2n real form, is tiny relative to the matrix norm.
+            for &(re, im) in &e {
+                let mut b = DenseMatrix::zeros(2 * n, 2 * n);
+                for i in 0..n {
+                    for j in 0..n {
+                        let d = if i == j { 1.0 } else { 0.0 };
+                        b[(i, j)] = m[(i, j)] - re * d;
+                        b[(n + i, n + j)] = m[(i, j)] - re * d;
+                        b[(i, n + j)] = im * d;
+                        b[(n + i, j)] = -im * d;
+                    }
+                }
+                prop_assert!(b.inverse().map_or(true, |bi| bi.data.iter().fold(0.0f64, |x, y| x.max(y.abs())) > 1e6));
+            }
+        }
+    }
     use proptest::prelude::*;
 
     fn spd6(k: usize, seed: &[f64]) -> Mat6 {

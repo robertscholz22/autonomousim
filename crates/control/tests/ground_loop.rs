@@ -37,6 +37,7 @@ fn e_sedan() -> WheeledDef {
                 time_constant: 0.02,
                 rotor_inertia: 0.0,
                 coupling: DifferentialDef::Open,
+                freewheel: false,
             })
             .collect(),
     });

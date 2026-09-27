@@ -1,0 +1,88 @@
+# A city bicycle (700C wheels, 37-622 tyres) with a 75 kg rider whose upper body leans.
+type = "wheeled"
+name = "bicycle_city"
+source = """
+Estimates for a typical city or trekking bicycle of about 18 kg: wheelbase 1.10 m, head \
+angle 70° (20° from the vertical), trail 65 mm, 700C wheels on 37-622 tyres (the estimated \
+MF-MC fit Bicycle_37_622). Rider 75 kg, 44 kg of it in the upper body, which leans on a \
+servo at about 5 Hz. Masses, inertias and centres of mass after Moore's measured city \
+bicycles and riders (J. K. Moore, PhD thesis, UC Davis 2012) in magnitude only. Pedalling \
+is a freewheeling rear drive limited to 90 N·m at the wheel and 600 W (a cyclist sustains \
+about 250 W). Rim brakes, drag area and colliders are estimates."""
+
+# Frame, rack and the rider's lower body on the saddle.
+[chassis]
+mass = 41.2
+com = [0.337, 0.0, 0.711]
+inertia = [4.5, 5.0, 1.8]
+drag_area = [0.55, 0.9, 0.6]
+
+[[axles]]
+name = "rear"
+position = [0.0, 0.0, 0.348]
+wheel = { mass = 2.4, inertia = [0.10, 0.20, 0.10] }
+tire = { mc = { file = "Bicycle_37_622" } }
+brake = { max_torque = 90.0 }
+
+[[axles]]
+name = "front"
+position = [1.10, 0.0, 0.348]
+wheel = { mass = 1.9, inertia = [0.08, 0.16, 0.08] }
+tire = { mc = { file = "Bicycle_37_622" } }
+brake = { max_torque = 180.0 }
+
+# Fork, stem, handlebar and the rider's hands; trail 0.065 m.
+[axles.steering_head]
+angle = 0.34907
+offset = 0.0579
+mass = 3.5
+com = [0.90, 0.0, 0.74]
+inertia = [0.20, 0.22, 0.12]
+products = [0.0, 0.03, 0.0]
+lock = 1.2
+max_torque = 30.0
+
+# Torso, arms and head, leaning about the hip.
+[rider]
+mass = 44.0
+com = [0.36, 0.0, 1.28]
+inertia = [2.0, 2.2, 0.6]
+hip = [0.25, 0.0, 1.00]
+max_lean = 0.3
+stiffness = 5400.0
+damping = 100.0
+max_torque = 400.0
+
+[feet]
+down = [0.30, 0.30, 0.07]
+up = [0.43, 0.12, 0.28]
+radius = 0.05
+speed = 1.5
+
+[powertrain]
+type = "electric"
+
+[[powertrain.motors]]
+wheels = [0]
+max_torque = 90.0
+max_power = 600.0
+ratio = 1.0
+time_constant = 0.15
+freewheel = true
+
+# The rider's torso and head, handlebar ends.
+[[colliders]]
+center = [0.35, 0.0, 1.25]
+radius = 0.2
+
+[[colliders]]
+center = [0.45, 0.0, 1.62]
+radius = 0.11
+
+[[colliders]]
+center = [0.93, 0.3, 1.05]
+radius = 0.05
+
+[[colliders]]
+center = [0.93, -0.3, 1.05]
+radius = 0.05
