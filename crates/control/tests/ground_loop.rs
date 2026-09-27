@@ -265,7 +265,7 @@ fn torque_difference_gives_the_predicted_yaw_moment() {
     let mut moment = 0.0;
     for w in 0..4 {
         let y = d.wheel_position(w).y;
-        let r = d.tire(w / 2).radius() - rig.v.wheel(w).tire.deflection;
+        let r = d.wheel_tire(w).radius() - rig.v.wheel(w).tire.deflection;
         predicted += -y * rig.v.wheel(w).drive_torque / r;
         moment += -y * rig.v.wheel(w).tire.fx;
     }

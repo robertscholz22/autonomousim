@@ -185,10 +185,12 @@ impl GroundActionMap {
                     e.motors.iter().map(|m| PerWheelChannel::Drive(m.wheels.iter().fold(0, |b, &w| b | 1 << w))),
                 );
             }
-            channels.extend((0..n).filter(|&w| def.axles[w / 2].brake.max_torque > 0.0).map(PerWheelChannel::Brake));
+            channels.extend(
+                (0..n).filter(|&w| def.axles[def.wheel_axle(w)].brake.max_torque > 0.0).map(PerWheelChannel::Brake),
+            );
             channels.extend(
                 (0..n)
-                    .filter(|&w| matches!(def.axles[w / 2].steer_mode, SteerMode::Independent { .. }))
+                    .filter(|&w| matches!(def.axles[def.wheel_axle(w)].steer_mode, SteerMode::Independent { .. }))
                     .map(PerWheelChannel::Steer),
             );
         }

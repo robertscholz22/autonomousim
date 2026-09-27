@@ -342,7 +342,7 @@ fn smooth(p: &[DVec2], half: usize) -> Vec<DVec2> {
 
 /// Half the width of a ground vehicle (m): its widest wheel or collider.
 pub fn half_width(def: &WheeledDef) -> f64 {
-    let wheels = (0..def.num_wheels()).map(|w| def.wheel_position_in_line(w).y.abs() + 0.5 * def.tire(w / 2).width());
+    let wheels = (0..def.num_wheels()).map(|w| def.wheel_position_in_line(w).y.abs() + 0.5 * def.wheel_tire(w).width());
     let colliders = def.colliders_in_line().into_iter().map(|c| c.center.y.abs() + c.radius);
     wheels.chain(colliders).fold(0.0, f64::max)
 }

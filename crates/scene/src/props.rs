@@ -263,7 +263,7 @@ struct WheelBox {
 pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual {
     let n = def.num_wheels();
     let positions: Vec<DVec3> = (0..n).map(|w| def.wheel_position(w)).collect();
-    let tire = |w: usize| def.tire(w / 2);
+    let tire = |w: usize| def.wheel_tire(w);
     let on = |u: usize| (0..n).filter(move |&w| def.wheel_unit(w) == u);
     let width = (0..n).map(|w| tire(w).width()).fold(0.0, f64::max);
     let radius = (0..n).map(|w| tire(w).radius()).fold(0.0, f64::max);
@@ -377,7 +377,7 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     // Strut from above the wheel, inboard, and lower arm to the body's side, below the axle line.
     let links = (0..n)
         .map(|w| {
-            def.axles[w / 2].suspension.as_ref()?;
+            def.axles[def.wheel_axle(w)].suspension.as_ref()?;
             let (p, r) = (positions[w], tire(w).radius());
             let inboard = p.y.signum() * (0.5 * width + 0.25 * r);
             let strut = DVec3::new(p.x, p.y - inboard, p.z + 0.9 * r);
@@ -638,7 +638,7 @@ mod tests {
             assert!(v.span > front);
             // Links on suspended wheels only; the eye is over the body.
             for (w, l) in v.links.iter().enumerate() {
-                assert_eq!(l.is_some(), def.axles[w / 2].suspension.is_some(), "{name}");
+                assert_eq!(l.is_some(), def.axles[def.wheel_axle(w)].suspension.is_some(), "{name}");
             }
             assert!((v.eye.x as f32) < hi.x && v.eye.z > def.wheel_position(0).z, "{name}: {}", v.eye);
         }

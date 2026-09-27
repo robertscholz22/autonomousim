@@ -255,10 +255,16 @@ fn status_window(
         });
 }
 
-/// Wheel names: FL, FR, RL, RR for two axles, else axle number and side.
-fn wheel_name(w: usize, axles: usize) -> String {
-    let side = if w.is_multiple_of(2) { "L" } else { "R" };
-    match (axles, w / 2) {
+/// Wheel names: FL, FR, RL, RR for two axles, else axle number and side (none for a single
+/// wheel: F and R on a bicycle).
+fn wheel_name(def: &autonomousim_vehicles::ground::WheeledDef, w: usize) -> String {
+    let a = def.wheel_axle(w);
+    let side = match (def.axles[a].is_single(), def.wheel_side(w)) {
+        (true, _) => "",
+        (false, 0) => "L",
+        _ => "R",
+    };
+    match (def.axles.len(), a) {
         (2, 0) => format!("F{side}"),
         (2, _) => format!("R{side}"),
         (_, a) => format!("{}{side}", a + 1),
@@ -314,7 +320,6 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
         });
     }
     track_status(ui, w);
-    let axles = w.def().axles.len();
     egui::Grid::new("wheels").num_columns(8).striped(true).show(ui, |ui| {
         for h in ["", "load kN", "travel mm", "κ", "α °", "Fx kN", "Fy kN", "drive/brake N·m"] {
             ui.label(egui::RichText::new(h).small());
@@ -322,7 +327,7 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
         ui.end_row();
         for (k, s) in w.wheels().enumerate() {
             let t = &s.tire;
-            ui.label(wheel_name(k, axles));
+            ui.label(wheel_name(w.def(), k));
             ui.monospace(format!("{:5.2}", t.fz / 1e3));
             ui.monospace(format!("{:+5.0}", s.travel * 1e3));
             ui.monospace(format!("{:+5.2}", t.kappa));
@@ -343,7 +348,7 @@ fn track_status(ui: &mut egui::Ui, w: &autonomousim_vehicles::ground::Wheeled) {
     if def.track.is_none() {
         return;
     }
-    let patch = |k: usize| match &def.tire(k / 2).model {
+    let patch = |k: usize| match &def.wheel_tire(k).model {
         TireModel::Track(p) => Some(p.radius),
         _ => None,
     };
@@ -353,8 +358,10 @@ fn track_status(ui: &mut egui::Ui, w: &autonomousim_vehicles::ground::Wheeled) {
         }
         ui.end_row();
         for (side, name) in ["left", "right"].into_iter().enumerate() {
-            let wheels: Vec<(usize, f64)> =
-                (0..w.num_wheels()).filter(|k| k % 2 == side).filter_map(|k| Some((k, patch(k)?))).collect();
+            let wheels: Vec<(usize, f64)> = (0..w.num_wheels())
+                .filter(|&k| def.wheel_side(k) == side)
+                .filter_map(|k| Some((k, patch(k)?)))
+                .collect();
             if wheels.is_empty() {
                 continue;
             }
@@ -504,7 +511,8 @@ fn tyre_plots(ui: &mut egui::Ui, sim: &Sim, history: &History) {
     let now = sim.time();
     let upto: Vec<&crate::history::Sample> = history.samples.iter().filter(|s| s.time <= now + 1e-9).collect();
     let n = upto.iter().map(|s| s.wheels.len()).max().unwrap_or(0);
-    let axles = n / 2;
+    let Some(def) = sim.world.agent(sim.pilot).vehicle.as_wheeled().map(|w| w.def()) else { return };
+    let n = n.min(def.num_wheels());
     let scatter = |x: fn(&crate::history::WheelSample) -> f64, y: fn(&crate::history::WheelSample) -> f64| {
         let upto = &upto;
         move |p: &mut egui_plot::PlotUi| {
@@ -515,7 +523,7 @@ fn tyre_plots(ui: &mut egui::Ui, sim: &Sim, history: &History) {
                     .map(|w| [x(w), y(w)])
                     .filter(|q| q[0].is_finite() && q[1].is_finite())
                     .collect();
-                p.points(Points::new(wheel_name(k, axles), pts).radius(1.5).color(WHEELS[k % WHEELS.len()]));
+                p.points(Points::new(wheel_name(def, k), pts).radius(1.5).color(WHEELS[k % WHEELS.len()]));
             }
         }
     };

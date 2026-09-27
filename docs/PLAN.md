@@ -1748,7 +1748,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 ### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | Single-track layout: centre-line wheels (`track = 0`, per-axle wheel counts), `[steering_head]` with a free steer joint and steer torque, `[rider]` lean joint with servo, feet; statics; `bicycle_benchmark` preset | Builds and settles; static wheel loads match the COM; standing still with feet up it falls over (capsize); freewheeling without dissipation conserves energy within 1e-3 over 10 s; cars, trucks and tracked goldens unchanged |
+| 1 ✅ | Single-track layout: centre-line wheels (`track = 0`, per-axle wheel counts), `[steering_head]` with a free steer joint and steer torque, `[rider]` lean joint with servo, feet; statics; `bicycle_benchmark` preset | Builds and settles; static wheel loads match the COM; standing still with feet up it falls over (capsize); freewheeling without dissipation conserves energy within 1e-3 over 10 s; cars, trucks and tracked goldens unchanged |
 | 2 | Tyres for two-wheelers: toroidal contact with `crown_radius`, large camber, MF 6.2 turn slip, `rigid_rolling`; motorcycle and bicycle tyre sets | Contact geometry matches the torus analytically up to 60°; forces and moments match MFeval up to ±55° camber and with turn slip (as in the M2 tyre tests); crown radius 0 leaves goldens unchanged |
 | 3 | Whipple benchmark: `single_track::linear` matrices; numerical linearisation of the full model; integrator fix if needed | The matrices reproduce the published `M`, `C1`, `K0`, `K2` (1e-3); the full model's eigenvalues match the benchmark's over 0–10 m/s within 1 %; weave speed 4.292 m/s and capsize speed 6.024 m/s within 1 % |
 | 4 | Presets and powertrains: `bicycle_city` (pedal drive, freewheel), `motorcycle_sport` (engine, gearbox, chain, fork, swing arm, steering damper, brakes) | Static sag and loads as specified; acceleration, top speed and braking plausible against published figures; steady turning roll angle vs lateral acceleration within 1° of the analytic value with tyre widths; weave and wobble modes present with frequencies and damping trends in Sharp et al.'s ranges |
@@ -1762,6 +1762,27 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 - whether MFeval evaluates turn slip at large camber (its `useMode`);
 - that Chrono::Vehicle has no single-track model;
 - whether the bicycle tyre fit from Dressel's measurements is close enough.
+
+#### As built
+- **Step 1 (single-track layout)**:
+  - **Wheels per axle**: an axle whose (left) wheel sits on the centreline (`position.y = 0`) has one wheel, not a pair; there is no `track` field. `WheeledDef::wheel_axle`, `wheel_side` (0 left or single, 1 right), `axle_wheels` and `axle_ranges` replace the `w / 2`, `w % 2` and `2a, 2a + 1` arithmetic everywhere (vehicles, powertrain, control, sim, scene, viewer). `MAX_WHEELS` (16) now limits wheels rather than axles. A single wheel takes no dual tyres, track or anti-roll bar. The combustion driveline splits an axle's share over its wheels, with no axle differential for a single wheel.
+  - **Steering head** (`[axles.steering_head]`, on one single, otherwise unsteered wheel of the towing unit):
+    - Given by head angle `λ` and fork offset (the wheel centre's distance ahead of the axis, square to it); the trail follows, `(R·sin λ − offset)/cos λ`.
+    - A free revolute about the tilted axis, carrying the steered body (mass, centre and full inertia tensor, chassis frame). The fork (`KcTravel`, if sprung) hangs from it, then the wheel. Without kinematics of its own, the fork slides along the axis (`SuspensionDef::fork_table`).
+    - Torques on it: the rider's, `DriveInput::steering × max_torque` (`steering` is the torque command on a head, the angle command otherwise); a damper; lock stops (`lock_stiffness`, default 500 N·m/rad, damped over 10 ms). `WheelState::steer` and `steer_torque` of its wheel report the angle and the applied torque; `Wheeled::steering_angle` returns the head angle.
+  - **Chassis inertia products**: `products = [I_xy, I_xz, I_yz]` (the tensor's off-diagonal entries) on chassis, units, steered body and rider, needed for the benchmark's rear frame.
+  - **Rider** (`[rider]`): an upper body on a revolute about the chassis x axis through `hip`, after the towing unit's wheels in the tree. Its servo is `stiffness·(lean·max_lean − φ) − damping·φ̇`, clamped to `max_torque`, with the new `DriveInput::lean` (positive to the right, as roll; not serialised when zero). `Wheeled::joints` (and `show`, and the recorded `joints`) append the lean.
+  - **Feet** (`[feet]`): two sphere colliders (`Skid`) on the chassis. They move to `down` below `speed` (default 1.5 m/s) and back to `up` above 1.25·`speed`. Down, they hover a few centimetres above flat ground, so the vehicle tips onto one at a few degrees of lean.
+  - **Statics**: a single-track towing unit has no roll unknown in the energy solver; it is balanced upright, steering straight, rider upright. Vehicles with a rider or single wheels skip the two-axle lever solver. Masses of the steered body and rider count in `total_mass`, `unit_mass` and `total_com`, summed in the old order so existing vehicles stay bit-identical.
+  - **`bicycle_benchmark`**: Meijaard et al. (2007) Table 1, converted to FLU (the x-z inertia entries change sign), origin at the rear contact point. The body colliders are the rider's torso, head and hands. It has stiff Fiala tyres for now (knife-edge rolling comes with `rigid_rolling` in step 2) and a small rear hub motor (40 N·m, 400 W).
+  - **Tests** (`vehicles/tests/single_track.rs`):
+    - The layout, the centre of mass and the trail (0.08 m, to 1e-9).
+    - Static loads by the lever rule (to 1e-3 of the weight).
+    - Upright, it stays up on its static loads for 2 s. Leaning 0.02 rad, it falls past 1 rad in 3 s, with the handlebar flopping into the fall, and the rider hits the ground.
+    - With feet down, it tips onto a foot and stays there; at 5 m/s the feet go up.
+    - Freewheeling without gravity, contacts or stops, with a rider on a conservative servo spring, energy drifts 7e-5 over 10 s.
+    - A fork and a swing arm with automatic preloads sit at zero travel.
+  - Goldens are unchanged. The first attempt changed the car trajectories: re-summing `total_mass` per unit had altered floating-point rounding.
 
 ## Roadmap after M1
 | M | Content | Validation |

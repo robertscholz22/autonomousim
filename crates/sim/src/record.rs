@@ -441,8 +441,9 @@ impl Recorder {
                     m.insert("wheels".into(), json!(wheels));
                     m.insert("gear".into(), json!(pt.gear));
                     m.insert("engine_speed".into(), json!(pt.engine_speed));
-                    if v.num_units() > 1 {
-                        m.insert("joints".into(), json!(v.joints()));
+                    let joints = v.joints();
+                    if !joints.is_empty() {
+                        m.insert("joints".into(), json!(joints));
                     }
                 }
             }

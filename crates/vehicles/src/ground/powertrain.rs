@@ -30,13 +30,14 @@
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::ops::Range;
 
 const RPM: f64 = std::f64::consts::PI / 30.0;
 
 /// Most wheels a vehicle can have, over all its units (eight axles).
 pub const MAX_WHEELS: usize = 16;
 
-/// Per-wheel commands, indexed by wheel (`2·axle + side`). When given in
+/// Per-wheel commands, indexed by wheel (axle by axle, left before right). When given in
 /// [`DriveInput::wheels`], they replace the mixed commands: `drive` those of the electric
 /// motors (a motor driving several wheels takes their mean; combustion drives keep the
 /// throttle), `brake` the service brake, and `steer` the steering of independently steered
@@ -56,7 +57,8 @@ pub struct WheelCommands {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DriveInput {
-    /// Steering, `[−1, 1]`, positive turns left.
+    /// Steering, `[−1, 1]`, positive turns left: of the equivalent bicycle's angle, or, on a
+    /// steering head, of the rider's steering torque.
     pub steering: f64,
     /// Accelerator, `[0, 1]` for combustion engines; `[−1, 1]` for electric drives (negative
     /// drives backwards).
@@ -76,6 +78,9 @@ pub struct DriveInput {
     /// other brake interventions).
     #[serde(skip_serializing_if = "is_zero")]
     pub wheel_brake: [f64; MAX_WHEELS],
+    /// The rider's lean, `[−1, 1]` of the largest, positive to the right.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub lean: f64,
 }
 
 fn is_zero_f64(x: &f64) -> bool {
@@ -103,6 +108,7 @@ impl DriveInput {
                 steer: w.steer.map(|x| c(x, -1.0)),
             }),
             wheel_brake: self.wheel_brake.map(|x| c(x, 0.0)),
+            lean: c(self.lean, -1.0),
         }
     }
 }
@@ -350,8 +356,10 @@ pub enum MotorSide {
 }
 
 impl PowertrainDef {
-    /// Check the definition against a vehicle with `axles` axles.
-    pub fn validate(&self, axles: usize) -> Result<(), String> {
+    /// Check the definition against a vehicle whose axles carry the wheels `axle_wheels`.
+    pub fn validate(&self, axle_wheels: &[Range<usize>]) -> Result<(), String> {
+        let axles = axle_wheels.len();
+        let wheels = axle_wheels.last().map_or(0, |r| r.end);
         let pos = |x: f64| x > 0.0 && x.is_finite();
         let nonneg = |x: f64| x >= 0.0 && x.is_finite();
         match self {
@@ -402,7 +410,7 @@ impl PowertrainDef {
                     return Err("an electric powertrain needs motors".into());
                 }
                 for m in &e.motors {
-                    if m.wheels.is_empty() || m.wheels.iter().any(|&w| w >= 2 * axles) {
+                    if m.wheels.is_empty() || m.wheels.iter().any(|&w| w >= wheels) {
                         return Err(format!("motor wheels {:?} out of range", m.wheels));
                     }
                     if !(pos(m.max_torque) && pos(m.max_power) && pos(m.ratio))
@@ -415,7 +423,7 @@ impl PowertrainDef {
                     }
                     m.coupling.validate()?;
                 }
-                let mut seen = vec![false; 2 * axles];
+                let mut seen = vec![false; wheels];
                 for w in e.motors.iter().flat_map(|m| &m.wheels) {
                     if std::mem::replace(&mut seen[*w], true) {
                         return Err(format!("wheel {w} is driven by two motors"));
@@ -426,14 +434,15 @@ impl PowertrainDef {
         Ok(())
     }
 
-    /// Extra spin inertia (kg·m²) the driveline adds to each wheel.
-    pub fn wheel_inertia(&self, wheels: usize) -> Vec<f64> {
+    /// Extra spin inertia (kg·m²) the driveline adds to each of `wheels` wheels, the axles
+    /// carrying `axle_wheels`.
+    pub fn wheel_inertia(&self, axle_wheels: &[Range<usize>], wheels: usize) -> Vec<f64> {
         let mut out = vec![0.0; wheels];
         match self {
             PowertrainDef::Combustion(c) => {
-                let n = 2 * c.driven.len();
+                let n: usize = c.driven.iter().map(|&a| axle_wheels[a].len()).sum();
                 for &a in &c.driven {
-                    for w in [2 * a, 2 * a + 1] {
+                    for w in axle_wheels[a].clone() {
                         out[w] += c.driveline_inertia / n as f64;
                     }
                 }
@@ -578,8 +587,9 @@ pub struct Powertrain {
 }
 
 impl Powertrain {
-    /// `inertia`: total spin inertia per wheel (including [`PowertrainDef::wheel_inertia`]).
-    pub fn new(def: &PowertrainDef, inertia: &[f64], dt: f64) -> Self {
+    /// `axle_wheels`: the wheels of each axle; `inertia`: total spin inertia per wheel
+    /// (including [`PowertrainDef::wheel_inertia`]).
+    pub fn new(def: &PowertrainDef, axle_wheels: &[Range<usize>], inertia: &[f64], dt: f64) -> Self {
         let mut shares = Vec::new();
         let mut motors = Vec::new();
         let mut couplings = Vec::new();
@@ -588,15 +598,19 @@ impl Powertrain {
                 let total: f64 = if c.split.is_empty() { c.driven.len() as f64 } else { c.split.iter().sum() };
                 for (k, &a) in c.driven.iter().enumerate() {
                     let share = c.split.get(k).copied().unwrap_or(1.0) / total;
-                    shares.push((2 * a, 0.5 * share));
-                    shares.push((2 * a + 1, 0.5 * share));
-                    if let Some(cap) = c.axle_differential.capacity() {
-                        couplings.push((Coupling::new(&[2 * a], &[2 * a + 1], inertia, dt), cap));
+                    let wheels = axle_wheels[a].clone();
+                    let n = wheels.len() as f64;
+                    shares.extend(wheels.clone().map(|w| (w, share / n)));
+                    if let (Some(cap), [l, r]) = (c.axle_differential.capacity(), [wheels.start, wheels.end - 1])
+                        && l != r
+                    {
+                        couplings.push((Coupling::new(&[l], &[r], inertia, dt), cap));
                     }
                 }
                 if let Some(cap) = c.center_differential.capacity() {
                     for pair in c.driven.windows(2) {
-                        let (f, r) = ([2 * pair[0], 2 * pair[0] + 1], [2 * pair[1], 2 * pair[1] + 1]);
+                        let (f, r): (Vec<usize>, Vec<usize>) =
+                            (axle_wheels[pair[0]].clone().collect(), axle_wheels[pair[1]].clone().collect());
                         couplings.push((Coupling::new(&f, &r, inertia, dt), cap));
                     }
                 }
@@ -837,9 +851,10 @@ mod tests {
                  time_constant = 0.0, coupling = { torsen = { bias = 3.0 } } }]"#,
         )
         .unwrap();
-        def.validate(1).unwrap();
+        let axles = [std::ops::Range { start: 0, end: 2 }];
+        def.validate(&axles).unwrap();
         let dt = 1e-3;
-        let mut p = Powertrain::new(&def, &[1.0, 1.0], dt);
+        let mut p = Powertrain::new(&def, &axles, &[1.0, 1.0], dt);
         let input = DriveInput { throttle: 1.0, ..Default::default() };
         // Wheel 1 is held by an 80 N·m load, wheel 0 runs free: the slow wheel gets 3/4 of the torque.
         let mut w = [0.0; 2];
@@ -903,7 +918,7 @@ mod tests {
         let tc = c.torque_converter.as_ref().unwrap();
         let n = def.num_wheels();
         let dt = 1e-3;
-        let mut p = Powertrain::new(&def.powertrain, &def.spin_inertia(), dt);
+        let mut p = Powertrain::new(&def.powertrain, &def.axle_ranges(), &def.spin_inertia(), dt);
         let full = DriveInput { throttle: 1.0, ..Default::default() };
         let spin = vec![0.0; n];
         let mut out = vec![0.0; n];

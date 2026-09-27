@@ -343,6 +343,7 @@ impl WheeledDef {
                             mass: m,
                             com: 0.5 * bar,
                             inertia: DVec3::new(1e-3 * m * l * l, m * l * l / 12.0, m * l * l / 12.0),
+                            products: DVec3::ZERO,
                             drag_area: DVec3::ZERO,
                         },
                         colliders: Vec::new(),

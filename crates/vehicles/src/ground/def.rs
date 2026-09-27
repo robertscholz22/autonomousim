@@ -3,8 +3,9 @@
 //!
 //! The chassis frame is FLU with an arbitrary origin; wheel positions, the centre of mass and
 //! colliders are given in it. Axles list the **left** wheel; the right wheel mirrors it
-//! (`y → −y`, and so do the suspension's lateral offset, toe and camber). Wheels are numbered
-//! axle by axle, left before right (`2·axle + side`).
+//! (`y → −y`, and so do the suspension's lateral offset, toe and camber). An axle on the
+//! centreline (`y = 0`) has a single wheel instead: single-track vehicles (bicycles,
+//! motorcycles). Wheels are numbered axle by axle, left before right.
 //!
 //! Each wheel hangs from the chassis on a kinematics table over its travel (`KcTravel` joint,
 //! travel positive in bump) or rigidly, may steer about the carrier's vertical axis (a
@@ -16,6 +17,10 @@
 //! Trailers and other units behind the towing unit are in [`WheeledDef::units`] (see
 //! [`super::units`]); their axles follow the towing unit's, unit by unit, with positions in
 //! their unit's frame.
+//!
+//! Single-track vehicles steer by a [`SteeringHeadDef`]: the front wheel and its fork turn
+//! freely about the tilted steering axis, driven by the rider's steering torque, and may carry
+//! a leaning rider ([`RiderDef`]) and feet that hold them up at a standstill ([`FeetDef`]).
 
 use super::powertrain::{MAX_WHEELS, PowertrainDef};
 use super::tire::{FialaParams, MfParams, TirFile, Tire, TireModel, TrackPatch};
@@ -26,7 +31,7 @@ use autonomousim_core::contact::SphereCollider;
 use autonomousim_core::dynamics::{KcTable, KcTableSpec};
 use autonomousim_core::material::Material;
 use autonomousim_core::math::spline::CubicSpline;
-use glam::{DQuat, DVec3};
+use glam::{DMat3, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 
 /// Standard gravity, used for the automatic spring preloads.
@@ -66,6 +71,12 @@ pub struct WheeledDef {
     /// `units[k]`), usually added by [`with_trailers`](Self::with_trailers).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub units: Vec<UnitDef>,
+    /// A rider leaning on the towing unit (single-track vehicles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rider: Option<RiderDef>,
+    /// Feet put down at a standstill (single-track vehicles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feet: Option<FeetDef>,
     /// Resolved per axle by [`finish`](Self::finish).
     #[serde(skip)]
     tires: Vec<Tire>,
@@ -84,8 +95,12 @@ pub struct ChassisDef {
     pub mass: f64,
     /// Centre of mass in the chassis frame (m).
     pub com: DVec3,
-    /// Principal moments of inertia about the centre of mass, chassis axes (kg·m²).
+    /// Moments of inertia about the centre of mass, chassis axes (kg·m²).
     pub inertia: DVec3,
+    /// Off-diagonal entries of the inertia tensor `[I_xy, I_xz, I_yz]` (kg·m²; `I_xz = −∫xz dm`),
+    /// zero for principal axes along the chassis axes.
+    #[serde(default, skip_serializing_if = "is_zero_vec")]
+    pub products: DVec3,
     /// Quadratic drag `C_d·A` per chassis axis (m²): `F_k = −½ρ·C_dA_k·|v_k|·v_k` at the
     /// centre of mass.
     #[serde(default)]
@@ -100,7 +115,8 @@ pub struct AxleDef {
     /// Unit carrying the axle (0: the towing unit); axles are listed unit by unit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unit: usize,
-    /// Left wheel centre at design ride height, chassis frame (m).
+    /// Left wheel centre at design ride height, chassis frame (m); on the centreline (`y = 0`)
+    /// the axle has a single wheel.
     pub position: DVec3,
     /// Independent suspension; `None` mounts the wheels rigidly (small robots).
     #[serde(default)]
@@ -123,6 +139,9 @@ pub struct AxleDef {
     /// back to the Ackermann angle without one), or from the unit's articulation angle.
     #[serde(default)]
     pub steer_mode: SteerMode,
+    /// A steering head: the (single) wheel steers freely about a tilted axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_head: Option<SteeringHeadDef>,
     pub brake: BrakeDef,
     /// `steer` resolved to a share (by [`WheeledDef::finish`]).
     #[serde(skip)]
@@ -289,8 +308,25 @@ pub enum SteerMode {
     Articulation(f64),
 }
 
+impl ChassisDef {
+    /// Inertia tensor about the centre of mass (chassis axes).
+    pub fn inertia_tensor(&self) -> DMat3 {
+        inertia_tensor(self.inertia, self.products)
+    }
+}
+
 impl AxleDef {
-    /// Whether the axle's wheels have a steering joint.
+    /// One wheel on the centreline rather than a left/right pair.
+    pub fn is_single(&self) -> bool {
+        self.position.y == 0.0
+    }
+
+    /// Number of wheels (1 or 2).
+    pub fn num_wheels(&self) -> usize {
+        if self.is_single() { 1 } else { 2 }
+    }
+
+    /// Whether the axle's wheels have a (prescribed) steering joint.
     pub fn is_steered(&self) -> bool {
         self.steer != Steer::Share(0.0) || !matches!(self.steer_mode, SteerMode::Ackermann)
     }
@@ -341,6 +377,129 @@ fn is_zero(x: &usize) -> bool {
 
 fn is_zero_f64(x: &f64) -> bool {
     *x == 0.0
+}
+
+fn is_zero_vec(x: &DVec3) -> bool {
+    *x == DVec3::ZERO
+}
+
+/// Symmetric tensor from its diagonal and off-diagonal entries `[xy, xz, yz]`.
+pub fn inertia_tensor(moments: DVec3, products: DVec3) -> DMat3 {
+    let (m, p) = (moments, products);
+    DMat3::from_cols(DVec3::new(m.x, p.x, p.y), DVec3::new(p.x, m.y, p.z), DVec3::new(p.y, p.z, m.z))
+}
+
+/// Whether a symmetric tensor is positive definite (leading minors).
+fn positive_definite(t: DMat3) -> bool {
+    let (a, b, c) = (t.x_axis, t.y_axis, t.z_axis);
+    a.x > 0.0 && a.x * b.y - a.y * b.x > 0.0 && t.determinant() > 0.0 && (a + b + c).is_finite()
+}
+
+/// Steering head of a single-track axle (bicycles, motorcycles): the wheel and the steered
+/// body (fork, handlebar) turn freely about the steering axis, tilted back from the vertical by
+/// the head angle and passing `offset` behind the wheel centre. The rider's steering torque
+/// (`DriveInput::steering`, positive turning left, times `max_torque`), a damper and the lock
+/// stops act on it. With a suspension, the fork slides along the axis (unless it has
+/// kinematics of its own, in the steered frame).
+///
+/// The trail, the distance the ground contact trails behind the axis' ground point, is
+/// `(R·sin λ − offset)/cos λ` for wheel radius `R`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SteeringHeadDef {
+    /// Head angle `λ`: the axis' tilt back from the vertical (rad).
+    pub angle: f64,
+    /// Fork offset: the wheel centre's distance ahead of the axis, square to it (m).
+    pub offset: f64,
+    /// The steered body without the wheel: mass (kg), centre of mass (chassis frame, design
+    /// pose, straight ahead) and inertia about it (chassis axes; kg·m²).
+    pub mass: f64,
+    pub com: DVec3,
+    pub inertia: DVec3,
+    #[serde(default, skip_serializing_if = "is_zero_vec")]
+    pub products: DVec3,
+    /// Steering lock each way (rad), where a stop of `lock_stiffness` (N·m/rad) engages.
+    pub lock: f64,
+    #[serde(default = "default_lock_stiffness")]
+    pub lock_stiffness: f64,
+    /// Steering damper (N·m·s/rad).
+    #[serde(default)]
+    pub damping: f64,
+    /// The rider's largest steering torque (N·m).
+    pub max_torque: f64,
+}
+
+fn default_lock_stiffness() -> f64 {
+    500.0
+}
+
+impl SteeringHeadDef {
+    /// The steering axis, pointing up (chassis frame).
+    pub fn axis(&self) -> DVec3 {
+        DVec3::new(-self.angle.sin(), 0.0, self.angle.cos())
+    }
+
+    /// The point of the axis square to the wheel centre `wheel` (chassis frame).
+    pub fn pivot(&self, wheel: DVec3) -> DVec3 {
+        wheel - self.offset * DVec3::new(self.angle.cos(), 0.0, self.angle.sin())
+    }
+
+    /// Stop and damper torque (N·m) at steering angle `delta` and rate `rate`.
+    pub fn passive_torque(&self, delta: f64, rate: f64) -> f64 {
+        let excess = delta - delta.clamp(-self.lock, self.lock);
+        // The stop is damped over 10 ms.
+        let stop = if excess != 0.0 { -self.lock_stiffness * (excess + 0.01 * rate) } else { 0.0 };
+        stop - self.damping * rate
+    }
+}
+
+/// A rider's upper body, leaning about the chassis x axis through the hip on a servo: torque
+/// `stiffness·(φ_ref − φ) − damping·φ̇`, at most `max_torque`, towards the lean
+/// `φ_ref = DriveInput::lean · max_lean` (positive: to the right, as roll). The legs and
+/// the lower body belong to the chassis.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiderDef {
+    /// Mass (kg), centre of mass (chassis frame, upright) and inertia about it (chassis axes).
+    pub mass: f64,
+    pub com: DVec3,
+    pub inertia: DVec3,
+    #[serde(default, skip_serializing_if = "is_zero_vec")]
+    pub products: DVec3,
+    /// A point on the lean axis (chassis frame).
+    pub hip: DVec3,
+    /// Largest lean each way (rad), servo stiffness (N·m/rad), damping (N·m·s/rad) and torque
+    /// (N·m).
+    pub max_lean: f64,
+    pub stiffness: f64,
+    pub damping: f64,
+    pub max_torque: f64,
+}
+
+impl RiderDef {
+    /// Servo torque (N·m) at lean `phi` and rate `rate` for the normalised command `lean`.
+    pub fn servo_torque(&self, lean: f64, phi: f64, rate: f64) -> f64 {
+        (self.stiffness * (lean * self.max_lean - phi) - self.damping * rate).clamp(-self.max_torque, self.max_torque)
+    }
+}
+
+/// The rider's feet: spheres on the chassis, put down below `speed` (forward, m/s) and lifted
+/// back onto the pegs or pedals above `1.25·speed`. Down, they hover a little above flat
+/// ground, so they catch the vehicle once it leans.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeetDef {
+    /// Left foot's centre down and up (chassis frame; the right foot mirrors it) and its
+    /// radius (m).
+    pub down: DVec3,
+    pub up: DVec3,
+    pub radius: f64,
+    #[serde(default = "default_feet_speed")]
+    pub speed: f64,
+}
+
+fn default_feet_speed() -> f64 {
+    1.5
 }
 
 /// Tracks on both sides of the towing unit. Every axle without a `tire` is a pair of road
@@ -494,6 +653,17 @@ impl SuspensionDef {
         KcTable::new(spec).map_err(|e| e.to_string())
     }
 
+    /// Kinematics of a wheel on a steering head with axis `axis` (steered frame): without
+    /// kinematics of its own, a fork sliding along the axis.
+    pub fn fork_table(&self, axis: DVec3) -> Result<KcTable, String> {
+        if !self.kinematics.travel.is_empty() || self.trailing_arm.is_some() {
+            return self.table(0);
+        }
+        let travel = vec![-0.1, 0.1];
+        let (x, z) = (travel.iter().map(|s| s * axis.x).collect(), travel.iter().map(|s| s * axis.z).collect());
+        KcTable::new(KcTableSpec { travel, x, z, ..Default::default() }).map_err(|e| e.to_string())
+    }
+
     /// Force pushing the wheel away from the body (N) at travel `s` from spring and stops,
     /// with spring preload `preload` (rate springs).
     pub fn spring_force(&self, s: f64, preload: f64) -> f64 {
@@ -597,7 +767,7 @@ impl WheeledDef {
             units: self.units[..units - 1].to_vec(),
             axles: self.axles[..axles].to_vec(),
             tires: self.tires[..axles].to_vec(),
-            preload: self.preload[..2 * axles].to_vec(),
+            preload: self.preload[..self.axle_wheels(axles).start].to_vec(),
             rest: None,
             ..self.clone()
         }
@@ -645,14 +815,14 @@ impl WheeledDef {
         let pos = |x: f64| x > 0.0 && x.is_finite();
         let nonneg = |x: f64| x >= 0.0 && x.is_finite();
         let c = &self.chassis;
-        if !pos(c.mass) || !pos(c.inertia.min_element()) || !c.com.is_finite() {
+        if !pos(c.mass) || !positive_definite(c.inertia_tensor()) || !c.com.is_finite() {
             return Err("chassis mass and inertia must be positive".into());
         }
         if !nonneg(c.drag_area.min_element()) {
             return Err("drag area must be non-negative".into());
         }
-        if self.axles.is_empty() || self.axles.len() > MAX_WHEELS / 2 {
-            return Err(format!("need 1 to {} axles", MAX_WHEELS / 2));
+        if self.axles.is_empty() || self.num_wheels() > MAX_WHEELS {
+            return Err(format!("need 1 to {MAX_WHEELS} wheels"));
         }
         if self.axles.windows(2).any(|w| w[1].unit < w[0].unit) || self.axles.iter().any(|a| a.unit > self.units.len())
         {
@@ -664,7 +834,10 @@ impl WheeledDef {
             if u.parent > k {
                 return fail("hangs from a later unit".into());
             }
-            if !pos(c.mass) || !pos(c.inertia.min_element()) || !c.com.is_finite() || !nonneg(c.drag_area.min_element())
+            if !pos(c.mass)
+                || !positive_definite(c.inertia_tensor())
+                || !c.com.is_finite()
+                || !nonneg(c.drag_area.min_element())
             {
                 return fail("mass and inertia must be positive, drag non-negative".into());
             }
@@ -702,8 +875,31 @@ impl WheeledDef {
             if a.is_geometric() && a.unit > 0 {
                 return fail("geometric steering is for the towing unit");
             }
-            if !a.position.is_finite() || !pos(a.position.y) {
-                return fail("the (left) wheel position needs y > 0");
+            if !a.position.is_finite() || !nonneg(a.position.y) {
+                return fail("the (left) wheel position needs y > 0 (y = 0: a single wheel)");
+            }
+            if a.is_single() && (track || a.dual.is_some() || a.suspension.as_ref().is_some_and(|s| s.anti_roll != 0.0))
+            {
+                return fail("a single wheel has a tyre, no dual and no anti-roll bar");
+            }
+            if let Some(h) = &a.steering_head {
+                let tensor = inertia_tensor(h.inertia, h.products);
+                if !a.is_single() || a.unit > 0 || a.is_steered() {
+                    return fail("a steering head is for a single, otherwise unsteered wheel of the towing unit");
+                }
+                if !(0.0..1.2).contains(&h.angle)
+                    || !h.offset.is_finite()
+                    || !pos(h.mass)
+                    || !h.com.is_finite()
+                    || !positive_definite(tensor)
+                {
+                    return fail(
+                        "a steering head needs 0 ≤ angle < 1.2 rad, a finite offset, and positive mass and inertia",
+                    );
+                }
+                if !(pos(h.lock) && h.lock < 1.5 && pos(h.lock_stiffness) && nonneg(h.damping) && pos(h.max_torque)) {
+                    return fail("a steering head needs 0 < lock < 1.5 rad and positive stiffness and torque");
+                }
             }
             if !pos(a.wheel.mass) || !pos(a.wheel.inertia.min_element()) {
                 return fail("wheel mass and inertia must be positive");
@@ -765,7 +961,31 @@ impl WheeledDef {
         {
             return Err("steering needs 0 < max_angle < 1.5 rad, a positive rate and ackermann in [0, 1]".into());
         }
-        self.powertrain.validate(self.axles.len())?;
+        if self.axles.iter().filter(|a| a.steering_head.is_some()).count() > 1 {
+            return Err("one steering head at most".into());
+        }
+        if let Some(r) = &self.rider {
+            let tensor = inertia_tensor(r.inertia, r.products);
+            if !(pos(r.mass) && r.com.is_finite() && r.hip.is_finite() && positive_definite(tensor)) {
+                return Err("the rider needs positive mass and inertia and finite positions".into());
+            }
+            if !(pos(r.max_lean) && r.max_lean < 1.5 && pos(r.stiffness) && nonneg(r.damping) && pos(r.max_torque)) {
+                return Err("the rider needs 0 < max_lean < 1.5 rad and positive stiffness and torque".into());
+            }
+        }
+        if let Some(f) = &self.feet
+            && !(f.down.is_finite()
+                && f.up.is_finite()
+                && pos(f.down.y)
+                && pos(f.up.y)
+                && pos(f.radius)
+                && nonneg(f.speed))
+        {
+            return Err(
+                "the feet need finite positions left of the centreline (y > 0), a positive radius and speed".into()
+            );
+        }
+        self.powertrain.validate(&self.axle_ranges())?;
         if self
             .colliders
             .iter()
@@ -777,13 +997,53 @@ impl WheeledDef {
         Ok(())
     }
 
-    /// Axle and side (0 left, 1 right) of every wheel, in wheel order.
+    /// Axle and side (0 left or single, 1 right) of every wheel, in wheel order.
     pub fn wheels(&self) -> impl Iterator<Item = (&AxleDef, usize)> {
-        self.axles.iter().flat_map(|a| [(a, 0), (a, 1)])
+        self.axles.iter().flat_map(|a| (0..a.num_wheels()).map(move |side| (a, side)))
     }
 
     pub fn num_wheels(&self) -> usize {
-        2 * self.axles.len()
+        self.axles.iter().map(AxleDef::num_wheels).sum()
+    }
+
+    /// Axle of wheel `w`.
+    pub fn wheel_axle(&self, w: usize) -> usize {
+        let mut first = 0;
+        for (a, axle) in self.axles.iter().enumerate() {
+            first += axle.num_wheels();
+            if w < first {
+                return a;
+            }
+        }
+        panic!("wheel {w} out of range")
+    }
+
+    /// Side of wheel `w`: 0 left (or a single wheel), 1 right.
+    pub fn wheel_side(&self, w: usize) -> usize {
+        w - self.axle_wheels(self.wheel_axle(w)).start
+    }
+
+    /// Wheels of axle `a` (`a = axles.len()`: the empty range after the last).
+    pub fn axle_wheels(&self, a: usize) -> std::ops::Range<usize> {
+        let start = self.axles[..a].iter().map(AxleDef::num_wheels).sum();
+        start..start + self.axles.get(a).map_or(0, AxleDef::num_wheels)
+    }
+
+    /// [`axle_wheels`](Self::axle_wheels) of every axle.
+    pub fn axle_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        (0..self.axles.len()).map(|a| self.axle_wheels(a)).collect()
+    }
+
+    /// Whether the towing unit stands on single wheels only (it needs a rider or feet to
+    /// stay up).
+    pub fn is_single_track(&self) -> bool {
+        self.axles.iter().filter(|a| a.unit == 0).all(AxleDef::is_single)
+    }
+
+    /// The axle with a steering head and its wheel, if any.
+    pub fn steering_head(&self) -> Option<(&SteeringHeadDef, usize)> {
+        let a = self.axles.iter().position(|a| a.steering_head.is_some())?;
+        Some((self.axles[a].steering_head.as_ref().expect("found"), self.axle_wheels(a).start))
     }
 
     /// Number of units (the towing unit and those behind it).
@@ -793,7 +1053,7 @@ impl WheeledDef {
 
     /// Unit carrying wheel `w`.
     pub fn wheel_unit(&self, w: usize) -> usize {
-        self.axles[w / 2].unit
+        self.axles[self.wheel_axle(w)].unit
     }
 
     /// Chassis of unit `u` (0: the towing unit).
@@ -808,14 +1068,22 @@ impl WheeledDef {
 
     /// Link of unit `u` in the multibody tree (see [`super::tree`]).
     pub fn unit_link(&self, u: usize) -> usize {
-        let links = |a: &AxleDef| 2 * (1 + usize::from(a.suspension.is_some()) + usize::from(a.is_steered()));
-        (0..u).map(|v| 1 + self.axles.iter().filter(|a| a.unit == v).map(links).sum::<usize>()).sum()
+        let links = |a: &AxleDef| {
+            a.num_wheels() * (1 + usize::from(a.suspension.is_some()) + usize::from(a.is_steered()))
+                + usize::from(a.steering_head.is_some())
+        };
+        let rider = usize::from(self.rider.is_some());
+        (0..u)
+            .map(|v| {
+                1 + self.axles.iter().filter(|a| a.unit == v).map(links).sum::<usize>() + rider * usize::from(v == 0)
+            })
+            .sum()
     }
 
     /// Design position of wheel `w` in its unit's frame.
     pub fn wheel_position(&self, w: usize) -> DVec3 {
-        let p = self.axles[w / 2].position;
-        if w.is_multiple_of(2) { p } else { DVec3::new(p.x, -p.y, p.z) }
+        let p = self.axles[self.wheel_axle(w)].position;
+        if self.wheel_side(w) == 0 { p } else { DVec3::new(p.x, -p.y, p.z) }
     }
 
     /// The last unit's rear on its centreline, in its frame: the rearmost extent of its wheels
@@ -825,7 +1093,7 @@ impl WheeledDef {
         let link = self.unit_link(u);
         let wheels = (0..self.num_wheels())
             .filter(|&w| self.wheel_unit(w) == u)
-            .map(|w| self.wheel_position(w).x - self.tire(w / 2).radius());
+            .map(|w| self.wheel_position(w).x - self.wheel_tire(w).radius());
         let colliders = self.sphere_colliders().into_iter().filter(|c| c.link == link).map(|c| c.center.x - c.radius);
         DVec3::new(wheels.chain(colliders).fold(f64::INFINITY, f64::min).min(0.0), 0.0, 0.0)
     }
@@ -864,6 +1132,11 @@ impl WheeledDef {
         &self.tires[axle]
     }
 
+    /// Tyre of wheel `w`'s axle.
+    pub fn wheel_tire(&self, w: usize) -> &Tire {
+        &self.tires[self.wheel_axle(w)]
+    }
+
     /// Spring preload of wheel `w` (N).
     pub fn preload(&self, w: usize) -> f64 {
         self.preload[w]
@@ -871,7 +1144,7 @@ impl WheeledDef {
 
     /// Unsprung mass of wheel `w` (carrier and wheel; kg).
     pub fn unsprung_mass(&self, w: usize) -> f64 {
-        let a = &self.axles[w / 2];
+        let a = &self.axles[self.wheel_axle(w)];
         a.wheel.mass + a.suspension.as_ref().map_or(0.0, |s| s.carrier_mass)
     }
 
@@ -897,12 +1170,22 @@ impl WheeledDef {
         self.chassis.mass
             + self.units.iter().map(|u| u.chassis.mass).sum::<f64>()
             + (0..self.num_wheels()).map(|w| self.unsprung_mass(w)).sum::<f64>()
+            + self.extra_masses().map(|m| m.0).sum::<f64>()
     }
 
-    /// Mass of unit `u` with its wheels (kg).
+    /// Mass of unit `u` with its wheels (and the towing unit's with its steered body and
+    /// rider; kg).
     pub fn unit_mass(&self, u: usize) -> f64 {
+        let extra = if u == 0 { self.extra_masses().map(|m| m.0).sum::<f64>() } else { 0.0 };
         self.unit_chassis(u).mass
             + (0..self.num_wheels()).filter(|&w| self.wheel_unit(w) == u).map(|w| self.unsprung_mass(w)).sum::<f64>()
+            + extra
+    }
+
+    /// The towing unit's steered body and rider: masses and centres (chassis frame, design).
+    fn extra_masses(&self) -> impl Iterator<Item = (f64, DVec3)> + '_ {
+        let heads = self.axles.iter().filter_map(|a| a.steering_head.as_ref()).map(|h| (h.mass, h.com));
+        heads.chain(self.rider.iter().map(|r| (r.mass, r.com)))
     }
 
     /// Centre of mass of the towing unit with its wheels at design (chassis frame).
@@ -911,20 +1194,35 @@ impl WheeledDef {
         for w in (0..self.num_wheels()).filter(|&w| self.wheel_unit(w) == 0) {
             m += self.wheel_position(w) * self.unsprung_mass(w);
         }
+        for (mass, com) in self.extra_masses() {
+            m += com * mass;
+        }
         m / self.unit_mass(0)
     }
 
     /// Wheel spin inertia including the driveline share (kg·m²), per wheel.
     pub fn spin_inertia(&self) -> Vec<f64> {
-        let extra = self.powertrain.wheel_inertia(self.num_wheels());
+        let extra = self.powertrain.wheel_inertia(&self.axle_ranges(), self.num_wheels());
         self.wheels().zip(extra).map(|((a, _), e)| a.wheel.inertia.y + e).collect()
     }
 
     /// Sphere colliders on their units' links (the towing unit's first, then its sprockets and
-    /// idlers).
+    /// idlers, then its feet, down).
     pub fn sphere_colliders(&self) -> Vec<SphereCollider> {
         let rollers: Vec<GroundColliderDef> = self.track.iter().flat_map(|t| t.colliders()).collect();
-        let own = self.colliders.iter().chain(&rollers).collect::<Vec<_>>();
+        let feet: Vec<GroundColliderDef> = self
+            .feet
+            .iter()
+            .flat_map(|f| {
+                [1.0, -1.0].map(|s| GroundColliderDef {
+                    center: DVec3::new(f.down.x, s * f.down.y, f.down.z),
+                    radius: f.radius,
+                    friction: 1.0,
+                    part: GroundPart::Skid,
+                })
+            })
+            .collect();
+        let own = self.colliders.iter().chain(&rollers).chain(&feet).collect::<Vec<_>>();
         let units = std::iter::once(own).chain(self.units.iter().map(|u| u.colliders.iter().collect()));
         units
             .enumerate()
@@ -955,14 +1253,14 @@ impl WheeledDef {
     /// wheels on the same side by design position.
     pub fn track_neighbours(&self) -> Vec<[Option<usize>; 2]> {
         let n = self.num_wheels();
-        let on_track = |w: usize| self.tires[w / 2].is_track() && self.wheel_unit(w) == 0;
+        let on_track = |w: usize| self.wheel_tire(w).is_track() && self.wheel_unit(w) == 0;
         (0..n)
             .map(|w| {
                 if !on_track(w) {
                     return [None; 2];
                 }
                 let x = self.wheel_position(w).x;
-                let side = (0..n).filter(|&o| o != w && o % 2 == w % 2 && on_track(o));
+                let side = (0..n).filter(|&o| o != w && self.wheel_side(o) == self.wheel_side(w) && on_track(o));
                 let front = side.clone().filter(|&o| self.wheel_position(o).x > x);
                 let rear = side.filter(|&o| self.wheel_position(o).x < x);
                 let by_x = |a: &usize, b: &usize| self.wheel_position(*a).x.total_cmp(&self.wheel_position(*b).x);
@@ -988,7 +1286,11 @@ impl WheeledDef {
         if self.tires.len() != self.axles.len() {
             return Err("definition not finished".into());
         }
-        if self.units.is_empty() && self.axles.len() == 2 {
+        if self.units.is_empty()
+            && self.axles.len() == 2
+            && self.axles.iter().all(|a| !a.is_single())
+            && self.rider.is_none()
+        {
             self.solve_two_axle(g, auto.is_some())
         } else if self.axles.len() >= 2 {
             super::statics::solve(self, g, auto)

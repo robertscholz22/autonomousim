@@ -251,12 +251,12 @@ impl GroundController {
         }
         let n = def.num_wheels();
         let inertia = def.spin_inertia();
-        let radius_of = |w: usize| def.tire(w / 2).radius();
+        let radius_of = |w: usize| def.wheel_tire(w).radius();
         let spinning: f64 = (0..n).map(|w| inertia[w] / radius_of(w).powi(2)).sum();
         let mass = def.total_mass() + spinning;
         let (drive, driven) = match &def.powertrain {
             PowertrainDef::Combustion(cd) => {
-                let wheels: Vec<usize> = cd.driven.iter().flat_map(|&a| [2 * a, 2 * a + 1]).collect();
+                let wheels: Vec<usize> = cd.driven.iter().flat_map(|&a| def.axle_wheels(a)).collect();
                 (Drive::Combustion(cd.clone()), wheels)
             }
             PowertrainDef::Electric(e) => {
@@ -283,7 +283,7 @@ impl GroundController {
         };
         let radius = driven.iter().map(|&w| radius_of(w)).sum::<f64>() / driven.len() as f64;
         let wheel_radius: Vec<f64> = (0..n).map(radius_of).collect();
-        let wheel_brake: Vec<f64> = (0..n).map(|w| def.axles[w / 2].brake.max_torque).collect();
+        let wheel_brake: Vec<f64> = (0..n).map(|w| def.axles[def.wheel_axle(w)].brake.max_torque).collect();
         let brake_torque = wheel_brake.iter().sum();
         let steering = def.steering.and_then(|s| {
             let axle = def

@@ -419,7 +419,7 @@ impl CompiledObs {
                         }
                         TermKind::WheelSpeeds => {
                             for (w, (d, s)) in dst.iter_mut().zip(v.wheels()).enumerate() {
-                                *d = value(s.spin * v.def().tire(w / 2).radius(), t);
+                                *d = value(s.spin * v.def().wheel_tire(w).radius(), t);
                             }
                         }
                         TermKind::WheelSlip => {

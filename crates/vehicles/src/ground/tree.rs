@@ -4,13 +4,16 @@
 //! chains, then each further unit's body (on its joint to the unit ahead) followed by its own
 //! wheel chains. Per wheel: carrier (`KcTravel`, if sprung) → steering knuckle (massless
 //! revolute about the carrier's z axis, prescribed, if steered) → wheel (revolute about the
-//! lateral axis).
+//! lateral axis). A wheel on a steering head hangs from the head instead: head (free
+//! revolute about the steering axis, carrying the steered body) → fork (`KcTravel`, if sprung)
+//! → wheel. The rider's upper body (revolute about the chassis x axis) follows the towing
+//! unit's wheels.
 
-use super::def::WheeledDef;
+use super::def::{WheeledDef, inertia_tensor};
 use super::units::UnitJoint;
 use autonomousim_core::dynamics::{JointType, MultibodyModel};
 use autonomousim_core::math::{Pose, RigidInertia};
-use glam::{DMat3, DVec3};
+use glam::DVec3;
 use std::sync::Arc;
 
 /// Links and coordinates of one wheel.
@@ -37,6 +40,9 @@ pub(super) struct Tree {
     pub model: MultibodyModel,
     pub corners: Vec<CornerLinks>,
     pub units: Vec<UnitLinks>,
+    /// The steering head's link and coordinates, and the rider's.
+    pub head: Option<UnitLinks>,
+    pub rider: Option<UnitLinks>,
 }
 
 /// The tree of `def` (validated), with wheel spin inertias `spin` (one per wheel).
@@ -44,10 +50,13 @@ pub(super) fn build(def: &WheeledDef, spin: &[f64]) -> Tree {
     let mut model = MultibodyModel::new();
     let mut corners = Vec::with_capacity(def.num_wheels());
     let mut units: Vec<UnitLinks> = Vec::with_capacity(def.units.len() + 1);
+    let (mut head, mut rider) = (None, None);
+    let links =
+        |model: &MultibodyModel, link: usize| UnitLinks { link, q: model.q_offset(link), v: model.v_offset(link) };
     for u in 0..=def.units.len() {
         let link = if u == 0 {
             let c = &def.chassis;
-            let inertia = RigidInertia::new(c.mass, c.com, DMat3::from_diagonal(c.inertia));
+            let inertia = RigidInertia::new(c.mass, c.com, c.inertia_tensor());
             model.add_link("chassis", None, JointType::Free, Pose::IDENTITY, inertia)
         } else {
             let unit = &def.units[u - 1];
@@ -62,15 +71,34 @@ pub(super) fn build(def: &WheeledDef, spin: &[f64]) -> Tree {
                 Some(units[unit.parent].link),
                 joint,
                 Pose::from_translation(unit.position),
-                RigidInertia::new(c.mass, c.com, DMat3::from_diagonal(c.inertia)),
+                RigidInertia::new(c.mass, c.com, c.inertia_tensor()),
             )
         };
-        units.push(UnitLinks { link, q: model.q_offset(link), v: model.v_offset(link) });
+        units.push(links(&model, link));
         for (w, (axle, side)) in def.wheels().enumerate().filter(|(_, (a, _))| a.unit == u) {
             let (mut parent, mut frame) = (link, Pose::from_translation(def.wheel_position(w)));
+            let mut fork_axis = None;
+            if let Some(h) = &axle.steering_head {
+                let pivot = h.pivot(def.wheel_position(w));
+                let body = RigidInertia::new(h.mass, h.com - pivot, inertia_tensor(h.inertia, h.products));
+                let l = model.add_link(
+                    format!("head_{w}"),
+                    Some(parent),
+                    JointType::Revolute { axis: h.axis() },
+                    Pose::from_translation(pivot),
+                    body,
+                );
+                head = Some(links(&model, l));
+                fork_axis = Some(h.axis());
+                (parent, frame) = (l, Pose::from_translation(def.wheel_position(w) - pivot));
+            }
             let mut travel = None;
             if let Some(s) = &axle.suspension {
-                let table = s.table(side).expect("validated");
+                let table = match fork_axis {
+                    Some(axis) => s.fork_table(axis),
+                    None => s.table(side),
+                }
+                .expect("validated");
                 let carrier = model.add_link(
                     format!("carrier_{w}"),
                     Some(parent),
@@ -107,6 +135,16 @@ pub(super) fn build(def: &WheeledDef, spin: &[f64]) -> Tree {
             let spin = (model.q_offset(wheel), model.v_offset(wheel));
             corners.push(CornerLinks { wheel, carrier, travel, steer, spin });
         }
+        if let (0, Some(r)) = (u, &def.rider) {
+            let l = model.add_link(
+                "rider",
+                Some(link),
+                JointType::Revolute { axis: DVec3::X },
+                Pose::from_translation(r.hip),
+                RigidInertia::new(r.mass, r.com - r.hip, inertia_tensor(r.inertia, r.products)),
+            );
+            rider = Some(links(&model, l));
+        }
     }
-    Tree { model, corners, units }
+    Tree { model, corners, units, head, rider }
 }

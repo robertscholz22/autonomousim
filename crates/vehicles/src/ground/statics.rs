@@ -8,6 +8,9 @@
 //! the tree (forward kinematics), the Hessian that of the tyre, spring and coupling
 //! stiffnesses over the same motions (Gauss–Newton), so the minimum is exact while the
 //! Newton steps are approximate. Tyres are vertical springs under the wheel centres.
+//!
+//! A single-track vehicle is balanced upright (no roll), steering straight and its rider
+//! upright: its roll is an unstable equilibrium.
 
 use super::def::{StaticState, WheeledDef, deflection_at};
 use super::tree::build;
@@ -42,7 +45,10 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
                 && a.suspension.as_ref().is_some_and(|s| s.spring.travel.is_empty() && s.spring.preload.is_none())
         })
         .collect();
-    let mut params = vec![Param::Height, Param::Pitch, Param::Roll];
+    let mut params = vec![Param::Height, Param::Pitch];
+    if !def.is_single_track() {
+        params.push(Param::Roll);
+    }
     for (k, u) in def.units.iter().enumerate() {
         match u.joint {
             UnitJoint::Coupling(_) => params.extend([Param::UnitPitch(k + 1), Param::UnitRoll(k + 1)]),
@@ -103,7 +109,7 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
         (com, wheels, rots)
     };
     let tire_force = |w: usize, d: f64| -> (f64, f64) {
-        let t = def.tire(w / 2);
+        let t = def.wheel_tire(w);
         let nominal = t.nominal_load();
         let soft = 1e-3 * nominal / deflection_at(t, nominal);
         if d <= 0.0 {
@@ -116,11 +122,11 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
 
     // Start with the towing unit's tyres at their nominal deflection, everything level.
     let mut p = vec![0.0; np];
-    let front: Vec<usize> = (0..n).filter(|&w| def.axles[w / 2].unit == 0).collect();
+    let front: Vec<usize> = (0..n).filter(|&w| def.wheel_unit(w) == 0).collect();
     p[0] = front
         .iter()
         .map(|&w| {
-            let t = def.tire(w / 2);
+            let t = def.wheel_tire(w);
             t.radius() - deflection_at(t, t.nominal_load()) - def.wheel_position(w).z
         })
         .sum::<f64>()
@@ -167,7 +173,7 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
         let mut loads = vec![0.0; n];
         let mut deflection = vec![0.0; n];
         for w in 0..n {
-            deflection[w] = def.tire(w / 2).radius() - wz[w];
+            deflection[w] = def.wheel_tire(w).radius() - wz[w];
             let (f, k) = tire_force(w, deflection[w]);
             loads[w] = f;
             // The tyre pushes the wheel centre up: energy falls as the centre rises.
@@ -185,13 +191,13 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
         // Springs, stops and anti-roll bars act on the travels directly.
         let travel_param = |w: usize| params.iter().position(|&x| x == Param::Travel(w));
         for w in 0..n {
-            let (Some(i), Some(s)) = (travel_param(w), &def.axles[w / 2].suspension) else { continue };
+            let (Some(i), Some(s)) = (travel_param(w), &def.axles[def.wheel_axle(w)].suspension) else { continue };
             let x = p[i];
             let f = s.spring_force(x, preload[w]);
             let k = (s.spring_force(x + h, preload[w]) - s.spring_force(x - h, preload[w])) / (2.0 * h);
             grad[i] += f;
             hess[(i, i)] += k;
-            if w % 2 == 0
+            if def.wheel_side(w) == 0
                 && s.anti_roll != 0.0
                 && let Some(j) = travel_param(w + 1)
             {
@@ -224,7 +230,8 @@ pub(super) fn solve(def: &WheeledDef, g: f64, auto: Option<usize>) -> Result<(St
                 }
             }
             let travel = (0..n).map(|w| travel_param(w).map_or(0.0, |i| p[i])).collect();
-            let state = StaticState { height: p[0], pitch: p[1], roll: p[2], loads, travel, deflection, joints };
+            let roll = params.iter().position(|&x| x == Param::Roll).map_or(0.0, |i| p[i]);
+            let state = StaticState { height: p[0], pitch: p[1], roll, loads, travel, deflection, joints };
             return Ok((state, out));
         }
         // Newton step on the free unknowns, at most 5 cm or 0.05 rad.

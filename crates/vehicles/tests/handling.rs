@@ -375,7 +375,7 @@ fn bicycle_yaw_rate(v: &Wheeled, u: f64, before: &[[f64; 2]; 4], steady: &[[f64;
     let (mut a, mut b) = ([[0.0; 2]; 2], [0.0; 2]);
     a[0][1] -= m * u;
     for w in 0..4 {
-        let TireModel::MagicFormula(p) = &d.tire(w / 2).model else { panic!("MF tyres expected") };
+        let TireModel::MagicFormula(p) = &d.wheel_tire(w).model else { panic!("MF tyres expected") };
         let fy = |alpha: f64, gamma: f64| p.eval(&MfInput::new(st.loads[w], 0.0, alpha, gamma, u)).fy;
         let (h, g0) = (1e-4, before[w][1]);
         let c_alpha = (fy(h, g0) - fy(-h, g0)) / (2.0 * h);

@@ -44,7 +44,8 @@ fn presets_load_with_documented_numbers() {
             "tracked_apc",
             "truck_6x4",
             "truck_8x8",
-            "farm_tractor"
+            "farm_tractor",
+            "bicycle_benchmark"
         ]
     );
     let cf = presets::multirotor("cf2x").unwrap();

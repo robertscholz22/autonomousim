@@ -15,8 +15,12 @@
 //! [`TrackSteering`] is regenerative): `DriveInput::steering > 0`
 //! adds service brake on the left (inner) track, `< 0` on the right, as Chrono's tracked
 //! drivelines do.
+//!
+//! Single-track vehicles: the steering head is a free joint, turned by the rider's steering
+//! torque (`DriveInput::steering`) against its damper and lock stops; the rider leans on a
+//! servo (`DriveInput::lean`); the feet go down below walking speed.
 
-use super::def::{SteerMode, TrackSteering, WheeledDef, deflection_at};
+use super::def::{SteerMode, SteeringHeadDef, TrackSteering, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
 use super::tire::{Surface, TRACK_CELLS, Tire, TireForces, TireState, WheelMotion};
 use super::tree::{UnitLinks, build};
@@ -71,6 +75,9 @@ pub struct WheelState {
 
 #[derive(Clone, Debug)]
 struct Corner {
+    /// Axle and side (0 left or single, 1 right).
+    axle: usize,
+    side: usize,
     wheel: usize,
     /// Link whose angular velocity the (non-spinning) carrier has.
     carrier: usize,
@@ -146,6 +153,13 @@ pub struct Wheeled {
     rollers: Vec<(usize, usize, f64)>,
     road_wheels: [Vec<usize>; 2],
     band_radius: f64,
+    /// The steering head: its definition, joint and wheel, and the torque on it last step.
+    head: Option<(SteeringHeadDef, UnitLinks, usize)>,
+    head_torque: f64,
+    rider: Option<UnitLinks>,
+    /// The left foot's collider (the right one follows it), and whether the feet are down.
+    feet: Option<usize>,
+    feet_down: bool,
     contact: ContactModel,
     // State.
     pub state: MbState,
@@ -183,9 +197,11 @@ impl Wheeled {
             .iter()
             .zip(def.wheels())
             .enumerate()
-            .map(|(w, (links, (axle, _)))| {
+            .map(|(w, (links, (axle, side)))| {
                 let p = def.wheel_position(w);
                 Corner {
+                    axle: def.wheel_axle(w),
+                    side,
                     wheel: links.wheel,
                     carrier: links.carrier,
                     travel: links.travel,
@@ -210,7 +226,7 @@ impl Wheeled {
                     brake: Coupling::new(&[w], &[], &inertia, dt),
                     brake_delay: vec![0.0; (axle.brake.delay / dt).round() as usize],
                     brake_level: 0.0,
-                    tire: def.tire(w / 2).initial_state(),
+                    tire: def.wheel_tire(w).initial_state(),
                     out: WheelState::default(),
                 }
             })
@@ -219,7 +235,7 @@ impl Wheeled {
         let mass = def.total_mass();
         let road_wheels: [Vec<usize>; 2] = [0, 1].map(|side| {
             (0..def.num_wheels())
-                .filter(|&w| w % 2 == side && def.wheel_unit(w) == 0 && def.tire(w / 2).is_track())
+                .filter(|&w| def.wheel_side(w) == side && def.wheel_unit(w) == 0 && def.wheel_tire(w).is_track())
                 .collect()
         });
         let mut s = Self {
@@ -232,8 +248,13 @@ impl Wheeled {
             drive: vec![0.0; def.num_wheels()],
             brake: vec![0.0; def.num_wheels()],
             brake_tick: 0,
-            powertrain: Powertrain::new(&def.powertrain, &inertia, dt),
+            powertrain: Powertrain::new(&def.powertrain, &def.axle_ranges(), &inertia, dt),
             colliders: def.sphere_colliders(),
+            head: def.steering_head().map(|(h, w)| (h.clone(), tree.head.expect("built"), w)),
+            head_torque: 0.0,
+            rider: tree.rider,
+            feet: def.feet.map(|_| def.colliders.len() + def.rollers().len()),
+            feet_down: true,
             track_neighbours: def.track_neighbours(),
             bands: def
                 .track_neighbours()
@@ -257,7 +278,7 @@ impl Wheeled {
             model,
             mass,
             corners,
-            tires: (0..def.num_wheels()).map(|w| def.tire(w / 2).on_side(w % 2 == 1)).collect(),
+            tires: (0..def.num_wheels()).map(|w| def.wheel_tire(w).on_side(def.wheel_side(w) == 1)).collect(),
             units: tree.units,
             tail: def.tail(),
             steer_angle: 0.0,
@@ -334,7 +355,7 @@ impl Wheeled {
             if let (Some((q, _)), Some(st)) = (c.travel, st) {
                 self.state.q[q] = st.travel[w];
             }
-            c.tire = self.def.tire(w / 2).initial_state();
+            c.tire = self.def.wheel_tire(w).initial_state();
             c.brake.reset();
             c.brake_delay.fill(0.0);
             c.brake_level = 0.0;
@@ -351,7 +372,7 @@ impl Wheeled {
         // from their centres' velocities along their heading.
         forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut self.ws.kin);
         for (w, c) in self.corners.iter().enumerate() {
-            let radius = self.def.tire(w / 2).radius() - st.map_or(0.0, |s| s.deflection[w].max(0.0));
+            let radius = self.def.wheel_tire(w).radius() - st.map_or(0.0, |s| s.deflection[w].max(0.0));
             let forward = if self.def.wheel_unit(w) == 0 {
                 (v_body + init.ang_vel_body.cross(self.def.wheel_position(w))).x
             } else {
@@ -361,6 +382,8 @@ impl Wheeled {
             self.state.v[c.spin.1] = forward / radius;
         }
         self.steer_angle = 0.0;
+        self.head_torque = 0.0;
+        self.set_feet(self.def.feet.is_some_and(|f| self.lin_vel_body().x.abs() < f.speed));
         self.specific_force = rot.inverse() * DVec3::Z * super::def::STANDARD_GRAVITY;
         self.ang_acc = DVec3::ZERO;
         let spin: Vec<f64> = self.corners.iter().map(|c| self.state.v[c.spin.1]).collect();
@@ -387,11 +410,16 @@ impl Wheeled {
         self.reset(init);
         if joints.len() == self.num_joint_coords() {
             let mut k = 0;
-            for u in &self.units[1..] {
+            for u in self.units[1..].iter().chain(&self.rider) {
                 let n = self.model.links()[u.link].joint.nq();
                 self.state.q[u.q..u.q + n].copy_from_slice(&joints[k..k + n]);
                 k += n;
             }
+        }
+        if let Some((_, head, hw)) = &self.head
+            && let Some(w) = wheels.get(*hw)
+        {
+            self.state.q[head.q] = w.steer;
         }
         for (c, w) in self.corners.iter_mut().zip(wheels) {
             if let Some((q, v)) = c.travel {
@@ -404,6 +432,7 @@ impl Wheeled {
             c.out = *w;
         }
         self.steer_angle = steering;
+        self.set_feet(self.def.feet.is_some_and(|f| self.lin_vel_body().x.abs() < f.speed));
         self.powertrain.set_status(powertrain);
         forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut self.ws.kin);
     }
@@ -439,12 +468,29 @@ impl Wheeled {
             };
             c.steer_cmd += (target - c.steer_cmd).clamp(-rate * dt, rate * dt);
         }
+        // Steering head: the rider's torque, the damper and the stops.
+        if let Some((h, head, _)) = &self.head {
+            let (delta, rate) = (self.state.q[head.q], self.state.v[head.v]);
+            self.head_torque = input.steering * h.max_torque + h.passive_torque(delta, rate);
+            self.tau[head.v] += self.head_torque;
+        }
+        // Rider: the lean servo. Feet: down at walking speed.
+        if let (Some(r), Some(links)) = (&self.def.rider, self.rider) {
+            self.tau[links.v] += r.servo_torque(input.lean, self.state.q[links.q], self.state.v[links.v]);
+        }
+        if let Some(f) = self.def.feet {
+            let v = self.lin_vel_body().x.abs();
+            let down = v < f.speed || (self.feet_down && v < 1.25 * f.speed);
+            if down != self.feet_down {
+                self.set_feet(down);
+            }
+        }
         // Suspension springs, stops, dampers and anti-roll bars.
         for (k, c) in self.corners.iter().enumerate() {
-            let (Some((q, v)), Some(susp)) = (c.travel, &self.def.axles[k / 2].suspension) else { continue };
+            let (Some((q, v)), Some(susp)) = (c.travel, &self.def.axles[c.axle].suspension) else { continue };
             let (s, ds) = (self.state.q[q], self.state.v[v]);
             self.tau[v] -= susp.spring_force(s, c.preload) + susp.damper_force(ds);
-            if k % 2 == 0 && susp.anti_roll != 0.0 {
+            if c.side == 0 && !self.def.axles[c.axle].is_single() && susp.anti_roll != 0.0 {
                 let other = &self.corners[k + 1];
                 if let Some((q2, v2)) = other.travel {
                     let f = susp.anti_roll * (s - self.state.q[q2]);
@@ -472,11 +518,11 @@ impl Wheeled {
         let tick = self.brake_tick;
         self.brake_tick = self.brake_tick.wrapping_add(1);
         for (w, c) in self.corners.iter_mut().enumerate() {
-            let b = &self.def.axles[w / 2].brake;
+            let b = &self.def.axles[c.axle].brake;
             let mut pedal = input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w];
             if brake_steered && input.wheels.is_none() {
                 // Brake steering: the inner track.
-                pedal += if w % 2 == 0 { input.steering.max(0.0) } else { (-input.steering).max(0.0) };
+                pedal += if c.side == 0 { input.steering.max(0.0) } else { (-input.steering).max(0.0) };
             }
             let mut pedal = pedal.min(1.0);
             // Air brakes: the pedal of `delay` ago, through the first-order lag.
@@ -649,6 +695,10 @@ impl Wheeled {
             (o.spin_angle, o.spin) = (self.state.q[c.spin.0], self.state.v[c.spin.1]);
             (o.drive_torque, o.brake_torque) = (self.drive[w], self.brake[w]);
         }
+        if let Some((_, head, w)) = &self.head {
+            let o = &mut self.corners[*w].out;
+            (o.steer, o.steer_torque) = (self.state.q[head.q], self.head_torque);
+        }
         Ok(())
     }
 
@@ -740,10 +790,11 @@ impl Wheeled {
     }
 
     /// Joint coordinates of the units behind the towing unit, unit by unit: a coupling's
-    /// quaternion (x, y, z, w; relative to the unit ahead), a hinge's or turntable's angle.
+    /// quaternion (x, y, z, w; relative to the unit ahead), a hinge's or turntable's angle;
+    /// then the rider's lean.
     pub fn joints(&self) -> Vec<f64> {
         let mut out = Vec::with_capacity(self.num_joint_coords());
-        for u in &self.units[1..] {
+        for u in self.units[1..].iter().chain(&self.rider) {
             let n = self.model.links()[u.link].joint.nq();
             out.extend_from_slice(&self.state.q[u.q..u.q + n]);
         }
@@ -751,7 +802,30 @@ impl Wheeled {
     }
 
     fn num_joint_coords(&self) -> usize {
-        self.units[1..].iter().map(|u| self.model.links()[u.link].joint.nq()).sum()
+        self.units[1..].iter().chain(&self.rider).map(|u| self.model.links()[u.link].joint.nq()).sum()
+    }
+
+    /// The rider's lean (rad, positive to the right) and its rate (rad/s); zero without one.
+    pub fn rider_lean(&self) -> (f64, f64) {
+        self.rider.map_or((0.0, 0.0), |r| (self.state.q[r.q], self.state.v[r.v]))
+    }
+
+    /// Link of the rider's upper body, if any.
+    pub fn rider_link(&self) -> Option<usize> {
+        self.rider.map(|r| r.link)
+    }
+
+    /// Whether the feet are down.
+    pub fn feet_down(&self) -> bool {
+        self.feet.is_some() && self.feet_down
+    }
+
+    fn set_feet(&mut self, down: bool) {
+        let (Some(k), Some(f)) = (self.feet, self.def.feet) else { return };
+        self.feet_down = down;
+        let p = if down { f.down } else { f.up };
+        self.colliders[k].center = p;
+        self.colliders[k + 1].center = DVec3::new(p.x, -p.y, p.z);
     }
 
     /// Articulation angles and rates (see [`articulation`](Self::articulation)) of the units
@@ -807,12 +881,20 @@ impl Wheeled {
 
     /// Unloaded tyre radius of wheel `w` (m).
     pub fn wheel_radius(&self, w: usize) -> f64 {
-        self.def.tire(w / 2).radius()
+        self.def.wheel_tire(w).radius()
     }
 
-    /// Bicycle steering angle (rad).
+    /// Bicycle steering angle (rad), or the steering head's angle.
     pub fn steering_angle(&self) -> f64 {
-        self.steer_angle
+        match &self.head {
+            Some((_, head, _)) => self.state.q[head.q],
+            None => self.steer_angle,
+        }
+    }
+
+    /// The steering head's angle (rad, positive left) and rate (rad/s), if any.
+    pub fn steering_head(&self) -> Option<(f64, f64)> {
+        self.head.as_ref().map(|(_, head, _)| (self.state.q[head.q], self.state.v[head.v]))
     }
 
     pub fn powertrain(&self) -> PowertrainStatus {

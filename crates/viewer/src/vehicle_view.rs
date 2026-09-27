@@ -62,7 +62,11 @@ fn track_band(w: &Wheeled, side: usize) -> Option<autonomousim_scene::MeshData> 
     let def = w.def();
     let track = def.track.as_ref()?;
     let wheels: Vec<usize> = (0..w.num_wheels())
-        .filter(|&k| k % 2 == side && def.wheel_unit(k) == 0 && matches!(def.tire(k / 2).model, TireModel::Track(_)))
+        .filter(|&k| {
+            def.wheel_side(k) == side
+                && def.wheel_unit(k) == 0
+                && matches!(def.wheel_tire(k).model, TireModel::Track(_))
+        })
         .collect();
     let TireModel::Track(patch) = &def.tire(*wheels.first()? / 2).model else { return None };
     let flat = |p: glam::DVec3| glam::DVec2::new(p.x, p.z);

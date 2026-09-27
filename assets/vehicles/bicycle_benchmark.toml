@@ -1,0 +1,97 @@
+# The benchmark bicycle of Meijaard, Papadopoulos, Ruina & Schwab (2007): a Whipple bicycle
+# (rigid rider on the rear frame) whose linearised dynamics are known to high precision.
+type = "wheeled"
+name = "bicycle_benchmark"
+source = """
+J. P. Meijaard, J. M. Papadopoulos, A. Ruina, A. L. Schwab, "Linearized dynamics equations \
+for the balance and steer of a bicycle: a benchmark and review", Proc. R. Soc. A 463 (2007), \
+Table 1. Converted from the paper's frame (x forward, z down) to FLU: z = −z, and the \
+off-diagonal x-z inertia entries change sign. The chassis frame origin is the rear contact \
+point. Wheelbase 1.02 m, trail 0.08 m, head angle π/10 from the vertical. The paper's wheels \
+are knife edges rolling without slip; here they are stiff Fiala tyres (no camber), and a \
+small hub motor lets the bicycle be driven. The colliders (rider and handlebar) are \
+estimates."""
+
+# Rear frame B with the rider.
+[chassis]
+mass = 85.0
+com = [0.3, 0.0, 0.9]
+inertia = [9.2, 11.0, 2.8]
+products = [0.0, -2.4, 0.0]
+
+# Rear wheel R.
+[[axles]]
+name = "rear"
+position = [0.0, 0.0, 0.3]
+wheel = { mass = 2.0, inertia = [0.0603, 0.12, 0.0603] }
+brake = { max_torque = 100.0 }
+
+[axles.tire.fiala]
+radius = 0.3
+width = 0.03
+vertical_stiffness = 2.0e5
+vertical_damping = 200.0
+slip_stiffness = 8000.0
+cornering_stiffness = 6000.0
+mu = 0.9
+nominal_load = 600.0
+relaxation_x = 0.03
+relaxation_y = 0.05
+
+# Front wheel F on the front frame H (fork and handlebar).
+[[axles]]
+name = "front"
+position = [1.02, 0.0, 0.35]
+wheel = { mass = 3.0, inertia = [0.1405, 0.28, 0.1405] }
+brake = { max_torque = 150.0 }
+
+[axles.tire.fiala]
+radius = 0.35
+width = 0.03
+vertical_stiffness = 2.0e5
+vertical_damping = 200.0
+slip_stiffness = 8000.0
+cornering_stiffness = 6000.0
+mu = 0.9
+nominal_load = 350.0
+relaxation_x = 0.03
+relaxation_y = 0.05
+
+# Offset: the trail c = 0.08 m for R_F = 0.35 m, (R_F·sin λ − c·cos λ).
+[axles.steering_head]
+angle = 0.3141592653589793
+offset = 0.0320714267
+mass = 4.0
+com = [0.9, 0.0, 0.7]
+inertia = [0.05892, 0.06, 0.00708]
+products = [0.0, 0.00756, 0.0]
+lock = 1.2
+max_torque = 10.0
+
+[powertrain]
+type = "electric"
+
+[[powertrain.motors]]
+wheels = [0]
+max_torque = 40.0
+max_power = 400.0
+ratio = 1.0
+time_constant = 0.05
+
+# Rider: torso and head.
+[[colliders]]
+center = [0.3, 0.0, 1.15]
+radius = 0.22
+
+[[colliders]]
+center = [0.45, 0.0, 1.6]
+radius = 0.12
+
+# Handlebar ends (on the rear frame: they only mark the rider's hands).
+[[colliders]]
+center = [0.85, 0.28, 1.0]
+radius = 0.05
+
+[[colliders]]
+center = [0.85, -0.28, 1.0]
+radius = 0.05
