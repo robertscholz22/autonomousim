@@ -23,7 +23,7 @@
 //! a leaning rider ([`RiderDef`]) and feet that hold them up at a standstill ([`FeetDef`]).
 
 use super::powertrain::{MAX_WHEELS, PowertrainDef};
-use super::tire::{FialaParams, MfParams, TirFile, Tire, TireModel, TrackPatch};
+use super::tire::{FialaParams, McParams, MfParams, TirFile, Tire, TireModel, TrackPatch};
 use super::units::{HitchDef, UnitDef, UnitJoint};
 use crate::VehicleError;
 use crate::multirotor::ContactDef;
@@ -42,6 +42,13 @@ const TIR_FILES: &[(&str, &str)] = &[
     ("Sedan_Pac02Tire", include_str!("../../../../assets/tires/Sedan_Pac02Tire.tir")),
     ("HMMWV_Pac02Tire", include_str!("../../../../assets/tires/HMMWV_Pac02Tire.tir")),
     ("Truck_Pac02Tire", include_str!("../../../../assets/tires/Truck_Pac02Tire.tir")),
+];
+
+/// Built-in motorcycle Magic Formula tyres (`assets/tires/*.toml`), by file stem.
+const MC_FILES: &[(&str, &str)] = &[
+    ("Evangelou_120_70_ZR17", include_str!("../../../../assets/tires/Evangelou_120_70_ZR17.toml")),
+    ("Evangelou_180_55_ZR17", include_str!("../../../../assets/tires/Evangelou_180_55_ZR17.toml")),
+    ("Bicycle_37_622", include_str!("../../../../assets/tires/Bicycle_37_622.toml")),
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -587,6 +594,17 @@ pub enum TireSpec {
         /// Inflation pressure (Pa; MF 6.x files), default the file's.
         #[serde(default)]
         pressure: Option<f64>,
+        /// Crown radius of a toroidal tread (m; two-wheelers), 0 for a thin disc.
+        #[serde(default, skip_serializing_if = "is_zero_f64")]
+        crown_radius: f64,
+        /// Model turn slip (MF 6.x files).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        turn_slip: bool,
+    },
+    /// Motorcycle Magic Formula (MF-MC) parameters in TOML: a built-in name (`assets/tires`,
+    /// without extension) or a path. Toroidal with the file's crown radius.
+    Mc {
+        file: String,
     },
     Fiala(FialaParams),
     /// A track patch (normally given once in [`TrackDef`]).
@@ -596,14 +614,26 @@ pub enum TireSpec {
 impl TireSpec {
     pub fn load(&self) -> Result<Tire, String> {
         match self {
-            TireSpec::Tir { file, pressure } => {
+            TireSpec::Tir { file, pressure, crown_radius, turn_slip } => {
                 let tir = match TIR_FILES.iter().find(|(n, _)| n == file) {
                     Some((_, text)) => TirFile::parse(text),
                     None => TirFile::read(file),
                 }
                 .map_err(|e| format!("tyre {file}: {e}"))?;
                 let params = MfParams::from_tir(&tir).map_err(|e| format!("tyre {file}: {e}"))?;
-                Tire::magic_formula(params, *pressure).map_err(|e| format!("tyre {file}: {e}"))
+                let mut tire = Tire::magic_formula(params, *pressure).and_then(|t| t.with_crown(*crown_radius));
+                if *turn_slip {
+                    tire = tire.and_then(Tire::with_turn_slip);
+                }
+                tire.map_err(|e| format!("tyre {file}: {e}"))
+            }
+            TireSpec::Mc { file } => {
+                let text = match MC_FILES.iter().find(|(n, _)| n == file) {
+                    Some((_, text)) => text.to_string(),
+                    None => std::fs::read_to_string(file).map_err(|e| format!("tyre {file}: {e}"))?,
+                };
+                let params: McParams = toml::from_str(&text).map_err(|e| format!("tyre {file}: {e}"))?;
+                Tire::motorcycle(params).map_err(|e| format!("tyre {file}: {e}"))
             }
             TireSpec::Fiala(p) => Tire::fiala(p.clone()),
             TireSpec::Track(p) => Tire::track(p.clone()),

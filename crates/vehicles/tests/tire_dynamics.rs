@@ -4,6 +4,7 @@
 
 use autonomousim_core::material::MaterialId;
 use autonomousim_core::terrain::{FlatTerrain, PlaneTerrain, Terrain};
+use autonomousim_vehicles::ground::TireSpec;
 use autonomousim_vehicles::ground::tire::{
     FialaParams, MfInput, MfParams, REFERENCE_ROLLING_RESISTANCE, Surface, Tire, TireForces, TireModel, TireState,
     WheelMotion,
@@ -30,7 +31,8 @@ fn robot() -> Tire {
 }
 
 fn tyres() -> Vec<(&'static str, Tire)> {
-    vec![("Sedan", mf("Sedan_Pac02Tire")), ("HMMWV", mf("HMMWV_Pac02Tire")), ("Fiala", robot())]
+    let motorcycle = TireSpec::Mc { file: "Evangelou_120_70_ZR17".into() }.load().unwrap();
+    vec![("Sedan", mf("Sedan_Pac02Tire")), ("HMMWV", mf("HMMWV_Pac02Tire")), ("Fiala", robot()), ("MF-MC", motorcycle)]
 }
 
 /// A point mass with one wheel whose axis stays fixed, damped normal to the road like a
@@ -130,6 +132,10 @@ fn transient_slip_settles_on_the_steady_state() {
             }
             TireModel::Fiala(p) => {
                 let o = p.eval(f.fz, kappa, tan_alpha, p.half_length(f.deflection), 1.0);
+                (o.fx, o.fy)
+            }
+            TireModel::Motorcycle(p) => {
+                let o = p.eval(f.fz, kappa, tan_alpha, 0.0, f.vx.abs(), 1.0);
                 (o.fx, o.fy)
             }
             TireModel::Track(_) => unreachable!("tyres only"),

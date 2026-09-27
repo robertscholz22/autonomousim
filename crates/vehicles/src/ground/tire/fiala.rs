@@ -36,6 +36,12 @@ pub struct FialaParams {
     /// Speed below which the low-speed slip damping acts (m/s).
     #[serde(default = "default_vxlow")]
     pub vxlow: f64,
+    /// Approximate a knife-edge wheel rolling without slip (the Whipple bicycle's): forces
+    /// linear in the slip with the given stiffnesses and no friction limit, no aligning or
+    /// rolling-resistance moment. Stiff slip stiffnesses and short relaxation lengths make the
+    /// slip small.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rigid_rolling: bool,
 }
 
 fn default_rolling_resistance() -> f64 {

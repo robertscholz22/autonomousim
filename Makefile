@@ -40,7 +40,7 @@ ORACLES ?= $(HOME)/.local/share/autonomousim-oracles
 JULIA ?= $(ORACLES)/julia-1.13.0/bin/julia
 MFEVAL_JL ?= $(ORACLES)/MFeval_julia
 MFEVAL_TYRES := fixtures/tir/MagicFormula52_Parameters.tir fixtures/tir/MagicFormula61_Parameters.tir \
-	assets/tires/HMMWV_Pac02Tire.tir assets/tires/Sedan_Pac02Tire.tir
+	fixtures/tir/MagicFormula62_Parameters.tir assets/tires/HMMWV_Pac02Tire.tir assets/tires/Sedan_Pac02Tire.tir
 
 fixtures-mfeval:  ## Magic Formula reference values from MFeval.jl (fixtures/mfeval/)
 	mkdir -p fixtures/mfeval
@@ -50,6 +50,8 @@ fixtures-mfeval:  ## Magic Formula reference values from MFeval.jl (fixtures/mfe
 		target/debug/examples/tir_canonical $$t fixtures/mfeval/$$n.tir && \
 		$(JULIA) --project=$(MFEVAL_JL) tools/gen_mfeval_fixtures.jl fixtures/mfeval/$$n.tir $$n fixtures/mfeval/$$n.json || exit 1; \
 	done
+	$(JULIA) --project=$(MFEVAL_JL) tools/gen_mfeval_fixtures.jl fixtures/mfeval/MagicFormula62_Parameters.tir \
+		MagicFormula62_Parameters fixtures/mfeval/MagicFormula62_Parameters_turnslip.json turnslip
 
 MICROMAMBA ?= $(HOME)/.local/bin/micromamba
 MAMBA_ROOT_PREFIX ?= $(HOME)/.local/share/micromamba

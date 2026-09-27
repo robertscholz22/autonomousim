@@ -1,0 +1,77 @@
+# Motorcycle rear tyre 180/55 ZR17 (motorcycle Magic Formula, MF-MC).
+source = """
+S. Evangelou, "Control and stability analysis of two-wheeled road vehicles", PhD thesis, \
+Imperial College London (2004), ch. 9 and appendix C: MF-MC coefficients fitted to the \
+measurements of de Vries & Pacejka (1997), Tables 9.1-9.3; relaxation from Table 9.5 \
+(§9.3.10). Crown radius from Cossalter & Lot (2002) as quoted in §9.3.5. The unloaded \
+radius follows from the size designation; the radial stiffness and damping are estimates \
+(Sharp, Evangelou & Limebeer 2004 quote radial stiffnesses of this order); the longitudinal \
+relaxation length is an estimate."""
+radius = 0.315
+width = 0.18
+crown_radius = 0.09
+vertical_stiffness = 1.4e5
+vertical_damping = 200.0
+fzo = 1600.0
+relaxation = [9.694e-6, -1.333e-8, 1.898e-9]
+relaxation_x = 0.1
+
+# Longitudinal force (Table 9.1; scaled from the 160/70 tyre's, §9.3.7)
+pcx1 = 1.6064
+pex1 = 0.0263
+pex2 = 0.27056
+pex3 = -0.076882
+pex4 = 1.1268
+pkx1 = 25.939
+pkx2 = -4.2327
+pkx3 = 0.33686
+pdx1 = 1.3548
+pdx2 = -0.060295
+
+# Lateral force (Table 9.2)
+pcy1 = 0.9
+pdy1 = 1.3
+pey1 = -2.2227
+pey2 = -1.669
+pey4 = -4.288
+pky1 = 15.791
+pky2 = 1.6935
+pky3 = 1.4604
+pky4 = 0.669
+pky5 = 0.18708
+pcy2 = 0.61397
+pky6 = 0.45512
+pky7 = 0.013293
+pey5 = -19.99
+
+# Aligning moment (Table 9.3)
+qhz3 = -0.028448
+qhz4 = -0.0098618
+qbz1 = 10.041
+qbz2 = -1.6065e-8
+qbz5 = -0.76784
+qbz6 = 0.73422
+qcz1 = 1.3153
+qdz1 = 0.26331
+qdz2 = 0.030987
+qdz3 = -0.62013
+qdz4 = 0.98524
+qez1 = -0.19924
+qez2 = -0.017638
+qez3 = 0.0
+qez5 = 3.6511
+qbz9 = 16.39
+qbz10 = -0.35549
+qdz8 = 0.50453
+qdz9 = 0.36312
+qdz10 = -0.19168
+qdz11 = -0.40709
+
+# Combined slip (§9.3.6, fitted to the 160/70 tyre and used for all three)
+rbx1 = 13.476
+rbx2 = 11.354
+rcx1 = 1.1231
+rby1 = 7.7856
+rby2 = 8.1697
+rby3 = -0.05914
+rcy1 = 1.0533

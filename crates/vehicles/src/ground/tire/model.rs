@@ -16,10 +16,20 @@
 //! `−k_Vlow V_sx / K_xκ` to `κ'` (and the lateral equivalent), a damping force `−k_Vlow V_s`
 //! that still saturates with friction. The relaxation lengths and slip stiffnesses are those
 //! of the previous step (one tick of lag).
+//!
+//! **Toroidal tyres** (`crown_radius > 0`, see [`super::road`]): the slip velocities are the
+//! crown centre's, the rolling radius shrinks by `r_c (1 − cos γ)` as the contact point moves
+//! around the crown, and the forces act at the contact point, so the overturning moment of a
+//! leaning tyre follows from the geometry.
+//!
+//! **Turn slip** (Magic Formula tyres with turn slip on): `φ_t = ψ̇/V_c` from the wheel
+//! carrier's yaw rate about the road normal and the camber spin `Ω sin γ / V_c`, with
+//! `V_c ≥ VXLOW`, steady state.
 
 use super::fiala::FialaParams;
-use super::mf::{MfInput, MfParams};
-use super::road::{RoadContact, road_contact};
+use super::mc::McParams;
+use super::mf::{MfInput, MfParams, MfVersion};
+use super::road::{RoadContact, toroidal_contact};
 use super::track::{TRACK_CELLS, TrackPatch};
 use autonomousim_core::material::{Material, Soil};
 use autonomousim_core::terrain::Terrain;
@@ -40,6 +50,8 @@ const GRAVITY: f64 = 9.80665;
 #[derive(Clone, Debug, PartialEq)]
 pub enum TireModel {
     MagicFormula(Box<MfParams>),
+    /// Motorcycle Magic Formula (see [`super::mc`]).
+    Motorcycle(Box<McParams>),
     Fiala(FialaParams),
     /// A track patch under a road wheel (see [`super::track`]).
     Track(TrackPatch),
@@ -58,6 +70,8 @@ pub struct Tire {
     /// Twin tyres (dual wheels) side by side at this centre distance (m): one wheel with two
     /// identical tyres sharing the load, each evaluated at half of it.
     pub dual: Option<f64>,
+    /// Crown radius of a toroidal tyre (m), 0 for a thin disc.
+    pub crown_radius: f64,
 }
 
 /// Road friction and rolling resistance relative to the reference surface.
@@ -153,6 +167,7 @@ impl Tire {
             low_speed_damping: [0.0; 2],
             rolling_from_surface,
             dual: None,
+            crown_radius: 0.0,
         };
         let sigma = tire.initial_state().sigma;
         if !sigma.iter().all(|s| s.is_finite() && *s > 0.0) {
@@ -170,9 +185,48 @@ impl Tire {
             low_speed_damping: [0.0; 2],
             rolling_from_surface: false,
             dual: None,
+            crown_radius: 0.0,
         };
         tire.low_speed_damping = tire.default_low_speed_damping();
         Ok(tire)
+    }
+
+    /// A motorcycle Magic Formula tyre (toroidal, with its crown radius).
+    pub fn motorcycle(params: McParams) -> Result<Self, String> {
+        params.validate()?;
+        let crown_radius = params.crown_radius;
+        let mut tire = Self {
+            model: TireModel::Motorcycle(Box::new(params)),
+            pressure: None,
+            low_speed_damping: [0.0; 2],
+            rolling_from_surface: false,
+            dual: None,
+            crown_radius,
+        };
+        tire.low_speed_damping = tire.default_low_speed_damping();
+        Ok(tire)
+    }
+
+    /// The same tyre with a toroidal tread of crown radius `crown_radius` (m; 0 for a thin
+    /// disc).
+    pub fn with_crown(mut self, crown_radius: f64) -> Result<Self, String> {
+        if !(crown_radius >= 0.0 && crown_radius <= 0.5 * self.section_width() && crown_radius < self.radius()) {
+            return Err(format!("crown radius {crown_radius} must lie between 0 and the tyre's half width"));
+        }
+        if self.is_track() && crown_radius > 0.0 {
+            return Err("track patches have no crown".into());
+        }
+        self.crown_radius = crown_radius;
+        Ok(self)
+    }
+
+    /// Model turn slip (Magic Formula 6.x tyres).
+    pub fn with_turn_slip(mut self) -> Result<Self, String> {
+        match &mut self.model {
+            TireModel::MagicFormula(p) if p.version == MfVersion::V61 => p.turn_slip = true,
+            _ => return Err("turn slip needs a Magic Formula 6.x tyre".into()),
+        }
+        Ok(self)
     }
 
     /// A track patch (its own low-speed damping; no tyre-style damping).
@@ -184,6 +238,7 @@ impl Tire {
             low_speed_damping: [0.0; 2],
             rolling_from_surface: false,
             dual: None,
+            crown_radius: 0.0,
         })
     }
 
@@ -235,6 +290,7 @@ impl Tire {
     fn single_nominal_load(&self) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => p.fnomin * p.lfzo,
+            TireModel::Motorcycle(p) => p.fzo,
             TireModel::Fiala(p) => p.nominal_load,
             TireModel::Track(p) => p.nominal_load,
         }
@@ -243,6 +299,7 @@ impl Tire {
     pub fn radius(&self) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => p.unloaded_radius,
+            TireModel::Motorcycle(p) => p.radius,
             TireModel::Fiala(p) => p.radius,
             TireModel::Track(p) => p.radius,
         }
@@ -257,6 +314,7 @@ impl Tire {
     pub fn section_width(&self) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => p.width,
+            TireModel::Motorcycle(p) => p.width,
             TireModel::Fiala(p) => p.width,
             TireModel::Track(p) => p.width,
         }
@@ -265,6 +323,7 @@ impl Tire {
     fn vxlow(&self) -> f64 {
         match &self.model {
             TireModel::MagicFormula(p) => p.vxlow,
+            TireModel::Motorcycle(p) => p.vxlow,
             TireModel::Fiala(p) => p.vxlow,
             TireModel::Track(p) => p.vxlow,
         }
@@ -277,6 +336,10 @@ impl Tire {
                 let mut input = MfInput::new(self.single_nominal_load(), 0.0, 0.0, 0.0, 0.0);
                 input.pressure = self.pressure;
                 let o = p.eval(&input);
+                ([o.sigma_x, o.sigma_y], [o.kxk, o.kya.abs()])
+            }
+            TireModel::Motorcycle(p) => {
+                let o = p.eval(p.fzo, 0.0, 0.0, 0.0, 0.0, 1.0);
                 ([o.sigma_x, o.sigma_y], [o.kxk, o.kya.abs()])
             }
             TireModel::Fiala(p) => ([p.relaxation_x, p.relaxation_y], [p.slip_stiffness, p.cornering_stiffness]),
@@ -304,7 +367,16 @@ impl Tire {
             TireModel::Track(p) => 0.5 * p.length,
             _ => 0.3 * r,
         };
-        road_contact(terrain, motion.center, motion.axis, half_length, 0.5 * self.width(), 2.0 * r)
+        toroidal_contact(
+            terrain,
+            motion.center,
+            motion.axis,
+            half_length,
+            0.5 * self.width(),
+            2.0 * r,
+            r,
+            self.crown_radius,
+        )
     }
 
     /// Vertical force (N; of both tyres for duals) at deflection `rho` (m), without damping.
@@ -320,6 +392,7 @@ impl Tire {
                     if p.bottom_stiff > 0.0 && rho > bottom { p.bottom_stiff * (rho - bottom) } else { 0.0 };
                 p.vertical_force(rho, self.pressure) + bottoming
             }
+            TireModel::Motorcycle(p) => p.vertical_stiffness * rho.max(0.0),
             TireModel::Fiala(p) => p.vertical_stiffness * rho.max(0.0),
             TireModel::Track(p) => p.vertical_stiffness * rho.max(0.0),
         }
@@ -348,17 +421,21 @@ impl Tire {
         let rho = r0 - c.loaded_radius;
         let damping = match &self.model {
             TireModel::MagicFormula(p) => p.vertical_damping,
+            TireModel::Motorcycle(p) => p.vertical_damping,
             TireModel::Fiala(p) => p.vertical_damping,
             TireModel::Track(_) => unreachable!("track patches step on their own"),
         };
         let fz = (self.single_vertical_force(rho) - damping * motion.velocity.dot(c.normal)).max(0.0);
         let arm = c.point - motion.center;
-        let vc = motion.velocity + motion.carrier_angvel.cross(arm);
+        let vc = motion.velocity + motion.carrier_angvel.cross(c.slip_point - motion.center);
         let (vx, vy) = (vc.dot(c.x), vc.dot(c.y));
-        let re = match &self.model {
+        let mut re = match &self.model {
             TireModel::MagicFormula(p) => p.effective_radius(fz, motion.spin, self.pressure),
             _ => r0 - rho / 3.0,
         };
+        if self.crown_radius > 0.0 {
+            re -= self.crown_radius * (1.0 - (1.0 - c.sin_gamma * c.sin_gamma).sqrt());
+        }
         let vsx = vx - motion.spin * re;
         let avx = vx.abs();
 
@@ -384,6 +461,18 @@ impl Tire {
                     vx: avx,
                     pressure: self.pressure,
                     mu_scale: surface.mu_scale,
+                    phit: 0.0,
+                    camber_spin: 0.0,
+                };
+                let input = if p.turn_slip {
+                    let vc = (vx * vx + vy * vy).sqrt().max(p.vxlow);
+                    MfInput {
+                        phit: motion.carrier_angvel.dot(c.normal) / vc * vx.signum(),
+                        camber_spin: motion.spin * c.sin_gamma / vc,
+                        ..input
+                    }
+                } else {
+                    input
                 };
                 let o = p.eval(&input);
                 if fz > 0.0 && o.sigma_x > 0.0 && o.sigma_y > 0.0 {
@@ -392,6 +481,19 @@ impl Tire {
                 }
                 let my = if self.rolling_from_surface { -REFERENCE_ROLLING_RESISTANCE * fz * r0 } else { o.my };
                 (o.fx, o.fy, o.mx, my * rolling, o.mz)
+            }
+            TireModel::Motorcycle(p) => {
+                let o = p.eval(fz, kappa, tan_alpha, c.sin_gamma.asin(), avx, surface.mu_scale);
+                if fz > 0.0 {
+                    state.sigma = [o.sigma_x, o.sigma_y];
+                    state.stiffness = [o.kxk, o.kya.abs()];
+                }
+                (o.fx, o.fy, 0.0, -p.rolling_resistance * fz * r0 * rolling, o.mz)
+            }
+            TireModel::Fiala(p) if p.rigid_rolling => {
+                // Knife edge rolling without slip: linear, unbounded, no aligning moment.
+                let on = if fz > 0.0 { 1.0 } else { 0.0 };
+                (on * p.slip_stiffness * kappa, -on * p.cornering_stiffness * tan_alpha, 0.0, 0.0, 0.0)
             }
             TireModel::Fiala(p) => {
                 let o = p.eval(fz, kappa, tan_alpha, p.half_length(rho), surface.mu_scale);

@@ -1,0 +1,52 @@
+# Bicycle tyre 37-622 (700x35C / 28x1.40), as a motorcycle Magic Formula (MF-MC) set.
+source = """
+An estimate. Normalised cornering stiffness about 12 /rad and camber stiffness about 0.9 /rad \
+at the nominal load, in the range Dressel & Rahman measured for bicycle tyres ("Measuring \
+sideslip and camber characteristics of bicycle tyres", Vehicle System Dynamics 50 (2012); \
+A. Dressel, PhD thesis, UW-Milwaukee 2013); a pneumatic trail of about 12 mm; peak friction \
+1.0. The curve shapes and the combined-slip loss functions are those of the Evangelou (2004) \
+motorcycle tyres. Crown radius half the section width; radial stiffness for about 4 bar."""
+radius = 0.348
+width = 0.037
+crown_radius = 0.0185
+vertical_stiffness = 8.0e4
+vertical_damping = 50.0
+fzo = 450.0
+relaxation = [1.9e-5, 0.0, 0.0]
+relaxation_x = 0.05
+
+# Longitudinal force: K_xκ/F_z = 15 at the nominal load, peak 1.05.
+pcx1 = 1.6064
+pdx1 = 1.05
+pex1 = 0.0263
+pex2 = 0.27056
+pex3 = -0.076882
+pex4 = 1.1268
+pkx1 = 15.0
+
+# Lateral force: K_yα/F_z = 12 /rad and K_yγ/F_z = 0.9 /rad at the nominal load, peak 1.0.
+pcy1 = 0.9
+pdy1 = 1.0
+pey1 = -1.0
+pky1 = 14.85
+pky2 = 1.6
+pky3 = 1.5
+pcy2 = 0.6
+pky6 = 0.9
+pey5 = -5.0
+
+# Aligning moment: trail R_o q_Dz1 = 12 mm at the nominal load; a small twisting moment.
+qbz1 = 10.0
+qcz1 = 1.1
+qdz1 = 0.65
+qbz9 = 10.0
+qdz8 = 0.3
+
+# Combined slip (§9.3.6, fitted to the 160/70 tyre and used for all three)
+rbx1 = 13.476
+rbx2 = 11.354
+rcx1 = 1.1231
+rby1 = 7.7856
+rby2 = 8.1697
+rby3 = -0.05914
+rcy1 = 1.0533

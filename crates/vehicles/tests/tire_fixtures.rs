@@ -1,6 +1,6 @@
 //! The Magic Formula against reference values from MFeval.jl (`make fixtures-mfeval`, see
-//! `tools/gen_mfeval_fixtures.jl`): MF 5.2 and 6.1 sample tyres (camber, pressure) and the
-//! PAC2002 files of the vehicle presets. The presets are also checked against Project Chrono's
+//! `tools/gen_mfeval_fixtures.jl`): MF 5.2, 6.1 and 6.2 sample tyres (camber up to ±55°,
+//! pressure, turn slip) and the PAC2002 files of the vehicle presets. The presets are also checked against Project Chrono's
 //! ChPac02Tire (`make fixtures-chrono`).
 
 use autonomousim_vehicles::ground::tire::{MfInput, MfParams};
@@ -13,8 +13,14 @@ fn root() -> PathBuf {
 
 /// Largest deviation of each output relative to its largest magnitude over all points.
 fn compare(tir: &str, name: &str) {
-    let params = MfParams::read(root().join(tir)).unwrap();
-    let path = root().join(format!("fixtures/mfeval/{name}.json"));
+    compare_set(tir, name, name, false);
+}
+
+/// `fixture` is the JSON file's stem; with `turn_slip` the points have MFeval's turn slip.
+fn compare_set(tir: &str, name: &str, fixture: &str, turn_slip: bool) {
+    let mut params = MfParams::read(root().join(tir)).unwrap();
+    params.turn_slip = turn_slip;
+    let path = root().join(format!("fixtures/mfeval/{fixture}.json"));
     let data: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("run `make fixtures-mfeval`")).unwrap();
     let points = data["points"].as_array().unwrap();
@@ -25,6 +31,12 @@ fn compare(tir: &str, name: &str) {
         let g = |f: &str| pt[f].as_f64().unwrap();
         let mut input = MfInput::new(g("fz"), g("kappa"), g("alpha"), g("gamma"), g("vx"));
         input.pressure = Some(g("pressure"));
+        if turn_slip {
+            // MFeval's spin is `−phit − (1 − ε_γ) ω sin γ / V_c` (ours: `φ_t + (1 − ε_γ) Ω sin γ / V_c`).
+            let vc = g("vx") / g("alpha").cos();
+            input.phit = -g("phit");
+            input.camber_spin = -g("omega") * g("gamma").sin() / vc;
+        }
         let out = params.eval(&input);
         let ours = [
             out.fx,
@@ -58,8 +70,9 @@ fn compare(tir: &str, name: &str) {
         let rel = err / scale.max(1e-12);
         // MFeval takes cos α' as V_cx/(V_c + 1e-6), which moves the trail by ~1e-7.
         let tolerance = if ["t", "Mz"].contains(f) { 1e-6 } else { 1e-9 };
-        // MFeval ignores LCZ (the vertical stiffness scale of PAC2002 files).
-        let skip = params.lcz != 1.0 && ["Re", "two_a"].contains(f);
+        // MFeval ignores LCZ (the vertical stiffness scale of PAC2002 files), and leaves the
+        // turn-slip moment (ζ₇, ζ₈) out of M_zr.
+        let skip = (params.lcz != 1.0 && ["Re", "two_a"].contains(f)) || (turn_slip && ["Mz", "Mzr"].contains(f));
         println!(
             "{name} {f}: max |error| {err:.3e} ({rel:.1e} of peak), point {k}{}",
             if skip { " (skipped)" } else { "" }
@@ -79,6 +92,13 @@ fn mf52_sample_tyre_matches_mfeval() {
 #[test]
 fn mf61_sample_tyre_matches_mfeval() {
     compare("fixtures/tir/MagicFormula61_Parameters.tir", "MagicFormula61_Parameters");
+}
+
+#[test]
+fn mf62_sample_tyre_matches_mfeval_with_and_without_turn_slip() {
+    let tir = "fixtures/tir/MagicFormula62_Parameters.tir";
+    compare(tir, "MagicFormula62_Parameters");
+    compare_set(tir, "MagicFormula62 (turn slip)", "MagicFormula62_Parameters_turnslip", true);
 }
 
 #[test]
@@ -109,6 +129,8 @@ fn compare_chrono(name: &str) {
             vx: 15.0,
             pressure: None,
             mu_scale: 1.0,
+            phit: 0.0,
+            camber_spin: 0.0,
         };
         let out = p.eval(&input);
         // Chrono clamps B·x to ±(π/2 − 0.01) in both pure-slip curves.
@@ -156,4 +178,40 @@ fn preset_tyres_match_chrono_pac02() {
     compare_chrono("HMMWV_Pac02Tire");
     compare_chrono("Sedan_Pac02Tire");
     compare_chrono("Truck_Pac02Tire");
+}
+
+/// With turn slip, camber acts through the spin: rolling straight at a small camber gives the
+/// camber thrust and twisting torque of the model without turn slip, and an upright wheel
+/// yawing left (the spin of a wheel leaning right) pushes to the right, with a moment against
+/// the yaw.
+#[test]
+fn turn_slip_is_consistent_with_camber() {
+    let mut p = MfParams::read(root().join("fixtures/tir/MagicFormula62_Parameters.tir")).unwrap();
+    let (fz, vx) = (p.fnomin, 20.0);
+    let rolling = |gamma: f64| {
+        let mut input = MfInput::new(fz, 0.0, 0.0, gamma, vx);
+        // Ω sin γ / V_c with Ω R₀ = V.
+        input.camber_spin = gamma.sin() / p.unloaded_radius;
+        input
+    };
+    let gamma = 0.02;
+    let plain = p.eval(&rolling(gamma));
+    p.turn_slip = true;
+    let spin = p.eval(&rolling(gamma));
+    println!("γ = {gamma}: Fy {} vs {}, Mz {} vs {}", spin.fy, plain.fy, spin.mz, plain.mz);
+    assert!(plain.fy < 0.0 && plain.mz < 0.0, "leaning right: thrust and twist to the right");
+    assert!((spin.fy / plain.fy - 1.0).abs() < 1e-3);
+    assert!((spin.mz / plain.mz - 1.0).abs() < 1e-3);
+    // Upright, yawing left at 0.05 rad/m.
+    let mut input = MfInput::new(fz, 0.0, 0.0, 0.0, vx);
+    input.phit = 0.05;
+    let turning = p.eval(&input);
+    assert!(turning.fy < 0.0 && turning.mz < 0.0, "{turning:?}");
+    // Turn slip lowers the peak side force and the cornering stiffness.
+    let slip = MfInput::new(fz, 0.0, 0.2, 0.0, vx);
+    let peak = p.eval(&slip).fy.abs();
+    let mut tight = slip;
+    tight.phit = 2.0;
+    let o = p.eval(&tight);
+    assert!(o.fy.abs() < peak && o.kya.abs() < p.eval(&slip).kya.abs());
 }
