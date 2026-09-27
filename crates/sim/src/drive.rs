@@ -4,6 +4,7 @@
 //! a goal can be reached from a spawn is one lookup; [`DriveGrid::path`] finds a path (A*),
 //! optionally preferring firm ground: each metre costs more by the vehicle's motion resistance
 //! on the cell's material (rolling resistance, and for tracks the soil's compaction).
+//! [`DriveGrid::legs`] plans smoothed paths through a chain of goals (`path` goals).
 //!
 //! Also here: [`ground_pose`], the pose of a ground vehicle resting on uneven terrain.
 
@@ -300,10 +301,43 @@ impl DriveGrid {
             cells.push(from[*cells.last()?]);
         }
         let mut path: Vec<DVec2> = cells.iter().rev().map(|&i| self.center(i)).collect();
+        if path.len() < 2 {
+            path.insert(0, a);
+        }
         path[0] = a;
         *path.last_mut()? = b;
         Some(path)
     }
+
+    /// The cheapest paths from `from` through `goals` in turn, one leg per goal, smoothed by a
+    /// moving average over `2·PATH_SMOOTHING + 1` cells (each leg keeps its ends); `None` if a
+    /// goal cannot be reached.
+    pub fn legs(&self, from: DVec2, goals: &[DVec2]) -> Option<Vec<Vec<DVec2>>> {
+        let mut a = from;
+        goals
+            .iter()
+            .map(|&b| {
+                let p = self.path(a, b)?;
+                a = b;
+                Some(smooth(&p, PATH_SMOOTHING))
+            })
+            .collect()
+    }
+}
+
+/// Half-width (cells) of the moving average over planned paths: the grid's 45° steps become
+/// curves; a right-angle corner is cut by 1.2 cells, gentler bends by less.
+const PATH_SMOOTHING: usize = 3;
+
+/// Moving average over `2·half + 1` points; the window shrinks towards the ends, which stay.
+fn smooth(p: &[DVec2], half: usize) -> Vec<DVec2> {
+    let n = p.len();
+    (0..n)
+        .map(|i| {
+            let h = half.min(i).min(n - 1 - i);
+            p[i - h..=i + h].iter().sum::<DVec2>() / (2 * h + 1) as f64
+        })
+        .collect()
 }
 
 /// Half the width of a ground vehicle (m): its widest wheel or collider.
@@ -397,6 +431,47 @@ mod tests {
             assert!(!g.reachable(DVec2::ZERO, outside));
         }
         assert!(g.is_drivable(DVec2::ZERO));
+    }
+
+    #[test]
+    fn legs_run_through_the_goals_in_turn() {
+        let w = testworlds::single_tree();
+        let g = DriveGrid::new(&w, &DrivableSpec::default(), 1.0);
+        let start = DVec2::new(-20.0, 0.0);
+        let goals = [DVec2::new(20.0, 0.0), DVec2::new(20.0, 20.0), DVec2::new(-20.0, 20.0)];
+        let legs = g.legs(start, &goals).unwrap();
+        assert_eq!(legs.len(), 3);
+        let mut from = start;
+        for (leg, &goal) in legs.iter().zip(&goals) {
+            // Each leg runs from the previous goal to the next, off the tree.
+            assert!(leg[0].distance(from) < 1e-9 && leg.last().unwrap().distance(goal) < 1e-9);
+            assert!(leg.iter().all(|q| g.is_drivable(*q)), "{leg:?}");
+            let len: f64 = leg.windows(2).map(|s| s[0].distance(s[1])).sum();
+            assert!(len < 1.2 * from.distance(goal) + 4.0, "{len}");
+            from = goal;
+        }
+        // The first leg bends around the tree.
+        assert!(legs[0].iter().all(|q| q.length() > 2.0));
+        // An unreachable goal: no legs.
+        assert!(g.legs(start, &[DVec2::ZERO]).is_none());
+        // A goal in the start cell still gives a leg of two points.
+        assert_eq!(g.legs(start, &[start + DVec2::new(0.3, 0.0)]).unwrap()[0].len(), 2);
+    }
+
+    #[test]
+    fn smoothing_keeps_the_ends_and_straight_lines() {
+        let line: Vec<DVec2> = (0..10).map(|i| DVec2::new(i as f64, 2.0 * i as f64)).collect();
+        assert!(smooth(&line, 3).iter().zip(&line).all(|(a, b)| a.distance(*b) < 1e-12));
+        // A right angle (2 m cells): the ends stay, the corner is cut by 1.2 cells.
+        let corner: Vec<DVec2> = (0..=6)
+            .map(|i| DVec2::new(2.0 * i as f64, 0.0))
+            .chain((1..=6).map(|i| DVec2::new(12.0, 2.0 * i as f64)))
+            .collect();
+        let s = smooth(&corner, 3);
+        assert_eq!((s[0], s[12]), (corner[0], corner[12]));
+        let cut = s[6].distance(corner[6]);
+        assert!((cut - 1.2 * 2.0).abs() < 0.1, "{cut}");
+        assert_eq!(smooth(&corner[..1], 3), corner[..1]);
     }
 
     #[test]

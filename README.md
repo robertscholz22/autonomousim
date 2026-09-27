@@ -71,7 +71,15 @@ sensors on trailers, and trailers in the viewer with a reversing camera. **Trail
 backs the semitrailer into a bay in a farm yard; a scripted reversing controller parks 90 % of
 the rigs.
 
-Next up: tracked vehicles and soft soil (Milestone 4c). The full plan, the design decisions and as-built notes for
+**Milestone 4c (tracked vehicles and soft soil) is done**: track running gear with shear along
+the band, soft soil after Bekker and Janosi–Hanamoto (sinkage, compaction, bulldozing), a
+tracked APC with a torque converter and regenerative steering, validated against Chrono's M113
+(Chrono runs offline only, to generate the committed fixtures), rural drainage ditches, and
+soil-weighted path planning. **TrackedCrossCountry-v0** drives the APC along a planned path
+through off-road waypoints across fields, soft soil and ditches; a scripted path follower
+finishes about three in four episodes.
+
+Next up: bicycles and motorcycles (Milestone 5). The full plan, the design decisions and as-built notes for
 every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
@@ -113,7 +121,7 @@ obs, reward, terminated, truncated, info = envs.step(envs.action_space.sample())
 ```
 
 Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0`,
-`CarWaypointOffroad-v0`, `RoadFollowRural-v0` and `TrailerReverse-v0`; for several agents `SwarmHover-v0` and
+`CarWaypointOffroad-v0`, `RoadFollowRural-v0`, `TrailerReverse-v0` and `TrackedCrossCountry-v0`; for several agents `SwarmHover-v0` and
 `SwarmWaypointForest-v0` (`autonomousim.multiagent.MultiAgentVectorEnv(num_envs, "swarm_hover")`
 or `autonomousim.pettingzoo.parallel_env`). Task options such as `action_mode`, `map_seed` or reward weights are
 passed as keyword arguments.

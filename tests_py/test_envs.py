@@ -24,17 +24,20 @@ KWARGS = {
     "autonomousim/CarWaypointOffroad-v0": {"map": "flat"},
     "autonomousim/RoadFollowRural-v0": {"map": RURAL},
     "autonomousim/TrailerReverse-v0": {"map": RURAL},
+    "autonomousim/TrackedCrossCountry-v0": {"map": RURAL},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
     "autonomousim/CarWaypointOffroad-v0": 231,
     "autonomousim/RoadFollowRural-v0": 97,
     "autonomousim/TrailerReverse-v0": 31,
+    "autonomousim/TrackedCrossCountry-v0": 95,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
     "autonomousim/RoadFollowRural-v0": 2,
     "autonomousim/TrailerReverse-v0": 2,
+    "autonomousim/TrackedCrossCountry-v0": 2,
 }
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
@@ -494,6 +497,63 @@ def test_trailer_reverse_fails_driving_away():
     # or a crash on the way out of the yard.
     assert failed.all() and (distance > 25.0).all() and (distance > 35.0).any(), distance
     assert (last < -10.0).all(), last
+    envs.close()
+
+
+def test_tracked_cross_country_scripted_driver_follows_the_path():
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/TrackedCrossCountry-v0", num_envs=n, num_threads=4, map=RURAL, autoreset_mode=AutoresetMode.DISABLED
+    )
+    task = envs.unwrapped.task
+    assert [t[0] for t in envs.unwrapped.obs_layout] == [
+        "route",
+        "goal_rel_heading",
+        "speed",
+        "lin_vel_body",
+        "ang_vel_body",
+        "pitch_roll",
+        "sinkage",
+        "last_action",
+        "lidar_log",
+    ]
+    obs, _ = envs.reset(seed=0)
+    # The APC starts facing along its path: the route points ahead lie ahead.
+    route = obs[:, 0:8].reshape(n, 4, 2)
+    assert (route[:, 1, 0] > 0.0).all(), route[:, 1]
+    ret, done, success, offsets = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool), []
+    while not done.all():
+        obs, reward, terminated, truncated, _ = envs.step(task.scripted(obs))
+        live = ~done
+        ret[live] += reward[live]
+        success |= live & task.success
+        offsets.append(np.abs(task.path_errors(envs.unwrapped.state)[1][live]))
+        done |= terminated | truncated
+    # The pure-pursuit driver finishes most episodes (it may stall climbing out of a muddy
+    # ditch or brush a hedge) and stays close to the path.
+    assert success.sum() >= n // 2, success
+    assert np.median(np.concatenate(offsets)) < 1.5
+    assert (ret[success] > 3 * task.goal_bonus).all(), ret
+    envs.close()
+
+
+def test_tracked_cross_country_fails_when_stuck():
+    envs = gym.make_vec(
+        "autonomousim/TrackedCrossCountry-v0",
+        num_envs=2,
+        map=RURAL,
+        stuck_time=2.0,
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    envs.reset(seed=0)
+    stop = np.zeros((2, 2), np.float32)
+    for k in range(100):
+        _, reward, terminated, _, info = envs.step(stop)
+        if terminated.any():
+            break
+    # Standing still for 2 s (40 steps at 20 Hz) ends the episode as a failure.
+    assert terminated.all() and not envs.unwrapped.task.success.any() and 38 <= k <= 42, k
+    assert (info["events"] & autonomousim.Event.STUCK).all() and (reward < -40.0).all()
     envs.close()
 
 

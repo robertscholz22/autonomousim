@@ -11,7 +11,9 @@ Importing the package registers the Gymnasium environments:
 - ``autonomousim/RoadFollowRural-v0``: drive a car along a route over the roads of generated
   farmland to a farm yard;
 - ``autonomousim/TrailerReverse-v0``: back a tractor's semitrailer into a bay at the far side
-  of a farm yard.
+  of a farm yard;
+- ``autonomousim/TrackedCrossCountry-v0``: drive a tracked APC across rural fields, soft soil
+  and ditches through waypoints along a planned path.
 
 ``gym.make_vec(id, num_envs=N, ...)`` gives the native vector environment
 (``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Worlds with several
@@ -43,6 +45,7 @@ ENVS = {
     "CarWaypointOffroad-v0": "car_waypoint",
     "RoadFollowRural-v0": "road_follow",
     "TrailerReverse-v0": "trailer_reverse",
+    "TrackedCrossCountry-v0": "tracked_cross_country",
 }
 
 for _name, _task in ENVS.items():

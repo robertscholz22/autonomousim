@@ -76,8 +76,12 @@ pub struct Agent {
     pub goals: Vec<Goal>,
     /// Index of the current goal; `goals.len()` once the last one has been reached.
     pub goal_index: usize,
-    /// The lane line of a `route` goal, followed by the `road` and `route` observation terms.
+    /// The line the `road` and `route` observation terms follow: the lane line of a `route`
+    /// goal, or the planned path to the current goal (`path` goals).
     pub route: Option<Arc<Polyline>>,
+    /// Planned paths to each goal (`path` goals): `route` is the current goal's (the last one's
+    /// once all are reached).
+    pub legs: Vec<Arc<Polyline>>,
     /// Reach radius of the goals (0: advanced explicitly only).
     goal_radius: f64,
     /// Events since the start of the current policy step.
@@ -131,6 +135,7 @@ impl Agent {
             goals: vec![Goal::default()],
             goal_index: 0,
             route: None,
+            legs: Vec::new(),
             goal_radius: group.spec.goals.radius,
             events: Events::NONE,
             disabled: false,
@@ -243,6 +248,7 @@ impl Agent {
     pub fn advance_goal(&mut self) -> bool {
         if self.goal_index + 1 < self.goals.len() {
             self.goal_index += 1;
+            self.follow_leg();
             true
         } else {
             false
@@ -401,10 +407,18 @@ impl Agent {
         let Some(goal) = self.goals.get(self.goal_index) else { return };
         if r > 0.0 && self.vehicle.position().distance_squared(goal.position) <= r * r {
             self.goal_index += 1;
+            self.follow_leg();
             self.events |= Events::GOAL_REACHED;
             if self.goal_index == self.goals.len() {
                 self.events |= Events::FINISHED;
             }
+        }
+    }
+
+    /// Route along the planned path to the current goal, if there are planned paths.
+    pub(crate) fn follow_leg(&mut self) {
+        if let Some(leg) = self.legs.get(self.goal_index.min(self.legs.len().saturating_sub(1))) {
+            self.route = Some(leg.clone());
         }
     }
 

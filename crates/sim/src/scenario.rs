@@ -784,6 +784,17 @@ pub struct GoalSpec {
     /// Settings of `GoalKind::Bay`.
     #[serde(skip_serializing_if = "is_default")]
     pub bay: BayGoals,
+    /// `Random` goals of ground vehicles: plan the cheapest drivable path from the spawn
+    /// through the goals ([`DriveGrid::legs`](crate::drive::DriveGrid::legs), weighted by
+    /// `drivable.resistance_cost`). The agent follows the leg to its current goal as its route,
+    /// for the `road` and `route` observation terms. It starts facing along the path, turned
+    /// by the sampled `spawn.yaw_deg`.
+    #[serde(skip_serializing_if = "is_default")]
+    pub path: bool,
+    /// `Random` goals of ground vehicles: away from the roads (goals on a road are drawn only
+    /// when no draw lands off them).
+    #[serde(skip_serializing_if = "is_default")]
+    pub off_road: bool,
 }
 
 impl Default for GoalSpec {
@@ -801,6 +812,8 @@ impl Default for GoalSpec {
             spacing: 2.0,
             route: RouteGoals::default(),
             bay: BayGoals::default(),
+            path: false,
+            off_road: false,
         }
     }
 }
@@ -1097,6 +1110,9 @@ impl CompiledGroup {
         gl.bay.validate().map_err(&fail)?;
         if gl.kind == GoalKind::Bay && family != Family::Wheeled {
             return Err(fail("`bay` goals need a ground vehicle".into()));
+        }
+        if (gl.path || gl.off_road) && (gl.kind != GoalKind::Random || family != Family::Wheeled) {
+            return Err(fail("`goals.path` and `goals.off_road` need `random` goals and a ground vehicle".into()));
         }
         // Trailers in line behind the towing unit.
         let colliders = match def.as_wheeled() {
@@ -1434,8 +1450,16 @@ impl GoalSpec {
                         let (p, free) = match ground {
                             Some(g) => {
                                 let p = xy.extend(world.terrain().height(xy.x, xy.y) + g.ride);
-                                // Unreachable goals rank below any reachable one.
-                                (p, if g.grid.reachable(spawn.pos.truncate(), xy) { 1.0 } else { -3.0 })
+                                // Unreachable goals rank below any reachable one, goals on
+                                // roads (with `off_road`) below any off them.
+                                let free = if !g.grid.reachable(spawn.pos.truncate(), xy) {
+                                    -3.0
+                                } else if self.off_road && world.roads().on_road(xy).is_some() {
+                                    0.5
+                                } else {
+                                    1.0
+                                };
+                                (p, free)
                             }
                             None => {
                                 let p = xy.extend(world.surface_height(xy.x, xy.y) + agl);

@@ -1545,7 +1545,7 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
 | 3 ✅ | Validation: Chrono M113 fixtures (static loads, straight acceleration, steady turn at a fixed sprocket speed ratio, braked hold on a 30 % slope) and analytic rigid-ground checks (gradeability, Wong's skid-steer turning) | Tolerances above met or explained |
 | 4 ✅ | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
 | 5 ✅ | Simulation and viewer: tracked agents in scenarios, drive grids with soil cost, track visuals (band around sprocket, road wheels and idler), HUD per side (band speed, slip, sinkage), rural ditches | An APC drives by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay; ditch invariants hold |
-| 6 | `TrackedCrossCountry-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
+| 6 ✅ | `TrackedCrossCountry-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
 #### As built
 - **Step 1 (track running gear)**:
@@ -1669,6 +1669,23 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
     - `farm_apc` spawns on up to 10° (was 6°). At 12°, one of 12 seeds crawled up a steepening bank (12 m in 8 s); the test's distance bound is now 10 m in 8 s.
   - **Chrono is offline only**: the fixtures are generated once by `tools/gen_chrono_tracked_fixtures.py` (micromamba env `chrono`) and committed; tests and training never run Chrono.
   - **Auto-export**: see "As built after M1: policy playback".
+- **Step 6** (`TrackedCrossCountry-v0`, `path` goals):
+  - **`path` goals** (`GoalSpec::path`, with `random` goals of ground vehicles; validated): each episode plans the cheapest drivable path from the spawn through the goals, one leg per goal (`DriveGrid::legs`: A* on the group's drive grid, then a 7-point moving average that turns 45° steps into curves and cuts a right-angle corner by 1.2 cells). The legs are lifted onto the terrain as polylines (`Agent::legs`). The current goal's leg is the agent's `route` (switched when a goal is reached; the last stays), so the `road` state columns and the `route` term follow it. The vehicle starts facing the path point 8 m ahead, turned by its sampled `spawn.yaw_deg`. `/episode` records the whole path as the agent's route, so the viewer overlay and replays draw it. `set_goals` drops the legs.
+  - **`off_road` goals** (`GoalSpec::off_road`): random ground goals prefer points off the roads (the candidate score drops from 1 to 0.5 on a road; unreachable ones stay at −3).
+  - Both are serialized only when set, so goldens are unchanged.
+  - **TrackedCrossCountry-v0** (`tasks/tracked_cross_country.py`):
+    - **Setup**: `tracked_apc` in `vw` mode (6 m/s forward, 3 m/s reverse, 1 rad/s), 20 Hz policy, 1 kHz physics, a pool of rural maps. Spawns 40 m from the edge on ≤ 10° slopes, facing along the path within ±30°. Three `off_road` + `path` goals 40–100 m apart, radius 4 m. Drive grid: slopes ≤ 30°, 2 m margin, `resistance_cost` 30. Episodes last 120 s.
+    - **Observation** (95): `route` (1/20, clipped to ±3), `goal_rel_heading` (1/50), speed, body velocity and rates, pitch and roll, `sinkage` (×10), last action, LiDAR (2 rings at −10° and 0°, 36 azimuths, 30 m, log ranges).
+    - **Reward**: speed along the path's tangent × Δt, 10 per goal, −0.05·min(1, (offset/5 m)²), −0.02‖Δa‖², −50 on failure. Failures are the terminal events plus `STUCK` (6 s).
+    - **Events**: `crash_speed` is 5 m/s. At 2 m/s (the drones' landing threshold), sprockets meeting the far bank of a ditch at 2–4 m/s ended a third of the scripted episodes as terrain crashes. Hull contacts are still always crashes.
+    - **Scripted driver** (`scripted(obs)`): pure pursuit on the `route` term, aiming 10 m ahead with a yaw rate of 1.2 × the bearing, at 4.5 m/s less 5 m/s per radian of the larger of the 10 m and 20 m bearings, at least 3 m/s. It finishes about 75 % of the episodes (24–25 of 32). Failures are physically plausible: stalling while climbing out of a ditch with the rear in mud (μ 0.35, pitch 20–23°), brushing a hedge's foliage, or sliding into water. It was not tuned further (at 1 m/s minimum it stalled on banks: 19 of 32).
+    - **Tuning history**: the spawn heading and the 2 m margin came from the scripted driver's failures. With random headings, the APC (no pivot turn; 4.3 m tightest radius) turned into banks; with a 1 m margin, it brushed fences and hedges. A lower slope limit (18°) did not help: the paths detoured and ran out of time.
+  - **Tests**:
+    - `sim/src/drive.rs`: legs through goals (around a tree, unreachable goal, goal in the start cell); smoothing keeps ends and straight lines.
+    - `sim/tests/paths.rs`: legs start at the spawn and end at each goal over drivable ground; ≤ 10 % of goals on roads; the route switches per goal; the vehicle faces its path; validation errors; recordings keep the whole path.
+    - `tests_py/test_envs.py`: API conformance (`check_env`, spaces); the scripted driver finishes ≥ 4 of 8 episodes with a median offset < 1.5 m; standing still fails as `STUCK` with the penalty.
+  - **Training** (`ppo_continuous.py --hidden 256 --bound-coef 0.01`, 3M steps, 256 envs, 14 min at 3.6k SPS; basic training only, to check the pipeline): the training return rose from −52 to +62, with 24 % success. Deterministic evaluation on unseen maps (`map_seed` 1000, 64 episodes): 31 % success, 1.4 of 3 goals.
+  - **Export and viewer**: `policy.json` is auto-exported. `autonomousim-viewer policy <json> --map-seed 1000` drives the APC at about 134 fps. `eval_record.py` recorded 4 episodes (3 successes); they re-simulate bit for bit and replay in the viewer at about 120 fps, with the path, the goals and the LiDAR view.
 
 ## Roadmap after M1
 | M | Content | Validation |

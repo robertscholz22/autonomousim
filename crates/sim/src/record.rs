@@ -3,7 +3,7 @@
 //! | Topic | When | Content |
 //! |---|---|---|
 //! | `/meta` | once | scenario, map pool (metadata and content hashes), vehicle definitions, rates, agent list |
-//! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses, goals and routes (lane points of agents with `route` goals) |
+//! | `/episode` | every reset | episode number and seed, map index, environment, spawn poses, goals and routes (lane points of agents with `route` goals, planned paths of `path` goals) |
 //! | `/agent/<id>/state` | `state_hz` | time, pose, velocity, rates, wind, goal, events; rotor speeds (multirotors) or steering, wheels, powertrain and the joints of trailers (ground vehicles) |
 //! | `/agent/<id>/pose` | `state_hz` | the pose as `foxglove.PoseInFrame` (frame `world`) |
 //! | `/agent/<id>/action` | each action | the normalised action |
@@ -317,7 +317,16 @@ impl Recorder {
                     "spawn": {"position": a.spawn.pos, "orientation": a.spawn.rot},
                     "goals": a.goals,
                 });
-                if let Some(route) = &a.route {
+                if !a.legs.is_empty() {
+                    // The whole planned path (each leg starts where the previous one ends).
+                    let path: Vec<_> = a
+                        .legs
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(k, l)| l.points()[usize::from(k > 0)..].iter().copied())
+                        .collect();
+                    m["route"] = json!(path);
+                } else if let Some(route) = &a.route {
                     m["route"] = json!(route.points());
                 }
                 m

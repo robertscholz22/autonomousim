@@ -29,16 +29,22 @@ use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
 use autonomousim_core::rng::Seed;
+use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::Vehicle;
 use autonomousim_world::StaticWorld;
-use glam::DVec3;
+use autonomousim_world::roads::Polyline;
+use glam::{DVec2, DVec3};
 use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Agent count from which the per-agent phases run in parallel.
 pub const PARALLEL_AGENTS: usize = 32;
+
+/// With `path` goals a ground vehicle starts facing the point of its path this far away (m),
+/// turned by its sampled heading.
+const PATH_HEADING_REACH: f64 = 8.0;
 
 /// Per-agent state row written by [`WorldInstance::write_state`]: `(name, length)` in order.
 /// `goal_index` equals the number of goals once the last one has been reached; `clearance` is
@@ -228,8 +234,38 @@ impl WorldInstance {
                     .as_multirotor()
                     .map(|d| g.spec.randomize.sample(d.rotors.len(), &mut seed.child("vehicle").rng()));
                 let agent = &mut self.agents[id];
+                // Planned paths through `path` goals.
+                let legs = match ground.filter(|_| g.spec.goals.path) {
+                    Some(gs) => {
+                        let targets: Vec<DVec2> = goals.iter().map(|q| q.position.truncate()).collect();
+                        let lift = |p: DVec2| p.extend(world.terrain().height(p.x, p.y));
+                        gs.grid
+                            .legs(placement.pose.pos.truncate(), &targets)
+                            .map(|legs| {
+                                legs.into_iter()
+                                    .map(|l| Arc::new(Polyline::new(l.into_iter().map(lift).collect())))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    }
+                    None => Vec::new(),
+                };
+                // The vehicle starts facing along its path, turned by the sampled heading.
+                if let (Some(d), Some(leg)) = (g.def.as_wheeled(), legs.first()) {
+                    let p0 = placement.pose.pos.truncate();
+                    let pts = leg.points();
+                    let ahead = pts.iter().map(|q| q.truncate()).find(|q| q.distance(p0) >= PATH_HEADING_REACH);
+                    if let Some(q) = ahead.or_else(|| pts.last().map(|q| q.truncate())).filter(|q| q.distance(p0) > 0.5)
+                    {
+                        let dir = q - p0;
+                        let heading = dir.y.atan2(dir.x) + yaw(placement.pose.rot);
+                        placement.pose = ground_pose(world, d, &g.rest, p0, heading);
+                    }
+                }
                 agent.reset(g, &placement, scales.as_ref(), goals, seed, &self.env, world);
                 agent.route = route.map(Arc::new);
+                agent.legs = legs;
+                agent.follow_leg();
                 let contact = g.def.contact_model(agent.vehicle.mass(), sc.dt());
                 self.shapes[id].set_contact(&contact.solid);
                 agent.update_shape(&mut self.shapes[id]);
@@ -482,6 +518,7 @@ impl WorldInstance {
         a.goals = goals;
         a.goal_index = 0;
         a.route = None;
+        a.legs.clear();
     }
 
     /// Advance the goal of `agent`; false if it was at its last goal.
