@@ -279,9 +279,9 @@ fn tracked_vehicles_report_their_sinkage() {
     assert!((f64::from(sand_obs) - 10.0 * sand).abs() < 1e-5);
 }
 
-/// The farm scenario: the APC spawns at rest on nearly level ground of the rural maps, drives
-/// off across them and sinks into the soft fields. Hedges, trees, ditches and the map's edge
-/// may stop it; it does not stall, roll over or drown.
+/// The farm scenario: the APC spawns at rest on slopes of up to 10° of the rural maps, drives
+/// off across them (> 10 m in 8 s: some climb banks) and sinks into the soft fields. Hedges,
+/// trees, ditches and the map's edge may stop it; it does not stall, roll over or drown.
 #[test]
 fn apc_drives_across_farmland() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/scenarios/farm_apc.toml");
@@ -306,7 +306,7 @@ fn apc_drives_across_farmland() {
         }
         assert!(state.iter().all(|x| x.is_finite()));
         let moved = (w.agent(0).vehicle.pose().pos - start).truncate().length();
-        assert!(moved > 20.0 || events.intersects(stops), "seed {seed}: moved {moved:.1} m, {events:?}");
+        assert!(moved > 10.0 || events.intersects(stops), "seed {seed}: moved {moved:.1} m, {events:?}");
         assert!(!events.intersects(never), "seed {seed}: {events:?}");
         sunk += usize::from(deepest > 0.005);
     }

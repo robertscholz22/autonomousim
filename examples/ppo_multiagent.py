@@ -44,6 +44,14 @@ from autonomousim.scenario import STATE  # noqa: E402
 from autonomousim.tasks.multi import make_multi_task  # noqa: E402
 
 
+def export_json(policy_path: pathlib.Path) -> None:
+    """Export the checkpoint for Rust programs (``export_policy.py``)."""
+    from export_policy import export
+
+    out = export(policy_path)
+    print(f"exported {out}", flush=True)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     a = p.add_argument
@@ -84,6 +92,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a("--save-every", type=int, default=50, help="iterations between checkpoints (0: only at the end)")
     a("--time-limit", type=float, default=0.0, help="stop training after this many minutes (0: none)")
     a("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+    a("--export", action=argparse.BooleanOptionalAction, default=True,
+      help="write policy.json next to policy.pt after training (export_policy.py; the viewer's `policy` command)")
     a("--runs-dir", default="runs")
     a("--task-kwargs", type=json.loads, default={}, help='task options as JSON, e.g. \'{"count": 16}\'')
     a("--eval-task-kwargs", type=json.loads, default={}, help="task options for the evaluation on top of --task-kwargs")
@@ -246,6 +256,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     envs.close()
     save_all(run_dir, groups, args, agent_steps)
+    if args.export:
+        for path in [run_dir / f"policy_{g}.pt" for g in groups] + ([run_dir / "policy.pt"] if len(groups) == 1 else []):
+            export_json(path)
     policies = {g: Policy(grp.agent, grp.obs_norm) for g, grp in groups.items()}
     task_kwargs = {**args.task_kwargs, **args.eval_task_kwargs}
     result = evaluate_multi(policies, args.task, args.eval_episodes, args.seed + 1000, task_kwargs)

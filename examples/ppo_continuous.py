@@ -17,7 +17,8 @@ Differences from CleanRL's ``ppo_continuous_action.py``:
   action. PPO then sees no effect of its exploration noise and cannot learn to back off.
 
 The checkpoint (``runs/<run>/policy.pt``) holds the network, the observation statistics and
-the arguments; ``load_policy`` rebuilds a numpy-in, numpy-out policy from it.
+the arguments; ``load_policy`` rebuilds a numpy-in, numpy-out policy from it. After training,
+``policy.json`` for the viewer is exported next to it (``--no-export`` skips this).
 """
 
 import argparse
@@ -35,6 +36,14 @@ from torch.distributions.normal import Normal
 
 import autonomousim  # noqa: F401  (registers the environments)
 from autonomousim.rl import ObsNormalizer, RewardScaler, evaluate
+
+
+def export_json(policy_path: pathlib.Path) -> None:
+    """Export the checkpoint for Rust programs (``export_policy.py``)."""
+    from export_policy import export
+
+    out = export(policy_path)
+    print(f"exported {out}", flush=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -71,6 +80,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a("--eval-episodes", type=int, default=64)
     a("--save-every", type=int, default=50, help="iterations between checkpoints (0: only at the end)")
     a("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+    a("--export", action=argparse.BooleanOptionalAction, default=True,
+      help="write policy.json next to policy.pt after training (export_policy.py; the viewer's `policy` command)")
     a("--runs-dir", default="runs")
     a("--env-kwargs", type=json.loads, default={}, help='task options as JSON, e.g. \'{"action_mode": "motors"}\'')
     a(
@@ -345,6 +356,8 @@ def main(argv: list[str] | None = None) -> dict[str, float]:
 
     envs.close()
     save_policy(policy_path, agent, obs_norm, args, global_step=global_step)
+    if args.export:
+        export_json(policy_path)
     eval_kwargs = {**args.env_kwargs, **args.eval_env_kwargs}
     result = evaluate(Policy(agent, obs_norm), args.env_id, args.eval_episodes, args.seed + 1000, eval_kwargs)
     result["sps"] = global_step / (time.time() - start)

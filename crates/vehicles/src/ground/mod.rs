@@ -10,12 +10,12 @@ mod wheeled;
 
 pub use def::{
     AxleDef, BrakeDef, ChassisDef, DamperDef, GroundColliderDef, GroundPart, RollerDef, STANDARD_GRAVITY, SpringDef,
-    StaticState, Steer, SteerMode, SteerName, SteeringDef, StopDef, SuspensionDef, TireSpec, TrackDef, TrailingArmDef,
-    WheelDef, WheeledDef, deflection_at, travel_direction,
+    StaticState, Steer, SteerMode, SteerName, SteeringDef, StopDef, SuspensionDef, TireSpec, TrackDef, TrackSteering,
+    TrailingArmDef, WheelDef, WheeledDef, deflection_at, travel_direction,
 };
 pub use powertrain::{
     CombustionDef, Coupling, DifferentialDef, DriveInput, ElectricDef, EngineDef, GearboxDef, LinearTable, MAX_WHEELS,
-    MotorDef, MotorSide, Powertrain, PowertrainDef, PowertrainStatus, WheelCommands,
+    MotorDef, MotorSide, Powertrain, PowertrainDef, PowertrainStatus, TorqueConverterDef, WheelCommands,
 };
 pub use units::{
     CouplingDef, CouplingJoint, CouplingKind, DollyDef, HitchDef, TrailerDef, UnitDef, UnitJoint, yaw_pitch_roll,

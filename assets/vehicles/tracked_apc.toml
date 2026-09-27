@@ -1,11 +1,12 @@
 # 11.3 t tracked armoured personnel carrier after the Chrono::Vehicle M113 model: five road
-# wheels per side on torsion-bar trailing arms, a front sprocket and a rear idler, a SimpleMap
-# engine with a 4-speed automatic, and a braked-differential steering driveline.
+# wheels per side on torsion-bar trailing arms, a front sprocket and a rear idler, an engine with
+# a torque converter and a 4-speed automatic, and a controlled-differential (regenerative)
+# steering driveline.
 type = "wheeled"
 name = "tracked_apc"
 source = """
 Masses, inertias, road-wheel, arm, sprocket and idler geometry, torsion-spring and damper \
-rates, brakes, engine map, gear ratios, shift points and the conical gear ratio from Project \
+rates, brakes, engine and torque converter maps, gear ratios and the conical gear ratio from Project \
 Chrono's M113 model (src/chrono_models/vehicle/m113 and data/vehicle/M113, BSD-3-Clause, \
 Copyright (c) 2014 projectchrono.org); static pose and road-wheel positions measured on it \
 (tools/gen_chrono_tracked_fixtures.py, which also checks the conical ratio). The chassis \
@@ -16,8 +17,7 @@ the rollers referred to the road wheels. Axle positions are Chrono's settled roa
 positions, left and right averaged (Chrono staggers the right side 8.5 cm back): at rest the \
 band lifts the first and last road wheels clear of the ground, so these hang on their springs \
 (given preload) while the others' preloads carry the static load. The torsion springs' and \
-dampers' rates are referred to the wheels at the settled arm angles. The full-throttle torque \
-below 500 rpm and the zero-throttle map (Chrono's repeats the full-throttle one), track shear modulus, bump and rebound \
+dampers' rates are referred to the wheels at the settled arm angles. The shift points, track shear modulus, bump and rebound \
 stops, drag and colliders are estimates. The internal rolling resistance is the M113's at \
 launch, measured on Chrono's model (fixtures/chrono/tracked_m113.json)."""
 
@@ -68,6 +68,11 @@ suspension = { trailing_arm = { length = 0.3176, angle = 0.6032 }, carrier_mass 
 [track]
 sprocket = { position = [0.0, 1.0795, 0.0], radius = 0.305 }     # 0.245 + shoe 0.06
 idler = { position = [-3.95, 1.0795, -0.12], radius = 0.315 }    # 0.255 + shoe 0.06
+# A controlled differential, as the real M113A1's (Chrono's M113 brakes the inner track; the
+# Chrono comparisons switch to that). Ratio and capacity are estimates: the tightest geared turn
+# has a radius of (B/2)·1.6/0.4 = 4.3 m, about twice the track width; 15 kN·m is twice what
+# that turn needs on rigid ground at μ 0.8.
+steering = { type = "regenerative", ratio = 0.6, torque = 15000.0 }
 
 [track.patch]
 radius = 0.374                          # road wheel 0.305 + shoe; 0.364 loaded, as in Chrono
@@ -80,9 +85,9 @@ mu = 0.8
 rolling_resistance = 0.045              # Chrono's M113 at launch (fixtures: accel, climb)
 nominal_load = 18500.0                  # weight over the six loaded road wheels
 
-# Braked differential steering: an open differential between the sprockets (here the axles'
-# open differentials, the bands locking each side's road wheels together); `steering` brakes
-# the inner track.
+# An open differential between the sprockets (here the axles' open differentials, the bands
+# locking each side's road wheels together); the controlled differential's steering brakes act
+# across it.
 [powertrain]
 type = "combustion"
 driven = [0, 1, 2, 3, 4]
@@ -91,17 +96,31 @@ driveline_inertia = 5.7                 # driveshaft 0.5 and differential box 0.
 axle_differential = "open"
 center_differential = "open"
 
-# Chrono's full-throttle map falls to zero from 500 to −100 rpm: with the clutchless SimpleMap
-# driveline that leaves the vehicle almost without torque from standstill (Chrono's M113 takes
-# 2 s to reach 0.3 m/s). Here the torque holds down to standstill, standing in for a launch
-# clutch.
+# Chrono's M113 shafts powertrain (M113_EngineShafts.json, M113_AutomaticTransmissionShafts.json):
+# Chrono's torque map plus its losses map at full throttle, the losses alone at zero throttle
+# (Chrono applies the losses at any throttle, so the blend is exact), and a fuel cut above
+# 3200 rpm. Inertia: the transmission's motorshaft 0.5. The data give the engine's motorshaft
+# 1.1 too, but Chrono's powertrain assembly imposes the transmission's motorshaft speed on the
+# engine's, so only the 0.5 turn with the engine there: its engine runs up from 0 to 45 rad/s
+# in 0.05 s at full throttle, and to the stall speed (162 rad/s) in about 0.3 s. (The
+# turbine's 0.3 in-gear shaft is not modelled.)
 [powertrain.engine]
 max_rpm = 3500.0
-full_throttle = [[-100, 610], [500, 610], [1000, 610], [1500, 603], [2000, 590], [2500, 556],
-    [2800, 535], [3000, 515], [3200, -135]]
-zero_throttle = [[-100, 0], [500, -20], [1000, -25], [1500, -30], [2000, -40], [2500, -50],
-    [3000, -65], [3500, -600]]
+inertia = 0.5
+full_throttle = [[0, 440.8], [50, 427.8], [500, 570.5], [1000, 560.0], [1500, 543.0], [2000, 520.0],
+    [2500, 476.0], [2800, 450.0], [3000, 425.0], [3200, -225.0]]
+zero_throttle = [[0, 0], [50, -30], [500, -39.5], [1000, -50], [1500, -60], [2000, -70], [2500, -80],
+    [3000, -90], [3200, -90], [3500, -600]]
 
+# The converter's stall torque ratio of 2 doubles the launch force of the clutchless SimpleMap
+# driveline Chrono's M113 also offers.
+[powertrain.torque_converter]
+capacity_factor = [[0.0, 7.0], [0.25, 7.0], [0.5, 7.0], [0.75, 8.0], [0.9, 9.0], [1.0, 18.0]]
+torque_ratio = [[0.0, 2.0], [0.25, 1.8], [0.5, 1.5], [0.75, 1.15], [0.9, 1.0], [1.0, 1.0]]
+
+# Shifts on the turbine speed. Chrono's shafts gearbox downshifts at 1000 rpm, above the 843
+# rpm a 1→2 upshift at 1500 leaves, so it hunts (its 0.5 s shift latency only slows this);
+# 750 here.
 [powertrain.gearbox]
 forward = [0.240, 0.427, 0.685, 0.962]
 reverse = -0.151

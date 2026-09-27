@@ -15,11 +15,10 @@ bounds_margin = 5.0
 name = "apc"
 vehicle = "tracked_apc"
 action_mode = "vw"
-# Ditch banks are some 20° steep: crossed with momentum. From standstill the APC starts
-# uphill only on gentle slopes (its clutchless driveline, as Chrono's M113, has no torque
-# converter), so it spawns on nearly level ground. Paths weigh soft ground by the APC's
-# motion resistance on it.
-drivable = { max_slope_deg = 30.0, spawn_slope_deg = 6.0, resistance_cost = 30.0 }
+# Ditch banks are some 20° steep: crossed with momentum. From standstill the torque converter
+# lets the APC start up some 16° of firm ground, less on soft soil, so it spawns on at most
+# 10°. Paths weigh soft ground by the APC's motion resistance on it.
+drivable = { max_slope_deg = 30.0, spawn_slope_deg = 10.0, resistance_cost = 30.0 }
 goals = { kind = "random", count = 3, distance = [40.0, 120.0], radius = 4.0 }
 obs = [
     { term = "goal_rel_body", scale = 0.02, clip = 3.0 },

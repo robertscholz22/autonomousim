@@ -7,7 +7,10 @@ static values are averaged over the last seconds.
 
     make fixtures-chrono      (slow: Chrono runs the M113 at ~1/50 real time)
     python tools/gen_chrono_tracked_fixtures.py [design] [static] [driveline] [accel] [turn]
-        [turn_hard] [hold] [climb]
+        [turn_hard] [hold] [climb] [climb_steep]
+
+Runs named together run one after another; separate processes may run in parallel (each
+writes its runs into the JSON under a lock). The six runs took about 2 h in parallel.
 
 Writes fixtures/chrono/tracked_m113.json, consumed by crates/vehicles/tests/tracks.rs and used
 to build assets/vehicles/tracked_apc.toml:
@@ -20,11 +23,11 @@ to build assets/vehicles/tracked_apc.toml:
   (which include the track tension: the springs carry about twice the weight), and the
   vertical ground reaction under each road wheel (see `GroundLoads`);
 * `driveline`: the conical gear ratio of the BDS driveline;
-* `accel`, `turn`, `turn_hard`, `hold`, `climb`: runs with our engine map (`ENGINE`, written to
-  a JSON file for Chrono; Chrono's own map has no torque at standstill and a zero-throttle map
-  equal to the full-throttle one) and Chrono's gearbox, at `ITERATIONS` solver iterations:
+* `accel`, `turn`, `turn_hard`, `hold`, `climb`, `climb_steep`: runs with the preset's
+  powertrain, Chrono's M113 shafts engine and torque-converter transmission (`ENGINE`,
+  `TRANSMISSION`: its data files with our downshift speed), at `ITERATIONS` solver iterations:
   - after settling braked for `SETTLE` s: the launch at full throttle; braked on a 30 % grade;
-    climbing a 15 % grade at full throttle (slopes tilt gravity);
+    climbing 15 % and 25 % grades at full throttle from standstill (slopes tilt gravity);
   - turns, started at `TURN_LAUNCH` m/s (Chrono gives the hull its speed but not the tracks,
     which drag it down to about 1.1 m/s at once), the speed held at `TURN_SPEED` by a PI
     throttle, steering (braking the inner track) by 0.3 and 0.6 from `TURN_AT` s.
@@ -34,6 +37,7 @@ to build assets/vehicles/tracked_apc.toml:
 At about 1/50 of real time (150 iterations; 600 take 4 times as long), the runs are kept short.
 """
 
+import fcntl
 import json
 import math
 import pathlib
@@ -59,20 +63,19 @@ TURN_AT = 1.0
 TURN_SECONDS = 5.0
 TURN_SPEED = 1.2
 SPEED_KP, SPEED_KI = 0.5, 0.3
-# The `tracked_apc` preset's engine (assets/vehicles/tracked_apc.toml).
-ENGINE = {
-    "Name": "tracked_apc engine", "Type": "Engine", "Template": "EngineSimpleMap",
-    "Maximal Engine Speed RPM": 3500.0,
-    "Map Full Throttle": [[-100, 610], [500, 610], [1000, 610], [1500, 603], [2000, 590], [2500, 556],
-                          [2800, 535], [3000, 515], [3200, -135]],
-    "Map Zero Throttle": [[-100, 0], [500, -20], [1000, -25], [1500, -30], [2000, -40], [2500, -50],
-                          [3000, -65], [3500, -600]],
-}
-TRANSMISSION = {
-    "Name": "M113 Simple Map Transmission", "Type": "Transmission", "Template": "AutomaticTransmissionSimpleMap",
-    "Gear Box": {"Reverse Gear Ratio": -0.151, "Forward Gear Ratios": [0.240, 0.427, 0.685, 0.962],
-                 "Shift Points Map RPM": [[750, 1500]] * 4},
-}
+# The `tracked_apc` preset's powertrain (assets/vehicles/tracked_apc.toml): Chrono's M113 shafts
+# engine and torque-converter transmission as in its data files, with the preset's downshift
+# speed (Chrono's 1000 rpm hunts after a 1→2 upshift at 1500).
+DATA = pathlib.Path(veh.GetVehicleDataFile("M113/powertrain"))
+def chrono_json(name: str) -> dict:
+    """A Chrono data file (JSON with // comments)."""
+    text = DATA.joinpath(name).read_text()
+    return json.loads("\n".join(line.split("//")[0] for line in text.splitlines()))
+
+
+ENGINE = chrono_json("M113_EngineShafts.json")
+TRANSMISSION = chrono_json("M113_AutomaticTransmissionShafts.json")
+TRANSMISSION["Gear Box"]["Downshift RPM"] = 750
 
 
 def vec(v) -> list[float]:
@@ -333,6 +336,7 @@ RUNS = {
     "turn_hard": lambda: held_turn(0.6),
     "hold": lambda: run(M113(ours=True, grade=0.3, iterations=ITERATIONS), 4.0, lambda t: (0.0, 0.0, 1.0)) | {"grade": 0.3},
     "climb": lambda: run(M113(ours=True, grade=0.15, iterations=ITERATIONS), 6.0, lambda t: (1.0, 0.0, 0.0)) | {"grade": 0.15},
+    "climb_steep": lambda: run(M113(ours=True, grade=0.25, iterations=ITERATIONS), 6.0, lambda t: (1.0, 0.0, 0.0)) | {"grade": 0.25},
 }
 
 
@@ -348,9 +352,11 @@ def main():
     for name, f in RUNS.items():
         if name in which:
             new[name] = f() | {"sample": SAMPLE, "iterations": ITERATIONS}
-    # Read last: runs of different parts may go in parallel.
-    out = json.loads(OUT.read_text()) if OUT.exists() else {}
-    OUT.write_text(json.dumps(out | new, indent=1))
+    # Read last, under a lock: runs of different parts may go in parallel.
+    with open(pathlib.Path(tempfile.gettempdir()) / "tracked_m113.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        out = json.loads(OUT.read_text()) if OUT.exists() else {}
+        OUT.write_text(json.dumps(out | new, indent=1))
     print(f"wrote {OUT}")
 
 

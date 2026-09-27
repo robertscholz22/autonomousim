@@ -3,9 +3,17 @@
 //! * **Combustion** (the SimpleMap model of Chrono::Vehicle): the engine speed follows the
 //!   driveline algebraically (no clutch, no torque converter, no engine inertia). The engine
 //!   torque interpolates between the zero- and full-throttle maps in the throttle. An automatic
-//!   gearbox shifts up and down at fixed engine speeds per gear, with an optional torque
+//!   gearbox shifts up and down at fixed input speeds per gear, with an optional torque
 //!   interruption. Open differentials split the torque in fixed shares; the driveline shafts'
 //!   inertia is lumped onto the driven wheels.
+//!
+//!   With a **torque converter** (Chrono's `ChShaftsTorqueConverter`, as in its shafts
+//!   powertrains) the engine speed is a state with the engine's inertia. The converter loads
+//!   the engine with `(ω_e/K(R))²` at the speed ratio `R = ω_t/ω_e` (turbine over engine) and
+//!   passes `TR(R)` times that to the gearbox, so a stalled converter (`R = 0`) multiplies the
+//!   engine torque by `TR(0)` (about 2). When the wheels drive the engine (`ω_t > ω_e`: engine
+//!   braking) the roles swap and the torque ratio is 1. The gearbox shifts on the turbine
+//!   speed.
 //! * **Electric**: motors with a torque limit, a power limit and a first-order torque lag,
 //!   either torque-commanded or, with a no-load speed, voltage-commanded DC motors (torque
 //!   falling linearly from stall at zero speed to zero at the commanded fraction of the no-load
@@ -68,6 +76,10 @@ pub struct DriveInput {
     /// other brake interventions).
     #[serde(skip_serializing_if = "is_zero")]
     pub wheel_brake: [f64; MAX_WHEELS],
+}
+
+fn is_zero_f64(x: &f64) -> bool {
+    *x == 0.0
 }
 
 fn is_zero(x: &[f64; MAX_WHEELS]) -> bool {
@@ -143,6 +155,8 @@ impl LinearTable {
     }
 }
 
+// A definition, built once per vehicle type.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PowertrainDef {
@@ -171,6 +185,39 @@ pub struct CombustionDef {
     /// Coupling between the driven axles (ignored with one driven axle).
     #[serde(default)]
     pub center_differential: DifferentialDef,
+    /// Hydrodynamic torque converter between the engine and the gearbox; without one the
+    /// engine is geared rigidly to the wheels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torque_converter: Option<TorqueConverterDef>,
+}
+
+/// Torque converter maps over the speed ratio `R` = turbine speed / pump (engine) speed, in
+/// `[0, 1]`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TorqueConverterDef {
+    /// Capacity factor `K(R)` = pump speed / √(pump torque), (rad/s)/√(N·m).
+    pub capacity_factor: LinearTable,
+    /// Torque ratio `TR(R)` = turbine torque / pump torque.
+    pub torque_ratio: LinearTable,
+}
+
+impl TorqueConverterDef {
+    /// Pump torque (load on the engine) and turbine torque (to the gearbox), N·m, at engine
+    /// speed `we` and turbine speed `wt` (rad/s).
+    pub fn torques(&self, we: f64, wt: f64) -> (f64, f64) {
+        let we = we.max(0.0);
+        if wt <= we {
+            // The engine drives; a turbine turning backward (rolling back in gear) is stalled.
+            let r = if we > 0.0 { (wt / we).max(0.0) } else { 1.0 };
+            let pump = (we / self.capacity_factor.eval(r)).powi(2);
+            (pump, self.torque_ratio.eval(r) * pump)
+        } else {
+            // Overrun: the turbine drives the pump, without torque multiplication.
+            let t = (wt / self.capacity_factor.eval(we / wt)).powi(2);
+            (-t, -t)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -181,6 +228,18 @@ pub struct EngineDef {
     /// Torque (N·m) over engine speed (rpm) at full and at zero throttle.
     pub full_throttle: LinearTable,
     pub zero_throttle: LinearTable,
+    /// Rotating inertia of the engine and the converter's pump (kg·m²); used, and required,
+    /// with a torque converter.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub inertia: f64,
+}
+
+impl EngineDef {
+    /// Engine torque (N·m) at `rpm` and `throttle` in `[0, 1]`.
+    fn torque(&self, rpm: f64, throttle: f64) -> f64 {
+        let zero = self.zero_throttle.eval(rpm);
+        if rpm > self.max_rpm { zero } else { throttle * self.full_throttle.eval(rpm) + (1.0 - throttle) * zero }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,7 +249,8 @@ pub struct GearboxDef {
     pub forward: Vec<f64>,
     /// Reverse ratio (negative).
     pub reverse: f64,
-    /// Down- and upshift engine speeds (rpm) per forward gear.
+    /// Down- and upshift speeds (rpm) of the gearbox input per forward gear (the engine, or the
+    /// converter's turbine).
     pub shift: Vec<[f64; 2]>,
     /// Torque interruption per shift (s).
     #[serde(default)]
@@ -320,6 +380,22 @@ impl PowertrainDef {
                 }
                 c.axle_differential.validate()?;
                 c.center_differential.validate()?;
+                if let Some(tc) = &c.torque_converter {
+                    if !pos(c.engine.inertia) {
+                        return Err("a torque converter needs a positive engine inertia".into());
+                    }
+                    let [first, .., last] = tc.capacity_factor.points() else {
+                        return Err("torque converter maps need at least two points".into());
+                    };
+                    if first[0] > 0.0 || last[0] < 1.0 || tc.torque_ratio.points().len() < 2 {
+                        return Err("torque converter maps must cover speed ratios 0 to 1".into());
+                    }
+                    if tc.capacity_factor.points().iter().any(|p| !pos(p[1]))
+                        || tc.torque_ratio.points().iter().any(|p| !pos(p[1]))
+                    {
+                        return Err("torque converter capacity factors and torque ratios must be positive".into());
+                    }
+                }
             }
             PowertrainDef::Electric(e) => {
                 if e.motors.is_empty() {
@@ -380,11 +456,14 @@ impl PowertrainDef {
 type Wheels = SmallVec<[usize; 4]>;
 
 /// A torsional bristle between the mean rotation of wheel group `a` and that of group `b`
-/// (empty `b`: the wheels' carriers, as for a brake).
+/// (empty `b`: the wheels' carriers, as for a brake). A geared coupling (ratio `ρ`) holds
+/// `ω_a = ρ·ω_b`: its torque `t` on `a` comes with `−ρ·t` on `b`, so it only dissipates
+/// (`t·(ω_a − ρ·ω_b) ≤ 0`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Coupling {
     a: Wheels,
     b: Wheels,
+    ratio: f64,
     /// Bristle stiffness (N·m/rad) and damping (N·m·s/rad) on the relative rotation.
     stiffness: f64,
     damping: f64,
@@ -402,13 +481,19 @@ const BRISTLE_ZETA: f64 = 0.7;
 impl Coupling {
     /// A coupling for wheels with spin inertias `inertia`, stepped at `dt`.
     pub fn new(a: &[usize], b: &[usize], inertia: &[f64], dt: f64) -> Self {
+        Self::geared(a, b, 1.0, inertia, dt)
+    }
+
+    /// A coupling holding group `a`'s mean speed at `ratio` times group `b`'s.
+    pub fn geared(a: &[usize], b: &[usize], ratio: f64, inertia: &[f64], dt: f64) -> Self {
         let sum = |g: &[usize]| g.iter().map(|&w| inertia[w]).sum::<f64>();
         let (ia, ib) = (sum(a), sum(b));
-        let i_eff = if b.is_empty() { ia } else { ia * ib / (ia + ib) };
+        let i_eff = if b.is_empty() { ia } else { ia * ib / (ib + ratio * ratio * ia) };
         let omega = BRISTLE_OMEGA_DT / dt;
         Self {
             a: a.into(),
             b: b.into(),
+            ratio,
             stiffness: i_eff * omega * omega,
             damping: 2.0 * BRISTLE_ZETA * i_eff * omega,
             deflection: 0.0,
@@ -427,7 +512,7 @@ impl Coupling {
             self.torque = 0.0;
             return;
         }
-        let rel = Self::mean(&self.a, spin) - Self::mean(&self.b, spin);
+        let rel = Self::mean(&self.a, spin) - self.ratio * Self::mean(&self.b, spin);
         let s = self.deflection + rel * dt;
         let trial = -self.stiffness * s - self.damping * rel;
         let t = if trial.abs() > limit {
@@ -443,7 +528,7 @@ impl Coupling {
             out[w] += t / self.a.len() as f64;
         }
         for &w in &self.b {
-            out[w] -= t / self.b.len() as f64;
+            out[w] -= self.ratio * t / self.b.len() as f64;
         }
     }
 
@@ -487,6 +572,8 @@ pub struct Powertrain {
     couplings: Vec<(Coupling, Capacity)>,
     gear: i32,
     shift_timer: f64,
+    /// Engine speed (rad/s), a state with a torque converter.
+    engine_speed: f64,
     status: PowertrainStatus,
 }
 
@@ -545,6 +632,7 @@ impl Powertrain {
             couplings,
             gear: 0,
             shift_timer: 0.0,
+            engine_speed: 0.0,
             status: PowertrainStatus::default(),
         };
         p.reset(&vec![0.0; inertia.len()]);
@@ -570,6 +658,8 @@ impl Powertrain {
                     self.gear = k as i32 + 1;
                 }
             }
+            // The converter turning as one.
+            self.engine_speed = (shaft / c.gearbox.forward[(self.gear - 1) as usize]).max(0.0);
         }
         self.status = PowertrainStatus { gear: self.gear, ..Default::default() };
     }
@@ -623,24 +713,36 @@ impl Powertrain {
                     self.shift_timer = g.shift_time;
                 }
                 let ratio = if self.gear < 0 { g.reverse } else { g.forward[(self.gear - 1) as usize] };
-                let engine_speed = shaft / ratio;
-                let rpm = engine_speed / RPM;
+                let input_speed = shaft / ratio;
                 let throttle = input.throttle.clamp(0.0, 1.0);
                 let e = &c.engine;
-                let zero = e.zero_throttle.eval(rpm);
-                let torque =
-                    if rpm > e.max_rpm { zero } else { throttle * e.full_throttle.eval(rpm) + (1.0 - throttle) * zero };
-                let delivered = if self.shift_timer > 0.0 {
+                let shifting = self.shift_timer > 0.0;
+                if shifting {
                     self.shift_timer -= dt;
-                    0.0
-                } else {
-                    torque
+                }
+                let (engine_speed, engine_torque, output) = match &c.torque_converter {
+                    None => {
+                        let torque = e.torque(input_speed / RPM, throttle);
+                        (input_speed, torque, if shifting { 0.0 } else { torque })
+                    }
+                    Some(tc) => {
+                        let we = self.engine_speed;
+                        let torque = e.torque(we / RPM, throttle);
+                        // In a shift the turbine runs free: no load, no output.
+                        let (pump, turbine) = if shifting { (0.0, 0.0) } else { tc.torques(we, input_speed) };
+                        self.engine_speed = (we + dt * (torque - pump) / e.inertia).max(0.0);
+                        (we, torque, turbine)
+                    }
                 };
-                let wheel = delivered / (ratio * c.final_drive);
+                let wheel = output / (ratio * c.final_drive);
                 for &(w, s) in &self.shares {
                     drive[w] += wheel * s;
                 }
-                self.status = PowertrainStatus { gear: self.gear, engine_speed, engine_torque: delivered };
+                self.status = PowertrainStatus {
+                    gear: self.gear,
+                    engine_speed,
+                    engine_torque: if shifting && c.torque_converter.is_none() { 0.0 } else { engine_torque },
+                };
             }
             PowertrainDef::Electric(_) => {
                 for (k, m) in self.motors.iter_mut().enumerate() {
@@ -767,5 +869,70 @@ mod tests {
         }
         assert!((w[0] - w[1]).abs() < 1e-6, "{w:?}");
         assert!((w[0] + 3.0 * w[1] - 4.0).abs() < 1e-12);
+    }
+
+    /// A geared coupling holds `ω_a = ρ·ω_b`, conserves `I_a·ω_a·ρ + I_b·ω_b` (its torques are
+    /// `t` and `−ρ·t`) and dissipates energy.
+    #[test]
+    fn geared_coupling_holds_its_ratio() {
+        let (dt, inertia) = (1e-3, [2.0, 5.0]);
+        let mut c = Coupling::geared(&[0], &[1], 0.6, &inertia, dt);
+        let mut w = [4.0, 4.0];
+        let energy = |w: &[f64; 2]| 0.5 * (inertia[0] * w[0] * w[0] + inertia[1] * w[1] * w[1]);
+        let momentum = |w: &[f64; 2]| 0.6 * inertia[0] * w[0] + inertia[1] * w[1];
+        let (e0, m0) = (energy(&w), momentum(&w));
+        for _ in 0..300 {
+            let mut t = [0.0; 2];
+            c.step(f64::INFINITY, &w, dt, &mut t);
+            for k in 0..2 {
+                w[k] += t[k] / inertia[k] * dt;
+            }
+        }
+        assert!((w[0] - 0.6 * w[1]).abs() < 1e-6, "{w:?}");
+        assert!((momentum(&w) - m0).abs() < 1e-9 && energy(&w) < e0);
+    }
+
+    /// Through the APC's converter: held at standstill at full throttle, the engine settles
+    /// where the stalled pump takes its torque, `(ω/K(0))² = T(ω)`, and the wheels get `TR(0)`
+    /// times it through the gears. Coasting in gear at zero throttle, the wheels drive the
+    /// engine (engine braking) without torque multiplication.
+    #[test]
+    fn torque_converter_stalls_and_overruns() {
+        let def = crate::presets::wheeled("tracked_apc").unwrap();
+        let PowertrainDef::Combustion(c) = &def.powertrain else { panic!() };
+        let tc = c.torque_converter.as_ref().unwrap();
+        let n = def.num_wheels();
+        let dt = 1e-3;
+        let mut p = Powertrain::new(&def.powertrain, &def.spin_inertia(), dt);
+        let full = DriveInput { throttle: 1.0, ..Default::default() };
+        let spin = vec![0.0; n];
+        let mut out = vec![0.0; n];
+        for _ in 0..3000 {
+            out.fill(0.0);
+            p.step(&full, &spin, dt, &mut out);
+        }
+        let we = p.status().engine_speed;
+        let torque = c.engine.full_throttle.eval(we / RPM);
+        assert!(((we / tc.capacity_factor.eval(0.0)).powi(2) / torque - 1.0).abs() < 1e-3, "stall at {we} rad/s");
+        let wheels: f64 = out.iter().sum();
+        let expected = tc.torque_ratio.eval(0.0) * torque / (c.gearbox.forward[0] * c.final_drive);
+        assert!((wheels / expected - 1.0).abs() < 1e-3, "{wheels} vs {expected} N·m");
+
+        // Rolling at a turbine speed of 150 rad/s in first gear, the engine idle.
+        let turbine = 150.0;
+        let spin = vec![turbine * c.gearbox.forward[0] * c.final_drive; n];
+        p.reset(&spin);
+        p.set_gear(1);
+        let coast = DriveInput::default();
+        for _ in 0..20 {
+            out.fill(0.0);
+            p.step(&coast, &spin, dt, &mut out);
+        }
+        let we = p.status().engine_speed;
+        assert!(we < turbine);
+        let (pump, turbine_torque) = tc.torques(we, turbine);
+        assert!(pump < 0.0 && pump == turbine_torque);
+        let wheels: f64 = out.iter().sum();
+        assert!(wheels < 0.0 && (wheels * c.gearbox.forward[0] * c.final_drive / pump - 1.0).abs() < 0.05);
     }
 }

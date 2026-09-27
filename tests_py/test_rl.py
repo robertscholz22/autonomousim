@@ -93,6 +93,7 @@ def test_ppo_and_eval_record(examples, tmp_path, capsys):
     )  # fmt: skip
     assert set(result) >= {"return", "length", "survived", "final_error_m"}
     policy = _run_dir(tmp_path) / "policy.pt"
+    assert policy.with_suffix(".json").exists()  # exported after training
     out = tmp_path / "rec.mcap"
     # Records three episodes and checks read-back and bit-exact replay (raises otherwise).
     eval_record.main([str(policy), "--episodes", "3", "--out", str(out)])
@@ -110,6 +111,7 @@ def test_sac_and_eval_record(examples, tmp_path, capsys):
          "--updates-per-step", "2", "--buffer-size", "1000", "--hidden", "32", "--sim-threads", "1",
          "--torch-threads", "1", "--eval-episodes", "2", "--no-tensorboard", "--runs-dir", str(tmp_path / "runs")]
     )  # fmt: skip
+    assert (_run_dir(tmp_path) / "policy.json").exists()
     eval_record.main([str(_run_dir(tmp_path) / "policy.pt"), "--episodes", "2", "--out", str(tmp_path / "s.mcap")])
     assert "replay: 2 episodes" in capsys.readouterr().out
     _check_export(_run_dir(tmp_path) / "policy.pt", "tanh")

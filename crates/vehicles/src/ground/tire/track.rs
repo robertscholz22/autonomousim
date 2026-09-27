@@ -52,6 +52,10 @@ const STICKING_SHEAR: f64 = 0.5;
 const SLIDING_SHEAR: f64 = 1.5;
 const STICKING_SPEED: f64 = 0.01;
 const SLIDING_SPEED: f64 = 0.05;
+/// Cosines of the angle between the shear and the direction it grows in (against the sliding
+/// velocity) over which a cell turns from sliding to sticking (unloading).
+const REVERSING: f64 = -0.7;
+const REVERSED: f64 = -0.9;
 /// Band speed (m/s) over which the internal resistance changes sign.
 const ROLLING_SMOOTHING: f64 = 0.05;
 /// Damping ratio of a corner mass on the shear spring at standstill: higher than the tyres'
@@ -209,9 +213,17 @@ impl TrackPatch {
             let j = e[0].hypot(e[1]);
             if j > 0.0 {
                 // Along the shear when sticking, against the sliding velocity when sliding.
+                // A cell whose sliding velocity turns right back along its shear unloads
+                // elastically and sticks. Otherwise an explicit step's friction impulse,
+                // enough to reverse a road wheel's slip, flips the stress every step: a
+                // chatter that walks a braked vehicle. (Across the turning patches of a skid
+                // turn the velocity turns less far against the shear, and the cells slide.)
                 let slide = vsx.hypot(vy_cell);
+                let loading =
+                    if slide > 0.0 && j > 0.0 { -(new[0] * vsx + new[1] * vy_cell) / (slide * j) } else { 1.0 };
                 let w = ((slide - STICKING_SPEED) / (SLIDING_SPEED - STICKING_SPEED)).clamp(0.0, 1.0)
-                    * ((j / k - STICKING_SHEAR) / (SLIDING_SHEAR - STICKING_SHEAR)).clamp(0.0, 1.0);
+                    * ((j / k - STICKING_SHEAR) / (SLIDING_SHEAR - STICKING_SHEAR)).clamp(0.0, 1.0)
+                    * ((loading - REVERSED) / (REVERSING - REVERSED)).clamp(0.0, 1.0);
                 let mut d = [(1.0 - w) * e[0] / j, (1.0 - w) * e[1] / j];
                 if slide > 0.0 {
                     d = [d[0] - w * vsx / slide, d[1] - w * vy_cell / slide];

@@ -11,11 +11,12 @@
 //!
 //! Tracked vehicles: each road wheel stands on a track patch (see [`super::tire`]), and the
 //! band ties the road wheels of a side together, a locked coupling between neighbours, so the
-//! sprocket's drive reaches all of them. They steer by braking: `DriveInput::steering > 0`
+//! sprocket's drive reaches all of them. They steer by braking (unless their
+//! [`TrackSteering`] is regenerative): `DriveInput::steering > 0`
 //! adds service brake on the left (inner) track, `< 0` on the right, as Chrono's tracked
 //! drivelines do.
 
-use super::def::{SteerMode, WheeledDef, deflection_at};
+use super::def::{SteerMode, TrackSteering, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
 use super::tire::{Surface, TRACK_CELLS, Tire, TireForces, TireState, WheelMotion};
 use super::tree::{UnitLinks, build};
@@ -137,6 +138,9 @@ pub struct Wheeled {
     track_neighbours: Vec<[Option<usize>; 2]>,
     /// The bands: locked couplings between neighbouring road wheels.
     bands: Vec<Coupling>,
+    /// Regenerative steering: the steering brakes holding the left and the right track (as
+    /// the inner one) geared to the other, and their capacity at full steering (N·m).
+    steer_brakes: Option<([Coupling; 2], f64)>,
     /// Sprockets and idlers (collider, side, radius) and each side's road wheels with their
     /// radius: the rollers' surfaces run at the band's speed.
     rollers: Vec<(usize, usize, f64)>,
@@ -213,6 +217,11 @@ impl Wheeled {
             .collect();
         let n = model.num_links();
         let mass = def.total_mass();
+        let road_wheels: [Vec<usize>; 2] = [0, 1].map(|side| {
+            (0..def.num_wheels())
+                .filter(|&w| w % 2 == side && def.wheel_unit(w) == 0 && def.tire(w / 2).is_track())
+                .collect()
+        });
         let mut s = Self {
             dt,
             ws: AbaWorkspace::new(&model),
@@ -233,11 +242,16 @@ impl Wheeled {
                 .filter_map(|(w, nb)| nb[1].map(|r| Coupling::new(&[w], &[r], &inertia, dt)))
                 .collect(),
             rollers: def.rollers(),
-            road_wheels: [0, 1].map(|side| {
-                (0..def.num_wheels())
-                    .filter(|&w| w % 2 == side && def.wheel_unit(w) == 0 && def.tire(w / 2).is_track())
-                    .collect()
-            }),
+            road_wheels: road_wheels.clone(),
+            steer_brakes: match def.track.as_ref().map(|t| t.steering) {
+                Some(TrackSteering::Regenerative { ratio, torque }) => {
+                    let [l, r] = &road_wheels;
+                    let (left, right) =
+                        (Coupling::geared(l, r, ratio, &inertia, dt), Coupling::geared(r, l, ratio, &inertia, dt));
+                    Some(([left, right], torque))
+                }
+                _ => None,
+            },
             band_radius: (0..def.axles.len()).find(|&a| def.tire(a).is_track()).map_or(0.0, |a| def.tire(a).radius()),
             contact: def.contact.model(mass, dt),
             model,
@@ -328,6 +342,9 @@ impl Wheeled {
             c.out = WheelState::default();
         }
         for b in &mut self.bands {
+            b.reset();
+        }
+        for b in self.steer_brakes.iter_mut().flat_map(|(b, _)| b) {
             b.reset();
         }
         // Wheels rolling with their unit: the towing unit's from the chassis motion, the others
@@ -446,13 +463,18 @@ impl Wheeled {
         for b in &mut self.bands {
             b.step(f64::INFINITY, &self.spin, dt, &mut self.drive);
         }
-        let tracked = self.def.track.is_some();
+        let brake_steered = self.def.track.is_some() && self.steer_brakes.is_none();
+        if let Some(([left, right], torque)) = &mut self.steer_brakes {
+            let steering = if input.wheels.is_none() { input.steering } else { 0.0 };
+            left.step(steering.max(0.0) * *torque, &self.spin, dt, &mut self.drive);
+            right.step((-steering).max(0.0) * *torque, &self.spin, dt, &mut self.drive);
+        }
         let tick = self.brake_tick;
         self.brake_tick = self.brake_tick.wrapping_add(1);
         for (w, c) in self.corners.iter_mut().enumerate() {
             let b = &self.def.axles[w / 2].brake;
             let mut pedal = input.wheels.map_or(input.brake, |wc| wc.brake[w]) + input.wheel_brake[w];
-            if tracked && input.wheels.is_none() {
+            if brake_steered && input.wheels.is_none() {
                 // Brake steering: the inner track.
                 pedal += if w % 2 == 0 { input.steering.max(0.0) } else { (-input.steering).max(0.0) };
             }

@@ -69,6 +69,7 @@ def test_ippo_runs_exports_and_replays(tmp_path, monkeypatch, capsys):
     assert result["episodes"] == 3 and np.isfinite(result["formation_error_mean"])
     run = next(tmp_path.iterdir())
     assert (run / "policy.pt").exists() and (run / "policy_drones.pt").exists()
+    assert (run / "policy.json").exists() and (run / "policy_drones.json").exists()
 
     import ppo_continuous
 

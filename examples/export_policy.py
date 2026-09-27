@@ -3,6 +3,9 @@
     uv run python examples/export_policy.py runs/<run>/policy.pt            # writes runs/<run>/policy.json
     cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json
 
+The training scripts export their final checkpoints this way themselves (``--no-export``
+skips it); run this for intermediate checkpoints or other task options.
+
 The JSON file (read by ``autonomousim_sim::policy``) holds the task's scenario, the
 observation normalisation and the actor network as a list of dense layers:
 

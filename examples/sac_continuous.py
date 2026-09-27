@@ -37,6 +37,14 @@ from autonomousim.rl import ObsNormalizer, evaluate
 LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
 
 
+def export_json(policy_path: pathlib.Path) -> None:
+    """Export the checkpoint for Rust programs (``export_policy.py``)."""
+    from export_policy import export
+
+    out = export(policy_path)
+    print(f"exported {out}", flush=True)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     a = p.add_argument
@@ -62,6 +70,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a("--log-every", type=int, default=20_000, help="environment steps between progress lines")
     a("--eval-episodes", type=int, default=64)
     a("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+    a("--export", action=argparse.BooleanOptionalAction, default=True,
+      help="write policy.json next to policy.pt after training (export_policy.py; the viewer's `policy` command)")
     a("--runs-dir", default="runs")
     a("--env-kwargs", type=json.loads, default={}, help='task options as JSON, e.g. \'{"action_mode": "motors"}\'')
     a(
@@ -327,6 +337,8 @@ def main(argv: list[str] | None = None) -> dict[str, float]:
     envs.close()
     policy_path = run_dir / "policy.pt"
     save_policy(policy_path, actor, obs_norm, args)
+    if args.export:
+        export_json(policy_path)
     eval_kwargs = {**args.env_kwargs, **args.eval_env_kwargs}
     result = evaluate(Policy(actor, obs_norm), args.env_id, args.eval_episodes, args.seed + 1000, eval_kwargs)
     result["sps"] = global_step / (time.time() - start)

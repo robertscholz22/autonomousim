@@ -357,6 +357,32 @@ pub struct TrackDef {
     pub sprocket: Option<RollerDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idler: Option<RollerDef>,
+    /// How `DriveInput::steering` steers (vehicles without per-wheel motor commands).
+    #[serde(default, skip_serializing_if = "TrackSteering::is_brake")]
+    pub steering: TrackSteering,
+}
+
+/// Steering of a tracked vehicle by `DriveInput::steering` (`> 0` turns left: the left track
+/// is the inner one going forward).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrackSteering {
+    /// Service brake on the inner track, `|steering|` of the pedal (Chrono's braked
+    /// differential steering): the braking torque is lost.
+    #[default]
+    Brake,
+    /// A controlled differential (regenerative, geared steering): a steering brake with
+    /// capacity `|steering|·torque` (N·m, at the side's road wheels) holds the inner track at
+    /// `ratio` times the outer track's speed, and passes `ratio` times its torque on to the
+    /// outer track. Fully applied, the tracks turn at the fixed radius
+    /// `(B/2)·(1 + ratio)/(1 − ratio)` (`B`: the track width), at any speed; slipping, wider.
+    Regenerative { ratio: f64, torque: f64 },
+}
+
+impl TrackSteering {
+    fn is_brake(&self) -> bool {
+        *self == Self::Brake
+    }
 }
 
 /// A sprocket or idler: its left centre in the chassis frame and its radius over the track (m).
@@ -728,6 +754,11 @@ impl WheeledDef {
             && t.sprocket.iter().chain(&t.idler).any(|r| !pos(r.radius) || !r.position.is_finite())
         {
             return Err("sprocket and idler need finite positions and positive radii".into());
+        }
+        if let Some(TrackDef { steering: TrackSteering::Regenerative { ratio, torque }, .. }) = &self.track
+            && !((0.0..1.0).contains(ratio) && pos(*torque))
+        {
+            return Err("regenerative steering needs 0 <= ratio < 1 and a positive torque".into());
         }
         if let Some(s) = &self.steering
             && !(pos(s.max_angle) && s.max_angle < 1.5 && pos(s.rate) && (0.0..=1.0).contains(&s.ackermann))

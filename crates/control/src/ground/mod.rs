@@ -5,7 +5,7 @@
 //! speed ─PI→ acceleration demand ─inverse powertrain→ throttle / motor commands / brake
 //! curvature ─bicycle model + ∫ curvature error→ steering
 //! (v, ω) ─kinematics + ∫ yaw-rate error→ side wheel speeds ─PI→ motor commands   (side drives)
-//! (v, ω) ─speed loop→ throttle / brake;  yaw-rate error ─PI→ brake steering        (tracks, engine)
+//! (v, ω) ─speed loop→ throttle / brake;  yaw-rate error ─PI→ track steering        (tracks, engine)
 //! ```
 //!
 //! The speed loop commands an acceleration. The allocator inverts the nominal powertrain to
@@ -21,14 +21,21 @@
 //! [`GroundConfig`] and the vehicle's nominal mass and inertia, so one configuration fits cars
 //! and robots.
 //!
-//! Tracked vehicles with an engine steer by braking the inner track (see
-//! [`Wheeled`](autonomousim_vehicles::ground::Wheeled)): a PI on the yaw-rate error sets the
-//! steering, with its sign flipped in reverse; while the speed builds up, the yaw-rate target
-//! follows the commanded path curvature (at most a pivot turn's `2/B`), and the steering's
-//! authority grows with the speed up to half the target. A turn on the spot becomes a pivot
-//! turn about the inner track, its centre moving at `|ω|·B/2`. Braking the inner track takes
+//! Tracked vehicles with an engine steer through `steering`, by braking the inner track or by
+//! a regenerative controlled differential (see
+//! [`TrackSteering`](autonomousim_vehicles::ground::TrackSteering)): a PI on the yaw-rate
+//! error sets the steering, with its sign flipped in reverse; while the speed builds up, the
+//! yaw-rate target follows the commanded path curvature (at most that of the tightest turn:
+//! a pivot about the inner track, `2/B`, or the controlled differential's geared radius), and
+//! the steering's authority grows with the speed up to half the target. A turn on the spot
+//! becomes that tightest turn, its centre moving at `|ω|·R`. Braking the inner track takes
 //! drive away rather than passing it to the outer one, so how tight a turn is reachable
-//! depends on the engine's reserve.
+//! depends on the engine's reserve; the controlled differential passes it on.
+//!
+//! With a torque converter the powertrain inversion divides by the converter's torque ratio at
+//! the current speed ratio, engine braking is left to the brakes, and a launch holds the
+//! brakes until the engine has run up towards the converter's stall speed for the throttle
+//! (so the vehicle does not roll back on a slope while the engine spins up).
 //!
 //! Automatic gear selection (combustion) engages reverse only near standstill: a negative
 //! speed request brakes a vehicle still rolling forward first.
@@ -39,7 +46,8 @@ pub use action::{GroundActionLimits, GroundActionMap, GroundActionMode, PerWheel
 
 use crate::ControlError;
 use autonomousim_vehicles::ground::{
-    DriveInput, MAX_WHEELS, MotorSide, PowertrainDef, WheelCommands, Wheeled, WheeledDef,
+    CombustionDef, DriveInput, MAX_WHEELS, MotorSide, PowertrainDef, TorqueConverterDef, TrackSteering, WheelCommands,
+    Wheeled, WheeledDef,
 };
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
@@ -173,9 +181,10 @@ struct Motor {
     inertia: f64,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum Drive {
-    Combustion(autonomousim_vehicles::ground::CombustionDef),
+    Combustion(CombustionDef),
     Electric(Vec<Motor>),
 }
 
@@ -202,8 +211,9 @@ pub struct GroundController {
     steering: Option<(f64, f64, f64)>,
     /// Track of a side drive (m).
     track: Option<f64>,
-    /// Track of a tracked vehicle steered by its brakes (m).
-    brake_steer: Option<f64>,
+    /// Tracked vehicles with an engine, steered by `steering`: the radius of the tightest turn
+    /// (m).
+    track_steer: Option<f64>,
     // Loop state.
     speed_i: f64,
     curvature_i: f64,
@@ -286,9 +296,15 @@ impl GroundController {
         });
         let ys: Vec<f64> = driven.iter().map(|&w| def.wheel_position(w).y.abs()).collect();
         let width = 2.0 * ys.iter().sum::<f64>() / ys.len() as f64;
-        let (track, brake_steer) = match &drive {
-            Drive::Electric(m) if is_side_drive(m) => (Some(width), None),
-            Drive::Combustion(_) if def.track.is_some() => (None, Some(width)),
+        let (track, track_steer) = match (&drive, &def.track) {
+            (Drive::Electric(m), _) if is_side_drive(m) => (Some(width), None),
+            (Drive::Combustion(_), Some(t)) => {
+                let tightest = match t.steering {
+                    TrackSteering::Brake => 0.5 * width,
+                    TrackSteering::Regenerative { ratio, .. } => 0.5 * width * (1.0 + ratio) / (1.0 - ratio),
+                };
+                (None, Some(tightest))
+            }
             _ => (None, None),
         };
         let motors = match &drive {
@@ -307,7 +323,7 @@ impl GroundController {
             wheel_brake,
             steering,
             track,
-            brake_steer,
+            track_steer,
             speed_i: 0.0,
             curvature_i: 0.0,
             yaw_i: 0.0,
@@ -344,9 +360,9 @@ impl GroundController {
         self.track.is_some()
     }
 
-    /// Whether the vehicle is tracked and steers by braking a track.
-    pub fn is_brake_steered(&self) -> bool {
-        self.brake_steer.is_some()
+    /// Whether the vehicle is tracked, has an engine and steers through `steering`.
+    pub fn is_track_steered(&self) -> bool {
+        self.track_steer.is_some()
     }
 
     /// Clear the loop state.
@@ -445,8 +461,8 @@ impl GroundController {
         // Spinning wheels under drive (not under braking) are braked in proportion to their
         // excess slip, up to their share of the drive torque, as an open differential would
         // otherwise waste that torque on them.
-        // (Not for brake-steered tracks, whose outer track runs ahead of the vehicle in a turn.)
-        if self.brake_steer.is_none() && ((self.reverse && accel < 0.0) || (!self.reverse && accel > 0.0)) {
+        // (Not for steered tracks, whose outer track runs ahead of the vehicle in a turn.)
+        if self.track_steer.is_none() && ((self.reverse && accel < 0.0) || (!self.reverse && accel > 0.0)) {
             let share = force.abs() * self.radius / self.driven.len() as f64;
             for &w in &self.driven {
                 let excess = (slip(w) - allowed) / allowed;
@@ -466,15 +482,28 @@ impl GroundController {
                 let reduction = ratio * c.final_drive * r;
                 let rpm = est.engine_speed.abs() / RPM;
                 let (full, zero) = (c.engine.full_throttle.eval(rpm), c.engine.zero_throttle.eval(rpm));
-                let torque = force * reduction;
+                // Engine torque per gearbox input torque, and the engine braking at the wheels.
+                let (per_input, braking) = match &c.torque_converter {
+                    Some(tc) => (1.0 / tc.torque_ratio.eval(self.speed_ratio(est, ratio)), 0.0),
+                    None => (1.0, zero / reduction),
+                };
+                let torque = force * reduction * per_input;
                 input.throttle = ((torque - zero) / (full - zero)).clamp(0.0, 1.0);
                 // What the engine cannot take away at zero throttle, the brakes do.
-                let residual = force - zero / reduction;
+                let residual = force - braking;
                 if (self.reverse && residual > 0.0) || (!self.reverse && residual < 0.0) {
                     input.brake = (residual.abs() * r / self.brake_torque).clamp(0.0, 1.0);
                 }
                 if v_ref == 0.0 {
                     input.throttle = 0.0;
+                }
+                // Launching through a converter: held on the brakes until the engine runs up.
+                if let Some(tc) = &c.torque_converter
+                    && v.abs() < self.config.hold_speed
+                    && input.throttle > 0.0
+                    && est.engine_speed < 0.9 * stall_speed(c, tc, input.throttle)
+                {
+                    input.brake = 1.0;
                 }
             }
             Drive::Electric(motors) => {
@@ -505,7 +534,10 @@ impl GroundController {
                     c.gearbox.forward[(est.gear.max(1) as usize - 1).min(c.gearbox.forward.len() - 1)]
                 };
                 let rpm = est.engine_speed.abs() / RPM;
-                let full = c.engine.full_throttle.eval(rpm) / (ratio * c.final_drive * self.radius) / self.mass;
+                let multiply =
+                    c.torque_converter.as_ref().map_or(1.0, |tc| tc.torque_ratio.eval(self.speed_ratio(est, ratio)));
+                let full =
+                    multiply * c.engine.full_throttle.eval(rpm) / (ratio * c.final_drive * self.radius) / self.mass;
                 if self.reverse { (full, f64::INFINITY) } else { (f64::NEG_INFINITY, full) }
             }
             Drive::Electric(motors) => {
@@ -531,6 +563,14 @@ impl GroundController {
         let lo = if v >= 0.0 { drive_lo.min(-brake) } else { drive_lo };
         let hi = if v <= 0.0 { drive_hi.max(brake) } else { drive_hi };
         (lo, hi)
+    }
+
+    /// Speed ratio of the torque converter (turbine over engine, in `[0, 1]`) in gear `ratio`.
+    fn speed_ratio(&self, est: &GroundEstimate, ratio: f64) -> f64 {
+        let Drive::Combustion(c) = &self.drive else { return 1.0 };
+        let spin = self.driven.iter().map(|&w| est.wheel_spin[w]).sum::<f64>() / self.driven.len() as f64;
+        let turbine = spin / (c.final_drive * ratio);
+        if est.engine_speed > 0.0 { (turbine / est.engine_speed).clamp(0.0, 1.0) } else { 0.0 }
     }
 
     /// Acceleration demand (m/s²) of the speed PI, within `[lo, hi]` and the configured
@@ -565,8 +605,8 @@ impl GroundController {
 
     /// Side drives: wheel speeds from speed and yaw rate, per-motor wheel-speed PI.
     fn side_drive(&mut self, v_ref: f64, yaw_ref: f64, est: &GroundEstimate) -> DriveInput {
-        if let Some(width) = self.brake_steer {
-            return self.brake_steered(v_ref, yaw_ref, width, est);
+        if let Some(tightest) = self.track_steer {
+            return self.track_steered(v_ref, yaw_ref, tightest, est);
         }
         let (Some(track), Drive::Electric(motors)) = (self.track, &self.drive) else {
             // Not a side drive: speed only.
@@ -614,21 +654,22 @@ impl GroundController {
         DriveInput { wheels: Some(WheelCommands { drive: commands, ..Default::default() }), ..Default::default() }
     }
 
-    /// Tracked vehicles with an engine: speed loop, and a yaw-rate PI on the brake steering.
-    fn brake_steered(&mut self, v_ref: f64, yaw_ref: f64, width: f64, est: &GroundEstimate) -> DriveInput {
+    /// Tracked vehicles with an engine: speed loop, and a yaw-rate PI on the steering.
+    fn track_steered(&mut self, v_ref: f64, yaw_ref: f64, tightest: f64, est: &GroundEstimate) -> DriveInput {
         let (v_ref, yaw_ref) = (finite(v_ref), finite(yaw_ref));
-        // On the spot: a pivot turn about the braked inner track.
-        let v_ref = if v_ref == 0.0 { 0.5 * yaw_ref.abs() * width } else { v_ref };
+        // On the spot: the tightest turn (a pivot about the braked inner track, or the
+        // controlled differential's geared turn).
+        let v_ref = if v_ref == 0.0 { yaw_ref.abs() * tightest } else { v_ref };
         let mut input = self.longitudinal(v_ref, est);
         let c = &self.config;
         if yaw_ref == 0.0 && input.brake >= 1.0 {
             self.yaw_i = 0.0;
             return input;
         }
-        // The commanded path curvature (at most a pivot about the stopped inner track) while
-        // the speed builds up: turning at the full yaw rate from standstill would ask for a
-        // turn so tight that its resistance stalls the vehicle.
-        let curvature = (yaw_ref / v_ref.abs().max(1e-3)).clamp(-2.0 / width, 2.0 / width);
+        // The commanded path curvature (at most the tightest turn's) while the speed builds
+        // up: turning at the full yaw rate from standstill would ask for a turn so tight that
+        // its resistance stalls the vehicle.
+        let curvature = (yaw_ref / v_ref.abs().max(1e-3)).clamp(-1.0 / tightest, 1.0 / tightest);
         let reachable = (curvature * est.speed().abs()).abs();
         let yaw_ref = yaw_ref.clamp(-reachable, reachable);
         // Braking the left track turns left going forward, right in reverse.
@@ -660,6 +701,26 @@ fn motor_command(m: &Motor, wheel_torque: f64, est: &GroundEstimate) -> f64 {
         None => torque / m.max_torque,
     };
     command.clamp(-1.0, 1.0)
+}
+
+/// Engine speed (rad/s) at which a stalled converter's pump absorbs the engine's torque at
+/// `throttle`: `(ω/K(0))² = T(ω)`.
+fn stall_speed(c: &CombustionDef, tc: &TorqueConverterDef, throttle: f64) -> f64 {
+    let k = tc.capacity_factor.eval(0.0);
+    let excess = |w: f64| {
+        let rpm = w / RPM;
+        let (full, zero) = (c.engine.full_throttle.eval(rpm), c.engine.zero_throttle.eval(rpm));
+        throttle * full + (1.0 - throttle) * zero - (w / k).powi(2)
+    };
+    let (mut lo, mut hi) = (0.0, c.engine.max_rpm * RPM);
+    if excess(lo) <= 0.0 {
+        return 0.0;
+    }
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if excess(mid) > 0.0 { lo = mid } else { hi = mid }
+    }
+    lo
 }
 
 fn is_side_drive(motors: &[Motor]) -> bool {
