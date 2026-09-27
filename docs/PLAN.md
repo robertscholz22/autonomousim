@@ -1687,13 +1687,89 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
   - **Training** (`ppo_continuous.py --hidden 256 --bound-coef 0.01`, 3M steps, 256 envs, 14 min at 3.6k SPS; basic training only, to check the pipeline): the training return rose from −52 to +62, with 24 % success. Deterministic evaluation on unseen maps (`map_seed` 1000, 64 episodes): 31 % success, 1.4 of 3 goals.
   - **Export and viewer**: `policy.json` is auto-exported. `autonomousim-viewer policy <json> --map-seed 1000` drives the APC at about 134 fps. `eval_record.py` recorded 4 episodes (3 successes); they re-simulate bit for bit and replay in the viewer at about 120 fps, with the path, the goals and the LiDAR view.
 
+## Milestone 5: Bicycles and motorcycles
+Planned 2026-09-27. The user decided the following at the start: both a bicycle and a motorcycle; a rider with a leaning upper body; stabilised actions by default plus a raw mode; and a motorcycle road ride as the closing demo. The rest of this section is proposed and open to change.
+
+### Design
+- **Single-track vehicles are built into `WheeledDef`**, not added as a new vehicle family, as tracks were in M4c. Spawns, drive grids, events, observations, recording, statics, the powertrain, brakes, tyres and the viewer then carry over.
+  - An axle with `track = 0` carries one wheel on the centre line.
+  - About 40 places assume a left/right pair per axle (`w / 2`, `k % 2`, `num_wheels = 2·axles`). They move to a per-axle wheel count.
+- **Steering head**: an optional `[steering_head]` on the front axle.
+  - It replaces the prescribed knuckle with a **free** revolute joint about the tilted steer axis. Parameters: head angle `λ` from vertical, fork offset (so the trail follows from the wheel radius), and the axis position.
+  - A steered body carries the fork, handlebar and front-wheel carrier: mass, COM and inertia.
+  - Steer stops, an optional steering damper, and the **steer torque** as the rider's input. The existing steering chain (rate limit, Ackermann blending) is bypassed.
+  - The Whipple benchmark's front frame is exactly this body.
+- **Suspension**:
+  - Front: a telescopic fork, a prismatic joint along the steer axis between the steered body and the wheel carrier, with spring, damper and stops.
+  - Rear: a swing arm, reusing M4c's `suspension.trailing_arm` with a spring and damper.
+  - Bicycles are rigid: no suspension joints.
+- **Rider** (`[rider]`):
+  - The lower body is lumped into the chassis. The upper body is a separate link on a revolute **lean joint** about the chassis x axis at the hip, with mass, COM and inertia.
+  - A servo holds the lean at a commanded angle relative to the frame: PD with a torque limit, representing the rider's muscles. With the lean locked (or `[rider]` absent) the model reduces to the Whipple benchmark's rigid rider.
+  - **Feet**: two sphere colliders beside the footpegs, at ground height when "down". They are down below `feet_speed` (default 1.5 m/s) and while stopped, and up otherwise. They let the vehicle spawn and stand upright and launch from rest. Their contacts are gear contacts, not crashes.
+- **Tyres**:
+  - **Toroidal contact** (`crown_radius` per tyre): the contact point moves sideways with camber as on a real tyre, `centre − (R − r_c)·ẑ_wheel − r_c·n_ground`. The vertical load uses the loaded radius along that line. It returns a contact up to about 60° of camber (the thin disc stops at "on its side"). A crown radius of 0 keeps today's thin disc, so goldens stay unchanged.
+  - **Large camber**: MF 6.1/6.2 already has camber thrust and Mx. It must now hold up to about ±55° (today's MFeval fixtures stop at 5.7°).
+  - **Turn slip** (MF 6.2, the `ζ` factors, when the `.tir` has turn-slip parameters): it matters for motorcycles at low speed and in tight turns.
+  - Presets need motorcycle tyre data: a published MF parameter set for a 120/70 ZR17 front and a 180/55 ZR17 rear (source to confirm in step 2), and a bicycle tyre fitted to measured cornering and camber stiffness (Dressel 2013; an estimate).
+  - A `rigid_rolling` tyre option approximates the benchmark's knife-edge, no-slip wheels: very stiff, without relaxation.
+- **Linear model** (`single_track::linear`): the Meijaard et al. (2007) matrices `M`, `C1`, `K0`, `K2` computed from a `WheeledDef`'s bodies and geometry. The rear frame is the chassis with the rider locked and the rear wheel; the front frame is the steered body with the front wheel.
+  - Used by the validation.
+  - Used by the controller: gain-scheduled LQR over speed, with steer torque and rider lean as inputs.
+  - Used for eigenvalue plots in tests.
+- **Rider controller and action modes** (the default mode is stabilised):
+  - `vk` (**default**): speed and curvature. The controller sets a target roll from the curvature, `φ_ref = atan(v²κ/g)` plus a correction for tyre width and rider lean. An LQR on `(φ, δ, φ̇, δ̇)` gives the steer torque. An integral on the curvature error removes steady-state error. Speed is held by throttle and brakes, with front/rear brake balance. The rider's lean stays neutral in `vk`. Below `feet_speed` the feet go down and the vehicle crawls straight.
+  - `vw`: speed and yaw rate, through `κ = ω/v`.
+  - `raw`: drive (throttle or brake), steer torque and rider lean angle, normalised. The agent must balance the vehicle itself; the feet still deploy at standstill.
+- **Events**: the frame, the rider or the handlebar touching the ground is a crash, as for the hulls of other vehicles. `ROLLOVER` (60° by default) stays as a backstop.
+- **Observations**:
+  - new term `lean` (roll angle and roll rate about the heading);
+  - `steering` gains the steer rate for free steering heads;
+  - new term `rider_lean`;
+  - new term `feet` (down or up).
+  - The existing terms (`speed`, `pitch_roll`, `road`, `route`, …) apply unchanged.
+- **Presets**:
+  - `bicycle_benchmark`: Meijaard 2007's benchmark bicycle, rigid rider and knife-edge wheels (`rigid_rolling`). Validation only.
+  - `bicycle_city`: about 18 kg bicycle plus 75 kg rider with a leaning upper body. Tyres 37-622. Pedalling as a power-limited drive (about 250 W sustained, 600 W peak) with a freewheel. Rim brakes.
+  - `motorcycle_sport`: about 200 kg plus 75 kg rider. Geometry, masses and inertias after a published sport-bike parameter set: Sharp, Evangelou & Limebeer (2004), Suzuki GSX-R1000; access to confirm. It has an engine map (about 130 kW), a 6-speed gearbox with shift schedule, chain drive, fork, swing arm, a steering damper and disc brakes.
+- **Oracles**:
+  - The **Whipple benchmark** (Meijaard, Papadopoulos, Ruina & Schwab 2007), analytic.
+  - **MFeval** for large camber and turn slip.
+  - Analytic steady turning.
+  - Published motorcycle modes (Sharp et al. 2004).
+  - Chrono::Vehicle has no motorcycle or bicycle model (to confirm), so there is no Chrono oracle this time.
+- **Integrator**: PLAN noted "revisit wheel gyroscopics in M2/M5". The spinning wheels' gyroscopic coupling is what stabilises a bicycle. If semi-implicit Euler at 1 kHz moves the benchmark eigenvalues by more than 1 %, articulated models get the implicit-midpoint velocity-product treatment the free bodies already use (or the benchmark runs at a smaller `dt`).
+- **Demo**, `MotorcycleRoadRural-v0`:
+  - The motorcycle rides a route along the lanes of the rural roads (spawn `on_road`, `route` goals), leaning into the bends, at up to about 25 m/s on paved roads and slower on gravel.
+  - Default mode `vk`. `action_mode="raw"` is the harder variant, in which the agent balances.
+  - Reward: progress along the route, lane keeping, smoothness, and a penalty for falls and crashes.
+  - Scripted driver: pure pursuit on the `route` term, with speed from the curvature ahead (0.5 g lateral, about 27° lean).
+
+### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Single-track layout: centre-line wheels (`track = 0`, per-axle wheel counts), `[steering_head]` with a free steer joint and steer torque, `[rider]` lean joint with servo, feet; statics; `bicycle_benchmark` preset | Builds and settles; static wheel loads match the COM; standing still with feet up it falls over (capsize); freewheeling without dissipation conserves energy within 1e-3 over 10 s; cars, trucks and tracked goldens unchanged |
+| 2 | Tyres for two-wheelers: toroidal contact with `crown_radius`, large camber, MF 6.2 turn slip, `rigid_rolling`; motorcycle and bicycle tyre sets | Contact geometry matches the torus analytically up to 60°; forces and moments match MFeval up to ±55° camber and with turn slip (as in the M2 tyre tests); crown radius 0 leaves goldens unchanged |
+| 3 | Whipple benchmark: `single_track::linear` matrices; numerical linearisation of the full model; integrator fix if needed | The matrices reproduce the published `M`, `C1`, `K0`, `K2` (1e-3); the full model's eigenvalues match the benchmark's over 0–10 m/s within 1 %; weave speed 4.292 m/s and capsize speed 6.024 m/s within 1 % |
+| 4 | Presets and powertrains: `bicycle_city` (pedal drive, freewheel), `motorcycle_sport` (engine, gearbox, chain, fork, swing arm, steering damper, brakes) | Static sag and loads as specified; acceleration, top speed and braking plausible against published figures; steady turning roll angle vs lateral acceleration within 1° of the analytic value with tyre widths; weave and wobble modes present with frequencies and damping trends in Sharp et al.'s ranges |
+| 5 | Rider controller and action modes: gain-scheduled LQR from the linear model, `vk`/`vw`/`raw`, rider lean servo, feet, launch from rest | Straight-line hold under a lateral impulse at 3, 10 and 25 m/s; curvature steps settle without falls; the initial countersteer has the right sign; launch from rest and stop with feet down; the bicycle stays up at walking speed |
+| 6 | Simulation: upright spawns with feet down (also on cross slopes), drive grid width, events, the `lean`/`rider_lean`/`feet` terms, recorded steer, lean and feet; Python `vehicle="motorcycle_sport"` | Scenarios with two-wheelers compile, spawn, ride and record; existing goldens unchanged; terms match references |
+| 7 | Viewer: two-wheeler visuals (frame, tank, fork, handlebar, toroidal tyres, rider with a leaning torso), HUD (roll, steer angle and torque, rider lean, feet, gear), keyboard riding in `vk`, replay | A motorcycle rides by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay |
+| 8 | `MotorcycleRoadRural-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy rides in the viewer; a recorded episode replays |
+
+**To confirm while building**:
+- access to the motorcycle parameter set and tyre data;
+- whether MFeval evaluates turn slip at large camber (its `useMode`);
+- that Chrono::Vehicle has no single-track model;
+- whether the bicycle tyre fit from Dressel's measurements is close enough.
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
 | M2 | (Detailed above.) Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
 | M3 | (Detailed above.) Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations | pettingzoo API tests; 256 drones at ≥ 20× real time |
 | M4 | (Detailed above; split into M4a/b/c.) Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
-| M5 | Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
+| M5 | (Detailed above.) Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
 | M6 | Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
