@@ -8,9 +8,11 @@ for the balance and steer of a bicycle: a benchmark and review", Proc. R. Soc. A
 Table 1. Converted from the paper's frame (x forward, z down) to FLU: z = −z, and the \
 off-diagonal x-z inertia entries change sign. The chassis frame origin is the rear contact \
 point. Wheelbase 1.02 m, trail 0.08 m, head angle π/10 from the vertical. The paper's wheels \
-are knife edges rolling without slip; here they are stiff Fiala tyres (no camber), and a \
-small hub motor lets the bicycle be driven. The colliders (rider and handlebar) are \
-estimates."""
+are knife edges rolling without slip; here they are rigid_rolling Fiala tyres (linear, stiff, \
+short relaxation lengths, no camber or aligning moment), stiff enough to land within a few \
+per cent of the benchmark's eigenvalues from 1 m/s at 1 kHz; stiffer still, at 0.1 ms, they \
+land within 1 % (vehicles/tests/whipple.rs). A small hub motor lets the bicycle be driven. \
+The colliders (rider and handlebar) are estimates."""
 
 # Rear frame B with the rider.
 [chassis]
@@ -32,11 +34,12 @@ width = 0.03
 vertical_stiffness = 2.0e5
 vertical_damping = 200.0
 slip_stiffness = 8000.0
-cornering_stiffness = 6000.0
+cornering_stiffness = 1.0e5
 mu = 0.9
 nominal_load = 600.0
 relaxation_x = 0.03
-relaxation_y = 0.05
+relaxation_y = 0.01
+rigid_rolling = true
 
 # Front wheel F on the front frame H (fork and handlebar).
 [[axles]]
@@ -51,11 +54,12 @@ width = 0.03
 vertical_stiffness = 2.0e5
 vertical_damping = 200.0
 slip_stiffness = 8000.0
-cornering_stiffness = 6000.0
+cornering_stiffness = 1.0e5
 mu = 0.9
 nominal_load = 350.0
 relaxation_x = 0.03
-relaxation_y = 0.05
+relaxation_y = 0.01
+rigid_rolling = true
 
 # Offset: the trail c = 0.08 m for R_F = 0.35 m, (R_F·sin λ − c·cos λ).
 [axles.steering_head]

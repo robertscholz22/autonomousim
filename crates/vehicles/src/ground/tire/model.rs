@@ -274,7 +274,7 @@ impl Tire {
     /// spring `K/σ` with ratio 0.25: enough to settle a parked vehicle in a few cycles, small
     /// enough for the wheel's spin mode to stay stable with explicit steps of 1 ms.
     fn default_low_speed_damping(&self) -> [f64; 2] {
-        if self.is_track() {
+        if self.is_track() || matches!(&self.model, TireModel::Fiala(p) if p.rigid_rolling) {
             return [0.0; 2];
         }
         let state = self.initial_state();

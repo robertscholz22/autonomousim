@@ -38,8 +38,10 @@ pub struct FialaParams {
     pub vxlow: f64,
     /// Approximate a knife-edge wheel rolling without slip (the Whipple bicycle's): forces
     /// linear in the slip with the given stiffnesses and no friction limit, no aligning or
-    /// rolling-resistance moment. Stiff slip stiffnesses and short relaxation lengths make the
-    /// slip small.
+    /// rolling-resistance moment, no low-speed damping (at standstill the carcass deflections
+    /// are undamped springs). Stiff slip stiffnesses and short relaxation lengths make the slip
+    /// small; the explicit step then needs `dt` well below `√(m/(C/σ))` for the lightest mass
+    /// `m` the tyre moves (a wheel's spin inertia over its radius squared, longitudinally).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rigid_rolling: bool,
 }

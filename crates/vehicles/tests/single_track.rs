@@ -107,7 +107,15 @@ fn benchmark_settles_upright_and_capsizes_standing_still() {
 
 #[test]
 fn feet_hold_it_up_and_lift_when_riding() {
+    // On ordinary tyres: the preset's knife-edge approximations are undamped springs at
+    // standstill, and it would bounce on the foot.
     let mut d = benchmark();
+    for a in &mut d.axles {
+        let Some(TireSpec::Fiala(p)) = &mut a.tire else { panic!("Fiala tyres") };
+        p.rigid_rolling = false;
+        [p.slip_stiffness, p.cornering_stiffness, p.relaxation_x, p.relaxation_y, p.vxlow] =
+            [8000.0, 6000.0, 0.03, 0.05, 1.0];
+    }
     d.feet =
         Some(FeetDef { down: DVec3::new(0.45, 0.3, 0.07), up: DVec3::new(0.45, 0.12, 0.3), radius: 0.05, speed: 1.5 });
     d.finish().unwrap();

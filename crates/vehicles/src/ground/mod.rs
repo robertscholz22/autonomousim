@@ -1,7 +1,9 @@
-//! Ground vehicles: definitions, tyres, powertrains and the wheeled multibody model.
+//! Ground vehicles: definitions, tyres, powertrains, the wheeled multibody model and the
+//! linearised single-track (bicycle) model.
 
 mod def;
 mod powertrain;
+pub mod single_track;
 mod statics;
 pub mod tire;
 mod tree;
