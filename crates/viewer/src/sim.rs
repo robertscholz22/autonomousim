@@ -262,7 +262,8 @@ impl Sim {
                         ((forward - self.steer).clamp(-1.0, 1.0), (forward + self.steer).clamp(-1.0, 1.0));
                     GroundSetpoint::Sides { left, right }.into()
                 } else {
-                    GroundSetpoint::Pedal { drive: forward, steering: self.steer, handbrake: self.handbrake }.into()
+                    GroundSetpoint::Pedal { drive: forward, steering: self.steer, handbrake: self.handbrake, lean: 0.0 }
+                        .into()
                 }
             }
         }
@@ -603,7 +604,7 @@ mod tests {
     fn drive_command_overrides_the_keys() {
         let mut s = ground_sim("offroad_4x4");
         s.stick = [1.0, 1.0, 0.0, 0.0];
-        s.drive_command = Some(GroundSetpoint::Pedal { drive: -0.5, steering: 0.0, handbrake: true });
+        s.drive_command = Some(GroundSetpoint::Pedal { drive: -0.5, steering: 0.0, handbrake: true, lean: 0.0 });
         assert!(matches!(
             s.pilot_command(),
             Command::Ground(GroundSetpoint::Pedal { drive, handbrake: true, .. }) if drive == -0.5

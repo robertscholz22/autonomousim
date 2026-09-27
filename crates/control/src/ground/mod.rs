@@ -41,6 +41,7 @@
 //! speed request brakes a vehicle still rolling forward first.
 
 pub mod action;
+mod rider;
 
 pub use action::{GroundActionLimits, GroundActionMap, GroundActionMode, PerWheelChannel};
 
@@ -66,6 +67,13 @@ pub struct GroundEstimate {
     /// Selected gear (combustion; 0 for electric drives) and engine speed (rad/s).
     pub gear: i32,
     pub engine_speed: f64,
+    /// Lean (roll of the yaw–pitch–roll angles; rad, positive to the right) and body roll rate
+    /// (rad/s), for single-track vehicles.
+    pub roll: f64,
+    pub roll_rate: f64,
+    /// Steering head angle (rad, positive left) and rate (rad/s), for single-track vehicles.
+    pub steer_angle: f64,
+    pub steer_rate: f64,
 }
 
 impl GroundEstimate {
@@ -76,12 +84,17 @@ impl GroundEstimate {
             *s = w.spin;
         }
         let p = v.powertrain();
+        let (steer_angle, steer_rate) = v.steering_head().unwrap_or_default();
         Self {
             velocity_body: v.lin_vel_body(),
             yaw_rate: v.ang_vel_body().z,
             wheel_spin,
             gear: p.gear,
             engine_speed: p.engine_speed,
+            roll: v.orientation().to_euler(glam::EulerRot::ZYX).2,
+            roll_rate: v.ang_vel_body().x,
+            steer_angle,
+            steer_rate,
         }
     }
 
@@ -101,8 +114,9 @@ pub enum GroundSetpoint {
     Direct(DriveInput),
     /// One pedal axis (`[−1, 1]`: accelerate forward, or brake and then reverse) and steering
     /// (`[−1, 1]`), with automatic reverse engagement near standstill; `handbrake` applies the
-    /// parking brake.
-    Pedal { drive: f64, steering: f64, handbrake: bool },
+    /// parking brake; `lean` is the rider's lean (`[−1, 1]`, single-track vehicles). On a
+    /// single-track vehicle the pedal only brakes, and `steering` is the steering torque.
+    Pedal { drive: f64, steering: f64, handbrake: bool, lean: f64 },
     /// Left and right motor commands (`[−1, 1]`), for side drives.
     Sides { left: f64, right: f64 },
     /// Forward speed (m/s, negative reverses) and path curvature (1/m, positive turns left).
@@ -146,6 +160,10 @@ pub struct GroundConfig {
     pub brake_steer_gain: f64,
     /// Wheel-speed loop time constant of side drives (s).
     pub wheel_time_constant: f64,
+    /// Single-track vehicles: the largest lean the rider takes (rad), and the speed (m/s)
+    /// below which they crawl on their feet rather than balance.
+    pub max_lean: f64,
+    pub balance_speed: f64,
 }
 
 impl Default for GroundConfig {
@@ -165,6 +183,8 @@ impl Default for GroundConfig {
             side_speed_integral: 2.0,
             brake_steer_gain: 1.0,
             wheel_time_constant: 0.05,
+            max_lean: 0.7,
+            balance_speed: 1.0,
         }
     }
 }
@@ -176,6 +196,8 @@ struct Motor {
     max_torque: f64,
     ratio: f64,
     no_load_speed: Option<f64>,
+    /// Drives only forward (a freewheel): the brakes decelerate.
+    freewheel: bool,
     /// Inertia seen by the motor's wheels in a speed change, including their share of the
     /// vehicle mass (kg·m²).
     inertia: f64,
@@ -214,6 +236,8 @@ pub struct GroundController {
     /// Tracked vehicles with an engine, steered by `steering`: the radius of the tightest turn
     /// (m).
     track_steer: Option<f64>,
+    /// Single-track vehicles: the rider's balance and steering.
+    rider: Option<rider::Rider>,
     // Loop state.
     speed_i: f64,
     curvature_i: f64,
@@ -245,7 +269,10 @@ impl GroundController {
             && c.yaw_integral >= 0.0
             && c.side_speed_integral >= 0.0
             && c.brake_steer_gain >= 0.0
-            && pos(c.wheel_time_constant))
+            && pos(c.wheel_time_constant)
+            && pos(c.max_lean)
+            && c.max_lean < 1.5
+            && c.balance_speed >= 0.0)
         {
             return Err(ControlError::InvalidConfig("ground controller gains must be positive".into()));
         }
@@ -272,6 +299,7 @@ impl GroundController {
                             max_torque: m.max_torque,
                             ratio: m.ratio,
                             no_load_speed: m.no_load_speed,
+                            freewheel: m.freewheel,
                             inertia: m.wheels.iter().map(|&w| inertia[w]).sum::<f64>()
                                 + share * def.total_mass() * r * r,
                         }
@@ -324,6 +352,7 @@ impl GroundController {
             steering,
             track,
             track_steer,
+            rider: rider::Rider::new(def, dt)?,
             speed_i: 0.0,
             curvature_i: 0.0,
             yaw_i: 0.0,
@@ -342,6 +371,17 @@ impl GroundController {
     /// Whether the vehicle has Ackermann steering (curvature control by steering).
     pub fn has_steering(&self) -> bool {
         self.steering.is_some()
+    }
+
+    /// Whether the vehicle is a single-track one (bicycle, motorcycle) balanced by its rider.
+    pub fn is_single_track(&self) -> bool {
+        self.rider.is_some()
+    }
+
+    /// The lean (rad, positive right) the rider takes for a steady turn of `curvature` (1/m,
+    /// positive left) at `speed` (m/s) before any correction; `None` unless single-track.
+    pub fn turn_lean(&self, speed: f64, curvature: f64) -> Option<f64> {
+        self.rider.as_ref().map(|r| r.turn_lean(speed, curvature))
     }
 
     /// Wheelbase of the bicycle model of the steered axle (m); `None` without steering.
@@ -375,6 +415,9 @@ impl GroundController {
         self.motor_i.fill(0.0);
         self.reverse = false;
         self.last = DriveInput::default();
+        if let Some(r) = &mut self.rider {
+            r.reset();
+        }
     }
 
     /// Driver input for setpoint `sp`.
@@ -390,8 +433,17 @@ impl GroundController {
             GroundSetpoint::Sides { left, right } => {
                 DriveInput { throttle: 0.5 * (left + right), yaw: 0.5 * (right - left), ..Default::default() }
             }
-            GroundSetpoint::Pedal { drive, steering, handbrake } => {
-                DriveInput { parking: handbrake, ..self.pedal(drive, steering, v) }
+            GroundSetpoint::Pedal { drive, steering, handbrake, lean } => {
+                DriveInput { parking: handbrake, lean: finite(lean), ..self.pedal(drive, steering, v) }
+            }
+            GroundSetpoint::SpeedCurvature { speed, curvature } if self.rider.is_some() => {
+                self.ride(speed, curvature, est)
+            }
+            GroundSetpoint::SpeedYawRate { speed, yaw_rate } if self.rider.is_some() => {
+                // The path curvature of that yaw rate at the commanded speed (at least the
+                // crawl's).
+                let v = finite(speed).abs().max(self.config.balance_speed).max(0.5);
+                self.ride(speed, finite(yaw_rate) / v, est)
             }
             GroundSetpoint::SpeedCurvature { speed, curvature } => match self.steering {
                 Some(_) => {
@@ -405,11 +457,26 @@ impl GroundController {
         }
     }
 
+    /// Single-track vehicles: the speed loop, and the rider's steering for `curvature`.
+    fn ride(&mut self, speed: f64, curvature: f64, est: &GroundEstimate) -> DriveInput {
+        let mut input = self.longitudinal(speed, est);
+        if let Some(r) = &mut self.rider {
+            input.steering = r.steering(finite(curvature), est, self.dt, &self.config);
+        }
+        input
+    }
+
     /// One pedal axis: forward throttle, or brake while rolling forward and reverse once
-    /// (nearly) stopped; the other way round in reverse.
+    /// (nearly) stopped; the other way round in reverse. Single-track vehicles only brake on
+    /// a negative pedal.
     fn pedal(&mut self, drive: f64, steering: f64, v: f64) -> DriveInput {
         let drive = finite(drive).clamp(-1.0, 1.0);
         let mut input = DriveInput { steering: finite(steering), ..Default::default() };
+        if self.rider.is_some() {
+            input.throttle = drive.max(0.0);
+            input.brake = (-drive).max(0.0);
+            return input;
+        }
         match self.drive {
             Drive::Electric(_) => input.throttle = drive,
             Drive::Combustion(_) => {
@@ -511,6 +578,11 @@ impl GroundController {
                 // and brakes keep their usual channels.
                 let wheels: usize = motors.iter().map(|m| m.wheels.len()).sum();
                 let per_wheel = force * r / wheels as f64;
+                // Freewheels drive only forward; the brakes take the rest.
+                if motors.iter().all(|m| m.freewheel) && force < 0.0 {
+                    input.brake = (-force * r / self.brake_torque).clamp(0.0, 1.0);
+                    return input;
+                }
                 input.throttle = motors
                     .iter()
                     .map(|m| m.wheels.len() as f64 * motor_command(m, per_wheel * m.wheels.len() as f64, est))
@@ -552,6 +624,7 @@ impl GroundController {
                         ),
                         None => (-m.max_torque, m.max_torque),
                     };
+                    let t_lo = if m.freewheel { 0.0 } else { t_lo };
                     lo += t_lo / m.ratio;
                     hi += t_hi / m.ratio;
                 }

@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn ground_references_and_tyre_samples() {
         // Pedal driving: the reference is the kinematic yaw rate v·tan δ / L.
-        let sp = GroundSetpoint::Pedal { drive: 0.5, steering: 0.2, handbrake: false };
+        let sp = GroundSetpoint::Pedal { drive: 0.5, steering: 0.2, handbrake: false, lean: 0.0 };
         let (cmd, act) = ground_tracking(Some(&sp), 10.0, 0.5, 0.1, Some(2.5));
         assert!((cmd[0] - (10.0 * 0.1f64.tan() / 2.5).to_degrees()).abs() < 1e-9);
         assert!(cmd[1].is_nan() && (act[0] - 0.5f64.to_degrees()).abs() < 1e-9 && act[1] == 10.0);

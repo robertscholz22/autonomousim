@@ -4,12 +4,19 @@
 //! |---|---|---|
 //! | `raw` | drive, steering (steered vehicles) | pedal: full throttle (+1), full brake then full reverse throttle (−1); full lock |
 //! | `raw` | left, right (side drives) | full motor command per side |
+//! | `raw` | drive, steering, lean (single-track vehicles with a rider) | full throttle (+1) or full brake (−1); full steering torque; full rider lean (+ right) |
 //! | `vk` | speed, curvature | `speed` forward (+1) or `reverse` backward (−1); ±`curvature` (1/m, + left) |
-//! | `vw` | speed, yaw rate (side drives and tracks only) | as `vk`; ±`yaw_rate` (rad/s) |
+//! | `vw` | speed, yaw rate (side drives, tracks and single-track vehicles) | as `vk`; ±`yaw_rate` (rad/s) |
 //! | `per_wheel` | the vehicle's own channels, see below | full command per channel |
 //!
+//! On single-track vehicles (bicycles, motorcycles), `vk` and `vw` are balanced by the rider
+//! (see [`GroundController`](super::GroundController)); full-scale curvature and yaw rate are
+//! also capped at what a steady turn at the commanded speed and a lean of `lean` gives,
+//! `g·tan(lean)/v²` and `g·tan(lean)/v`, so the whole action range stays useful at any speed.
+//!
 //! `per_wheel` exposes only channels the vehicle has, in this order: `throttle` (combustion
-//! drives, `[0, 1]`), `steering` (axles steered by the Ackermann linkage), `drive_<wheels>` (one per electric
+//! drives, `[0, 1]`), `steering` (axles steered by the Ackermann linkage, or the steering
+//! torque of a steering head), `lean` (a rider's), `drive_<wheels>` (one per electric
 //! motor, named by its wheels), `brake_<w>` (wheels with a service brake, `[0, 1]`) and
 //! `steer_<w>` (wheels on independently steered axles, fraction of the axle's lock). One-sided
 //! channels read negative actions as 0.
@@ -19,7 +26,7 @@
 use super::GroundSetpoint;
 use crate::ControlError;
 use autonomousim_vehicles::ground::{
-    DriveInput, MAX_WHEELS, MotorSide, PowertrainDef, SteerMode, WheelCommands, WheeledDef,
+    DriveInput, MAX_WHEELS, MotorSide, PowertrainDef, STANDARD_GRAVITY, SteerMode, WheelCommands, WheeledDef,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -78,6 +85,9 @@ pub struct GroundActionLimits {
     pub curvature: Option<f64>,
     /// Yaw rate (rad/s).
     pub yaw_rate: Option<f64>,
+    /// Single-track vehicles: the lean (rad) of a steady turn at full-scale curvature or yaw
+    /// rate.
+    pub lean: Option<f64>,
 }
 
 /// One `per_wheel` channel.
@@ -85,6 +95,7 @@ pub struct GroundActionLimits {
 pub enum PerWheelChannel {
     Throttle,
     Steering,
+    Lean,
     /// Motor driving the wheels in the bit mask.
     Drive(u32),
     Brake(usize),
@@ -96,6 +107,7 @@ impl PerWheelChannel {
         match self {
             PerWheelChannel::Throttle => "throttle".into(),
             PerWheelChannel::Steering => "steering".into(),
+            PerWheelChannel::Lean => "lean".into(),
             PerWheelChannel::Drive(mask) => {
                 let wheels: Vec<String> =
                     (0..MAX_WHEELS).filter(|w| mask >> w & 1 == 1).map(|w| w.to_string()).collect();
@@ -112,6 +124,9 @@ impl PerWheelChannel {
 pub struct GroundActionMap {
     mode: GroundActionMode,
     side_drive: bool,
+    /// Single-track: `g·tan(lean)` (m/s²), and whether a rider leans.
+    single_track: Option<f64>,
+    rider: bool,
     speed: f64,
     reverse: f64,
     curvature: f64,
@@ -124,7 +139,9 @@ impl GroundActionMap {
     /// top gear) up to 20 m/s; `reverse` 0.3·`speed` for engines and `speed` for electric drives;
     /// `curvature` 95 % of the tightest bicycle-model curvature, or 2/track for side drives;
     /// `yaw_rate` 0.8·`speed`/track for side drives and tracked vehicles, `speed`·`curvature`
-    /// otherwise.
+    /// otherwise. Single-track vehicles: `speed` also at most the top speed on the motors'
+    /// power against drag and rolling resistance; `curvature` 95 % of the steering lock's
+    /// (`tan(lock·cos λ)/wheelbase`); `lean` 0.7 rad.
     pub fn new(mode: GroundActionMode, limits: &GroundActionLimits, def: &WheeledDef) -> Result<Self, ControlError> {
         let n = def.num_wheels();
         let radius = def.tire(0).radius();
@@ -146,6 +163,13 @@ impl GroundActionMap {
             }
         };
         let track = 2.0 * def.axles.iter().map(|a| a.position.y).sum::<f64>() / def.axles.len() as f64;
+        let head = def.steering_head().filter(|_| def.is_single_track());
+        let top = match (&def.powertrain, head) {
+            (PowertrainDef::Electric(e), Some(_)) => {
+                top.min(power_limited_speed(def, e.motors.iter().map(|m| m.max_power).sum()))
+            }
+            _ => top,
+        };
         let speed = limits.speed.unwrap_or(top.min(20.0));
         let reverse = limits.reverse.unwrap_or(if combustion { 0.3 * speed } else { speed });
         let tightest = def.steering.and_then(|s| {
@@ -153,22 +177,28 @@ impl GroundActionMap {
             let wheelbase = (axle.position.x - def.steer_reference()).abs();
             (wheelbase > 0.0).then(|| (s.max_angle * axle.share().abs()).tan() / wheelbase)
         });
-        let curvature = limits.curvature.unwrap_or(match tightest {
-            Some(k) => 0.95 * k,
-            None => 2.0 / track,
+        let lock = head.map(|(h, _)| {
+            let wheelbase = def.axles[1].position.x - def.axles[0].position.x;
+            (0.95 * h.lock * h.angle.cos()).tan() / wheelbase
         });
+        let curvature = limits.curvature.unwrap_or(match (tightest, lock) {
+            (Some(k), _) => 0.95 * k,
+            (None, Some(k)) => k,
+            (None, None) => 2.0 / track,
+        });
+        let lean = limits.lean.unwrap_or(0.7);
         let skid = side_drive || def.track.is_some();
         let yaw_rate = limits.yaw_rate.unwrap_or(if skid { 0.8 * speed / track } else { speed * curvature });
         let pos = |x: f64| x > 0.0 && x.is_finite();
-        if !(pos(speed) && pos(reverse) && pos(curvature) && pos(yaw_rate)) {
+        if !(pos(speed) && pos(reverse) && pos(curvature) && pos(yaw_rate) && pos(lean) && lean < 1.5) {
             return Err(ControlError::InvalidConfig(format!(
                 "{}: action limits must be positive (speed {speed}, reverse {reverse}, curvature {curvature}, yaw rate {yaw_rate})",
                 def.name
             )));
         }
-        if mode == GroundActionMode::Vw && !skid {
+        if mode == GroundActionMode::Vw && !skid && head.is_none() {
             return Err(ControlError::InvalidConfig(format!(
-                "{}: vw needs a skid-steer, diff-drive or tracked vehicle",
+                "{}: vw needs a skid-steer, diff-drive, tracked or single-track vehicle",
                 def.name
             )));
         }
@@ -177,8 +207,11 @@ impl GroundActionMap {
             if combustion {
                 channels.push(PerWheelChannel::Throttle);
             }
-            if def.axles.iter().any(|a| a.share() != 0.0 && a.steer_mode == SteerMode::Ackermann) {
+            if head.is_some() || def.axles.iter().any(|a| a.share() != 0.0 && a.steer_mode == SteerMode::Ackermann) {
                 channels.push(PerWheelChannel::Steering);
+            }
+            if def.rider.is_some() {
+                channels.push(PerWheelChannel::Lean);
             }
             if let PowertrainDef::Electric(e) = &def.powertrain {
                 channels.extend(
@@ -194,7 +227,9 @@ impl GroundActionMap {
                     .map(PerWheelChannel::Steer),
             );
         }
-        Ok(Self { mode, side_drive, speed, reverse, curvature, yaw_rate, channels })
+        let single_track = head.map(|_| STANDARD_GRAVITY * lean.tan());
+        let rider = def.rider.is_some();
+        Ok(Self { mode, side_drive, single_track, rider, speed, reverse, curvature, yaw_rate, channels })
     }
 
     pub fn mode(&self) -> GroundActionMode {
@@ -226,6 +261,7 @@ impl GroundActionMap {
     pub fn dim(&self) -> usize {
         match self.mode {
             GroundActionMode::PerWheel => self.channels.len(),
+            GroundActionMode::Raw if self.single_track.is_some() && self.rider => 3,
             _ => 2,
         }
     }
@@ -235,6 +271,7 @@ impl GroundActionMap {
         let two = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
         match self.mode {
             GroundActionMode::Raw if self.side_drive => two("left", "right"),
+            GroundActionMode::Raw if self.dim() == 3 => vec!["drive".into(), "steering".into(), "lean".into()],
             GroundActionMode::Raw => two("drive", "steering"),
             GroundActionMode::Vk => two("speed", "curvature"),
             GroundActionMode::Vw => two("speed", "yaw_rate"),
@@ -249,11 +286,28 @@ impl GroundActionMap {
         let speed = |x: f64| if x >= 0.0 { x * self.speed } else { x * self.reverse };
         match self.mode {
             GroundActionMode::Raw if self.side_drive => GroundSetpoint::Sides { left: a(0), right: a(1) },
-            GroundActionMode::Raw => GroundSetpoint::Pedal { drive: a(0), steering: a(1), handbrake: false },
+            GroundActionMode::Raw => GroundSetpoint::Pedal {
+                drive: a(0),
+                steering: a(1),
+                handbrake: false,
+                lean: if self.dim() == 3 { a(2) } else { 0.0 },
+            },
             GroundActionMode::Vk => {
-                GroundSetpoint::SpeedCurvature { speed: speed(a(0)), curvature: a(1) * self.curvature }
+                let v = speed(a(0));
+                let curvature = match self.single_track {
+                    Some(lateral) => self.curvature.min(lateral / (v * v).max(1e-9)),
+                    None => self.curvature,
+                };
+                GroundSetpoint::SpeedCurvature { speed: v, curvature: a(1) * curvature }
             }
-            GroundActionMode::Vw => GroundSetpoint::SpeedYawRate { speed: speed(a(0)), yaw_rate: a(1) * self.yaw_rate },
+            GroundActionMode::Vw => {
+                let v = speed(a(0));
+                let yaw_rate = match self.single_track {
+                    Some(lateral) => self.yaw_rate.min(lateral / v.abs().max(1e-9)),
+                    None => self.yaw_rate,
+                };
+                GroundSetpoint::SpeedYawRate { speed: v, yaw_rate: a(1) * yaw_rate }
+            }
             GroundActionMode::PerWheel => {
                 let mut input = DriveInput::default();
                 let mut wheels = WheelCommands::default();
@@ -262,6 +316,7 @@ impl GroundActionMap {
                     match *c {
                         PerWheelChannel::Throttle => input.throttle = x.max(0.0),
                         PerWheelChannel::Steering => input.steering = x,
+                        PerWheelChannel::Lean => input.lean = x,
                         PerWheelChannel::Drive(mask) => {
                             for w in (0..MAX_WHEELS).filter(|w| mask >> w & 1 == 1) {
                                 wheels.drive[w] = x;
@@ -276,6 +331,19 @@ impl GroundActionMap {
             }
         }
     }
+}
+
+/// Top speed (m/s) of a single-track vehicle on `power` (W) against its drag and a rolling
+/// resistance of 1 % of its weight, in still sea-level air.
+fn power_limited_speed(def: &WheeledDef, power: f64) -> f64 {
+    let drag = 0.5 * 1.225 * def.chassis.drag_area.x;
+    let rolling = 0.01 * def.total_mass() * STANDARD_GRAVITY;
+    let (mut lo, mut hi) = (0.0, 200.0);
+    for _ in 0..60 {
+        let v = 0.5 * (lo + hi);
+        if (drag * v * v + rolling) * v < power { lo = v } else { hi = v }
+    }
+    lo
 }
 
 #[cfg(test)]
@@ -317,6 +385,31 @@ mod tests {
             panic!()
         };
         assert!(left == 0.5 && right == -1.0);
+    }
+
+    #[test]
+    fn single_track_modes() {
+        let moto = map(GroundActionMode::Raw, "motorcycle_sport").unwrap();
+        assert_eq!(moto.names(), ["drive", "steering", "lean"]);
+        let GroundSetpoint::Pedal { drive, steering, lean, .. } = moto.setpoint(&[-0.5, 0.25, 2.0]) else { panic!() };
+        assert_eq!((drive, steering, lean), (-0.5, 0.25, 1.0));
+        // Full-scale curvature: the steering lock's at a crawl, a 0.7 rad lean's at speed.
+        let vk = map(GroundActionMode::Vk, "motorcycle_sport").unwrap();
+        assert_eq!(vk.speed(), 20.0);
+        assert!(vk.curvature() > 0.3 && vk.curvature() < 0.4, "{}", vk.curvature());
+        let GroundSetpoint::SpeedCurvature { speed, curvature } = vk.setpoint(&[1.0, 1.0]) else { panic!() };
+        assert!(speed == 20.0 && (curvature - STANDARD_GRAVITY * 0.7f64.tan() / 400.0).abs() < 1e-12);
+        let GroundSetpoint::SpeedCurvature { curvature, .. } = vk.setpoint(&[0.01, -1.0]) else { panic!() };
+        assert_eq!(curvature, -vk.curvature());
+        let vw = map(GroundActionMode::Vw, "motorcycle_sport").unwrap();
+        let GroundSetpoint::SpeedYawRate { yaw_rate, .. } = vw.setpoint(&[0.5, 1.0]) else { panic!() };
+        assert!((yaw_rate - STANDARD_GRAVITY * 0.7f64.tan() / 10.0).abs() < 1e-12, "{yaw_rate}");
+        // The bicycle's pedalling (600 W) tops out near 11 m/s.
+        let bike = map(GroundActionMode::Vk, "bicycle_city").unwrap();
+        assert!(bike.speed() > 10.5 && bike.speed() < 12.0, "{}", bike.speed());
+        let names = |n: &str| map(GroundActionMode::PerWheel, n).unwrap().names();
+        assert_eq!(names("motorcycle_sport"), ["throttle", "steering", "lean", "brake_0", "brake_1"]);
+        assert_eq!(names("bicycle_city"), ["steering", "lean", "drive_0", "brake_0", "brake_1"]);
     }
 
     #[test]

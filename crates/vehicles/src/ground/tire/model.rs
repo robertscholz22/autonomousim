@@ -484,7 +484,9 @@ impl Tire {
             }
             TireModel::Motorcycle(p) => {
                 let o = p.eval(fz, kappa, tan_alpha, c.sin_gamma.asin(), avx, surface.mu_scale);
-                if fz > 0.0 {
+                // (The cornering stiffness, and with it the relaxation length, turns over at
+                // extreme loads: the last positive one holds.)
+                if fz > 0.0 && o.sigma_x > 0.0 && o.sigma_y > 0.0 {
                     state.sigma = [o.sigma_x, o.sigma_y];
                     state.stiffness = [o.kxk, o.kya.abs()];
                 }
