@@ -4,9 +4,10 @@
 use crate::mesh::{self, MeshData, srgb};
 use crate::terrain::Chunk;
 use autonomousim_core::material::MaterialId;
+use autonomousim_vehicles::ground::tire::TireModel;
 use autonomousim_world::obstacles::tags;
 use autonomousim_world::{HeightGrid, Obstacle, ObstacleClass, ObstacleShape, StaticWorld};
-use glam::{DQuat, DVec3, Vec3};
+use glam::{DMat3, DQuat, DVec2, DVec3, Vec3};
 
 /// Tessellation of the primitives.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -355,10 +356,14 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     let axis = DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2);
     let wheels = (0..n)
         .map(|w| {
-            let (r, b) = (tire(w).radius() as f32, tire(w).width() as f32);
+            let (mut r, mut b) = (tire(w).radius() as f32, tire(w).width() as f32);
+            // Road wheels inside a track: the band (drawn separately) wraps them.
+            if def.track.is_some() && matches!(tire(w).model, TireModel::Track(_)) {
+                (r, b) = (r - track_thickness(r as f64) as f32, 0.6 * b);
+            }
             let mut m = MeshData::new();
             // Dual wheels: two tyres side by side.
-            let section = tire(w).section_width() as f32;
+            let section = if def.track.is_some() { b } else { tire(w).section_width() as f32 };
             let offsets = tire(w).dual.map_or(vec![0.0], |s| vec![-0.5 * s, 0.5 * s]);
             for y in offsets {
                 let tyre = mesh::cylinder(r, 0.5 * section, 20, srgb([30, 30, 32]));
@@ -389,12 +394,161 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     WheeledVisual { body, units, wheels, span, eye, rear_eye, links, link }
 }
 
+/// Thickness of a track's band (m) around road wheels whose track patch has this radius
+/// (road wheel plus band).
+pub fn track_thickness(patch_radius: f64) -> f64 {
+    (0.18 * patch_radius).clamp(0.01, 0.07)
+}
+
+/// A track's band at lateral position `y` in the chassis frame (FLU), `width` wide: the loop
+/// around its sprocket, road wheels and idler, given as circles `(centre (x, z), radius)` of
+/// the band's outer surface, with grousers every `pitch` metres. The band has run `travel`
+/// metres (forward driving is positive: the ground run moves backwards relative to the hull).
+pub fn track_band(circles: &[(DVec2, f64)], y: f64, width: f64, thickness: f64, pitch: f64, travel: f64) -> MeshData {
+    let mut m = MeshData::new();
+    // The loop: convex hull of the circles, counter-clockwise in (x, z).
+    let mut pts: Vec<DVec2> = circles
+        .iter()
+        .flat_map(|&(c, r)| (0..24).map(move |k| c + r * DVec2::from_angle(std::f64::consts::TAU * k as f64 / 24.0)))
+        .collect();
+    let hull = hull_2d(&mut pts);
+    let n = hull.len();
+    if n < 3 {
+        return m;
+    }
+    // Outward normals of the edges (i → i + 1) and at the vertices (mitred).
+    let edge_normal = |i: usize| {
+        let e = (hull[(i + 1) % n] - hull[i]).normalize_or_zero();
+        DVec2::new(e.y, -e.x)
+    };
+    let inner: Vec<DVec2> = (0..n)
+        .map(|i| {
+            let (a, b) = (edge_normal((i + n - 1) % n), edge_normal(i));
+            let v = (a + b).normalize_or(b);
+            hull[i] - thickness / v.dot(b).max(0.5) * v
+        })
+        .collect();
+    let at = |p: DVec2, side: f64| DVec3::new(p.x, y + 0.5 * side * width, p.y).as_vec3();
+    let band = srgb([46, 46, 50]);
+    // A quad, wound to face `out`.
+    let quad = |m: &mut MeshData, q: [Vec3; 4], out: Vec3| {
+        let flip = (q[1] - q[0]).cross(q[2] - q[0]).dot(out) < 0.0;
+        let [a, b, c, d] = if flip { [q[0], q[3], q[2], q[1]] } else { q };
+        m.push_flat_triangle(a, b, c, band);
+        m.push_flat_triangle(a, c, d, band);
+    };
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let o = edge_normal(i);
+        let out = Vec3::new(o.x as f32, 0.0, o.y as f32);
+        quad(&mut m, [at(hull[i], -1.0), at(hull[j], -1.0), at(hull[j], 1.0), at(hull[i], 1.0)], out);
+        quad(&mut m, [at(inner[i], -1.0), at(inner[j], -1.0), at(inner[j], 1.0), at(inner[i], 1.0)], -out);
+        for side in [-1.0, 1.0] {
+            let q = [at(hull[i], side), at(hull[j], side), at(inner[j], side), at(inner[i], side)];
+            quad(&mut m, q, Vec3::Y * side as f32);
+        }
+    }
+    // Grousers at fixed places on the band, which moves against the loop's direction.
+    let lengths: Vec<f64> = (0..n).map(|i| hull[i].distance(hull[(i + 1) % n])).collect();
+    let total: f64 = lengths.iter().sum();
+    let count = (total / pitch).floor().max(1.0) as usize;
+    let spacing = total / count as f64;
+    let grouser = mesh::cuboid(DVec3::new(0.2 * spacing, 0.5 * width, 0.25 * thickness).as_vec3(), srgb([92, 92, 98]));
+    let (mut edge, mut start) = (0, 0.0);
+    for k in 0..count {
+        let s = (k as f64 * spacing - travel).rem_euclid(total);
+        if s < start {
+            (edge, start) = (0, 0.0);
+        }
+        while start + lengths[edge] < s && edge + 1 < n {
+            start += lengths[edge];
+            edge += 1;
+        }
+        let t = (hull[(edge + 1) % n] - hull[edge]).normalize_or(DVec2::X);
+        let p = hull[edge] + (s - start) * t;
+        let o = edge_normal(edge);
+        let (t3, o3) = (DVec3::new(t.x, 0.0, t.y), DVec3::new(o.x, 0.0, o.y));
+        let rot = DQuat::from_mat3(&DMat3::from_cols(t3, DVec3::Y, t3.cross(DVec3::Y)));
+        m.append_transformed(&grouser, rot, DVec3::new(p.x, y, p.y) + 0.25 * thickness * o3);
+    }
+    m
+}
+
+/// Convex hull (Andrew's monotone chain), counter-clockwise, without repeated points.
+fn hull_2d(pts: &mut [DVec2]) -> Vec<DVec2> {
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    let cross = |o: DVec2, a: DVec2, b: DVec2| (a - o).perp_dot(b - o);
+    let mut hull: Vec<DVec2> = Vec::with_capacity(pts.len() + 1);
+    for pass in 0..2 {
+        let floor = hull.len();
+        let iter: Box<dyn Iterator<Item = &DVec2>> =
+            if pass == 0 { Box::new(pts.iter()) } else { Box::new(pts.iter().rev()) };
+        for &p in iter {
+            while hull.len() >= floor + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 1e-12 {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull.dedup_by(|a, b| a.distance(*b) < 1e-9);
+    hull
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terrain::chunks;
     use autonomousim_vehicles::presets;
     use autonomousim_world::testworlds;
+
+    #[test]
+    fn track_band_wraps_the_wheels_and_moves_with_travel() {
+        // Sprocket, two road wheels, idler: the loop's bottom run is flat under the road wheels.
+        let circles = [
+            (DVec2::new(0.0, 0.0), 0.3),
+            (DVec2::new(-1.0, -0.3), 0.35),
+            (DVec2::new(-2.0, -0.3), 0.35),
+            (DVec2::new(-3.0, -0.1), 0.3),
+        ];
+        let band = |travel| track_band(&circles, 1.0, 0.4, 0.06, 0.15, travel);
+        let m = band(0.0);
+        let (lo, hi) = m.bounds().unwrap();
+        // Grousers stand half the band's thickness out of its outer surface.
+        assert!((lo.z as f64 + 0.65 + 0.03).abs() < 1e-3, "{lo}");
+        assert!((lo.y - 0.8).abs() < 1e-6 && (hi.y - 1.2).abs() < 1e-6);
+        assert!((lo.x as f64 + 3.3).abs() < 0.04 && (hi.x as f64 - 0.3).abs() < 0.04, "{lo} {hi}");
+        assert!(m.triangle_count() > 100);
+        // A band that ran a whole grouser spacing looks the same; half of one does not.
+        let spacing = |m: &MeshData| {
+            let mut p: Vec<[i64; 3]> = m.positions.iter().map(|v| v.map(|c| (c as f64 * 1e3).round() as i64)).collect();
+            p.sort();
+            p
+        };
+        let total: f64 = {
+            let mut pts: Vec<DVec2> = circles
+                .iter()
+                .flat_map(|&(c, r)| {
+                    (0..24).map(move |k| c + r * DVec2::from_angle(std::f64::consts::TAU * k as f64 / 24.0))
+                })
+                .collect();
+            let h = hull_2d(&mut pts);
+            (0..h.len()).map(|i| h[i].distance(h[(i + 1) % h.len()])).sum()
+        };
+        let pitch = total / (total / 0.15).floor();
+        let same =
+            |a: &[[i64; 3]], b: &[[i64; 3]]| a.iter().zip(b).all(|(p, q)| (0..3).all(|k| (p[k] - q[k]).abs() <= 1));
+        assert!(same(&spacing(&m), &spacing(&band(pitch))));
+        assert!(!same(&spacing(&m), &spacing(&band(0.5 * pitch))));
+        // Forward travel moves the grousers on the ground run backwards (−x): the grouser
+        // nearest below x = −1.5 moves by the travel.
+        let under = |m: &MeshData| {
+            let low: Vec<f32> = m.positions.iter().filter(|p| p[2] < -0.66).map(|p| p[0]).collect();
+            low.iter().copied().filter(|x| *x < -1.5).fold(f32::NEG_INFINITY, f32::max)
+        };
+        let d = under(&band(0.02)) - under(&m);
+        assert!((d as f64 + 0.02).abs() < 1e-3, "{d}");
+    }
 
     #[test]
     fn props_land_in_the_chunk_below_them() {

@@ -486,6 +486,7 @@ fn main() -> anyhow::Result<()> {
                 history::record,
                 world_view::sync_map,
                 vehicle_view::sync_vehicles,
+                vehicle_view::sync_tracks,
                 camera::update_camera,
                 world_view::update_lod,
                 overlay::draw,

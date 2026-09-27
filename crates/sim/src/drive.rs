@@ -1,10 +1,13 @@
 //! Where ground vehicles can drive: a coarse grid over the map whose cells are drivable when
 //! the terrain is not too steep, dry, and free of solid obstacles (trunks, large rocks) within
 //! the vehicle's half-width. Drivable cells are labelled by 4-connected component, so whether
-//! a goal can be reached from a spawn is one lookup; [`DriveGrid::path`] finds a path (A*).
+//! a goal can be reached from a spawn is one lookup; [`DriveGrid::path`] finds a path (A*),
+//! optionally preferring firm ground: each metre costs more by the vehicle's motion resistance
+//! on the cell's material (rolling resistance, and for tracks the soil's compaction).
 //!
 //! Also here: [`ground_pose`], the pose of a ground vehicle resting on uneven terrain.
 
+use autonomousim_core::material::{Material, MaterialId};
 use autonomousim_core::math::Pose;
 use autonomousim_core::terrain::Terrain;
 use autonomousim_vehicles::ground::WheeledDef;
@@ -35,6 +38,14 @@ pub struct DrivableSpec {
     pub obstacle_height: f64,
     /// Water shallower than this (m) can be forded.
     pub max_water_depth: f64,
+    /// Paths: each metre costs `1 + resistance_cost·f`, with `f` the vehicle's motion
+    /// resistance (share of its weight) on the ground there; 0 finds the shortest path.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub resistance_cost: f64,
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 impl Default for DrivableSpec {
@@ -46,6 +57,7 @@ impl Default for DrivableSpec {
             margin: 1.0,
             obstacle_height: 0.25,
             max_water_depth: 0.0,
+            resistance_cost: 0.0,
         }
     }
 }
@@ -60,7 +72,9 @@ impl DrivableSpec {
             && self.spawn_slope_deg < 90.0
             && self.margin >= 0.0
             && self.obstacle_height >= 0.0
-            && self.max_water_depth >= 0.0;
+            && self.max_water_depth >= 0.0
+            && self.resistance_cost >= 0.0
+            && self.resistance_cost.is_finite();
         if ok { Ok(()) } else { Err(format!("invalid drivable spec {self:?}")) }
     }
 }
@@ -77,11 +91,25 @@ pub struct DriveGrid {
     /// Cells per component (index = label).
     sizes: Vec<usize>,
     largest: u32,
+    /// Path cost per metre of each cell (≥ 1); empty when all are 1.
+    cost: Vec<f32>,
 }
 
 impl DriveGrid {
-    /// Grid over `world` for vehicles `half_width` wide (m) on each side.
+    /// Grid over `world` for vehicles `half_width` wide (m) on each side; paths ignore the
+    /// ground's resistance.
     pub fn new(world: &StaticWorld, spec: &DrivableSpec, half_width: f64) -> Self {
+        Self::with_resistance(world, spec, half_width, |_| 0.0)
+    }
+
+    /// Grid whose paths weigh each metre by the vehicle's motion `resistance` on the material
+    /// under the cell centre (see [`DrivableSpec::resistance_cost`]).
+    pub fn with_resistance(
+        world: &StaticWorld,
+        spec: &DrivableSpec,
+        half_width: f64,
+        resistance: impl Fn(&Material) -> f64,
+    ) -> Self {
         let (lo, hi) = world.extent();
         let cell = spec.cell;
         let nx = (((hi.x - lo.x) / cell).floor() as usize).max(1);
@@ -157,7 +185,20 @@ impl DriveGrid {
             sizes.push(size);
         }
         let largest = (1..sizes.len()).max_by_key(|&k| (sizes[k], Reverse(k))).unwrap_or(0) as u32;
-        Self { origin: lo, cell, nx, ny, label, sizes, largest }
+        let mut cost = Vec::new();
+        if spec.resistance_cost > 0.0 {
+            let table = world.materials();
+            let per_material: Vec<f32> = (0..table.len())
+                .map(|m| (1.0 + spec.resistance_cost * resistance(table.get(MaterialId(m as u8))).max(0.0)) as f32)
+                .collect();
+            cost = (0..nx * ny)
+                .map(|i| {
+                    let c = lo + DVec2::new((i % nx) as f64 + 0.5, (i / nx) as f64 + 0.5) * cell;
+                    per_material[terrain.material(c.x, c.y).0 as usize]
+                })
+                .collect();
+        }
+        Self { origin: lo, cell, nx, ny, label, sizes, largest, cost }
     }
 
     pub fn cell_size(&self) -> f64 {
@@ -210,8 +251,9 @@ impl DriveGrid {
         self.component(a).is_some_and(|c| self.component(b) == Some(c))
     }
 
-    /// Shortest path of cell centres from `a` to `b` (A*, 8 neighbours without cutting
-    /// blocked corners), starting at `a` and ending at `b`; `None` if unreachable.
+    /// Cheapest path of cell centres from `a` to `b` (A*, 8 neighbours without cutting
+    /// blocked corners; the shortest one unless the grid has resistance costs), starting at
+    /// `a` and ending at `b`; `None` if unreachable.
     pub fn path(&self, a: DVec2, b: DVec2) -> Option<Vec<DVec2>> {
         if !self.reachable(a, b) {
             return None;
@@ -243,7 +285,9 @@ impl DriveGrid {
                     continue;
                 }
                 let j = ny as usize * self.nx + nx as usize;
-                let c = cost[i] + if dx != 0 && dy != 0 { std::f64::consts::SQRT_2 } else { 1.0 } * self.cell;
+                let step = if dx != 0 && dy != 0 { std::f64::consts::SQRT_2 } else { 1.0 } * self.cell;
+                let weight = if self.cost.is_empty() { 1.0 } else { 0.5 * f64::from(self.cost[i] + self.cost[j]) };
+                let c = cost[i] + weight * step;
                 if c < cost[j] {
                     cost[j] = c;
                     from[j] = i;
@@ -353,6 +397,45 @@ mod tests {
             assert!(!g.reachable(DVec2::ZERO, outside));
         }
         assert!(g.is_drivable(DVec2::ZERO));
+    }
+
+    #[test]
+    fn resistance_costs_steer_paths_around_soft_ground() {
+        use autonomousim_core::material::MaterialTable;
+        use autonomousim_world::{HeightGrid, MapMeta, ObstacleSet};
+        // A plowed field across the way on a meadow; around its ends is further.
+        let field = |x: f64, y: f64| x.abs() < 10.0 && y.abs() < 15.0;
+        let terrain = HeightGrid::from_fn(
+            DVec2::splat(-60.0),
+            1.0,
+            121,
+            121,
+            |_, _| 0.0,
+            |x, y| {
+                if field(x, y) { MaterialId::PLOWED } else { MaterialId::MEADOW }
+            },
+        );
+        let w =
+            StaticWorld::new(MapMeta::new("field", "test", 0), terrain, ObstacleSet::default(), MaterialTable::rural());
+        let (a, b) = (DVec2::new(-30.0, 0.0), DVec2::new(30.0, 0.0));
+        let length = |p: &[DVec2]| p.windows(2).map(|s| s[0].distance(s[1])).sum::<f64>();
+        let crosses = |p: &[DVec2]| p.iter().any(|q| field(q.x, q.y));
+        let preset = |name| autonomousim_vehicles::SharedDef::from(autonomousim_vehicles::presets::get(name).unwrap());
+        let (car, apc) = (preset("sedan_like"), preset("tracked_apc"));
+        let spec = DrivableSpec { resistance_cost: 30.0, ..DrivableSpec::default() };
+        let route = |def: &autonomousim_vehicles::SharedDef, spec: &DrivableSpec| {
+            let d = def.as_wheeled().unwrap();
+            DriveGrid::with_resistance(&w, spec, 1.0, |m| d.motion_resistance(m, 9.80665)).path(a, b).unwrap()
+        };
+
+        // Shortest: straight through. A car goes around the field (rolling resistance 0.14
+        // against 0.06); a tracked vehicle hardly sinks in, so it crosses.
+        let straight = route(&car, &DrivableSpec::default());
+        assert!(crosses(&straight) && length(&straight) < 61.0);
+        let car_route = route(&car, &spec);
+        assert!(!crosses(&car_route) && length(&car_route) > 64.0, "{}", length(&car_route));
+        let apc_route = route(&apc, &spec);
+        assert!(crosses(&apc_route) && length(&apc_route) < 61.0);
     }
 
     #[test]

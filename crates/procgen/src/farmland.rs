@@ -142,6 +142,116 @@ impl ScatterConfig {
     }
 }
 
+/// Drainage ditches along some parcel edges.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DitchesConfig {
+    /// Share of parcel edges (not between two woods) with a ditch; those get no hedge or fence.
+    pub share: f64,
+    /// Depth (m), and the top and bottom widths (m) of the trapezoidal section.
+    pub depth: f64,
+    pub width: f64,
+    pub bottom: f64,
+    /// Ditches stop this far (m) from road edges (culverts), yard pads and water, and reach
+    /// their full depth [`DITCH_RAMP`] m further on.
+    pub gap: f64,
+}
+
+/// Run (m) over which a ditch deepens from nothing to its full depth at its ends.
+pub const DITCH_RAMP: f64 = 3.0;
+
+impl Default for DitchesConfig {
+    fn default() -> Self {
+        Self { share: 0.3, depth: 0.8, width: 6.0, bottom: 1.5, gap: 1.5 }
+    }
+}
+
+impl DitchesConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !((0.0..=1.0).contains(&self.share)
+            && self.depth >= 0.0
+            && self.bottom >= 0.0
+            && self.width > self.bottom
+            && self.gap >= 0.0)
+        {
+            return Err("ditches: share in [0, 1], depth, bottom and gap ≥ 0, width > bottom".into());
+        }
+        Ok(())
+    }
+
+    /// Depth of the section (m) at distance `d` (m) from the centre line.
+    pub fn profile(&self, d: f64) -> f64 {
+        let (hb, ht) = (0.5 * self.bottom, 0.5 * self.width);
+        self.depth * (1.0 - ((d - hb) / (ht - hb)).clamp(0.0, 1.0))
+    }
+}
+
+/// Which parcel edges get a ditch (not between two woods).
+pub(crate) fn ditch_edges(
+    c: &DitchesConfig,
+    parcels: &Parcels,
+    edges: &[(usize, usize, DVec2, DVec2)],
+    seed: &Seed,
+) -> Vec<bool> {
+    edges
+        .iter()
+        .map(|&(i, j, _, _)| {
+            let woods = parcels.kinds[i] == ParcelKind::Woods && parcels.kinds[j] == ParcelKind::Woods;
+            !woods && seed.child_index((i * parcels.centres.len() + j) as u64).rng().uniform() < c.share
+        })
+        .collect()
+}
+
+/// Ditch centre lines, bucketed for distance queries.
+pub(crate) struct Ditches {
+    pub lines: Vec<(DVec2, DVec2)>,
+    origin: DVec2,
+    bucket: f64,
+    k: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl Ditches {
+    /// Lines on a square map of `size` m; queries look up to `reach` m.
+    pub(crate) fn new(lines: Vec<(DVec2, DVec2)>, size: f64, reach: f64) -> Self {
+        let bucket = 32.0;
+        let origin = DVec2::splat(-0.5 * size - reach);
+        let k = ((size + 2.0 * reach) / bucket).ceil() as usize + 1;
+        let mut cells = vec![Vec::new(); k * k];
+        let cell = |p: DVec2| {
+            let g = ((p - origin) / bucket).floor();
+            ((g.x.max(0.0) as usize).min(k - 1), (g.y.max(0.0) as usize).min(k - 1))
+        };
+        for (n, &(a, b)) in lines.iter().enumerate() {
+            let (x0, y0) = cell(a.min(b) - DVec2::splat(reach));
+            let (x1, y1) = cell(a.max(b) + DVec2::splat(reach));
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    cells[y * k + x].push(n as u32);
+                }
+            }
+        }
+        Self { lines, origin, bucket, k, cells }
+    }
+
+    /// Distance (m) from `p` to the nearest centre line, if one lies within the reach.
+    pub(crate) fn distance(&self, p: DVec2) -> f64 {
+        let g = ((p - self.origin) / self.bucket).floor();
+        if g.x < 0.0 || g.y < 0.0 || g.x >= self.k as f64 || g.y >= self.k as f64 {
+            return f64::INFINITY;
+        }
+        self.cells[g.y as usize * self.k + g.x as usize]
+            .iter()
+            .map(|&n| {
+                let (a, b) = self.lines[n as usize];
+                let d = b - a;
+                let t = ((p - a).dot(d) / d.length_squared()).clamp(0.0, 1.0);
+                p.distance(a + t * d)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParcelKind {
     Meadow,
@@ -368,16 +478,19 @@ fn wall(grid: &HeightGrid, a: DVec2, b: DVec2, width: f64, height: f64) -> (Obst
     (shape, Pose::new(centre, from_yaw(d.y.atan2(d.x))))
 }
 
-/// Hedges and fences along the parcel edges (not between two woods), as obstacle groups.
+/// Hedges and fences along the parcel edges `edges` (not between two woods, nor along a
+/// ditch), as obstacle groups.
 pub(crate) fn edge_obstacles(
     c: &ScatterConfig,
     parcels: &Parcels,
+    edges: &[(usize, usize, DVec2, DVec2)],
+    ditch: &[bool],
     grid: &HeightGrid,
     seed: &Seed,
 ) -> Vec<Vec<Obstacle>> {
     let mut out = Vec::new();
-    for (i, j, a, b) in parcels.edges() {
-        if parcels.kinds[i] == ParcelKind::Woods && parcels.kinds[j] == ParcelKind::Woods {
+    for (&(i, j, a, b), &ditch) in edges.iter().zip(ditch) {
+        if ditch || (parcels.kinds[i] == ParcelKind::Woods && parcels.kinds[j] == ParcelKind::Woods) {
             continue;
         }
         let mut rng = seed.child_index((i * parcels.centres.len() + j) as u64).rng();

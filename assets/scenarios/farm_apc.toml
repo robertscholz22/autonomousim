@@ -1,0 +1,31 @@
+# A tracked APC (the M113-like `tracked_apc`) in a pool of four generated rural maps: fields
+# of meadow, crops and plowed soil (soft Bekker soils under the tracks), ditches, hedges and
+# farm tracks. A scenario for the viewer (`--scenario assets/scenarios/farm_apc.toml`; it
+# drives the APC from the keyboard in `vw` mode) and a starting point for cross-country tasks.
+name = "farm_apc"
+physics_hz = 1000
+policy_hz = 20
+
+map = { type = "rural", seed = 0, count = 4, preset = "training" }
+
+[events]
+bounds_margin = 5.0
+
+[[groups]]
+name = "apc"
+vehicle = "tracked_apc"
+action_mode = "vw"
+# Ditch banks are some 20° steep: crossed with momentum. From standstill the APC starts
+# uphill only on gentle slopes (its clutchless driveline, as Chrono's M113, has no torque
+# converter), so it spawns on nearly level ground. Paths weigh soft ground by the APC's
+# motion resistance on it.
+drivable = { max_slope_deg = 30.0, spawn_slope_deg = 6.0, resistance_cost = 30.0 }
+goals = { kind = "random", count = 3, distance = [40.0, 120.0], radius = 4.0 }
+obs = [
+    { term = "goal_rel_body", scale = 0.02, clip = 3.0 },
+    { term = "lin_vel_body", scale = 0.2 },
+    { term = "ang_vel_body", scale = 0.5 },
+    { term = "rot6d" },
+    { term = "sinkage", scale = 10.0 },
+    { term = "last_action" },
+]

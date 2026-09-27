@@ -278,3 +278,37 @@ fn tracked_vehicles_report_their_sinkage() {
     assert!(sand > 0.03 && sand < 0.1, "sinkage {sand}");
     assert!((f64::from(sand_obs) - 10.0 * sand).abs() < 1e-5);
 }
+
+/// The farm scenario: the APC spawns at rest on nearly level ground of the rural maps, drives
+/// off across them and sinks into the soft fields. Hedges, trees, ditches and the map's edge
+/// may stop it; it does not stall, roll over or drown.
+#[test]
+fn apc_drives_across_farmland() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/scenarios/farm_apc.toml");
+    let sc = Arc::new(Scenario::load(path).unwrap().compile().unwrap());
+    let col = autonomousim_sim::STATE_FIELDS.iter().take_while(|f| f.0 != "sinkage").map(|f| f.1).sum::<usize>();
+    let stops =
+        Events(Events::CRASH_OBSTACLE.0 | Events::FOLIAGE.0 | Events::CRASH_TERRAIN.0 | Events::OUT_OF_BOUNDS.0);
+    let never = Events(Events::STUCK.0 | Events::NAN.0 | Events::ROLLOVER.0 | Events::WATER.0);
+    let mut sunk = 0;
+    for seed in 0..12 {
+        let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(seed));
+        let start = w.agent(0).vehicle.pose().pos;
+        let mut state = vec![0.0; autonomousim_sim::STATE_DIM];
+        let (mut deepest, mut events) = (0.0f64, Events::NONE);
+        for _ in 0..8 * sc.spec.policy_hz {
+            step(&mut w, &[&[0.4, 0.0]]);
+            w.write_state(0, &mut state);
+            deepest = deepest.max(state[col]);
+            let mut e = [0u32];
+            w.write_events(0, &mut e);
+            events = Events(events.0 | e[0]);
+        }
+        assert!(state.iter().all(|x| x.is_finite()));
+        let moved = (w.agent(0).vehicle.pose().pos - start).truncate().length();
+        assert!(moved > 20.0 || events.intersects(stops), "seed {seed}: moved {moved:.1} m, {events:?}");
+        assert!(!events.intersects(never), "seed {seed}: {events:?}");
+        sunk += usize::from(deepest > 0.005);
+    }
+    assert!(sunk >= 8, "the APC sank into soft ground on {sunk} of 12 maps");
+}

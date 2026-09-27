@@ -1,6 +1,8 @@
 //! Vehicle visuals: a multirotor's body and rotor discs whose opacity follows the rotor speed;
 //! a wheeled vehicle's body, wheels posed from the simulated steering, travel and spin, and a
-//! strut and lower arm per suspended wheel that follow the wheel. The units behind a tractor
+//! strut and lower arm per suspended wheel that follow the wheel; a tracked vehicle's band on
+//! each side, wrapped around its sprocket, road wheels and idler and running with the road
+//! wheels. The units behind a tractor
 //! (trailers, dollies, drawbars) are children of the root posed from the simulated joints, and
 //! carry their own wheels and links.
 
@@ -11,6 +13,7 @@ use autonomousim_scene::mesh::srgb;
 use autonomousim_scene::props;
 use autonomousim_vehicles::Vehicle;
 use autonomousim_vehicles::ground::Wheeled;
+use autonomousim_vehicles::ground::tire::TireModel;
 use bevy::prelude::*;
 
 /// Root entity of agent `0`'s visual.
@@ -43,6 +46,33 @@ pub struct LinkVisual {
     agent: usize,
     wheel: usize,
     mount: glam::DVec3,
+}
+
+/// The band of a track (side 0: left, 1: right), rebuilt in the chassis frame every frame.
+#[derive(Component)]
+pub struct TrackVisual {
+    agent: usize,
+    side: usize,
+    mesh: Handle<Mesh>,
+}
+
+/// Band of side `side` of a tracked vehicle around its sprocket, idler and road wheels as
+/// they stand, advanced by the road wheels' mean spin; `None` without tracks.
+fn track_band(w: &Wheeled, side: usize) -> Option<autonomousim_scene::MeshData> {
+    let def = w.def();
+    let track = def.track.as_ref()?;
+    let wheels: Vec<usize> = (0..w.num_wheels())
+        .filter(|&k| k % 2 == side && def.wheel_unit(k) == 0 && matches!(def.tire(k / 2).model, TireModel::Track(_)))
+        .collect();
+    let TireModel::Track(patch) = &def.tire(*wheels.first()? / 2).model else { return None };
+    let flat = |p: glam::DVec3| glam::DVec2::new(p.x, p.z);
+    let mut circles: Vec<(glam::DVec2, f64)> =
+        wheels.iter().map(|&k| (flat(wheel_local(w, k).pos), patch.radius)).collect();
+    circles.extend(track.sprocket.iter().chain(&track.idler).map(|r| (flat(r.position), r.radius)));
+    let y = def.wheel_position(wheels[0]).y;
+    let spin = wheels.iter().map(|&k| w.wheel(k).spin_angle).sum::<f64>() / wheels.len() as f64;
+    let thickness = props::track_thickness(patch.radius);
+    Some(props::track_band(&circles, y, patch.width, thickness, 0.25 * patch.length, spin * patch.radius))
 }
 
 /// Transform (in a unit's frame) of a unit link (a cylinder along z from −0.5 to 0.5)
@@ -119,6 +149,16 @@ pub fn spawn_vehicles(
                             LinkVisual { agent: i, wheel: k, mount },
                         ));
                     }
+                }
+                for side in 0..2 {
+                    let Some(band) = track_band(w, side) else { break };
+                    let mesh = meshes.add(convert::mesh(&band));
+                    commands.entity(root).with_child((
+                        Mesh3d(mesh.clone()),
+                        MeshMaterial3d(body_material.clone()),
+                        Transform::IDENTITY,
+                        TrackVisual { agent: i, side, mesh },
+                    ));
                 }
                 for (k, mesh) in v.wheels.iter().enumerate() {
                     commands.entity(parents[w.def().wheel_unit(k)]).with_child((
@@ -208,6 +248,16 @@ pub fn sync_vehicles(
             if (c.alpha - alpha).abs() > 0.01 {
                 material.base_color = Color::linear_rgba(c.red, c.green, c.blue, alpha);
             }
+        }
+    }
+}
+
+/// Rebuild the track bands from the road wheels' travel and spin.
+pub fn sync_tracks(sim: Res<Sim>, tracks: Query<&TrackVisual>, mut meshes: ResMut<Assets<Mesh>>) {
+    for t in &tracks {
+        let Some(w) = sim.world.agent(t.agent).vehicle.as_wheeled() else { continue };
+        if let (Some(band), Some(mut mesh)) = (track_band(w, t.side), meshes.get_mut(&t.mesh)) {
+            *mesh = convert::mesh(&band);
         }
     }
 }

@@ -13,16 +13,20 @@
 //! 5. Road profiles: terrain heights along each road, smoothed, pinned to the node heights
 //!    (level with a yard across its pad) and limited to the class's maximum grade.
 //! 6. Terrain blending: the road surfaces (with a crown) and the farm yards are cut or filled
-//!    into the terrain, with shoulders falling off smoothly.
+//!    into the terrain, with shoulders falling off smoothly. Then drainage ditches (a
+//!    trapezoidal section) are cut along some parcel edges, stopping short of roads
+//!    (culverts), yard pads and water.
 //! 7. Materials per cell: roads (asphalt, gravel, dirt), yards (concrete), lake beds and
-//!    shores, rock on steep slopes, marsh, grass verges and headlands, and the parcels' crops.
-//! 8. Obstacles: farm buildings, hedges and fences along parcel edges, tree lines along some
+//!    shores, ditches (grass banks, mud at the bottom), rock on steep slopes, marsh, grass
+//!    verges and headlands, and the parcels' crops.
+//! 8. Obstacles: farm buildings, hedges and fences along parcel edges without a ditch, tree lines along some
 //!    roads, woods and single trees; none on a road (below the headroom) or in a yard.
 //!
 //! As for wild maps, the result depends only on the configuration and the seed.
 
 use crate::ProcgenError;
-use crate::farmland::{self, Clearance, FieldsConfig, ParcelKind, Parcels, ScatterConfig};
+use crate::farmland::{self, Clearance, Ditches, FieldsConfig, ParcelKind, Parcels, ScatterConfig};
+pub use crate::farmland::{DITCH_RAMP, DitchesConfig};
 use crate::noise::smoothstep;
 use crate::scatter::{Ground, trees};
 use crate::terrain::{ErosionConfig, TerrainConfig};
@@ -42,7 +46,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const RURAL_VERSION: u32 = 4;
+pub const RURAL_VERSION: u32 = 5;
 
 /// Geometry limits of one road class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -180,6 +184,7 @@ pub struct RuralConfig {
     pub farms: FarmsConfig,
     pub roads: RoadsConfig,
     pub fields: FieldsConfig,
+    pub ditches: DitchesConfig,
     pub materials: RuralMaterialsConfig,
     pub scatter: ScatterConfig,
 }
@@ -249,6 +254,7 @@ impl RuralConfig {
             farms: FarmsConfig::default(),
             roads: RoadsConfig::default(),
             fields: FieldsConfig::default(),
+            ditches: DitchesConfig::default(),
             materials: RuralMaterialsConfig::default(),
             scatter: ScatterConfig::default(),
         }
@@ -301,6 +307,7 @@ impl RuralConfig {
                 return Err("farms: spacing and yard must be positive, max_relief, margin and pad ≥ 0".into());
             }
             self.fields.validate()?;
+            self.ditches.validate()?;
             self.scatter.validate()?;
             let m = &self.materials;
             if !(m.rock_slope_deg > 0.0 && m.rock_slope_deg < 90.0 && m.shore_width >= 0.0) {
@@ -313,6 +320,23 @@ impl RuralConfig {
             Ok(())
         };
         check().map_err(ProcgenError::Config)
+    }
+}
+
+/// Ditch centre lines (end points); debug-printed as their count only.
+#[derive(Clone, Default)]
+pub struct DitchLines(pub Vec<[DVec2; 2]>);
+
+impl std::ops::Deref for DitchLines {
+    type Target = [[DVec2; 2]];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DitchLines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{} lines]", self.0.len())
     }
 }
 
@@ -334,6 +358,11 @@ pub struct RuralStats {
     /// Field parcels on the map, and fields reached by a track.
     pub parcels: usize,
     pub tracks: usize,
+    /// Ditches along parcel edges and their total length (m); their centre lines.
+    pub ditches: usize,
+    pub ditch_length: f64,
+    #[serde(skip)]
+    pub ditch_lines: DitchLines,
     /// Obstacles: buildings (with silos), hedge and fence pieces, trees.
     pub buildings: usize,
     pub hedges: usize,
@@ -564,15 +593,23 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
     let network = RoadNetwork::new(nodes, roads).map_err(|e| ProcgenError::Config(e.to_string()))?;
     stats.stage("profiles", &mut t);
 
-    // 6. Terrain blending.
+    // 6. Terrain blending, then the ditches along some parcel edges.
     blend(c, &mut heights, n, origin, &network, &yards, pad_half);
+    let edges = parcels.edges();
+    let ditch = farmland::ditch_edges(&c.ditches, &parcels, &edges, &root.child("ditches"));
+    let lines: Vec<(DVec2, DVec2)> = edges.iter().zip(&ditch).filter(|e| *e.1).map(|(e, _)| (e.2, e.3)).collect();
+    stats.ditches = lines.len();
+    stats.ditch_length = lines.iter().map(|(a, b)| a.distance(*b)).sum();
+    stats.ditch_lines = DitchLines(lines.iter().map(|&(a, b)| [a, b]).collect());
+    let ditches = Ditches::new(lines, c.size, 0.5 * c.ditches.width);
+    let carved = carve_ditches(c, &mut heights, n, origin, &ditches, &network, &yards, pad_half, &water);
     stats.stage("blending", &mut t);
 
     // 7. Materials.
     let moisture = moisture(&acc, n);
     drop(acc);
     let land = Landuse { net: &network, yards: &yards, yard_half, pad_half, parcels: &parcels };
-    let (materials, slope) = materials(c, origin, &heights, &water, &moisture, &land);
+    let (materials, slope) = materials(c, origin, &heights, &water, &moisture, &carved, &land);
     drop(moisture);
     let table = MaterialTable::rural();
     let mut counts = [0usize; 256];
@@ -615,7 +652,7 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
         farmland::keep_clear(groups, &clear, &mut obstacles);
     }
     stats.buildings = obstacles.len();
-    let edges = farmland::edge_obstacles(sc, &parcels, &grid, &root.child("edges"));
+    let edges = farmland::edge_obstacles(sc, &parcels, &edges, &ditch, &grid, &root.child("edges"));
     // Hedges and fences keep off farm pads and leave gaps where tracks and roads pass.
     let edges = edges.into_iter().filter(|g| {
         let p = g[0].pose.pos.truncate();
@@ -1359,6 +1396,107 @@ fn blend(
     });
 }
 
+/// Carve the ditches into the vertex heights; returns the depth carved per vertex. Ditches
+/// stop `gap` short of road edges (culverts), yard pads and water (where they drain), and
+/// deepen over [`DITCH_RAMP`] m beyond.
+#[allow(clippy::too_many_arguments)]
+fn carve_ditches(
+    c: &RuralConfig,
+    heights: &mut [f32],
+    n: usize,
+    origin: DVec2,
+    ditches: &Ditches,
+    net: &RoadNetwork,
+    yards: &[Yard],
+    pad_half: DVec2,
+    water: &[f32],
+) -> Vec<f32> {
+    let d = &c.ditches;
+    let mut carved = vec![0.0f32; n * n];
+    if ditches.lines.is_empty() || d.depth == 0.0 {
+        return carved;
+    }
+    let r = &c.roads;
+    let max_half = [&r.paved, &r.gravel, &r.track].iter().map(|k| 0.5 * k.width).fold(0.0, f64::max);
+    let clear = d.gap + DITCH_RAMP;
+    let to_water = water_distance(water, n - 1, (clear / c.cell).ceil() as f32 + 1.0);
+    let ramp = |free: f64| ((free - d.gap) / DITCH_RAMP).clamp(0.0, 1.0);
+    heights.par_chunks_mut(n).zip(carved.par_chunks_mut(n)).enumerate().for_each(|(iy, (row, out))| {
+        let y = origin.y + iy as f64 * c.cell;
+        for (ix, (h, o)) in row.iter_mut().zip(out.iter_mut()).enumerate() {
+            let p = DVec2::new(origin.x + ix as f64 * c.cell, y);
+            let depth = d.profile(ditches.distance(p));
+            if depth <= 0.0 {
+                continue;
+            }
+            // From the edge of the nearest wet cell touching this vertex.
+            let cells = [
+                (ix.max(1) - 1, iy.max(1) - 1),
+                (ix.min(n - 2), iy.max(1) - 1),
+                (ix.max(1) - 1, iy.min(n - 2)),
+                (ix.min(n - 2), iy.min(n - 2)),
+            ];
+            let wet = cells.iter().map(|&(i, j)| to_water[i + j * (n - 1)]).fold(f32::INFINITY, f32::min);
+            let mut f = ramp((f64::from(wet) - 0.5) * c.cell);
+            if let Some(rp) = net.nearest(p, max_half + clear) {
+                f = ramp(rp.projection.distance - 0.5 * net.roads()[rp.road as usize].width);
+            }
+            for yard in yards {
+                f = f64::min(f, ramp(yard.distance(p, pad_half)));
+            }
+            let cut = (f * depth) as f32;
+            *h -= cut;
+            *o = cut;
+        }
+    });
+    carved
+}
+
+/// Distance (in cells, capped at `max`) from each cell centre to the nearest wet cell centre,
+/// by an 8-neighbour chamfer transform (exact along axes and diagonals, within 8 % elsewhere).
+fn water_distance(water: &[f32], w: usize, max: f32) -> Vec<f32> {
+    let h = water.len() / w;
+    let mut d: Vec<f32> = water.iter().map(|v| if v.is_nan() { max } else { 0.0 }).collect();
+    let diag = std::f32::consts::SQRT_2;
+    for iy in 0..h {
+        for ix in 0..w {
+            let mut v = d[iy * w + ix];
+            if ix > 0 {
+                v = v.min(d[iy * w + ix - 1] + 1.0);
+            }
+            if iy > 0 {
+                v = v.min(d[(iy - 1) * w + ix] + 1.0);
+                if ix > 0 {
+                    v = v.min(d[(iy - 1) * w + ix - 1] + diag);
+                }
+                if ix + 1 < w {
+                    v = v.min(d[(iy - 1) * w + ix + 1] + diag);
+                }
+            }
+            d[iy * w + ix] = v;
+        }
+    }
+    for iy in (0..h).rev() {
+        for ix in (0..w).rev() {
+            let mut v = d[iy * w + ix];
+            if ix + 1 < w {
+                v = v.min(d[iy * w + ix + 1] + 1.0);
+            }
+            if iy + 1 < h {
+                v = v.min(d[(iy + 1) * w + ix] + 1.0);
+                if ix + 1 < w {
+                    v = v.min(d[(iy + 1) * w + ix + 1] + diag);
+                }
+                if ix > 0 {
+                    v = v.min(d[(iy + 1) * w + ix - 1] + diag);
+                }
+            }
+            d[iy * w + ix] = v;
+        }
+    }
+    d
+}
+
 // ------------------------------------------------------------------------------ materials
 
 /// What covers the land: roads, yards and their pads, parcels.
@@ -1377,6 +1515,7 @@ fn materials(
     heights: &[f32],
     water: &[f32],
     moisture: &[f32],
+    carved: &[f32],
     land: &Landuse,
 ) -> (Vec<MaterialId>, Vec<f32>) {
     let m = &c.materials;
@@ -1412,6 +1551,7 @@ fn materials(
                 let road = &land.net.roads()[rp.road as usize];
                 (road.class, rp.projection.distance - 0.5 * road.width)
             });
+            let cut = 0.25 * (carved[i] + carved[i + 1] + carved[i + n] + carved[i + n + 1]) as f64;
             *mat = if !water[k].is_nan() {
                 if water[k] as f64 - z < 0.5 { MaterialId::SAND } else { MaterialId::MUD }
             } else if land.yards.iter().any(|y| y.distance(p, land.yard_half) == 0.0) {
@@ -1422,6 +1562,9 @@ fn materials(
                     RoadClass::Gravel => MaterialId::GRAVEL,
                     RoadClass::Track => MaterialId::DIRT,
                 }
+            } else if cut > 0.1 {
+                // Ditches: grass banks, a muddy bottom.
+                if cut > 0.6 * c.ditches.depth { MaterialId::MUD } else { MaterialId::GRASS }
             } else if slope > rock {
                 MaterialId::ROCK
             } else if near.as_ref().is_some_and(|l| z < l[k] as f64 + m.shore_height) {

@@ -225,6 +225,64 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
     assert_eq!(by_tag[tags::FENCE as usize], stats.fences);
     assert_eq!(by_tag[tags::TRUNK as usize], stats.trees);
 
+    // Ditches: against the same map without them, the terrain is cut to their depth along
+    // their lines (away from their ends, roads, yards, water and each other) and untouched a
+    // cell diagonal beyond their banks; mud lines the bottom and hedges and fences do not stand in them.
+    let d = &c.ditches;
+    assert!(stats.ditches > 0 && stats.ditch_length > 0.0, "seed {seed}: {} ditches", stats.ditches);
+    let flat =
+        rural::generate(&RuralConfig { ditches: rural::DitchesConfig { depth: 0.0, ..d.clone() }, ..c.clone() }, seed)
+            .unwrap()
+            .0;
+    let cut = |q: DVec2| flat.terrain().height(q.x, q.y) - t.height(q.x, q.y);
+    let lines = &stats.ditch_lines;
+    let dist = |p: DVec2, a: DVec2, b: DVec2| {
+        let e = b - a;
+        p.distance(a + ((p - a).dot(e) / e.length_squared()).clamp(0.0, 1.0) * e)
+    };
+    let rim_off = 0.5 * d.width + 1.5;
+    let clear = d.gap + rural::DITCH_RAMP + rim_off;
+    let wet = |p: DVec2, r: f64| {
+        let k = r.ceil() as i32;
+        (-k..=k).any(|i| (-k..=k).any(|j| t.water_level(p.x + f64::from(i), p.y + f64::from(j)).is_some()))
+    };
+    let mut checked = 0;
+    for (k, &[a, b]) in lines.iter().enumerate() {
+        let len = a.distance(b);
+        let (along, across) = ((b - a) / len, ((b - a) / len).perp());
+        let mut s = 5.0;
+        while s < len - 5.0 {
+            let p = a + s * along;
+            s += 2.0;
+            let rim = [p + rim_off * across, p - rim_off * across];
+            let crowded = net
+                .nearest(p, clear + 10.0)
+                .is_some_and(|rp| rp.projection.distance - 0.5 * net.roads()[rp.road as usize].width < clear)
+                || yards.iter().any(|y| y.position.truncate().distance(p) < 60.0)
+                || lines.iter().enumerate().any(|(j, l)| j != k && dist(p, l[0], l[1]) < 2.0 * rim_off)
+                || wet(p, clear)
+                || rim.iter().any(|q| q.abs().max_element() > 0.5 * c.size - 1.0);
+            if crowded {
+                continue;
+            }
+            checked += 1;
+            // Bilinear sampling of the 1 m grid mixes in bank vertices up to a diagonal away.
+            assert!((cut(p) - d.depth).abs() < 0.05, "seed {seed}: ditch cut {:.2} m deep at {p}", cut(p));
+            for q in rim {
+                assert!(cut(q).abs() < 1e-6, "seed {seed}: terrain cut {:.2} m beside a ditch at {q}", cut(q));
+            }
+            assert_eq!(t.material(p.x, p.y), MaterialId::MUD, "seed {seed}: ditch bottom at {p}");
+        }
+    }
+    assert!(checked > 20, "seed {seed}: only {checked} ditch points checked");
+    for o in w.obstacles().obstacles() {
+        if o.tag == tags::HEDGE || o.tag == tags::FENCE {
+            let p = o.pose.pos.truncate();
+            let near = lines.iter().map(|l| dist(p, l[0], l[1])).fold(f64::INFINITY, f64::min);
+            assert!(near > 0.5, "seed {seed}: hedge or fence in a ditch at {p}");
+        }
+    }
+
     // Yards are flat concrete.
     for y in &yards {
         let p = y.position;

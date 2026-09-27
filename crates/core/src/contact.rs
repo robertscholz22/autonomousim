@@ -33,6 +33,15 @@ pub struct SphereCollider {
     /// Multiplies the friction coefficient (0 for a frictionless skid or caster ball).
     #[serde(default = "one")]
     pub friction: f64,
+    /// Angular velocity (rad/s) of the sphere's surface about the link's y axis relative to
+    /// the link: a roller wrapped by a moving band (a track's sprocket or idler). Friction
+    /// acts against the slip of that surface.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spin: f64,
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 fn one() -> f64 {
@@ -42,7 +51,7 @@ fn one() -> f64 {
 impl SphereCollider {
     /// A collider with full friction.
     pub fn new(link: usize, center: DVec3, radius: f64, group: u8) -> Self {
-        Self { link, center, radius, group, friction: 1.0 }
+        Self { link, center, radius, group, friction: 1.0, spin: 0.0 }
     }
 }
 
@@ -240,7 +249,10 @@ pub fn compute_contacts(
 
                 let n = sp.normal;
                 let p_link = pose.inverse_transform_point(sp.point);
-                let v = kin.point_velocity_world(c.link, p_link);
+                let mut v = kin.point_velocity_world(c.link, p_link);
+                if c.spin != 0.0 {
+                    v += (pose.rot * DVec3::new(0.0, c.spin, 0.0)).cross(sp.point - center);
+                }
                 let vn = n.dot(v);
                 let fn_ = (params.stiffness * depth - params.damping * vn).max(0.0);
 

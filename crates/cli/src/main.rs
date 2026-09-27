@@ -246,6 +246,7 @@ fn print_rural_stats(s: &RuralStats) {
         s.lakes, s.lake_cells, s.farms, s.farm_sites, s.junctions, s.parcels, s.tracks
     );
     println!("buildings {}, hedge pieces {}, fence pieces {}, trees {}", s.buildings, s.hedges, s.fences, s.trees);
+    println!("ditches {} ({:.1} km)", s.ditches, 1e-3 * s.ditch_length);
     println!("heights {:.1} … {:.1} m", s.height_range.0, s.height_range.1);
     let cells: usize = s.materials.iter().map(|m| m.1).sum();
     let shares: Vec<String> =

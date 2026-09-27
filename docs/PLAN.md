@@ -888,6 +888,7 @@ Planned 2026-09-24; **done 2026-09-25** (steps 0–9, as built below). Scope fro
     - a solid obstacle's AABB (from `obstacle_height` above the ground up to 2 m above the terrain) comes within its radius + half-width + `margin`. Foliage does not block.
   - Connected components (4-connected, found in scan order) answer reachability, instead of an A* per goal.
   - `DriveGrid::path` (8-connected A* without corner cutting, deterministic) serves scripted drivers and tests.
+  - `resistance_cost` (default 0) weighs soft ground: a metre costs `1 + resistance_cost·f`, where `f` is the group vehicle's motion resistance on the cell's material (`WheeledDef::motion_resistance`; added in M4c step 5).
   - A `drivable` table on a multirotor group is an error.
 - **Spawning**:
   - Ground vehicles spawn in drivable cells of the largest component, clear of solids by their radius and at most `spawn_slope_deg` steep. The slope is `drive::slope`: the steeper of the normal and the gradient over ±1.5 m.
@@ -1543,7 +1544,7 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
 | 2 ✅ | Tracked drivelines (braked differential, electric sides; see as built), controller and action modes for tracks, presets `tracked_apc` (Chrono extraction) and `rover_tracked` | Presets load, settle and drive; `vw` holds speed and yaw rate; static loads against Chrono's |
 | 3 ✅ | Validation: Chrono M113 fixtures (static loads, straight acceleration, steady turn at a fixed sprocket speed ratio, braked hold on a 30 % slope) and analytic rigid-ground checks (gradeability, Wong's skid-steer turning) | Tolerances above met or explained |
 | 4 ✅ | Soft soil: material soil parameters, sinkage, compaction and bulldozing resistance, soil shear; rural materials get soft values; `sinkage` state and observation term | Drawbar pull against slip matches the Janosi–Hanamoto integral (5 %); sinkage matches Bekker's law; motion resistance matches the compaction integral; existing goldens unchanged |
-| 5 | Simulation and viewer: tracked agents in scenarios, drive grids with soil cost, track visuals (band around sprocket, road wheels and idler), HUD per side (band speed, slip, sinkage), rural ditches | An APC drives by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay; ditch invariants hold |
+| 5 ✅ | Simulation and viewer: tracked agents in scenarios, drive grids with soil cost, track visuals (band around sprocket, road wheels and idler), HUD per side (band speed, slip, sinkage), rural ditches | An APC drives by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay; ditch invariants hold |
 | 6 | `TrackedCrossCountry-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy drives in the viewer; a recorded episode replays |
 
 #### As built
@@ -1638,6 +1639,19 @@ Planned 2026-09-26. The user asked to go on; the decisions below were taken at t
     - **Drawbar pull**: the rover on plowed soil at 10, 25 and 40 % of its weight. Pull matches the integral under the actual loads within 5 %, and slip grows with the load.
     - `sim/tests/ground.rs`: the state column and the obs term read the APC's sinkage on sand, and 0 on rigid ground.
   - **Limitation**: sprocket and idler colliders (and the hull's) meet the rigid terrain surface. A vehicle sunk deeper than their clearance rests on them: the rover in snow sinks 5 cm, and its sprocket and idler carry about a quarter of its weight.
+- **Step 5 (simulation and viewer)**:
+  - **Rural ditches** (`RURAL_VERSION` 5, rural goldens re-blessed): trapezoidal drainage ditches along a share of field edges (`DitchesConfig { share 0.3, depth 0.8, width 6, bottom 1.5, gap 1.5 }`, banks about 20°), mud at the bottom.
+    - They ramp out over `DITCH_RAMP` (3 m) near roads, farm yards and water. Distance to water comes from a chamfer transform, so a ditch meets a pond without a wall.
+    - `RuralStats` counts them; `mapgen` prints "ditches N (x km)". The ditch lines are kept (not serialized) for tests.
+    - **Invariants** (`procgen/tests/rural.rs`), against the same seed without ditches: the centre cut is the depth (0.05 m, bilinear sampling), the cut is 0 at the rim + 1.5 m, the bottom is mud, and no hedge or fence lies in a ditch.
+  - **Soil cost in drive grids**: `drivable.resistance_cost` (above). `WheeledDef::motion_resistance(material, g)` is the tyres' rolling resistance, or for tracks the patch's internal resistance plus Bekker compaction and bulldozing under evenly loaded road wheels (APC 0.045–0.052, 0.099 in snow; sedan 0.013 on asphalt to 0.14 on plowed soil). A* edges cost the mean of their cells. Grids are shared only between equal vehicles when the cost is on. A test: a plowed field in meadow, which the car drives around and the APC crosses.
+  - **Band-driven rollers** (revises step 4's limitation): sprockets and idlers are rollers (`SphereCollider::spin`, the surface's angular velocity about the link's y axis), turning with the band (mean road-wheel spin × band radius / roller radius). Friction acts on the band's slip against the ground, and its moment about the roller axle moves from the hull to the side's road wheels. Before, a sunk APC's sprocket and idler slid with μ 1 and anchored it in plowed soil. A test lowers the idler 0.25 m onto the ground: it carries > 10 % of the weight, and the speed after 2 s stays within 10 % of the unmodified APC's (the old colliders: 1.70 against 2.27 m/s).
+  - **Track visuals** (`scene::props::track_band`): a band around the convex hull of sprocket, road wheels and idler, with grousers at a quarter patch length that move with the band's travel (mean road-wheel spin angle × radius). Road wheels are drawn inside it. Viewer system `sync_tracks`.
+  - **HUD**: a table per side for tracked vehicles: band speed, slip (mean κ of the loaded patches), sinkage and load.
+  - **Recordings**: `RecordedWheel.sinkage` (omitted when 0, so older recordings and `hover.mcap` are unchanged); replay interpolates it. A test replays an APC on sand, sunk, its bands running.
+  - **`assets/scenarios/farm_apc.toml`**: the APC in `vw` mode on 4 rural training maps, random goals, soil-weighted paths, a `sinkage` observation term. `sim/tests/ground.rs` drives it on 12 seeds for 8 s: it moves > 20 m or stops on an obstacle, foliage, terrain or the boundary, is never stuck, and sinks > 5 mm on at least 8 maps.
+  - **Viewer**: the APC by keyboard over a rural map at 96–103 fps (1080p, medium, `--demo`), real time ×1.00; across crop fields at 3.9 m/s, 25–35 mm sinkage.
+  - **Limitation, launch**: without a torque converter (as Chrono's M113), 1st gear gives about 20.7 kN against 110 kN weight, so from standstill the APC starts uphill only on about 8–10°. Ditch banks are crossed with momentum; `farm_apc` spawns at most 6° steep (at 15°, 3 of 24 seeds stalled at spawn).
 
 ## Roadmap after M1
 | M | Content | Validation |

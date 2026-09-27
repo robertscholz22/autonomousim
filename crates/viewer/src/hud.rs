@@ -313,6 +313,7 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
             }
         });
     }
+    track_status(ui, w);
     let axles = w.def().axles.len();
     egui::Grid::new("wheels").num_columns(8).striped(true).show(ui, |ui| {
         for h in ["", "load kN", "travel mm", "κ", "α °", "Fx kN", "Fy kN", "drive/brake N·m"] {
@@ -329,6 +330,45 @@ fn ground_status(ui: &mut egui::Ui, sim: &Sim, w: &autonomousim_vehicles::ground
             ui.monospace(format!("{:+5.2}", t.fx / 1e3));
             ui.monospace(format!("{:+5.2}", t.fy / 1e3));
             ui.monospace(format!("{:+5.0}/{:4.0}", s.drive_torque, s.brake_torque.abs()));
+            ui.end_row();
+        }
+    });
+}
+
+/// Tracked vehicles, per side: band speed (the road wheels' mean rim speed), slip (mean κ of
+/// the loaded road wheels), sinkage into soft soil and load.
+fn track_status(ui: &mut egui::Ui, w: &autonomousim_vehicles::ground::Wheeled) {
+    use autonomousim_vehicles::ground::tire::TireModel;
+    let def = w.def();
+    if def.track.is_none() {
+        return;
+    }
+    let patch = |k: usize| match &def.tire(k / 2).model {
+        TireModel::Track(p) => Some(p.radius),
+        _ => None,
+    };
+    egui::Grid::new("tracks").num_columns(5).striped(true).show(ui, |ui| {
+        for h in ["track", "band m/s", "slip", "sinkage mm", "load kN"] {
+            ui.label(egui::RichText::new(h).small());
+        }
+        ui.end_row();
+        for (side, name) in ["left", "right"].into_iter().enumerate() {
+            let wheels: Vec<(usize, f64)> =
+                (0..w.num_wheels()).filter(|k| k % 2 == side).filter_map(|k| Some((k, patch(k)?))).collect();
+            if wheels.is_empty() {
+                continue;
+            }
+            let band = wheels.iter().map(|&(k, r)| w.wheel(k).spin * r).sum::<f64>() / wheels.len() as f64;
+            let loaded: Vec<&autonomousim_vehicles::ground::tire::TireForces> =
+                wheels.iter().map(|&(k, _)| &w.wheel(k).tire).filter(|t| t.fz > 0.0).collect();
+            let mean = |f: &dyn Fn(&autonomousim_vehicles::ground::tire::TireForces) -> f64| {
+                if loaded.is_empty() { 0.0 } else { loaded.iter().map(|t| f(t)).sum::<f64>() / loaded.len() as f64 }
+            };
+            ui.label(name);
+            ui.monospace(format!("{band:+6.2}"));
+            ui.monospace(format!("{:+5.2}", mean(&|t| t.kappa)));
+            ui.monospace(format!("{:5.0}", mean(&|t| t.sinkage) * 1e3));
+            ui.monospace(format!("{:6.1}", loaded.iter().map(|t| t.fz).sum::<f64>() / 1e3));
             ui.end_row();
         }
     });

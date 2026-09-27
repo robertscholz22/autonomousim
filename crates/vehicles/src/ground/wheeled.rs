@@ -137,6 +137,11 @@ pub struct Wheeled {
     track_neighbours: Vec<[Option<usize>; 2]>,
     /// The bands: locked couplings between neighbouring road wheels.
     bands: Vec<Coupling>,
+    /// Sprockets and idlers (collider, side, radius) and each side's road wheels with their
+    /// radius: the rollers' surfaces run at the band's speed.
+    rollers: Vec<(usize, usize, f64)>,
+    road_wheels: [Vec<usize>; 2],
+    band_radius: f64,
     contact: ContactModel,
     // State.
     pub state: MbState,
@@ -227,6 +232,13 @@ impl Wheeled {
                 .enumerate()
                 .filter_map(|(w, nb)| nb[1].map(|r| Coupling::new(&[w], &[r], &inertia, dt)))
                 .collect(),
+            rollers: def.rollers(),
+            road_wheels: [0, 1].map(|side| {
+                (0..def.num_wheels())
+                    .filter(|&w| w % 2 == side && def.wheel_unit(w) == 0 && def.tire(w / 2).is_track())
+                    .collect()
+            }),
+            band_radius: (0..def.axles.len()).find(|&a| def.tire(a).is_track()).map_or(0.0, |a| def.tire(a).radius()),
             contact: def.contact.model(mass, dt),
             model,
             mass,
@@ -523,8 +535,18 @@ impl Wheeled {
         }
     }
 
-    /// Penalty contacts of the chassis colliders with the static world.
+    /// Penalty contacts of the chassis colliders with the static world. A sprocket or idler
+    /// touching the ground is wrapped by the band: friction acts against the slip of the band's
+    /// surface there, and its moment about the roller's axle goes into the band (the side's
+    /// road wheels) rather than into the hull.
     pub fn apply_contacts(&mut self, scene: &StaticScene) {
+        for &(ci, side, radius) in &self.rollers {
+            let wheels = &self.road_wheels[side];
+            let band = wheels.iter().map(|&w| self.state.v[self.corners[w].spin.1]).sum::<f64>() * self.band_radius
+                / wheels.len().max(1) as f64;
+            self.colliders[ci].spin = band / radius;
+        }
+        let first = self.contacts.len();
         compute_contacts(
             scene,
             &self.ws.kin,
@@ -536,6 +558,25 @@ impl Wheeled {
             &mut self.f_ext,
             &mut self.contacts,
         );
+        for k in first..self.contacts.len() {
+            let c = self.contacts[k];
+            let Some(&(ci, side, radius)) = self.rollers.iter().find(|r| r.0 == c.collider as usize) else { continue };
+            let collider = &self.colliders[ci];
+            let pose = self.ws.kin.pose[collider.link];
+            let axle = pose.rot * DVec3::Y;
+            let moment = (c.point - pose.transform_point(collider.center)).cross(c.friction).dot(axle);
+            // The band carries the moment from the roller to the road wheels (in the ratio of
+            // their radii); the hull keeps the rest.
+            let to_band = moment * self.band_radius / radius;
+            self.f_ext[collider.link] += SpatialForce::new(pose.inverse_transform_vector(-to_band * axle), DVec3::ZERO);
+            let wheels = &self.road_wheels[side];
+            for &w in wheels {
+                let link = self.corners[w].wheel;
+                let torque = to_band / wheels.len() as f64 * axle;
+                self.f_ext[link] +=
+                    SpatialForce::new(self.ws.kin.pose[link].inverse_transform_vector(torque), DVec3::ZERO);
+            }
+        }
     }
 
     /// Add an external force (world frame) acting on the chassis at a world point.

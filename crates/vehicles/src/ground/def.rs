@@ -24,6 +24,7 @@ use crate::VehicleError;
 use crate::multirotor::ContactDef;
 use autonomousim_core::contact::SphereCollider;
 use autonomousim_core::dynamics::{KcTable, KcTableSpec};
+use autonomousim_core::material::Material;
 use autonomousim_core::math::spline::CubicSpline;
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
@@ -843,6 +844,23 @@ impl WheeledDef {
         a.wheel.mass + a.suspension.as_ref().map_or(0.0, |s| s.carrier_mass)
     }
 
+    /// Motion resistance on level `material` at low speed, as a share of the weight (for route
+    /// costs): the tyres' rolling resistance on it; for tracks, their running gear's plus, on
+    /// soft soil, compaction and bulldozing (Bekker) under evenly loaded road wheels.
+    pub fn motion_resistance(&self, material: &Material, g: f64) -> f64 {
+        let patches: Vec<&TrackPatch> = (0..self.axles.len())
+            .filter_map(|a| match &self.tire(a).model {
+                TireModel::Track(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let Some(p) = patches.first() else { return material.rolling_resistance };
+        let Some(s) = &material.soil else { return p.rolling_resistance };
+        let weight = self.total_mass() * g;
+        let z = s.sinkage(weight / (2 * patches.len()) as f64 / (p.width * p.length), p.width);
+        p.rolling_resistance + 2.0 * (s.compaction(p.width, 0.0, z) + s.bulldozing(p.width, z, g)) / weight
+    }
+
     /// Mass of all units (kg).
     pub fn total_mass(&self) -> f64 {
         self.chassis.mass
@@ -871,7 +889,6 @@ impl WheeledDef {
         self.wheels().zip(extra).map(|((a, _), e)| a.wheel.inertia.y + e).collect()
     }
 
-    /// Sphere colliders on their units' links (the towing unit's first).
     /// Sphere colliders on their units' links (the towing unit's first, then its sprockets and
     /// idlers).
     pub fn sphere_colliders(&self) -> Vec<SphereCollider> {
@@ -887,6 +904,19 @@ impl WheeledDef {
                     ..SphereCollider::new(link, c.center, c.radius, c.part as u8)
                 })
             })
+            .collect()
+    }
+
+    /// The sprockets and idlers among [`sphere_colliders`](Self::sphere_colliders): collider
+    /// index, side (0 left, 1 right) and radius.
+    pub fn rollers(&self) -> Vec<(usize, usize, f64)> {
+        let first = self.colliders.len();
+        self.track
+            .iter()
+            .flat_map(|t| t.sprocket.iter().chain(&t.idler))
+            .flat_map(|r| [0, 1].map(|side| (side, r.radius)))
+            .enumerate()
+            .map(|(k, (side, radius))| (first + k, side, radius))
             .collect()
     }
 

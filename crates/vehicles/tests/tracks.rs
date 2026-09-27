@@ -529,6 +529,37 @@ fn apc_climbs_up_to_its_gradeability() {
     assert!(s.iter().all(|s| s.speed < 0.1), "climbs {:.3} beyond its gradeability {:.3}", s[5].speed, limit.tan());
 }
 
+/// A sprocket or idler on the ground is wrapped by the band: it rolls with the band rather
+/// than dragging the hull. With the idler lowered by 25 cm it carries a large share of the
+/// weight on flat asphalt, yet the APC launches as without it; anchored to the hull
+/// (friction against its sliding), the idler would brake with μ times its load.
+#[test]
+fn a_roller_on_the_ground_rolls_with_the_band() {
+    let launch = |lower: f64| {
+        let mut d = presets::wheeled("tracked_apc").unwrap();
+        d.track.as_mut().unwrap().idler.as_mut().unwrap().position.z -= lower;
+        let rollers = d.rollers();
+        let mut v = Wheeled::new(Arc::new(d), DT);
+        let w = World::flat();
+        w.run(&mut v, &DriveInput { brake: 1.0, ..Default::default() }, 1.0);
+        let load: f64 = v
+            .contacts()
+            .iter()
+            .filter(|c| rollers.iter().any(|r| r.0 == c.collider as usize))
+            .map(|c| c.normal_force)
+            .sum();
+        w.run(&mut v, &DriveInput { throttle: 1.0, ..Default::default() }, 2.0);
+        (load, v.lin_vel_body().x)
+    };
+    let (none, free) = launch(0.0);
+    let (load, lowered) = launch(0.25);
+    assert_eq!(none, 0.0);
+    let weight = presets::wheeled("tracked_apc").unwrap().total_mass() * G;
+    assert!(load > 0.1 * weight, "idler load {load} N of {weight} N");
+    // The drag of an anchored idler: μ·load ≥ 0.8·0.1·W, some 0.8 m/s² of deceleration.
+    assert!((lowered / free - 1.0).abs() < 0.1, "speed after 2 s: {lowered} with the idler down, {free} without");
+}
+
 /// Wong and Chiang's theory of skid steering on firm ground (Wong, *Theory of Ground
 /// Vehicles*, §7.3.3): each track element carries `μp` against its sliding velocity, the
 /// shear being well developed. In a pivot turn at yaw rate `ω` with band speeds `±V`, the

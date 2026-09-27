@@ -424,6 +424,7 @@ impl Recorder {
                             tan_alpha: w.tire.tan_alpha,
                             fx: w.tire.fx,
                             fy: w.tire.fy,
+                            sinkage: w.tire.sinkage,
                         })
                         .collect();
                     let pt = v.powertrain();
@@ -518,6 +519,13 @@ pub struct RecordedWheel {
     pub tan_alpha: f64,
     pub fx: f64,
     pub fy: f64,
+    /// Sinkage of a track patch into soft soil (m; left out when 0).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub sinkage: f64,
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// A `/agent/<id>/action` message: the normalised action held from `time` on.

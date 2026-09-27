@@ -1148,10 +1148,23 @@ fn build_drive_grids(groups: &mut [CompiledGroup], maps: &[Arc<StaticWorld>]) {
             continue;
         }
         let (spec, hw) = (&groups[i].spec.drivable, groups[i].half_width);
-        let shared = groups[..i].iter().find(|o| !o.drive.is_empty() && o.spec.drivable == *spec && o.half_width == hw);
+        let def = groups[i].def.as_wheeled().expect("wheeled group");
+        // With resistance costs the grid also depends on the vehicle's running gear.
+        let same = |o: &CompiledGroup| {
+            o.spec.drivable == *spec
+                && o.half_width == hw
+                && (spec.resistance_cost == 0.0 || o.def.as_wheeled().is_some_and(|d| d == def))
+        };
+        let shared = groups[..i].iter().find(|o| !o.drive.is_empty() && same(o));
         groups[i].drive = match shared {
             Some(o) => o.drive.clone(),
-            None => maps.par_iter().map(|m| Arc::new(DriveGrid::new(m, spec, hw))).collect(),
+            None => maps
+                .par_iter()
+                .map(|m| {
+                    let g = autonomousim_core::math::frames::STANDARD_GRAVITY;
+                    Arc::new(DriveGrid::with_resistance(m, spec, hw, |mat| def.motion_resistance(mat, g)))
+                })
+                .collect(),
         };
     }
 }

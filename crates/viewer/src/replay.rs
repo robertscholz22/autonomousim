@@ -179,6 +179,7 @@ fn lerp_wheel(a: &RecordedWheel, b: &RecordedWheel, alpha: f64) -> RecordedWheel
         tan_alpha: l(a.tan_alpha, b.tan_alpha),
         fx: l(a.fx, b.fx),
         fy: l(a.fy, b.fy),
+        sinkage: l(a.sinkage, b.sinkage),
     }
 }
 
@@ -197,6 +198,7 @@ pub fn wheel_state(w: &RecordedWheel) -> WheelState {
             fy: w.fy,
             kappa: w.kappa,
             tan_alpha: w.tan_alpha,
+            sinkage: w.sinkage,
             ..Default::default()
         },
         ..Default::default()
@@ -318,6 +320,46 @@ mod tests {
         }
         assert!(shown.wheels().next().unwrap().steer > 0.05);
         assert_eq!(shown.powertrain().gear, live.powertrain().gear);
+    }
+
+    /// A tracked APC on sand replays with its road wheels' spin and sinkage, so its bands run
+    /// and the HUD shows how deep it sank.
+    #[test]
+    fn replayed_tracked_vehicles_sink_and_run_their_bands() {
+        let sc = Scenario::from_toml(
+            r#"
+            name = "sand"
+            physics_hz = 1000
+            map = { type = "testworld", kind = "incline", size = 200.0, angle_deg = 0.0, material = 3 }
+            [[groups]]
+            vehicle = "tracked_apc"
+            action_mode = "vw"
+            "#,
+        )
+        .unwrap();
+        let sc = Arc::new(sc.compile().unwrap());
+        let path = std::env::temp_dir().join(format!("autonomousim-replay-tracked-{}.mcap", std::process::id()));
+        let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+        let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+        rec.on_reset(&w);
+        for _ in 0..100 {
+            w.set_actions(0, &[0.3, 0.0]);
+            rec.on_actions(&w);
+            w.step_with(&mut |w| rec.on_tick(w));
+        }
+        rec.finish().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut r = Replay::new(recording, 0);
+        r.seek(r.duration());
+        r.apply(&mut world);
+        let (live, shown) = (w.agent(0).vehicle.as_wheeled().unwrap(), world.agent(0).vehicle.as_wheeled().unwrap());
+        assert!(live.lin_vel_body().x > 1.0 && live.sinkage() > 0.03);
+        assert!((shown.sinkage() - live.sinkage()).abs() < 1e-6, "{} vs {}", shown.sinkage(), live.sinkage());
+        for (i, (a, b)) in live.wheels().zip(shown.wheels()).enumerate() {
+            assert!((a.spin_angle - b.spin_angle).abs() < 1e-5, "wheel {i}");
+        }
     }
 
     /// A semitrailer rig replays with its trailer where it was.
