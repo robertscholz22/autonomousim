@@ -2000,7 +2000,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 |---|---|---|
 | 1 ✅ | `world::tiles` + `procgen::large`: coarse layer (terrain, erosion, hydrology, materials, rural roads and airstrips), detail tiles, `TiledWorld` with the tile LRU, hashes, `large` presets | Tiles are identical whatever the access order and thread count; heights and normals are continuous across tile seams; queries agree with a monolithic grid built from the same functions; the coarse 16 km layer generates in ≤ 15 s and a tile in ≤ 50 ms; memory stays under the cache bound; existing goldens are unchanged |
 | 2 ✅ | Viewer: floating origin, streamed tiles and far-field coarse chunks, aerial view distance | A drone flies across a 16 km map without jitter at the far edge; ≥ 60 fps at 1080p medium at 30 m/s and 200 m AGL on the Iris Xe |
-| 3 | Shared aero: `AirData` move, `AeroSurface`, medium/high-altitude Dryden, `pitot`, the `air_data`/`wind_body` terms, state columns | Lift, drag and moment of a surface match analytic thin-aerofoil and flat-plate values; Dryden spectra match MIL-F-8785C at altitude; goldens re-blessed after an A/B check |
+| 3 ✅ | Shared aero: `AirData` move, `AeroSurface`, medium/high-altitude Dryden, `pitot`, the `air_data`/`wind_body` terms, state columns | Lift, drag and moment of a surface match analytic thin-aerofoil and flat-plate values; Dryden spectra match MIL-F-8785C at altitude; goldens re-blessed after an A/B check |
 | 4 | `FixedWing` family: aero model (derivatives and tables), propeller and motor or engine, gear, presets, wiring through vehicles, sim, recorder and Python | Both presets trim in level flight; engine-off glide conserves energy with drag accounted for; they stand on their gear; scenarios spawn them in the air and on a runway |
 | 5 | JSBSim fixtures and validation | Trim α, elevator and throttle within 5 % (or 0.5°) of JSBSim over the airspeed sweep; mode frequencies and damping within 10 %; doublet responses close; c172 takeoff roll within 10 % of JSBSim and the POH |
 | 6 | Control and action modes (`raw`, `rates`, `attitude`, `guidance`) | Rate and attitude steps meet rise and overshoot bounds across the speed range; coordinated turns keep β small; altitude and airspeed hold under wind and turbulence; L1 follows a straight and a circular path |
@@ -2075,6 +2075,36 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
     - the tiles within the radius are streamed, and coarse chunks under them hidden;
     - moving away drops the old tiles and brings the new ones;
     - the origin snaps and carries every anchored entity.
+- **Step 3 (shared aerodynamics)**:
+  - **`vehicles::aero`** (the former `multirotor::aero`, re-exported there):
+    - `AirData` gains `speed_of_sound` and `gust_rates` (the air's angular velocity in the body frame). The air-relative velocity is a method rather than a stored field (`relative(v)`, `flow(attitude, v, ω)`): the vehicle moves within the tick, so each model computes it from its own state.
+    - `AirFlow`: body-frame air-relative velocity and rates, airspeed, α = atan2(−v_z, v_x), β = asin(−v_y/V) (FRD sign conventions on the FLU body), Mach and dynamic pressure; `at(r)` gives the velocity of a body point.
+  - **`AeroSurface`** (`aero/surface.rs`, TOML-loadable, radians):
+    - Area, span, chord, aerodynamic centre, `roll` about body x (0 wing, ±π/2 fin), incidence.
+    - Lift curve `cl0 + cl_alpha·(α + τδ)`, with `cl_alpha` from Helmbold when absent. Polar `cd0 + cl²/(π·e·A)`.
+    - Post-stall flat plate: normal force `cd90·sin α`, centre of pressure moving to mid-chord. Blended with Beard & McLain's sigmoid (stall angle, sharpness M = 50).
+    - Optional `Flap`: τ = 1 − (θ_h − sin θ_h)/π and Δc_m = −½·sin θ_h·(1 − cos θ_h)·δ from thin-aerofoil theory, or a given τ.
+    - Optional `AlphaTable` (cl, cd, cm against α) replaces the parametric curves.
+    - `wrench(flow, δ)` gives force and moment about the centre of mass. Only the chord-plane flow counts (no sweep).
+    - β tables are deferred to the fixed-wing body model (step 4), where JSBSim-style coefficient tables live.
+  - **Dryden** (`world::environment::wind`):
+    - `DrydenScales::at` covers low altitude up to 1000 ft; the medium/high-altitude model from 2000 ft (isotropic, L = 1750 ft, σ from the MIL-HDBK-1797 exceedance table at the light/moderate/severe level of W20, interpolated between levels); and linear interpolation between. Height above ground stands for altitude.
+    - Rotational gusts: `Dryden::with_rotational`, `step_rotational(dt, V, span)`, `rates(scales, span)`. `p_g` is first-order with the MIL-F-8785C variance. `q_g = ∂w_g/∂x` and `r_g = −∂v_g/∂x` come through their lags (4b/πV, 3b/πV), discretised with a first-order hold; a zero-order hold gave 10–15 % low spectra. Turbulence axes stand for body axes.
+    - Rotational gusts are drawn only for vehicles with `Vehicle::gust_span()` (none yet), so existing turbulence streams are unchanged.
+  - **Sensors**:
+    - `BodyKinematics.wind` (serde default).
+    - `pitot` sensor: axial dynamic pressure `½ρ·max(0, v·x̂)²` at the probe (lever arm included), per-episode offset (2 Pa) and noise (1 Pa); readings are differential pressure, indicated airspeed and true airspeed.
+  - **Sim**:
+    - Agents fill `speed_of_sound` from the atmosphere and `gust_rates` when the vehicle wants them.
+    - Observation terms `air_data` (V, α, β), `wind_body` and `pitot` (indicated airspeed).
+    - State column `air_data` (V, α, β; `STATE_DIM` 33).
+  - **Goldens**: an A/B run against HEAD (hashing only the first 30 state columns and skipping `/meta`) matched for all four scenarios. The re-blessed hashes change only through the new column and the `/meta` field list.
+  - **Tests**:
+    - `aero`: flow angles and wind.
+    - `aero::surface`: 2-D thin aerofoil (2π, τ and Δc_m of a quarter-chord flap), Helmbold slope and induced drag, flat plate at 45–180°, a bounded and continuous lift curve over ±180°, tail moment and pitch damping, fin weathercocking, tables and validation.
+    - `wind`: altitude scales (table values, continuity at 1000/2000 ft); PSDs at 3000 m of u, w, p_g, q_g, r_g against MIL-F-8785C (within 5 %, tolerance 12 %).
+    - `sensors`: pitot through wind and crosswind, lever arm, offset statistics.
+    - `obs`: `air_terms`.
 
 ### M6b: Helicopter
 

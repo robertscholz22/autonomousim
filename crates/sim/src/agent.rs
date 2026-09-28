@@ -100,7 +100,7 @@ pub struct Agent {
 
 /// Kinematics of unit `u` (≥ 1) of a wheeled vehicle at the start of the last physics step,
 /// for the sensors it carries (no accelerations: those carry no inertial sensors).
-fn unit_kinematics(w: &Wheeled, u: usize) -> BodyKinematics {
+fn unit_kinematics(w: &Wheeled, u: usize, wind: DVec3) -> BodyKinematics {
     let pose = w.unit_pose(u);
     let (velocity, omega) = w.unit_velocity(u);
     BodyKinematics {
@@ -110,6 +110,7 @@ fn unit_kinematics(w: &Wheeled, u: usize) -> BodyKinematics {
         rates: pose.rot.inverse() * omega,
         specific_force: DVec3::ZERO,
         ang_acc: DVec3::ZERO,
+        wind,
     }
 }
 
@@ -205,6 +206,9 @@ impl Agent {
         self.still_time = 0.0;
         self.turbulence_rng = seed.child("turbulence").rng();
         self.turbulence = Dryden::stationary(&mut self.turbulence_rng);
+        if self.vehicle.gust_span().is_some() {
+            self.turbulence = self.turbulence.with_rotational(&mut self.turbulence_rng);
+        }
         self.update_air(world, env, 0.0, Some(0.0));
     }
 
@@ -275,6 +279,7 @@ impl Agent {
             rates: v.ang_vel_body(),
             specific_force: v.specific_force_body(),
             ang_acc: v.ang_acc_body(),
+            wind: self.air.wind,
         }
     }
 
@@ -295,15 +300,22 @@ impl Agent {
         let w = &env.config.wind;
         let agl = self.agl.max(0.0);
         let mut wind = w.steady_at(agl, time);
+        let mut gust_rates = DVec3::ZERO;
         if w.has_turbulence() {
             let scales = w.turbulence_scales(agl);
+            let span = self.vehicle.gust_span();
             if dt > 0.0 {
                 let airspeed = (self.vehicle.lin_vel_world() - self.air.wind).length();
                 self.turbulence.step(dt, airspeed, &scales, &mut self.turbulence_rng);
+                if let Some(b) = span {
+                    self.turbulence.step_rotational(dt, airspeed, b, &mut self.turbulence_rng);
+                }
             }
             wind += self.turbulence.velocity(&scales, env.turbulence_axis);
+            gust_rates = span.map_or(DVec3::ZERO, |b| self.turbulence.rates(&scales, b));
         }
-        self.air = AirData { density: env.config.atmosphere.density(env.origin_altitude + p.z), wind };
+        let state = env.config.atmosphere.at_altitude(env.origin_altitude + p.z);
+        self.air = AirData { density: state.density, wind, speed_of_sound: state.speed_of_sound, gust_rates };
     }
 
     /// Phase 1: air, controller, rotor forces, contacts with the static world and with other
@@ -566,7 +578,7 @@ impl Agent {
             let unit_kin;
             let kin = match (u, self.vehicle.as_wheeled()) {
                 (1.., Some(w)) => {
-                    unit_kin = unit_kinematics(w, u);
+                    unit_kin = unit_kinematics(w, u, self.air.wind);
                     &unit_kin
                 }
                 _ => &kin,

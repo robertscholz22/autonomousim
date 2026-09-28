@@ -66,6 +66,7 @@ fn static_imu_on_a_slope() {
         rates: q.ang_vel_body(),
         specific_force: q.specific_force_body(),
         ang_acc: q.ang_acc_body(),
+        wind: DVec3::ZERO,
     };
     for tick in 0..3 * u64::from(HZ) {
         let scene_ref = StaticScene {
@@ -247,6 +248,58 @@ fn barometer_and_magnetometer() {
     assert!((autonomousim_core::math::quat::wrap_angle(heading - yaw)).abs() < 1e-12, "{heading}");
 }
 
+/// Pitot probe: true airspeed through the wind, indicated airspeed scaled by √(ρ/ρ₀), only the
+/// axial flow, the lever arm of a yawing probe, and the zero offset.
+#[test]
+fn pitot_airspeed() {
+    let scene = Scene::new(testworlds::flat(200.0));
+    let clock = Clock::new(HZ);
+    let read = |config: PitotConfig, kin: &BodyKinematics| {
+        let mut p = Pitot::new(config, &clock, seed("pitot")).unwrap();
+        p.update(0, 0.0, kin, &scene.env());
+        p.latest().unwrap().value
+    };
+    // Flying north-east at 25 m/s into a 5 m/s headwind, 3000 m up.
+    let heading = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
+    let mut kin = at(DVec3::new(0.0, 0.0, 3000.0), heading);
+    kin.velocity = heading * DVec3::new(25.0, 0.0, 0.0);
+    kin.wind = heading * DVec3::new(-5.0, 0.0, 0.0);
+    let r = read(PitotConfig::ideal(), &kin);
+    let rho = scene.atmosphere.at_altitude(scene.geo.altitude(kin.position)).density;
+    assert!((r.true_airspeed - 30.0).abs() < 1e-9 && (r.differential_pressure - 450.0 * rho).abs() < 1e-9);
+    assert!((r.indicated_airspeed - 30.0 * (rho / 1.225).sqrt()).abs() < 1e-9, "{r:?}");
+    // A crosswind is not seen; flying backwards reads zero.
+    kin.wind = heading * DVec3::new(0.0, 12.0, 0.0);
+    assert!((read(PitotConfig::ideal(), &kin).true_airspeed - 25.0).abs() < 1e-9);
+    kin.velocity = -kin.velocity;
+    assert_eq!(read(PitotConfig::ideal(), &kin).true_airspeed, 0.0);
+    // A probe 4 m behind the centre of mass, pointing right.
+    let mut kin = at(DVec3::new(0.0, 0.0, 100.0), DQuat::IDENTITY);
+    kin.rates = DVec3::new(0.0, 0.0, 2.0);
+    let side =
+        Mount { position: DVec3::new(-4.0, 0.0, 0.0), rotation: DVec3::new(0.0, 0.0, -std::f64::consts::FRAC_PI_2) };
+    // Yawing left at 2 rad/s, a point 4 m behind moves right at 8 m/s: the air comes from its
+    // right, along a probe pointing right.
+    let r = read(PitotConfig { mount: side, ..PitotConfig::ideal() }, &kin);
+    assert!((r.true_airspeed - 8.0).abs() < 1e-9, "{r:?}");
+    // The offset: about ±2 Pa, ≈ 1.8 m/s indicated in still air when positive.
+    let mut p = Pitot::new(PitotConfig { noise: 0.0, ..PitotConfig::default() }, &clock, seed("pitot")).unwrap();
+    let mut biases = Vec::new();
+    for k in 0..400 {
+        p.reset(seed("pitot").child_index(k));
+        biases.push(p.bias());
+    }
+    let std = (biases.iter().map(|b| b * b).sum::<f64>() / 400.0).sqrt();
+    assert!((1.7..2.3).contains(&std), "{std}");
+    let b = biases[399];
+    p.update(0, 0.0, &at(DVec3::ZERO, DQuat::IDENTITY), &scene.env());
+    let r = p.latest().unwrap().value;
+    assert!(
+        (r.differential_pressure - b).abs() < 1e-12
+            && (r.indicated_airspeed - (2.0 * b.max(0.0) / 1.225).sqrt()).abs() < 1e-9
+    );
+}
+
 #[test]
 fn rangefinder_over_flat_ground_and_water() {
     let scene = Scene::new(testworlds::flat(200.0));
@@ -383,6 +436,7 @@ fn readings_are_deterministic() {
         SensorConfig::Rangefinder(RangefinderConfig::default()),
         SensorConfig::Lidar(LidarConfig { dropout: 0.05, ..LidarConfig::rl64() }),
         SensorConfig::GroundTruth(GroundTruthConfig::default()),
+        SensorConfig::Pitot(PitotConfig::default()),
     ];
     let run = |order: &[usize]| {
         let mut sensors: Vec<(usize, Sensor)> =
@@ -401,6 +455,7 @@ fn readings_are_deterministic() {
                         Sensor::Gps(s) => format!("{:?}", s.latest()),
                         Sensor::Baro(s) => format!("{:?}", s.latest()),
                         Sensor::Mag(s) => format!("{:?}", s.latest()),
+                        Sensor::Pitot(s) => format!("{:?}", s.latest()),
                         Sensor::Rangefinder(s) => format!("{:?}", s.latest()),
                         Sensor::Lidar(s) => format!("{:?}", s.latest()),
                         Sensor::GroundTruth(s) => format!("{:?}", s.latest()),
@@ -410,7 +465,7 @@ fn readings_are_deterministic() {
         }
         log
     };
-    let a = run(&[0, 1, 2, 3, 4, 5, 6]);
-    assert_eq!(a, run(&[6, 5, 4, 3, 2, 1, 0]));
+    let a = run(&[0, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(a, run(&[7, 6, 5, 4, 3, 2, 1, 0]));
     assert!(a.iter().all(|l| !l.is_empty()));
 }

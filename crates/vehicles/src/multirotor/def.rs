@@ -5,8 +5,7 @@ use autonomousim_core::contact::{ContactModel, PenaltyParams, SphereCollider};
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
-/// Sea-level ISA air density (kg/m³), the default reference density of rotor coefficients.
-pub const SEA_LEVEL_DENSITY: f64 = 1.225;
+pub use crate::aero::SEA_LEVEL_DENSITY;
 
 /// Multirotor of any rotor count and layout; the body frame (FLU) has its origin at the centre
 /// of mass.

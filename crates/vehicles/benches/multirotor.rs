@@ -26,7 +26,7 @@ fn bench(c: &mut Criterion) {
             ..InitialState::at(Pose::from_translation(start), MotorInit::Speed(hover))
         };
         quad.reset(&init);
-        let air = AirData { density: 1.2, wind: DVec3::new(2.0, 0.0, 0.0) };
+        let air = AirData { density: 1.2, wind: DVec3::new(2.0, 0.0, 0.0), ..AirData::default() };
         // Small yaw differential; reset every 2 s so the vehicle stays airborne.
         let cmd: Vec<f64> = quad.def().rotors.iter().map(|m| hover * (1.0 + 0.01 * m.spin.sign())).collect();
         let mut k = 0;

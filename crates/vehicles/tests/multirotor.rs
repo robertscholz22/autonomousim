@@ -80,7 +80,7 @@ fn definitions_are_validated() {
 fn hover_is_an_exact_equilibrium() {
     for name in ["cf2x", "iris_like"] {
         let mut q = quad(name, DT);
-        let air = AirData { density: 1.1, wind: DVec3::ZERO };
+        let air = AirData { density: 1.1, ..AirData::default() };
         let w = hover_at(&mut q, 50.0, air.density);
         let cmd = vec![w; q.num_rotors()];
         for _ in 0..1000 {
@@ -202,7 +202,8 @@ fn rotor_drag_and_wind_are_relative_airspeed() {
     // Hovering in a 2 m/s tail wind from −x is the same as flying at 2 m/s in still air.
     init.lin_vel_world = DVec3::ZERO;
     q.reset(&init);
-    q.step(&[w; 4], &free_env(AirData { density: 1.225, wind: DVec3::new(-2.0, 0.0, 0.0) })).unwrap();
+    q.step(&[w; 4], &free_env(AirData { density: 1.225, wind: DVec3::new(-2.0, 0.0, 0.0), ..AirData::default() }))
+        .unwrap();
     let windy = q.external_wrench();
     assert!((moving.lin - windy.lin).length() < 1e-15 && (moving.ang - windy.ang).length() < 1e-15);
 }

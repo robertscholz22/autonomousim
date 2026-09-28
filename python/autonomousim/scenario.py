@@ -17,7 +17,9 @@ from autonomousim._native import STATE_FIELDS, default_scenario as _default_json
 #: velocity (world), rates (body), goal, goal_yaw, agl, goal_index (the number of goals once
 #: the last one is reached) and clearance (distance to the nearest terrain or solid obstacle,
 #: up to 20 m; for ground vehicles to the nearest solid obstacle only) and agent_clearance
-#: (surface distance to the nearest other active agent's colliders, up to 20 m).
+#: (surface distance to the nearest other active agent's colliders, up to 20 m), and so on to
+#: air_data (true airspeed, angle of attack and sideslip relative to the air); see
+#: ``STATE_FIELDS`` and the Rust ``STATE_FIELDS`` docs for the full list.
 STATE: dict[str, slice] = {}
 _offset = 0
 for _name, _len in STATE_FIELDS:

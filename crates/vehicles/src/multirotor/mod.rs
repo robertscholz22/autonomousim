@@ -3,12 +3,11 @@
 //! effect, density scaling), quadratic body drag, optional battery sag, and sphere colliders
 //! for penalty contacts.
 
-mod aero;
 mod battery;
 mod def;
 mod model;
 
-pub use aero::{AirData, GroundPlane, ground_effect};
+pub use crate::aero::{AirData, GroundPlane, ground_effect};
 pub use battery::BatteryState;
 pub use def::{
     BatteryDef, BodyDef, ColliderDef, ColliderPart, ContactDef, MultirotorDef, RotorMount, RotorParams,

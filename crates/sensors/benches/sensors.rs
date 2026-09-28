@@ -34,6 +34,7 @@ fn bench(c: &mut Criterion) {
             SensorConfig::Gps(c) => 500 / c.rate_hz,
             SensorConfig::Baro(c) => 500 / c.rate_hz,
             SensorConfig::Mag(c) => 500 / c.rate_hz,
+            SensorConfig::Pitot(c) => 500 / c.rate_hz,
             SensorConfig::Rangefinder(c) => 500 / c.rate_hz,
             SensorConfig::Lidar(c) => 500 / c.rate_hz,
             SensorConfig::GroundTruth(c) => 500 / c.rate_hz,

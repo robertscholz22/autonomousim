@@ -16,7 +16,7 @@
 
 use crate::{
     BaroConfig, Barometer, BodyKinematics, Gps, GpsConfig, GroundTruthConfig, GroundTruthSensor, Imu, ImuConfig, Lidar,
-    LidarConfig, MagConfig, Magnetometer, Rangefinder, RangefinderConfig, SensorEnv, SensorError,
+    LidarConfig, MagConfig, Magnetometer, Pitot, PitotConfig, Rangefinder, RangefinderConfig, SensorEnv, SensorError,
 };
 use autonomousim_core::rng::Seed;
 use autonomousim_core::time::Clock;
@@ -29,6 +29,7 @@ pub enum SensorConfig {
     Gps(GpsConfig),
     Baro(BaroConfig),
     Mag(MagConfig),
+    Pitot(PitotConfig),
     Rangefinder(RangefinderConfig),
     Lidar(LidarConfig),
     GroundTruth(GroundTruthConfig),
@@ -41,6 +42,7 @@ impl SensorConfig {
             SensorConfig::Gps(_) => "gps",
             SensorConfig::Baro(_) => "baro",
             SensorConfig::Mag(_) => "mag",
+            SensorConfig::Pitot(_) => "pitot",
             SensorConfig::Rangefinder(_) => "rangefinder",
             SensorConfig::Lidar(_) => "lidar",
             SensorConfig::GroundTruth(_) => "ground_truth",
@@ -73,6 +75,7 @@ pub enum Sensor {
     Gps(Gps),
     Baro(Barometer),
     Mag(Magnetometer),
+    Pitot(Pitot),
     Rangefinder(Rangefinder),
     Lidar(Lidar),
     GroundTruth(GroundTruthSensor),
@@ -85,6 +88,7 @@ impl Sensor {
             SensorConfig::Gps(c) => Sensor::Gps(Gps::new(c.clone(), clock, seed)?),
             SensorConfig::Baro(c) => Sensor::Baro(Barometer::new(c.clone(), clock, seed)?),
             SensorConfig::Mag(c) => Sensor::Mag(Magnetometer::new(c.clone(), clock, seed)?),
+            SensorConfig::Pitot(c) => Sensor::Pitot(Pitot::new(c.clone(), clock, seed)?),
             SensorConfig::Rangefinder(c) => Sensor::Rangefinder(Rangefinder::new(c.clone(), clock, seed)?),
             SensorConfig::Lidar(c) => Sensor::Lidar(Lidar::new(c.clone(), clock, seed)?),
             SensorConfig::GroundTruth(c) => Sensor::GroundTruth(GroundTruthSensor::new(c.clone(), clock)?),
@@ -98,6 +102,7 @@ impl Sensor {
             Sensor::Gps(s) => s.reset(seed),
             Sensor::Baro(s) => s.reset(seed),
             Sensor::Mag(s) => s.reset(seed),
+            Sensor::Pitot(s) => s.reset(seed),
             Sensor::Rangefinder(s) => s.reset(seed),
             Sensor::Lidar(s) => s.reset(seed),
             Sensor::GroundTruth(s) => s.reset(),
@@ -111,6 +116,7 @@ impl Sensor {
             Sensor::Gps(s) => s.update(tick, time, kin, env),
             Sensor::Baro(s) => s.update(tick, time, kin, env),
             Sensor::Mag(s) => s.update(tick, time, kin, env),
+            Sensor::Pitot(s) => s.update(tick, time, kin, env),
             Sensor::Rangefinder(s) => s.update(tick, time, kin, env),
             Sensor::Lidar(s) => s.update(tick, time, kin, env),
             Sensor::GroundTruth(s) => s.update(tick, time, kin, env),

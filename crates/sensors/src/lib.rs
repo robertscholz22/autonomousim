@@ -1,5 +1,5 @@
-//! Sensor models: IMU, GPS, barometer, magnetometer, rangefinder, raycast LiDAR and ground
-//! truth.
+//! Sensor models: IMU, GPS, barometer, magnetometer, pitot-static airspeed, rangefinder, raycast
+//! LiDAR and ground truth.
 //!
 //! Every sensor is updated once per physics tick with the vehicle's [`BodyKinematics`] and the
 //! [`SensorEnv`]. It measures on the ticks its rate divides, and a reading becomes visible
@@ -19,6 +19,7 @@ pub mod latency;
 pub mod lidar;
 pub mod mag;
 pub mod noise;
+pub mod pitot;
 pub mod rangefinder;
 pub mod suite;
 
@@ -29,6 +30,7 @@ pub use imu::{Imu, ImuConfig, ImuReading, InertialNoise};
 pub use latency::{DelayLine, Stamped};
 pub use lidar::{BeamPattern, Lidar, LidarConfig, LidarScan, ReturnKind};
 pub use mag::{MagConfig, MagReading, Magnetometer};
+pub use pitot::{Pitot, PitotConfig, PitotReading};
 pub use rangefinder::{RangeReading, Rangefinder, RangefinderConfig};
 pub use suite::{Sensor, SensorConfig, SensorSpec};
 
@@ -66,6 +68,9 @@ pub struct BodyKinematics {
     pub specific_force: DVec3,
     /// Body angular acceleration (rad/s²).
     pub ang_acc: DVec3,
+    /// Air velocity at the vehicle (world frame, m/s), for air-data sensors.
+    #[serde(default)]
+    pub wind: DVec3,
 }
 
 impl BodyKinematics {

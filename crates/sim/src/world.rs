@@ -57,8 +57,10 @@ const PATH_HEADING_REACH: f64 = 8.0;
 /// without); `tail` the x, y and heading of the last unit's tail, the reference point for
 /// reversing ([`Wheeled::tail_pose`](autonomousim_vehicles::ground::Wheeled::tail_pose); the
 /// position and heading for other vehicles); `sinkage` the mean sinkage of a tracked
-/// vehicle's loaded patches into soft soil (m; 0 otherwise).
-pub const STATE_FIELDS: [(&str, usize); 14] = [
+/// vehicle's loaded patches into soft soil (m; 0 otherwise); `air_data` the true airspeed
+/// (m/s), angle of attack and sideslip (rad) relative to the air at the vehicle
+/// ([`AirFlow`](autonomousim_vehicles::aero::AirFlow)).
+pub const STATE_FIELDS: [(&str, usize); 15] = [
     ("position", 3),
     ("orientation", 4),
     ("velocity", 3),
@@ -73,10 +75,11 @@ pub const STATE_FIELDS: [(&str, usize); 14] = [
     ("articulation", 2),
     ("tail", 3),
     ("sinkage", 1),
+    ("air_data", 3),
 ];
 
 /// Length of a state row.
-pub const STATE_DIM: usize = 30;
+pub const STATE_DIM: usize = 33;
 
 #[derive(Clone, Debug)]
 pub struct WorldInstance {
@@ -410,6 +413,8 @@ impl WorldInstance {
             row[24..26].copy_from_slice(&art);
             row[26..29].copy_from_slice(&[tail.pos.x, tail.pos.y, yaw(tail.rot)]);
             row[29] = v.as_wheeled().map_or(0.0, |w| w.sinkage());
+            let flow = a.air().flow(q, q * v.lin_vel_body(), v.ang_vel_body());
+            row[30..33].copy_from_slice(&[flow.airspeed, flow.alpha, flow.beta]);
         };
         let rows = out.as_chunks_mut::<STATE_DIM>().0;
         if g.spec.count >= PARALLEL_AGENTS {
@@ -597,6 +602,11 @@ fn hash_sensor(s: &Sensor, f: &mut impl FnMut(f64)) {
         Sensor::Mag(s) => {
             if let Some(r) = s.latest() {
                 v3(r.value.field)
+            }
+        }
+        Sensor::Pitot(s) => {
+            if let Some(r) = s.latest() {
+                f(r.value.differential_pressure)
             }
         }
         Sensor::Rangefinder(s) => {

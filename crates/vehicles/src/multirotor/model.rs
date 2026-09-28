@@ -1,9 +1,9 @@
 //! Multirotor instance: parameters (possibly randomised), state and per-step force model.
 
 use super::MAX_ROTORS;
-use super::aero::{AirData, GroundPlane, ground_effect};
 use super::battery::BatteryState;
 use super::def::MultirotorDef;
+use crate::aero::{AirData, GroundPlane, ground_effect};
 use autonomousim_core::contact::{
     ContactCache, ContactModel, ContactPoint, ContactScratch, SphereCollider, StaticScene, compute_contacts,
 };

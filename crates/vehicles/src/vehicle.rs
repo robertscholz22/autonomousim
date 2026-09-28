@@ -225,6 +225,14 @@ impl Vehicle {
         each!(self, v => v.ang_vel_body())
     }
 
+    /// Wing span (m) for rotational gusts, if the vehicle wants them (fixed-wing aircraft).
+    #[inline]
+    pub fn gust_span(&self) -> Option<f64> {
+        match self {
+            Vehicle::Multirotor(_) | Vehicle::Wheeled(_) => None,
+        }
+    }
+
     /// Current total mass (kg), with randomisation.
     #[inline]
     pub fn mass(&self) -> f64 {

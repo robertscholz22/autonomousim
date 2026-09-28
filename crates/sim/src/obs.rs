@@ -12,6 +12,8 @@
 //! | `lin_vel_world` / `lin_vel_body` / `lin_vel_heading` | 3 | velocity (m/s) |
 //! | `ang_vel_body` | 3 | body rates (rad/s) |
 //! | `speed` / `sideslip` | 1 | forward speed (body x, m/s) / sideslip angle atan2(v_y, max(\|v_x\|, 1 m/s)) (rad) |
+//! | `air_data` | 3 | true airspeed (m/s), angle of attack and sideslip (rad) relative to the air at the vehicle (wind, gusts and turbulence; see [`AirFlow`](autonomousim_vehicles::aero::AirFlow)) |
+//! | `wind_body` | 3 | air velocity at the vehicle in the body frame (m/s) |
 //! | `pitch_roll` | 2 | pitch and roll (rad; Z-Y-X Euler angles) |
 //! | `lean` | 2 | roll (rad, positive right; Z-Y-X Euler angles, so about the pitched heading) and its rate (rad/s) |
 //! | `wheel_speeds` / `wheel_slip` | wheels | ground vehicles: wheel spin × tyre radius (m/s) / longitudinal slip κ |
@@ -25,6 +27,7 @@
 //! | `imu` / `imu_accel` / `imu_gyro` | 6 / 3 / 3 | IMU reading (sensor frame): specific force (m/s²) then rates (rad/s) |
 //! | `gps_position` / `gps_velocity` / `gps_goal_rel_world` | 3 | GPS fix (ENU; m, m/s); goal − GPS position |
 //! | `baro_altitude` | 1 | pressure altitude (m) |
+//! | `pitot` | 1 | indicated airspeed (m/s) |
 //! | `mag` | 3 | magnetic field (sensor frame, µT) |
 //! | `range` | 1 | rangefinder distance / max range (no return: 1) |
 //! | `lidar` / `lidar_log` | beams | range / max range, or ln(1 + r)/ln(1 + max) (no return: 1) |
@@ -50,6 +53,7 @@ use crate::lane::Follow;
 use crate::scenario::Goal;
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
+use autonomousim_vehicles::aero::AirData;
 use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_world::{Polyline, StaticWorld};
 use glam::{DQuat, DVec3, EulerRot};
@@ -116,6 +120,9 @@ pub enum TermKind {
     Lean,
     RiderLean,
     Feet,
+    AirData,
+    WindBody,
+    Pitot,
 }
 
 /// Distances ahead at which the `road` and `route` terms look (m).
@@ -129,6 +136,7 @@ impl TermKind {
             Imu | ImuAccel | ImuGyro => Some("imu"),
             GpsPosition | GpsVelocity | GpsGoalRelWorld => Some("gps"),
             BaroAltitude => Some("baro"),
+            Pitot => Some("pitot"),
             Mag => Some("mag"),
             Range => Some("rangefinder"),
             Lidar | LidarLog => Some("lidar"),
@@ -304,6 +312,7 @@ impl CompiledObs {
                     | TermKind::Agl
                     | TermKind::Clearance
                     | TermKind::BaroAltitude
+                    | TermKind::Pitot
                     | TermKind::Speed
                     | TermKind::Sideslip
                     | TermKind::Steering
@@ -402,6 +411,12 @@ impl CompiledObs {
                 TermKind::LinVelHeading => put3(dst, heading.inverse() * k.velocity),
                 TermKind::AngVelBody => put3(dst, k.rates),
                 TermKind::Speed => put(dst, &[(q.inverse() * k.velocity).x], t),
+                TermKind::AirData => {
+                    let air = AirData { wind: k.wind, ..AirData::default() };
+                    let f = air.flow(q, k.velocity, k.rates);
+                    put(dst, &[f.airspeed, f.alpha, f.beta], t)
+                }
+                TermKind::WindBody => put3(dst, q.inverse() * k.wind),
                 TermKind::Sideslip => {
                     let v = q.inverse() * k.velocity;
                     put(dst, &[v.y.atan2(v.x.abs().max(1.0))], t)
@@ -569,6 +584,10 @@ fn write_sensor(t: &Compiled, sensor: &Sensor, goal: Goal, dst: &mut [f32]) {
             Some(r) => put(dst, &[r.value.altitude], t),
             None => dst.fill(0.0),
         },
+        (TermKind::Pitot, Sensor::Pitot(s)) => match s.latest() {
+            Some(r) => put(dst, &[r.value.indicated_airspeed], t),
+            None => dst.fill(0.0),
+        },
         (TermKind::Mag, Sensor::Mag(s)) => v3(dst, s.latest().map(|r| r.value.field * 1e6)),
         (TermKind::Range, Sensor::Rangefinder(s)) => {
             let r = s.latest().and_then(|r| r.value.range).map_or(1.0, |r| r / t.max_range);
@@ -702,6 +721,45 @@ mod tests {
             ObsTerm::new(TermKind::GearRpm, 1.0),
         ] {
             assert!(CompiledObs::new(&[bad], &sensors, 4, 4, 0, false).is_err());
+        }
+    }
+
+    #[test]
+    fn air_terms() {
+        let terms = [ObsTerm::new(TermKind::AirData, 1.0), ObsTerm::new(TermKind::WindBody, 1.0)];
+        let obs = CompiledObs::new(&terms, &[], 4, 4, 0, false).unwrap();
+        assert_eq!(obs.dim(), 6);
+        let world = testworlds::flat(50.0);
+        // Heading north at 20 m/s, 2 m/s sinking, with a 5 m/s wind from the west.
+        let att = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        let kin = BodyKinematics {
+            attitude: att,
+            velocity: DVec3::new(0.0, 20.0, -2.0),
+            wind: DVec3::new(5.0, 0.0, 0.0),
+            ..Default::default()
+        };
+        let inp = ObsInput {
+            kin: &kin,
+            goal: Goal { position: DVec3::ZERO, yaw: 0.0 },
+            agl: 10.0,
+            motors: &[],
+            motor_range: (0.0, 1.0),
+            last_action: &[0.0; 4],
+            wheeled: None,
+            sensors: &[],
+            world: &world,
+            agents: &[],
+            me: 0,
+            grid: &AgentGrid::default(),
+            route: None,
+        };
+        let mut out = vec![f32::NAN; 6];
+        obs.write(&inp, &mut out);
+        // Relative to the air: 20 m/s ahead, 5 m/s to the left (air from the left: β < 0).
+        let v = DVec3::new(20.0, 5.0, -2.0);
+        let want = [v.length(), 2f64.atan2(20.0), (-5.0 / v.length()).asin(), 0.0, -5.0, 0.0];
+        for (o, w) in out.iter().zip(want) {
+            assert!((f64::from(*o) - w).abs() < 1e-5, "{out:?} vs {want:?}");
         }
     }
 }
