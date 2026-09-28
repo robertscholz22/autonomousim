@@ -1905,6 +1905,187 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
     - In `raw` mode, throttle alone ends every episode, at least one of them in a fall.
     - `sim/tests/roads.rs` checks `road_class` against the road under each car, and that routes keep clear of the map's edges.
 
+## Milestone 6: Aircraft (fixed-wing, helicopter, tiltrotor) and large maps
+
+Planned 2026-09-28. Decided with the user at the start:
+- **Aircraft**: all three roadmap types. The VTOL is a **tiltrotor**.
+- **Maps**: **tiled large maps** (10–20 km), streamed around the agents, with a floating origin in the viewer.
+- **Demos**: **one task per aircraft type**.
+- **Training**: as before, only enough to test what was built; the user trains the agents.
+
+The rest of this section is proposed and open to change.
+
+Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a commit and a push.
+- **M6a**: large maps, then the shared aerodynamics, then fixed-wing aircraft. Fixed-wing aircraft need the space most, and the helicopter and the tiltrotor reuse their wing and air-data parts.
+- **M6b**: helicopter. Its rotor model (forward flight, flapping) also serves the tiltrotor's proprotors in edgewise flow.
+- **M6c**: tiltrotor.
+
+**Already in place**:
+- **Rigid bodies**: Free-joint rigid bodies with implicit-midpoint gyroscopics.
+- **Multirotor rotors**: first-order motors, thrust and torque ∝ ω², rotor drag, ground effect, battery.
+- **Environment**: ISA atmosphere with speed of sound; wind with a log profile, 1−cos gusts and Dryden turbulence (low-altitude form only, floored at 2 m/s airspeed).
+- **Sensors**: IMU, GPS, baro, mag, rangefinder, LiDAR.
+- **Contacts**: penalty contacts with gear/crash semantics and `LANDED`.
+- **Multi-agent and Python stack**: batched and multi-agent worlds, the Python stack, PPO/SAC, policy export, viewer policy mode and MCAP replay.
+
+**Not in place**:
+- **Maps**: all maps are single monolithic `HeightGrid`s (2 km at 1 m ≈ 20 MB). At 1 m, 20 km would be about 1.6 GB of heights alone, and erosion runs sequentially over the whole grid. The viewer meshes the whole map at load time and converts f64 to f32 without an origin shift.
+- **Aerodynamics**: `AirData` lives in the multirotor module. There are no aerodynamic surfaces or airspeed terms.
+
+### M6a: Large maps and fixed-wing aircraft
+
+#### Design
+- **Tiled large maps** (`world::tiles`, `procgen::large`):
+  - **Two layers.**
+    - A **coarse layer** covers the whole map (e.g. 16 km at 8 m, 2000², about 40 MB). It is generated globally: terrain noise, erosion at the coarse scale, hydrology (lakes, rivers as the flow network), materials, and for rural maps farm sites, the road network and **airstrips** (a flat mown grass or asphalt runway, 400–800 m).
+    - **Detail tiles** (256 m at 1 m) are pure functions of (map, tile index). Each is made by bicubic upsampling of the coarse heights plus detail noise, road blending and materials from the coarse network, and scatter from the tile's own seed stream (`map/<gen>/<tile>`). A tile's content is then independent of when, by which thread and in which order it is generated. Seams are continuous because the upsampling and noise are global functions and scatter is assigned by candidate position.
+  - **`TiledWorld`** implements `Terrain` and `StaticGeometry`.
+    - Queries go to the detail tile when it is loaded or loadable, and to the coarse layer beyond a query's `far` range (long LiDAR rays, AGL of high aircraft).
+    - Tiles sit in a shared, thread-safe LRU cache (`Arc`; a few hundred tiles, about 150 MB) used by all worlds of a batch. Obstacles are per tile (one BVH each); ray casts walk the tiles along the ray.
+    - `StaticWorld` becomes an enum (`Grid` or `Tiled`), or `HeightGrid` is wrapped behind the trait, so existing maps, hashes and goldens stay unchanged.
+  - **Hash**: generator version, config, seed and the coarse layer's content, plus a golden sample of detail tiles (tile hashes checked in tests). The map file caches the coarse layer; tiles are recomputed (or cached on disk under their own keys).
+  - **Presets**: `wild` and `rural` gain `large` (16 km). The pool `count` for large maps is small (1–4), since tiles, not whole maps, are the unit of cost.
+- **Viewer**:
+  - A **floating origin**: render space is re-centred on the camera every 1 km, and transforms are computed in f64 relative to the origin before converting to f32.
+  - **Streaming**: detail tiles are meshed as today's chunks, with LOD, near the camera (up to about 1.5 km, with vegetation). Coarse-layer chunks at strides of 16–64 m cover the far field out to 8–12 km, fogged.
+  - **An aerial view distance** that grows with the camera's height.
+  - **Target**: ≥ 60 fps at 1080p medium on the Iris Xe while flying at 30 m/s at 200 m AGL.
+- **Shared aerodynamics** (`vehicles::aero`):
+  - `AirData` moves here and gains the air-relative velocity and the speed of sound.
+  - **`AeroSurface`**: a lifting surface (area, chord, span, position, incidence, lift curve with stall, drag polar, control surface with effectiveness τ). It has a post-stall flat-plate blend (Beard & McLain's sigmoid) and optional α/β tables, and is used by wings, tails and helicopter fins.
+  - **Wind**: Dryden gains the medium/high-altitude form (MIL-F-8785C above 2000 ft) and optional rotational gusts `p_g, q_g, r_g`.
+  - **New sensor**: `pitot` (airspeed with noise and lag).
+  - **New observation terms**: `air_data` (airspeed, α, β) and `wind_body`.
+  - **New state columns**: airspeed, α, β. Goldens are re-blessed after an A/B check of trajectories in a worktree.
+- **Fixed-wing aircraft** (`vehicles::fixedwing`, `type = "fixed_wing"`, `Family::FixedWing`):
+  - **Structure**: a rigid body with an aerodynamic model, propulsion, control surfaces with servo rate and lag, landing gear, colliders and a battery or fuel.
+  - **Aerodynamic model**:
+    - Either **stability and control derivatives** (CL, CD polar, CY, Cl, Cm, Cn in α, β, p̂, q̂, r̂, δa, δe, δr, δf, with stall blending), as in Beard & McLain;
+    - or **coefficient tables** in α, β, Mach and δ, as JSBSim models are written.
+    - A component build-up from `AeroSurface`s is also available, for the tiltrotor's wing.
+  - **Propulsion**: a propeller with `C_T(J)`, `C_P(J)` tables on an electric motor (Kv, resistance, current limit, battery) or a piston engine (power map, mixture ignored). It is modelled as a rotor with inertia, torque reaction and gyroscopic moments.
+  - **Landing gear**: a light `Gear` force element in the manner of JSBSim's LGear.
+    - A strut spring and damper along the gear axis.
+    - Rolling friction along the wheel plane, side friction across it, brakes, and a steerable nose or tail wheel.
+    - It is not the M2 tyre model, which would need a 1 kHz tyre relaxation for no benefit here.
+  - **Spawns**: in the air at trim (heading, airspeed, height AGL), or on a runway on the gear.
+  - **Presets**:
+    - `aerosonde_like`: a 13.5 kg UAV at 25 m/s, from Beard & McLain's *Small Unmanned Aircraft*, electric.
+    - `c172_like`: a Cessna 172, from JSBSim's c172x model data and the POH, with piston engine and tricycle gear. It is used for the JSBSim oracle and runway takeoffs.
+  - **Events**:
+    - A crash is any non-gear contact, or gear touchdown above a sink-rate limit.
+    - `LANDED` means on the gear, slow.
+    - A new non-terminal `STALL` bit is raised when α exceeds the stall α.
+- **Oracle**: **JSBSim** (PyPI `jsbsim`), run offline like Chrono to generate committed fixtures (`tools/gen_jsbsim_fixtures.py`, `make fixtures-jsbsim`).
+  - **Checks**: trim over an airspeed sweep (α, elevator, throttle); linear modes (short period, phugoid, Dutch roll, roll subsidence, spiral) from JSBSim's linearisation; doublet time histories; the c172 takeoff roll.
+  - **Also**: Beard & McLain's published Aerosonde trim and transfer functions, and analytic checks (glide ratio `L/D`, turn rate `g·tan φ / V`, energy with the engine off).
+- **Control** (`control::fixedwing`, gains scheduled on dynamic pressure and derived from the model, as for the multirotor):
+  - **Action modes**:
+    - `raw`: aileron, elevator, rudder, throttle, optionally flaps.
+    - `rates`: p, q, r and throttle; a rate PI with turn coordination.
+    - `attitude` (default): roll, pitch and airspeed; TECS handles throttle.
+    - `guidance`: course rate or course, climb rate or altitude, airspeed; TECS plus L1 lateral guidance, as in PX4.
+  - **Takeoff and landing**: a scripted runway takeoff and a glide-slope landing helper in the task layer or scripted drivers, not in the controller.
+- **Viewer**:
+  - **Visuals** built from the definition: fuselage, wings, tail, control surfaces deflecting, prop disc, gear.
+  - **HUD**: an artificial horizon, airspeed, altitude and vertical speed, α and β, throttle, surface deflections, stall warning.
+  - **Keyboard flight** in `attitude` (and `guidance`), a chase camera suited to high speeds, and replay.
+- **Demo**, **`FixedWingWaypoints-v0`**: `aerosonde_like` in `attitude` mode on a large wild map.
+  - It starts in the air at trim, 150 m AGL, and flies through waypoints 1–3 km apart around the relief, in wind and turbulence.
+  - Terrain contact is a crash. A rangefinder or LiDAR fan looks ahead and down for terrain.
+  - **Reward**: progress to the goal, a bonus per waypoint, a penalty below a safe AGL and on stalling, and smoothness.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | `world::tiles` + `procgen::large`: coarse layer (terrain, erosion, hydrology, materials, rural roads and airstrips), detail tiles, `TiledWorld` with the tile LRU, hashes, `large` presets | Tiles are identical whatever the access order and thread count; heights and normals are continuous across tile seams; queries agree with a monolithic grid built from the same functions; the coarse 16 km layer generates in ≤ 15 s and a tile in ≤ 50 ms; memory stays under the cache bound; existing goldens are unchanged |
+| 2 | Viewer: floating origin, streamed tiles and far-field coarse chunks, aerial view distance | A drone flies across a 16 km map without jitter at the far edge; ≥ 60 fps at 1080p medium at 30 m/s and 200 m AGL on the Iris Xe |
+| 3 | Shared aero: `AirData` move, `AeroSurface`, medium/high-altitude Dryden, `pitot`, the `air_data`/`wind_body` terms, state columns | Lift, drag and moment of a surface match analytic thin-aerofoil and flat-plate values; Dryden spectra match MIL-F-8785C at altitude; goldens re-blessed after an A/B check |
+| 4 | `FixedWing` family: aero model (derivatives and tables), propeller and motor or engine, gear, presets, wiring through vehicles, sim, recorder and Python | Both presets trim in level flight; engine-off glide conserves energy with drag accounted for; they stand on their gear; scenarios spawn them in the air and on a runway |
+| 5 | JSBSim fixtures and validation | Trim α, elevator and throttle within 5 % (or 0.5°) of JSBSim over the airspeed sweep; mode frequencies and damping within 10 %; doublet responses close; c172 takeoff roll within 10 % of JSBSim and the POH |
+| 6 | Control and action modes (`raw`, `rates`, `attitude`, `guidance`) | Rate and attitude steps meet rise and overshoot bounds across the speed range; coordinated turns keep β small; altitude and airspeed hold under wind and turbulence; L1 follows a straight and a circular path |
+| 7 | Viewer: visuals, HUD, keyboard flight, cameras, replay | The Aerosonde flies by keyboard over a large map at ≥ 60 fps; recordings replay |
+| 8 | `FixedWingWaypoints-v0`: task, scripted pilot, short training, export, viewer, replay | The task trains end to end; the exported policy flies in the viewer; a recorded episode replays |
+
+### M6b: Helicopter
+
+#### Design
+- **Rotor model** (`vehicles::rotorcraft::rotor`), shared by the helicopter's main and tail rotors and the tiltrotor's proprotors:
+  - **Aerodynamics**: blade-element theory integrated in closed form over a rigid blade (linear twist, lift slope, profile drag, root cut-out, tip loss), with inflow from momentum theory in forward flight (Glauert). Iteration over inflow and thrust gives thrust, torque and power, and the H- and Y-forces.
+  - **Flapping**: the tip-path plane follows first-order flapping dynamics `a₁, b₁` with time constant `16/(γΩ)`, from cyclic, rates (gyroscopic and aerodynamic cross-coupling) and advance ratio. A hinge offset or spring gives a hub moment.
+  - **Ground effect** and a vortex-ring-state warning (not modelled beyond the momentum-theory limit).
+  - **Rotor speed**: a state driven by the engine and governor against the rotor torque, so autorotation is possible.
+  - **Optional**: Pitt–Peters dynamic inflow (three states), if the quasi-steady inflow misses the validation.
+- **Helicopter** (`type = "helicopter"`, `Family::Rotorcraft`):
+  - **Components**: main rotor, tail rotor geared to it, swashplate servos (collective, longitudinal and lateral cyclic; tail collective), fuselage drag areas, horizontal and vertical fins (`AeroSurface`), engine with governor and torque limit, and skids as gear colliders.
+  - **Presets**:
+    - `xcell60_like`: an 8.2 kg RC helicopter, from Gavrilets, Mettler & Feron's published model.
+    - `bo105_like`: a light twin, from Padfield's *Helicopter Flight Dynamics* configuration data.
+- **Validation**:
+  - **Hover**: power against momentum theory with a figure of merit; thrust and torque coefficients against blade-element formulas.
+  - **Bo105 (Padfield)**: the power-versus-speed bucket, trim collective and attitudes, and selected stability derivatives, within about 10–15 %.
+  - **X-Cell**: flapping time constants and hover trim.
+  - **Behaviour**: autorotation keeps rotor speed with a plausible descent rate.
+- **Control**:
+  - **Action modes**:
+    - `raw`: collective, cyclic, pedal.
+    - `rates`: collective and body rates, the counterpart of `ctbr`.
+    - `attitude`.
+    - `velocity`: horizontal velocity, vertical velocity and yaw rate, as for multirotors.
+  - **Gains**: from a numerical linearisation in hover and forward flight, scheduled on airspeed.
+- **Viewer**: fuselage, a rotor disc tilted by the flapping, tail rotor, skids; HUD with rotor rpm, collective, torque and power; keyboard flight; replay.
+- **Demo**, **`HeliLandingZone-v0`**: the X-Cell (or Bo105) flies from forward flight over a large wild map to a landing zone (flat open ground in a valley or on a ridge) and lands. Success requires a touchdown sink rate and attitude limit, in wind and turbulence.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Rotor model: BEMT with forward-flight inflow, flapping, hub moments, ground effect, rotor speed | Hover and forward-flight thrust, torque and flapping match closed-form blade-element and momentum results; flapping lag matches `16/(γΩ)` |
+| 2 | Helicopter family and presets; engine and governor; tail rotor; fins; skids; wiring | Both presets trim in hover and forward flight; stand on their skids; rotor speed recovers from load steps |
+| 3 | Validation against Padfield (Bo105) and Gavrilets (X-Cell) | Hover power, power curve, trim controls and attitudes within the tolerances above |
+| 4 | Control and action modes | Attitude and velocity steps settle in hover and at 20 m/s; hover holds position in wind |
+| 5 | Viewer: visuals, HUD, keyboard flight, replay | The helicopter flies by keyboard and lands on a large map; recordings replay |
+| 6 | `HeliLandingZone-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
+
+### M6c: Tiltrotor
+
+#### Design
+- **Layout** (proposed): a **quad tiltrotor UAV**, like PX4's tiltrotor airframes, with a wing, a tail with control surfaces and four fixed-pitch rotors on tilting mounts.
+  - In hover it is controlled like a multirotor, with differential thrust plus differential tilt for yaw. In cruise it is a fixed-wing with the rotors forward.
+  - A twin proprotor layout in the manner of the V-22 would need cyclic pitch on the proprotors from M6b and is harder to control; it stays an option.
+- **Model**:
+  - Each rotor mount is an actuated revolute (tilt servo with rate limit and lag). Tilt reaction and gyroscopic moments of the spinning rotors act on the airframe.
+  - The rotors use M6b's rotor model (fixed pitch, oblique and edgewise inflow in transition).
+  - The wing and tail use the fixed-wing surfaces, with an optional simple slipstream factor over the wing behind the rotors.
+- **Control**:
+  - **Transition**: a transition scheduler gives the tilt as a function of airspeed within the conversion corridor. The control allocation blends multirotor thrust and tilt allocation with the aerodynamic surfaces, weighted by dynamic pressure.
+  - **Action modes**:
+    - `velocity`: transitions automatically with the commanded speed.
+    - `attitude` with airspeed.
+    - `raw`: rotor throttles, tilts and surfaces.
+- **Validation**:
+  - Hover trim like a multirotor (power against momentum theory).
+  - Cruise trim like a fixed-wing (against a component build-up of the same wing).
+  - The conversion corridor (feasible tilt against airspeed) from trim sweeps, with a plausible shape.
+  - A scripted transition in both directions within an altitude band and without stall.
+  - Energy bookkeeping.
+- **Viewer**: visuals with tilting nacelles; HUD with tilt, transition state and corridor; keyboard flight; replay.
+- **Demo**, **`TiltrotorDelivery-v0`**: the tiltrotor takes off vertically from a pad on a large rural map, transitions, cruises 2–4 km to a farm yard, transitions back and lands on the yard's pad.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Tilting rotor mounts, tiltrotor preset, trims | Hover and cruise trims match their references; the corridor is computed; energy balance holds |
+| 2 | Transition control and action modes | Scripted transitions both ways hold altitude within bounds without stall; hover and cruise steps settle |
+| 3 | Viewer: visuals, HUD, keyboard flight, replay | It flies by keyboard through both transitions; recordings replay |
+| 4 | `TiltrotorDelivery-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
+
+**To confirm while building**:
+- JSBSim's PyPI package and licence for generating fixtures offline (its aircraft data is LGPL; only derived fixtures are committed);
+- access to Beard & McLain's Aerosonde parameters and Padfield's Bo105 data;
+- Gavrilets' X-Cell 60 parameter table;
+- whether the aerial physics rate stays 500 Hz for fixed-wing aircraft (the short period of a small UAV is several Hz) and moves to 1 kHz for helicopters;
+- the tile size and cache bound against memory on the laptop.
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
@@ -1912,7 +2093,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 | M3 | (Detailed above.) Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations | pettingzoo API tests; 256 drones at ≥ 20× real time |
 | M4 | (Detailed above; split into M4a/b/c.) Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
 | M5 ✅ | (Detailed above; done 2026-09-28.) Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
-| M6 | Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
+| M6 | (Detailed above; split into M6a/b/c.) Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
 | M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export; live viewer attach to a running simulation (moved from M3, 2026-09-25) | Round trip with `ros2 topic echo` |
