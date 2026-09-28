@@ -154,18 +154,22 @@ impl AeroModel {
     }
 
     /// Angles of attack of maximum and minimum lift (the stall angles), searched over ±0.6 rad
-    /// in 0.005 rad steps with everything else neutral.
+    /// in 0.005 rad steps with everything else neutral. A peak the lift does not fall from
+    /// (a table that ends there and is held flat, like JSBSim's C172 below −5°) is no stall:
+    /// the search limit is returned instead.
     pub fn stall_angles(&self, geo: &Geometry) -> (f64, f64) {
         let search = |sign: f64| {
-            let (mut best, mut at) = (f64::NEG_INFINITY, 0.0);
+            let (mut best, mut at, mut falls) = (f64::NEG_INFINITY, 0.0, false);
             for i in 0..=120 {
                 let a = sign * 0.005 * i as f64;
                 let cl = sign * self.lift_at(geo, a);
                 if cl > best + 1e-12 {
-                    (best, at) = (cl, a);
+                    (best, at, falls) = (cl, a, false);
+                } else if cl < best - 1e-9 {
+                    falls = true;
                 }
             }
-            at
+            if falls { at } else { sign * 0.6 }
         };
         (search(1.0), search(-1.0))
     }

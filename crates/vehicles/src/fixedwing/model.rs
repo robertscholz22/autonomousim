@@ -577,19 +577,21 @@ impl FixedWing {
     }
 
     /// Aerodynamic and propulsive loads (FLU body frame, about the centre of mass) at a fixed
-    /// state, for trimming: body velocity `v_body` in still air of density `rho`, zero rates,
-    /// deflections `surfaces`, throttle, rotor speed `omega`; out of ground effect. Returns the
-    /// force, moment and the net rotor torque.
+    /// state, for trimming and linearising: body velocity `v_body` and body rates `rates` in
+    /// still air of density `rho`, deflections `surfaces`, throttle, rotor speed `omega`; out of
+    /// ground effect. Returns the force, moment and the net rotor torque.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn static_loads(
         &self,
         v_body: DVec3,
+        rates: DVec3,
         rho: f64,
         surfaces: [f64; 4],
         throttle: f64,
         omega: f64,
     ) -> (DVec3, DVec3, f64) {
         let air = AirData { density: rho, ..AirData::default() };
-        let flow = AirFlow::new(&air, v_body, DVec3::ZERO);
+        let flow = AirFlow::new(&air, v_body, rates);
         let p = &self.propulsion;
         let v_axial = v_body.dot(p.axis);
         let supply = self.def.battery.as_ref().map_or(0.0, |b| b.full_voltage());

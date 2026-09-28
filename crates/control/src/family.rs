@@ -3,7 +3,10 @@
 //! are disjoint, so a mode name alone selects the family.
 
 use crate::ControlError;
-use crate::fixedwing::{FixedWingActionMap, FixedWingActionMode, FixedWingController, FixedWingSetpoint};
+use crate::fixedwing::{
+    FixedWingActionLimits, FixedWingActionMap, FixedWingActionMode, FixedWingConfig, FixedWingController,
+    FixedWingSetpoint,
+};
 use crate::ground::GroundSetpoint;
 use crate::ground::{GroundActionLimits, GroundActionMap, GroundActionMode, GroundConfig, GroundController};
 use crate::multirotor::{ActionLimits, ActionMap, ActionMode, ControllerConfig, MultirotorController};
@@ -202,11 +205,12 @@ impl Controller {
         dt: f64,
         multirotor: &ControllerConfig,
         ground: &GroundConfig,
+        fixed_wing: &FixedWingConfig,
     ) -> Result<Self, ControlError> {
         Ok(match def {
             SharedDef::Multirotor(d) => Controller::Multirotor(MultirotorController::new(d, dt, multirotor)?),
             SharedDef::Wheeled(d) => Controller::Ground(GroundController::new(d, dt, ground)?),
-            SharedDef::FixedWing(_) => Controller::FixedWing(FixedWingController::new()),
+            SharedDef::FixedWing(d) => Controller::FixedWing(FixedWingController::new(d, dt, fixed_wing)?),
         })
     }
 
@@ -268,6 +272,7 @@ impl ActionMapping {
         mode: AgentActionMode,
         multirotor: &ActionLimits,
         ground: &GroundActionLimits,
+        fixed_wing: &FixedWingActionLimits,
         def: &SharedDef,
         controller: &Controller,
     ) -> Result<Self, ControlError> {
@@ -278,8 +283,8 @@ impl ActionMapping {
             (AgentActionMode::Ground(m), SharedDef::Wheeled(d), Controller::Ground(_)) => {
                 Ok(ActionMapping::Ground(GroundActionMap::new(m, ground, d)?))
             }
-            (AgentActionMode::FixedWing(m), SharedDef::FixedWing(_), Controller::FixedWing(_)) => {
-                Ok(ActionMapping::FixedWing(FixedWingActionMap::new(m)))
+            (AgentActionMode::FixedWing(m), SharedDef::FixedWing(_), Controller::FixedWing(c)) => {
+                Ok(ActionMapping::FixedWing(FixedWingActionMap::new(m, fixed_wing, c)?))
             }
             _ => Err(ControlError::InvalidConfig(format!(
                 "action mode {mode} does not drive {} vehicles ({:?})",

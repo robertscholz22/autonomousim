@@ -53,6 +53,8 @@ fn presets_are_consistent() {
     // The c172's stall at the top of JSBSim's lift table (0.28 rad).
     let c = aircraft("c172_like");
     assert!((c.stall_angles().0 - 0.28).abs() < 1e-9);
+    // Below −0.09 rad the table is held flat: no negative stall.
+    assert_eq!(c.stall_angles().1, -0.6);
     // Beard & McLain: elevator and rudder derivatives are negative.
     assert_eq!(aircraft("aerosonde_like").control_signs(), [1.0, -1.0, -1.0]);
 }

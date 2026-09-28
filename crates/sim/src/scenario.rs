@@ -42,6 +42,7 @@ use crate::bay::BayGoals;
 use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
+use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
 use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
 use autonomousim_control::{ActionMapping, AgentActionMode, Controller};
@@ -562,7 +563,8 @@ impl VehicleRef {
 /// group as arrays of shape `[num_envs, count, dim]`.
 ///
 /// `controller`, `action_limits` and `randomize` configure multirotors; `ground_controller`,
-/// `ground_action_limits` and `drivable` wheeled vehicles. Setting those of the other family is an error.
+/// `ground_action_limits` and `drivable` wheeled vehicles; `fixed_wing_controller` and
+/// `fixed_wing_action_limits` fixed-wing aircraft. Setting those of another family is an error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -583,6 +585,10 @@ pub struct GroupSpec {
     pub ground_controller: GroundConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub ground_action_limits: GroundActionLimits,
+    #[serde(skip_serializing_if = "is_default")]
+    pub fixed_wing_controller: FixedWingConfig,
+    #[serde(skip_serializing_if = "is_default")]
+    pub fixed_wing_action_limits: FixedWingActionLimits,
     /// Terrain that ground vehicles can drive over: spawns and goals only use drivable cells,
     /// and goals must be reachable from the spawn.
     #[serde(skip_serializing_if = "is_default")]
@@ -610,6 +616,8 @@ impl Default for GroupSpec {
             action_limits: ActionLimits::default(),
             ground_controller: GroundConfig::default(),
             ground_action_limits: GroundActionLimits::default(),
+            fixed_wing_controller: FixedWingConfig::default(),
+            fixed_wing_action_limits: FixedWingActionLimits::default(),
             drivable: DrivableSpec::default(),
             sensors: Vec::new(),
             obs: Vec::new(),
@@ -1061,9 +1069,13 @@ impl CompiledGroup {
             ("ground_action_limits", !is_default(&spec.ground_action_limits)),
             ("drivable", !is_default(&spec.drivable)),
         ];
+        let fixed_wing = [
+            ("fixed_wing_controller", !is_default(&spec.fixed_wing_controller)),
+            ("fixed_wing_action_limits", !is_default(&spec.fixed_wing_action_limits)),
+        ];
         let foreign: Vec<_> = match family {
-            Family::Multirotor => ground.to_vec(),
-            Family::Wheeled => multirotor.to_vec(),
+            Family::Multirotor => ground.into_iter().chain(fixed_wing).collect(),
+            Family::Wheeled => multirotor.into_iter().chain(fixed_wing).collect(),
             Family::FixedWing => multirotor.into_iter().chain(ground).collect(),
         };
         if let Some((field, _)) = foreign.iter().find(|f| f.1) {
@@ -1073,9 +1085,17 @@ impl CompiledGroup {
         if family == Family::Wheeled {
             spec.spawn.on_ground = true;
         }
-        let controller = Controller::new(&def, clock.dt(), &spec.controller, &spec.ground_controller)?;
-        let action_map = ActionMapping::new(mode, &spec.action_limits, &spec.ground_action_limits, &def, &controller)
-            .map_err(|e| fail(e.to_string()))?;
+        let controller =
+            Controller::new(&def, clock.dt(), &spec.controller, &spec.ground_controller, &spec.fixed_wing_controller)?;
+        let action_map = ActionMapping::new(
+            mode,
+            &spec.action_limits,
+            &spec.ground_action_limits,
+            &spec.fixed_wing_action_limits,
+            &def,
+            &controller,
+        )
+        .map_err(|e| fail(e.to_string()))?;
         spec.randomize.validate()?;
         for (i, s) in spec.sensors.iter().enumerate() {
             if spec.sensors[..i].iter().any(|o| o.name == s.name) {

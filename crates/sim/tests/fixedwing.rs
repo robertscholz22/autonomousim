@@ -1,5 +1,6 @@
 //! Fixed-wing aircraft in the simulation: trimmed air spawns (with wind), spawns on the gear,
-//! the `surfaces` action mode, the stall event and recordings.
+//! the `surfaces` action mode, the stall event, recordings and the controlled `guidance` mode in
+//! turbulence.
 
 use autonomousim_core::rng::Seed;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
@@ -20,6 +21,7 @@ fn scenario(vehicle: &str, spawn: &str, extra: &str) -> Arc<CompiledScenario> {
         [[groups]]
         name = "air"
         vehicle = "{vehicle}"
+        action_mode = "surfaces"
         obs = [ {{ term = "air_data" }}, {{ term = "rot6d" }}, {{ term = "last_action" }} ]
         spawn = {{ region = [[-300.0, -300.0], [300.0, 300.0]], {spawn} }}
         "#
@@ -127,4 +129,40 @@ fn records_the_aircraft_state() {
     assert_eq!((last.airspeed, last.alpha), (live.flow().airspeed, live.flow().alpha));
     assert_eq!(last.gear_loads, vec![0.0; 3]);
     assert!(last.surfaces[0] > 0.0 && last.position.distance(live.position()) < 1e-9);
+}
+
+/// The default controller in `guidance` mode through the scenario: a zero action (straight,
+/// level, mid-range airspeed) keeps altitude and the ground track in light turbulence over a
+/// crosswind.
+#[test]
+fn guidance_mode_holds_course_and_altitude() {
+    for vehicle in ["aerosonde_like", "c172_like"] {
+        let sc = compile(&format!(
+            r#"
+            name = "fw"
+            map = {{ type = "testworld", kind = "flat", size = 8000.0 }}
+            environment = {{ wind = {{ mean = [0.0, 4.0], turbulence_w20 = 7.7 }} }}
+            [[groups]]
+            name = "air"
+            vehicle = "{vehicle}"
+            action_mode = "guidance"
+            obs = [ {{ term = "air_data" }} ]
+            spawn = {{ region = [[-100.0, -100.0], [100.0, 100.0]], agl = [400.0, 400.0], yaw_deg = [0.0, 0.0], clearance = 0.0 }}
+            "#
+        ));
+        let mut w = WorldInstance::new(sc, Seed::from_u64(5));
+        w.set_actions(0, &[0.0, 0.0, 0.0]);
+        // The first 20 s trade some height for the speed-up from the spawn speed (1.5 V_s).
+        let mut e = run(&mut w, 20.0);
+        let p1 = aircraft(&w).position();
+        let z0 = p1.z;
+        e |= run(&mut w, 40.0);
+        let a = aircraft(&w);
+        let v = a.lin_vel_world();
+        assert!(!e.is_terminal() && !e.contains(Events::STALL), "{vehicle}: {e:?}");
+        assert!((a.position().z - z0).abs() < 10.0, "{vehicle}: altitude {} → {}", z0, a.position().z);
+        // A zero course rate holds the ground track (crabbing into the wind), not the heading.
+        let track = (a.position() - p1).truncate();
+        assert!(v.truncate().angle_to(track).abs() < 0.1, "{vehicle}: course {v} vs track {track}");
+    }
 }

@@ -22,4 +22,4 @@ pub use propulsion::{
     ElectricMotorDef, EngineDef, PistonEngineDef, PropellerDef, Propulsion, PropulsionDef, PropulsionOutput,
 };
 pub use table::{Curve, Table};
-pub use trim::Trim;
+pub use trim::{ControlDerivatives, Trim};

@@ -246,6 +246,7 @@ def test_fixed_wing():
         "groups": [
             {
                 "vehicle": "c172_like",
+                "action_mode": "surfaces",
                 "spawn": {
                     "agl": [300.0, 300.0],
                     "airspeed": [40.0, 45.0],
@@ -266,6 +267,6 @@ def test_fixed_wing():
         stalled |= (sim.events(0)[:, 0] & Event.STALL) != 0
         assert not (sim.events(0) & TERMINAL).any()
     assert stalled.all()
-    bad = deep_merge(flight, {"groups": [{"vehicle": "cf2x"}]})
+    bad = deep_merge(flight, {"groups": [{"vehicle": "cf2x", "action_mode": "ctbr"}]})
     with pytest.raises(ValueError, match="airspeed"):
         BatchSim(json.dumps(bad), 1)

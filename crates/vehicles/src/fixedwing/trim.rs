@@ -9,6 +9,23 @@ use super::model::FixedWing;
 use crate::VehicleError;
 use glam::{DQuat, DVec3};
 
+/// Local control model about a trim, for controller design: how the moments respond to the
+/// normalised controls and to the body rates, and the thrust to the throttle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ControlDerivatives {
+    pub trim: Trim,
+    /// Moment (FLU body frame, N·m) per unit of normalised aileron, elevator and rudder.
+    pub control: [DVec3; 3],
+    /// Moment (N·m) per body rate (rad/s) about x, y and z.
+    pub damping: [DVec3; 3],
+    /// Moment (N·m) per radian of angle of attack at constant airspeed.
+    pub alpha: DVec3,
+    /// Lift (N, normal to the airspeed in the symmetry plane) per radian of angle of attack.
+    pub lift_alpha: f64,
+    /// Steady thrust (N) per unit of throttle, the rotor settled, at the trim airspeed.
+    pub thrust_per_throttle: f64,
+}
+
 /// Trimmed straight flight.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trim {
@@ -93,7 +110,7 @@ impl FixedWing {
         let rot = DQuat::from_rotation_y(-theta) * DQuat::from_rotation_x(phi);
         let (sa, ca) = alpha.sin_cos();
         let v_body = DVec3::new(ca, 0.0, -sa) * airspeed;
-        let (f, m, rotor) = self.static_loads(v_body, rho, [da, de, dr, flap], throttle, omega);
+        let (f, m, rotor) = self.static_loads(v_body, DVec3::ZERO, rho, [da, de, dr, flap], throttle, omega);
         let lin = f / self.mass() + rot.inverse() * DVec3::new(0.0, 0.0, -g);
         let ang = self.inertia().inverse() * m;
         let climb = (rot * v_body).z / airspeed - gamma.sin();
@@ -193,5 +210,46 @@ impl FixedWing {
             rotor_speed: omega,
             residual,
         })
+    }
+
+    /// Control derivatives about the level trim at `airspeed` (central differences of the
+    /// aerodynamic and propulsive loads; the rotor held at its trim speed for the moments).
+    pub fn control_derivatives(&self, airspeed: f64, rho: f64, g: f64) -> Result<ControlDerivatives, VehicleError> {
+        let t = self.trim(airspeed, rho, 0.0, 0.0, g)?;
+        let v = t.velocity_body();
+        let moment = |c: &super::FixedWingInput, rates: DVec3| {
+            self.static_loads(v, rates, rho, self.targets(c), c.throttle, t.rotor_speed).1
+        };
+        let h = 0.02;
+        let control = [0, 1, 2].map(|k| {
+            let (mut cp, mut cm) = (t.controls, t.controls);
+            let (p, m) = match k {
+                0 => (&mut cp.aileron, &mut cm.aileron),
+                1 => (&mut cp.elevator, &mut cm.elevator),
+                _ => (&mut cp.rudder, &mut cm.rudder),
+            };
+            *p += h;
+            *m -= h;
+            (moment(&cp, DVec3::ZERO) - moment(&cm, DVec3::ZERO)) / (2.0 * h)
+        });
+        let hr = 0.01;
+        let damping = [DVec3::X, DVec3::Y, DVec3::Z]
+            .map(|e| (moment(&t.controls, e * hr) - moment(&t.controls, -e * hr)) / (2.0 * hr));
+        let at_alpha = |da: f64| {
+            let (sa, ca) = (t.alpha + da).sin_cos();
+            let v = DVec3::new(ca, 0.0, -sa) * airspeed;
+            self.static_loads(v, DVec3::ZERO, rho, self.targets(&t.controls), t.controls.throttle, t.rotor_speed)
+        };
+        let ((fp, mp, _), (fm, mm, _)) = (at_alpha(0.005), at_alpha(-0.005));
+        let alpha = (mp - mm) / 0.01;
+        let (sa, ca) = t.alpha.sin_cos();
+        let lift_alpha = (fp - fm).dot(DVec3::new(sa, 0.0, ca)) / 0.01;
+        let p = self.propulsion();
+        let supply = self.def().battery.as_ref().map_or(0.0, |b| b.full_voltage());
+        let v_axial = v.dot(p.axis);
+        let thrust = |throttle: f64| p.prop_loads(p.steady_omega(throttle, v_axial, rho, supply), v_axial, rho).0;
+        let (lo, hi) = ((t.controls.throttle - 0.05).max(0.0), (t.controls.throttle + 0.05).min(1.0));
+        let thrust_per_throttle = (thrust(hi) - thrust(lo)) / (hi - lo);
+        Ok(ControlDerivatives { trim: t, control, damping, alpha, lift_alpha, thrust_per_throttle })
     }
 }
