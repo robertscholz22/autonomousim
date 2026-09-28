@@ -46,6 +46,7 @@ use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
 use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
 use autonomousim_control::rotorcraft::{HelicopterActionLimits, HelicopterConfig};
+use autonomousim_control::tiltrotor::{TiltrotorActionLimits, TiltrotorConfig};
 use autonomousim_control::{ActionMapping, AgentActionMode, Controller};
 use autonomousim_core::geometry::{HitMask, StaticGeometry};
 use autonomousim_core::material::MaterialId;
@@ -571,7 +572,8 @@ impl VehicleRef {
 /// `controller`, `action_limits` and `randomize` configure multirotors; `ground_controller`,
 /// `ground_action_limits` and `drivable` wheeled vehicles; `fixed_wing_controller` and
 /// `fixed_wing_action_limits` fixed-wing aircraft; `helicopter_controller` and
-/// `helicopter_action_limits` helicopters. Setting those of another family is an error.
+/// `helicopter_action_limits` helicopters; `tiltrotor_controller` and
+/// `tiltrotor_action_limits` tiltrotors. Setting those of another family is an error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -600,6 +602,10 @@ pub struct GroupSpec {
     pub helicopter_controller: HelicopterConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub helicopter_action_limits: HelicopterActionLimits,
+    #[serde(skip_serializing_if = "is_default")]
+    pub tiltrotor_controller: TiltrotorConfig,
+    #[serde(skip_serializing_if = "is_default")]
+    pub tiltrotor_action_limits: TiltrotorActionLimits,
     /// Terrain that ground vehicles can drive over: spawns and goals only use drivable cells,
     /// and goals must be reachable from the spawn.
     #[serde(skip_serializing_if = "is_default")]
@@ -631,6 +637,8 @@ impl Default for GroupSpec {
             fixed_wing_action_limits: FixedWingActionLimits::default(),
             helicopter_controller: HelicopterConfig::default(),
             helicopter_action_limits: HelicopterActionLimits::default(),
+            tiltrotor_controller: TiltrotorConfig::default(),
+            tiltrotor_action_limits: TiltrotorActionLimits::default(),
             drivable: DrivableSpec::default(),
             sensors: Vec::new(),
             obs: Vec::new(),
@@ -1106,11 +1114,15 @@ impl CompiledGroup {
             ("helicopter_controller", !is_default(&spec.helicopter_controller)),
             ("helicopter_action_limits", !is_default(&spec.helicopter_action_limits)),
         ];
+        let tiltrotor = [
+            ("tiltrotor_controller", !is_default(&spec.tiltrotor_controller)),
+            ("tiltrotor_action_limits", !is_default(&spec.tiltrotor_action_limits)),
+        ];
         let foreign: Vec<_> = match family {
-            Family::Multirotor => ground.into_iter().chain(fixed_wing).chain(helicopter).collect(),
-            Family::Wheeled => multirotor.into_iter().chain(fixed_wing).chain(helicopter).collect(),
-            Family::FixedWing => multirotor.into_iter().chain(ground).chain(helicopter).collect(),
-            Family::Rotorcraft => multirotor.into_iter().chain(ground).chain(fixed_wing).collect(),
+            Family::Multirotor => ground.into_iter().chain(fixed_wing).chain(helicopter).chain(tiltrotor).collect(),
+            Family::Wheeled => multirotor.into_iter().chain(fixed_wing).chain(helicopter).chain(tiltrotor).collect(),
+            Family::FixedWing => multirotor.into_iter().chain(ground).chain(helicopter).chain(tiltrotor).collect(),
+            Family::Rotorcraft => multirotor.into_iter().chain(ground).chain(fixed_wing).chain(tiltrotor).collect(),
             Family::Tiltrotor => multirotor.into_iter().chain(ground).chain(fixed_wing).chain(helicopter).collect(),
         };
         if let Some((field, _)) = foreign.iter().find(|f| f.1) {
@@ -1128,6 +1140,7 @@ impl CompiledGroup {
             &spec.ground_controller,
             &spec.fixed_wing_controller,
             &spec.helicopter_controller,
+            &spec.tiltrotor_controller,
         )?;
         let action_map = ActionMapping::new(
             mode,
@@ -1135,6 +1148,7 @@ impl CompiledGroup {
             &spec.ground_action_limits,
             &spec.fixed_wing_action_limits,
             &spec.helicopter_action_limits,
+            &spec.tiltrotor_action_limits,
             &def,
             &controller,
         )

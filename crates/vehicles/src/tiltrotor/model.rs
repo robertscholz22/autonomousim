@@ -98,6 +98,30 @@ pub struct TiltrotorLoads {
     pub v_axial: [f64; MAX_ROTORS],
 }
 
+/// Loads of one rotor (body frame, about the centre of mass): thrust (N, with ground effect),
+/// propeller torque (N·m), axial speed into the disc (m/s), force and moment.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RotorLoad {
+    pub thrust: f64,
+    pub torque: f64,
+    pub v_axial: f64,
+    pub force: DVec3,
+    pub moment: DVec3,
+}
+
+/// Recorded state that [`Tiltrotor::show`] displays.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TiltrotorDisplay {
+    pub rotor_speeds: Vec<f64>,
+    pub throttles: Vec<f64>,
+    pub tilts: Vec<f64>,
+    pub channels: [f64; 3],
+    pub electric_power: f64,
+    pub airspeed: f64,
+    pub alpha: f64,
+    pub beta: f64,
+}
+
 /// One simulated tiltrotor.
 ///
 /// Step phases: [`begin_step`](Self::begin_step) → [`apply_controls`](Self::apply_controls) /
@@ -268,33 +292,91 @@ impl Tiltrotor {
         ge: &[f64; MAX_ROTORS],
     ) -> TiltrotorLoads {
         let mut l = TiltrotorLoads::default();
-        let rho = flow.density;
-        for (k, mount) in self.def.rotors.iter().enumerate() {
-            let axis = TiltMount::axis(tilt[k]);
-            let hub = mount.hub(tilt[k]);
-            let v = flow.at(hub);
-            let v_axial = v.dot(axis);
-            let (thrust, torque) = self.propulsion.prop_loads(omega[k], v_axial, rho);
-            let thrust = if thrust > 0.0 { thrust * ge[k] } else { thrust };
-            let f = axis * thrust - (v - axis * v_axial) * (self.def.rotor_drag * omega[k]);
-            l.force += f;
-            l.moment += hub.cross(f);
-            l.thrust[k] = thrust;
-            l.prop_torque[k] = torque;
-            l.v_axial[k] = v_axial;
+        for k in 0..self.rotors {
+            let r = self.rotor_load(k, flow, omega[k], tilt[k], ge[k]);
+            l.force += r.force;
+            l.moment += r.moment;
+            l.thrust[k] = r.thrust;
+            l.prop_torque[k] = r.torque;
+            l.v_axial[k] = r.v_axial;
         }
+        let (f, m) = self.aero_loads(flow, channels);
+        l.force += f;
+        l.moment += m;
+        l
+    }
+
+    /// Loads of rotor `k` turning at `omega` (rad/s) on its mount at tilt `tilt` (rad), with
+    /// ground-effect thrust ratio `ge`: thrust along the axis and in-plane drag at the hub.
+    pub fn rotor_load(&self, k: usize, flow: &AirFlow, omega: f64, tilt: f64, ge: f64) -> RotorLoad {
+        let axis = TiltMount::axis(tilt);
+        let hub = self.def.rotors[k].hub(tilt);
+        let v = flow.at(hub);
+        let v_axial = v.dot(axis);
+        let (thrust, torque) = self.propulsion.prop_loads(omega, v_axial, flow.density);
+        let thrust = if thrust > 0.0 { thrust * ge } else { thrust };
+        let force = axis * thrust - (v - axis * v_axial) * (self.def.rotor_drag * omega);
+        RotorLoad { thrust, torque, v_axial, force, moment: hub.cross(force) }
+    }
+
+    /// Force and moment of the lifting surfaces at channel deflections `channels` (rad) and
+    /// of the fuselage.
+    pub fn aero_loads(&self, flow: &AirFlow, channels: &[f64; 3]) -> (DVec3, DVec3) {
+        let (mut force, mut moment) = (DVec3::ZERO, DVec3::ZERO);
         for (s, g) in self.def.surfaces.iter().zip(&self.gains) {
             let d = g[0] * channels[0] + g[1] * channels[1] + g[2] * channels[2];
             let (f, m) = s.wrench(flow, d);
-            l.force += f;
-            l.moment += m;
+            force += f;
+            moment += m;
         }
         let fus = &self.def.fuselage;
         let v = flow.at(fus.position);
-        let drag = -0.5 * rho * v.length() * (fus.drag_area * v);
-        l.force += drag;
-        l.moment += fus.position.cross(drag);
-        l
+        let drag = -0.5 * flow.density * v.length() * (fus.drag_area * v);
+        (force + drag, moment + fus.position.cross(drag))
+    }
+
+    /// Mixing gains `[aileron, elevator, rudder]` of each surface.
+    pub fn surface_gains(&self) -> &[[f64; 3]] {
+        &self.gains
+    }
+
+    /// Rotor speed (rad/s) at which a rotor gives `thrust` (N) at axial speed `v_axial` (m/s)
+    /// in air of density `rho`, by Newton's method from `guess`.
+    pub fn rotor_speed_for(&self, thrust: f64, v_axial: f64, rho: f64, guess: f64) -> f64 {
+        let t = |w: f64| self.propulsion.prop_loads(w, v_axial, rho).0;
+        let mut w = guess.max(10.0);
+        for _ in 0..6 {
+            let h = 1e-3 * w + 0.1;
+            let slope = (t(w + h) - t(w - h)) / (2.0 * h);
+            if !(slope.is_finite() && slope > 1e-9) {
+                break;
+            }
+            let next = (w - (t(w) - thrust) / slope).clamp(0.5 * w, 2.0 * w);
+            let done = (next - w).abs() < 1e-6 * w;
+            w = next;
+            if done {
+                break;
+            }
+        }
+        w
+    }
+
+    /// Throttle that drives a rotor turning at `omega` toward `target` (rad/s) with time
+    /// constant `lag` (s) at axial speed `v_axial` in air of density `rho`: the motor torque
+    /// carries the propeller torque plus `I·(target − ω)/lag`, so it holds `target` once there.
+    /// Unclamped.
+    pub fn throttle_for(&self, omega: f64, target: f64, v_axial: f64, rho: f64, lag: f64) -> f64 {
+        let m = &self.def.motor;
+        let k = 60.0 / (2.0 * std::f64::consts::PI * m.kv);
+        let q = self.propulsion.prop_loads(omega, v_axial, rho).1;
+        let i = (q + self.propulsion.inertia * (target - omega) / lag) / k + m.no_load_current;
+        (k * omega + i * m.resistance) / m.voltage.unwrap_or(1.0)
+    }
+
+    /// Steady thrust (N) of one rotor at full throttle at axial speed `v_axial` (m/s).
+    pub fn max_thrust(&self, v_axial: f64, rho: f64) -> f64 {
+        let w = self.propulsion.steady_omega(1.0, v_axial, rho, 0.0);
+        self.propulsion.prop_loads(w, v_axial, rho).0
     }
 
     /// Reaction on the airframe of the motor torques `q_motor` (body frame).
@@ -485,6 +567,42 @@ impl Tiltrotor {
     }
 
     /// Electric power drawn by all motors in the last step (W).
+    /// Show recorded state without stepping (replay): rotor speeds (rad/s), throttles, mount
+    /// tilts (rad), surface channel deflections (rad), electric power of all motors (W, shared
+    /// evenly), airspeed (m/s), angle of attack and sideslip (rad). Entries beyond the
+    /// vehicle's rotors are ignored; missing ones leave the state as it is.
+    pub fn show(&mut self, d: &TiltrotorDisplay) {
+        let n = self.rotors;
+        for (k, &w) in d.rotor_speeds.iter().take(n).enumerate() {
+            self.omega[k] = w.max(0.0);
+            self.omega_next[k] = self.omega[k];
+        }
+        for (k, &x) in d.tilts.iter().take(n).enumerate() {
+            self.tilt[k] = x;
+        }
+        for (k, &x) in d.throttles.iter().take(n).enumerate() {
+            self.input.throttle[k] = x;
+        }
+        self.channels = d.channels;
+        for o in &mut self.outputs[..n] {
+            o.electric_power = d.electric_power / n as f64;
+        }
+        self.h_rotor = self.rotor_momentum(&self.omega, &self.tilt);
+        self.flow.airspeed = d.airspeed;
+        self.flow.alpha = d.alpha;
+        self.flow.beta = d.beta;
+    }
+
+    /// Static rotor speed at full throttle at sea level (rad/s), a scale for displays.
+    pub fn full_throttle_speed(&self) -> f64 {
+        self.propulsion.steady_omega(1.0, 0.0, crate::aero::SEA_LEVEL_DENSITY, 0.0)
+    }
+
+    /// Angular momentum of the spinning rotors (body frame, N·m·s).
+    pub fn rotor_momentum_body(&self) -> DVec3 {
+        self.h_rotor
+    }
+
     pub fn electric_power(&self) -> f64 {
         self.rotor_outputs().iter().map(|o| o.electric_power).sum()
     }

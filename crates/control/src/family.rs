@@ -15,7 +15,10 @@ use crate::rotorcraft::{
     HelicopterActionLimits, HelicopterActionMap, HelicopterActionMode, HelicopterConfig, HelicopterController,
     HelicopterSetpoint,
 };
-use crate::tiltrotor::{TiltrotorActionMap, TiltrotorActionMode, TiltrotorController, TiltrotorSetpoint};
+use crate::tiltrotor::{
+    TiltrotorActionLimits, TiltrotorActionMap, TiltrotorActionMode, TiltrotorConfig, TiltrotorController,
+    TiltrotorSetpoint,
+};
 use autonomousim_core::math::quat::yaw;
 use autonomousim_vehicles::{Family, SharedDef, Vehicle};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -289,13 +292,14 @@ impl Controller {
         ground: &GroundConfig,
         fixed_wing: &FixedWingConfig,
         helicopter: &HelicopterConfig,
+        tiltrotor: &TiltrotorConfig,
     ) -> Result<Self, ControlError> {
         Ok(match def {
             SharedDef::Multirotor(d) => Controller::Multirotor(MultirotorController::new(d, dt, multirotor)?),
             SharedDef::Wheeled(d) => Controller::Ground(GroundController::new(d, dt, ground)?),
             SharedDef::FixedWing(d) => Controller::FixedWing(FixedWingController::new(d, dt, fixed_wing)?),
             SharedDef::Helicopter(d) => Controller::Helicopter(HelicopterController::new(d, dt, helicopter)?),
-            SharedDef::Tiltrotor(d) => Controller::Tiltrotor(TiltrotorController::new(d, dt)?),
+            SharedDef::Tiltrotor(d) => Controller::Tiltrotor(TiltrotorController::new(d, dt, tiltrotor)?),
         })
     }
 
@@ -379,6 +383,7 @@ impl ActionMapping {
         ground: &GroundActionLimits,
         fixed_wing: &FixedWingActionLimits,
         helicopter: &HelicopterActionLimits,
+        tiltrotor: &TiltrotorActionLimits,
         def: &SharedDef,
         controller: &Controller,
     ) -> Result<Self, ControlError> {
@@ -395,8 +400,8 @@ impl ActionMapping {
             (AgentActionMode::Helicopter(m), SharedDef::Helicopter(d), Controller::Helicopter(c)) => {
                 Ok(ActionMapping::Helicopter(HelicopterActionMap::new(m, helicopter, d, c)?))
             }
-            (AgentActionMode::Tiltrotor(m), SharedDef::Tiltrotor(d), Controller::Tiltrotor(_)) => {
-                Ok(ActionMapping::Tiltrotor(TiltrotorActionMap::new(m, d)?))
+            (AgentActionMode::Tiltrotor(m), SharedDef::Tiltrotor(d), Controller::Tiltrotor(c)) => {
+                Ok(ActionMapping::Tiltrotor(TiltrotorActionMap::new(m, tiltrotor, d, c)?))
             }
             _ => Err(ControlError::InvalidConfig(format!(
                 "action mode {mode} does not drive {} vehicles ({:?})",

@@ -402,6 +402,153 @@ pub fn fixed_wing(def: &autonomousim_vehicles::fixedwing::FixedWingDef) -> Fixed
     FixedWingVisual { body, surfaces, propeller: (p.position, axis), propeller_radius: radius, span, eye }
 }
 
+/// A flapped surface of a [`TiltrotorVisual`]: the flap turns about `axis` through `hinge` by
+/// its deflection (positive lowers the trailing edge, in the surface's own frame).
+#[derive(Clone, Debug)]
+pub struct TiltSurfaceVisual {
+    pub mesh: MeshData,
+    pub hinge: DVec3,
+    pub axis: DVec3,
+    /// Index of the surface in the definition (its mixing gains give the deflection).
+    pub surface: usize,
+}
+
+/// A rotor pod of a [`TiltrotorVisual`], in its own frame: origin at the pivot, z along the
+/// thrust axis at tilt 0; posed by `R_y(tilt)` at `pivot`. The disc sits at `offset` along z.
+#[derive(Clone, Debug)]
+pub struct NacelleVisual {
+    pub mesh: MeshData,
+    pub pivot: DVec3,
+    pub offset: f64,
+    pub radius: f32,
+}
+
+/// Visual of a tiltrotor, derived from its definition: a fuselage along the frame colliders
+/// on the centre line, the lifting surfaces as plates with their flaps, booms joining the
+/// rotor pivots on each side, landing legs, and one tilting pod per rotor. Body frame FLU.
+#[derive(Clone, Debug)]
+pub struct TiltrotorVisual {
+    pub body: MeshData,
+    pub surfaces: Vec<TiltSurfaceVisual>,
+    pub nacelles: Vec<NacelleVisual>,
+    /// Largest distance of any part from the centre of mass (m), for cameras.
+    pub span: f32,
+    /// Pilot's eye point (m), for the first-person camera.
+    pub eye: DVec3,
+}
+
+pub fn tiltrotor(def: &autonomousim_vehicles::tiltrotor::TiltrotorDef) -> TiltrotorVisual {
+    use autonomousim_vehicles::multirotor::ColliderPart;
+    let white = srgb([232, 234, 238]);
+    let trim = srgb([40, 110, 190]);
+    let grey = srgb([150, 154, 160]);
+    let dark = srgb([40, 42, 46]);
+    let glass = srgb([60, 90, 120]);
+    let mut body = MeshData::new();
+    // Fuselage between the frame colliders on the centre line.
+    let centre: Vec<_> =
+        def.colliders.iter().filter(|k| k.part == ColliderPart::Frame && k.center.y.abs() < 0.05).collect();
+    let nose = centre.iter().map(|k| k.center.x + k.radius).fold(0.3, f64::max);
+    let tail = centre.iter().map(|k| k.center.x - k.radius).fold(-0.3, f64::min);
+    let girth = centre.iter().map(|k| k.radius).fold(0.05, f64::max);
+    let (w, h) = (1.6 * girth, 1.8 * girth);
+    let mid = nose - 0.4 * (nose - tail);
+    let section = |x: f64, w: f64, h: f64, z: f64| {
+        [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)]
+            .map(|(sy, sz)| DVec3::new(x, sy * 0.5 * w, z + sz * 0.5 * h))
+    };
+    let front: Vec<_> = section(nose, 0.5 * w, 0.5 * h, 0.0).into_iter().chain(section(mid, w, h, 0.0)).collect();
+    body.append(&mesh::convex_hull(&front, white));
+    let boom: Vec<_> = section(mid, w, h, 0.0).into_iter().chain(section(tail, 0.3 * w, 0.3 * h, 0.2 * h)).collect();
+    body.append(&mesh::convex_hull(&boom, white));
+    let eye = DVec3::new(nose - 0.25 * (nose - tail), 0.0, 0.35 * h);
+    let dome = mesh::ellipsoid(Vec3::new((0.1 * (nose - tail)) as f32, (0.35 * w) as f32, (0.3 * h) as f32), 1, glass);
+    body.append_transformed(&dome, DQuat::IDENTITY, eye - DVec3::Z * 0.1 * h);
+    // Surfaces: a plate from the leading edge to the hinge (its quarter chord at `position`),
+    // 10 % thick, turned by the surface's roll; the flap behind the hinge.
+    let mut surfaces = Vec::new();
+    let mut extent = nose.abs().max(tail.abs());
+    for (i, sf) in def.surfaces.iter().enumerate() {
+        let (c, b) = (sf.chord, sf.span);
+        let t = (0.05 * c) as f32;
+        let roll = DQuat::from_rotation_x(sf.roll);
+        let cf = sf.flap.as_ref().map_or(0.0, |f| f.chord_fraction);
+        let (le, hinge) = (0.25 * c, 0.25 * c - (1.0 - cf) * c);
+        let color = if sf.roll.cos().abs() < 0.5 { trim } else { white };
+        let plate = mesh::cuboid(Vec3::new((0.5 * (le - hinge)) as f32, (0.5 * b) as f32, t), color);
+        body.append_transformed(&plate, roll, sf.position + roll * DVec3::X * 0.5 * (le + hinge));
+        extent = extent.max(sf.position.length() + 0.5 * b);
+        if cf > 0.0 {
+            let fc = cf * c;
+            let mut m = MeshData::new();
+            let flap = mesh::cuboid(Vec3::new((0.5 * fc) as f32, (0.5 * b) as f32, 0.8 * t), grey);
+            m.append_transformed(&flap, roll, roll * DVec3::new(-0.5 * fc, 0.0, 0.0));
+            // Trailing edge down (towards −normal) is a rotation about −span.
+            surfaces.push(TiltSurfaceVisual {
+                mesh: m,
+                hinge: sf.position + roll * DVec3::X * hinge,
+                axis: roll * -DVec3::Y,
+                surface: i,
+            });
+        }
+    }
+    // Booms along x joining the pivots on each side (and to the wing).
+    let mut sides: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for r in &def.rotors {
+        match sides.iter_mut().find(|s| (s.0 - r.pivot.y).abs() < 1e-3) {
+            Some(s) => (s.1, s.2) = (s.1.min(r.pivot.x), s.2.max(r.pivot.x)),
+            None => sides.push((r.pivot.y, r.pivot.x.min(0.0), r.pivot.x.max(0.0), r.pivot.z)),
+        }
+    }
+    let boom_r = (0.3 * girth) as f32;
+    for (y, x0, x1, z) in sides {
+        let len = x1 - x0;
+        if len > 1e-3 {
+            let tube = mesh::cylinder(boom_r, (0.5 * len) as f32, 10, grey);
+            body.append_transformed(
+                &tube,
+                DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2),
+                DVec3::new(0.5 * (x0 + x1), y, z - 1.2 * boom_r as f64),
+            );
+        }
+    }
+    // Landing legs from the body down to the gear.
+    for g in def.colliders.iter().filter(|k| k.part == ColliderPart::Gear) {
+        let foot = g.center;
+        let top = DVec3::new(foot.x, 0.6 * foot.y, -0.3 * h);
+        let d = top - foot;
+        if d.length() > 1e-3 {
+            let leg = mesh::cylinder((0.6 * g.radius) as f32, (0.5 * d.length()) as f32, 6, dark);
+            body.append_transformed(&leg, DQuat::from_rotation_arc(DVec3::Z, d.normalize()), foot + 0.5 * d);
+        }
+        body.append_transformed(&mesh::icosphere(g.radius as f32, 1, true, dark), DQuat::IDENTITY, foot);
+    }
+    // Pods: motor can from the pivot to the hub, spinner on top.
+    let radius = (0.5 * def.propeller.diameter) as f32;
+    let can = (0.12 * radius as f64).max(0.02);
+    let nacelles = def
+        .rotors
+        .iter()
+        .map(|r| {
+            let mut m = MeshData::new();
+            let len = r.offset.max(2.0 * can);
+            m.append_transformed(
+                &mesh::cylinder(can as f32, (0.5 * len) as f32, 12, trim),
+                DQuat::IDENTITY,
+                DVec3::Z * (r.offset - 0.5 * len),
+            );
+            m.append_transformed(
+                &mesh::cone((0.8 * can) as f32, (0.6 * can) as f32, 12, dark),
+                DQuat::IDENTITY,
+                DVec3::Z * (r.offset + 0.6 * can),
+            );
+            extent = extent.max(r.pivot.length() + r.offset + radius as f64);
+            NacelleVisual { mesh: m, pivot: r.pivot, offset: r.offset, radius }
+        })
+        .collect();
+    TiltrotorVisual { body, surfaces, nacelles, span: extent as f32, eye }
+}
+
 /// A rotor of a [`HelicopterVisual`]: its hub and shaft frame, and one blade to be posed per
 /// blade from the rotor's azimuth, tip-path-plane tilt and coning.
 #[derive(Clone, Debug)]

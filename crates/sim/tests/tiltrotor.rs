@@ -1,5 +1,5 @@
 //! Tiltrotors in the simulation: trimmed air spawns (rotors up in hover, forward in cruise),
-//! spawns on the gear, the `raw` action mode and recordings.
+//! spawns on the gear, the `raw` and the default `velocity` action modes, and recordings.
 
 use autonomousim_core::rng::Seed;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
@@ -9,6 +9,10 @@ use std::f64::consts::FRAC_PI_2;
 use std::sync::Arc;
 
 fn scenario(spawn: &str) -> Arc<CompiledScenario> {
+    scenario_in(spawn, "action_mode = \"raw\"")
+}
+
+fn scenario_in(spawn: &str, mode: &str) -> Arc<CompiledScenario> {
     let toml = format!(
         r#"
         name = "tilt"
@@ -16,7 +20,7 @@ fn scenario(spawn: &str) -> Arc<CompiledScenario> {
         [[groups]]
         name = "air"
         vehicle = "quadtilt_like"
-        action_mode = "raw"
+        {mode}
         obs = [ {{ term = "rot6d" }}, {{ term = "last_action" }} ]
         spawn = {{ region = [[-100.0, -100.0], [100.0, 100.0]], {spawn} }}
         "#
@@ -101,4 +105,39 @@ fn records_the_tiltrotor_state() {
     assert_eq!(last.surfaces, [a, e, r, 0.0]);
     assert!(a > 0.0 && last.engine_power == live.electric_power() && last.engine_power > 0.0);
     assert!(last.position.distance(live.position()) < 1e-9);
+}
+
+/// The default `velocity` mode from the gear: climb out, convert to the wing and fly, convert
+/// back to a hover, descend and settle on the gear with the rotors idling.
+#[test]
+fn velocity_mode_flies_a_circuit() {
+    let sc = scenario_in("on_ground = true", "");
+    assert_eq!(sc.groups[0].spec.action_mode.unwrap().name(), "velocity");
+    assert_eq!(sc.groups[0].act_dim(), 4);
+    let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+    let z0 = tilt(&w).position().z;
+    w.set_actions(0, &[0.0, 0.0, 1.0, 0.0]);
+    let e = run(&mut w, 8.0);
+    assert!(!e.is_terminal() && tilt(&w).position().z > z0 + 12.0, "{e:?} {}", tilt(&w).position());
+    // 20 m/s on the wing.
+    let forward = w.scenario().groups[0].action_map.as_tiltrotor().unwrap().speeds()[0];
+    let cruise = (20.0 / forward) as f32;
+    w.set_actions(0, &[cruise, 0.0, 0.0, 0.0]);
+    let e = run(&mut w, 25.0);
+    let t = tilt(&w);
+    assert!(!e.is_terminal(), "{e:?}");
+    assert!(
+        (t.lin_vel_world().length() - 20.0).abs() < 0.3 && t.tilts().iter().all(|x| *x > 1.5),
+        "{}",
+        t.lin_vel_world()
+    );
+    w.set_actions(0, &[0.0, 0.0, 0.0, 0.0]);
+    let e = run(&mut w, 30.0);
+    let t = tilt(&w);
+    assert!(!e.is_terminal() && t.lin_vel_world().length() < 0.2 && t.tilts().iter().all(|x| x.abs() < 0.05), "{e:?}");
+    w.set_actions(0, &[0.0, 0.0, -0.5, 0.0]);
+    let e = run(&mut w, 25.0);
+    let t = tilt(&w);
+    assert!(e.contains(Events::LANDED) && !e.is_terminal(), "{e:?} {}", t.position());
+    assert!(t.lin_vel_world().length() < 0.05 && t.input().throttle.iter().all(|x| *x < 0.2), "{:?}", t.input());
 }

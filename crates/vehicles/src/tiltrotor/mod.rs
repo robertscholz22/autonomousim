@@ -7,5 +7,5 @@ mod model;
 mod trim;
 
 pub use def::{MAX_ROTORS, SurfaceMix, TiltMount, TiltrotorControlsDef, TiltrotorDef};
-pub use model::{Tiltrotor, TiltrotorInit, TiltrotorInput, TiltrotorLoads};
+pub use model::{RotorLoad, Tiltrotor, TiltrotorDisplay, TiltrotorInit, TiltrotorInput, TiltrotorLoads};
 pub use trim::{CorridorPoint, TiltrotorTrim, TrimLimits};
