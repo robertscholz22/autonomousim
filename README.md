@@ -87,7 +87,7 @@ LQR) that balances them behind `vk`/`vw` actions, or `raw` actions for agents th
 themselves; riders in the viewer. **MotorcycleRoadRural-v0** rides a route over the rural
 roads to a farm yard; a scripted rider finishes about 85 % of the routes.
 
-Next up: fixed-wing aircraft, helicopters and VTOL (Milestone 6). The full plan, the design decisions and as-built notes for
+Next up (Milestone 6, in progress): large tiled maps, fixed-wing aircraft, helicopters and a tiltrotor. The full plan, the design decisions and as-built notes for
 every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
