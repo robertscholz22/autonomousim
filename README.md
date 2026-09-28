@@ -79,7 +79,15 @@ soil-weighted path planning. **TrackedCrossCountry-v0** drives the APC along a p
 through off-road waypoints across fields, soft soil and ditches; a scripted path follower
 finishes about three in four episodes.
 
-Next up: bicycles and motorcycles (Milestone 5). The full plan, the design decisions and as-built notes for
+**Milestone 5 (bicycles and motorcycles) is done**: single-track vehicles with a free
+steering head, a rider whose upper body leans and whose feet come down at a stop, toroidal tyres at
+large camber (Pacejka's motorcycle Magic Formula, turn slip), validated against the Whipple
+bicycle benchmark; a city bicycle and a sport motorcycle; a rider controller (gain-scheduled
+LQR) that balances them behind `vk`/`vw` actions, or `raw` actions for agents that balance
+themselves; riders in the viewer. **MotorcycleRoadRural-v0** rides a route over the rural
+roads to a farm yard; a scripted rider finishes about 85 % of the routes.
+
+Next up: fixed-wing aircraft, helicopters and VTOL (Milestone 6). The full plan, the design decisions and as-built notes for
 every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
@@ -107,6 +115,9 @@ cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad
 
 # Farmland: a sedan in its lane with a route to a farm (--demo drives it).
 cargo run -p autonomousim-viewer --release -- --map rural --vehicle sedan_like
+
+# Ride a motorcycle (W/S speed, A/D lean into a turn, Space stop).
+cargo run -p autonomousim-viewer --release -- --map rural --vehicle motorcycle_sport
 ```
 
 ### Python
@@ -121,7 +132,8 @@ obs, reward, terminated, truncated, info = envs.step(envs.action_space.sample())
 ```
 
 Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0`,
-`CarWaypointOffroad-v0`, `RoadFollowRural-v0`, `TrailerReverse-v0` and `TrackedCrossCountry-v0`; for several agents `SwarmHover-v0` and
+`CarWaypointOffroad-v0`, `RoadFollowRural-v0`, `TrailerReverse-v0`, `TrackedCrossCountry-v0` and
+`MotorcycleRoadRural-v0`; for several agents `SwarmHover-v0` and
 `SwarmWaypointForest-v0` (`autonomousim.multiagent.MultiAgentVectorEnv(num_envs, "swarm_hover")`
 or `autonomousim.pettingzoo.parallel_env`). Task options such as `action_mode`, `map_seed` or reward weights are
 passed as keyword arguments.

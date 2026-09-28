@@ -25,6 +25,7 @@ KWARGS = {
     "autonomousim/RoadFollowRural-v0": {"map": RURAL},
     "autonomousim/TrailerReverse-v0": {"map": RURAL},
     "autonomousim/TrackedCrossCountry-v0": {"map": RURAL},
+    "autonomousim/MotorcycleRoadRural-v0": {"map": RURAL},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
@@ -32,12 +33,14 @@ OBS_DIM = {
     "autonomousim/RoadFollowRural-v0": 97,
     "autonomousim/TrailerReverse-v0": 31,
     "autonomousim/TrackedCrossCountry-v0": 95,
+    "autonomousim/MotorcycleRoadRural-v0": 106,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
     "autonomousim/RoadFollowRural-v0": 2,
     "autonomousim/TrailerReverse-v0": 2,
     "autonomousim/TrackedCrossCountry-v0": 2,
+    "autonomousim/MotorcycleRoadRural-v0": 2,
 }
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
@@ -574,6 +577,75 @@ def test_car_waypoint_fails_when_stuck():
     # Standing still for 2 s (40 steps at 20 Hz) ends the episode as a failure.
     assert terminated.all() and not envs.unwrapped.task.success.any() and 38 <= k <= 42, k
     assert (info["events"] & autonomousim.Event.STUCK).all() and (reward < -40.0).all()
+    envs.close()
+
+
+def test_motorcycle_road_scripted_rider_reaches_the_yards():
+    from autonomousim import Event
+
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/MotorcycleRoadRural-v0", num_envs=n, num_threads=4, map=RURAL, autoreset_mode=AutoresetMode.DISABLED
+    )
+    u = envs.unwrapped
+    task = u.task
+    assert [t[0] for t in u.obs_layout] == [
+        "road",
+        "route",
+        "on_road",
+        "road_class",
+        "speed",
+        "lin_vel_body",
+        "ang_vel_body",
+        "lean",
+        "steering",
+        "rider_lean",
+        "feet",
+        "last_action",
+        "lidar_log",
+    ]
+    full = u.sim.group_info(0)["full_scale"]
+    assert full["speed"] == task.max_speed and 0.3 < full["curvature"] < 0.35, full
+    obs, _ = envs.reset(seed=0)
+    # On its feet in the lane, on a road of one class.
+    assert (obs[:, 31] == 1.0).all() and (obs[:, 14] == 1.0).all() and (obs[:, 15:18].sum(1) == 1.0).all()
+    done, success, falls = np.zeros(n, bool), np.zeros(n, bool), np.zeros(n, bool)
+    leaned = np.zeros(n)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(task.scripted(obs, full["curvature"]))
+        live = ~done
+        success |= live & task.success
+        falls |= live & ((info["events"].reshape(-1) & int(Event.CRASH_TERRAIN | Event.ROLLOVER)) != 0)
+        leaned[live] = np.maximum(leaned[live], np.abs(obs[live, 25]))
+        done |= terminated | truncated
+    # The scripted rider leans into the bends and finishes most routes (about 85 % over 32
+    # episodes; it falls in some tight bends of the dirt tracks).
+    assert success.sum() >= n - 2 and (success | falls).all(), (success, falls)
+    assert leaned.max() > 0.2, leaned
+    envs.close()
+
+
+def test_motorcycle_road_raw_actions_do_not_balance():
+    envs = gym.make_vec(
+        "autonomousim/MotorcycleRoadRural-v0",
+        num_envs=2,
+        map=RURAL,
+        action_mode="raw",
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    assert envs.single_action_space.shape == (3,)
+    envs.reset(seed=0)
+    # Throttle without balance or steering: it falls over, or (running fast enough to stay up
+    # on its own) leaves the road, within 10 s.
+    ended, fell = np.zeros(2, bool), np.zeros(2, bool)
+    for _ in range(200):
+        _, _, terminated, _, info = envs.step(np.tile(np.array([0.3, 0.0, 0.0], np.float32), (2, 1)))
+        fell |= terminated & ~ended & ((info["events"].reshape(-1) & int(autonomousim.TERMINAL)) != 0)
+        ended |= terminated
+        assert not envs.unwrapped.task.success.any()
+        if ended.all():
+            break
+    assert ended.all() and fell.any(), (ended, fell)
     envs.close()
 
 

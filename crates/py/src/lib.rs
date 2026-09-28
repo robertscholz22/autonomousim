@@ -332,7 +332,9 @@ impl BatchSim {
     }
 
     /// Layout of a group: name, count, vehicle, family, action mode, `obs_dim`, `act_dim` and the
-    /// observation terms as `(name, offset, length)`.
+    /// observation terms as `(name, offset, length)`; for ground vehicles in `vk`/`vw` also
+    /// `full_scale`, the action map's full-scale speed, reverse speed (m/s), curvature (1/m)
+    /// and yaw rate (rad/s).
     #[pyo3(signature = (group = GroupRef::Index(0)))]
     fn group_info<'py>(&self, py: Python<'py>, group: GroupRef) -> PyResult<Bound<'py, PyDict>> {
         let g = &self.scenario.groups[self.group(&group)?];
@@ -347,6 +349,14 @@ impl BatchSim {
         d.set_item("num_rotors", g.def.as_multirotor().map_or(0, |d| d.rotors.len()))?;
         d.set_item("mass", g.def.mass())?;
         d.set_item("obs_layout", g.obs.layout())?;
+        if let Some(m) = g.action_map.as_ground() {
+            let full = PyDict::new(py);
+            full.set_item("speed", m.speed())?;
+            full.set_item("reverse", m.reverse())?;
+            full.set_item("curvature", m.curvature())?;
+            full.set_item("yaw_rate", m.yaw_rate())?;
+            d.set_item("full_scale", full)?;
+        }
         Ok(d)
     }
 

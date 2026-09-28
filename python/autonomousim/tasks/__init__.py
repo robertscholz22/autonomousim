@@ -5,6 +5,7 @@ from typing import Any
 from autonomousim.tasks.base import Task, map_source
 from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.hover import QuadHover
+from autonomousim.tasks.motorcycle_road import MotorcycleRoadRural
 from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.tasks.recover import QuadRecover
 from autonomousim.tasks.road_follow import RoadFollowRural
@@ -21,12 +22,14 @@ TASKS: dict[str, type[Task]] = {
     "road_follow": RoadFollowRural,
     "trailer_reverse": TrailerReverse,
     "tracked_cross_country": TrackedCrossCountry,
+    "motorcycle_road": MotorcycleRoadRural,
 }
 
 
 def make_task(task: str | Task, **kwargs: Any) -> Task:
     """A task instance from its name (``hover``, ``recover``, ``waypoint_forest``,
-    ``car_waypoint``, ``road_follow``, ``trailer_reverse``, ``tracked_cross_country``) and keyword
+    ``car_waypoint``, ``road_follow``, ``trailer_reverse``, ``tracked_cross_country``,
+    ``motorcycle_road``) and keyword
     arguments, or the instance itself."""
     if isinstance(task, Task):
         if kwargs:
@@ -43,6 +46,7 @@ __all__ = [
     "TASKS",
     "CarWaypointOffroad",
     "FormationHover",
+    "MotorcycleRoadRural",
     "MultiAgentTask",
     "QuadHover",
     "QuadRecover",

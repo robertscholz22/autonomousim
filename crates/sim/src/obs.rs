@@ -32,6 +32,7 @@
 //! | `road` | 6 | lateral offset from the lane centre (m, + left), lane heading − heading (rad), lane curvature 5, 10, 20 and 40 m ahead (1/m, + left) |
 //! | `route` | 8 | lane centre 5, 10, 20 and 40 m ahead in the heading frame (x, y; m) |
 //! | `on_road` | 1 | 1 on a road's surface, else 0 |
+//! | `road_class` | 3 | the class of the road whose surface the agent is on, one-hot: paved, gravel, track; all 0 off the road |
 //! | `articulation` | 4 | ground vehicles: yaw of the first two trailers (or dollies) relative to the unit ahead (rad, positive pointing left), then their rates (rad/s); 0 without |
 //! | `sinkage` | 1 | ground vehicles: mean sinkage of the loaded track patches into soft soil (m); 0 on rigid ground and for tyres |
 //! | `trailer_goal` | 4 | goal − tail of the last unit, in that unit's heading frame (x, y; m), then sin, cos of goal heading − the unit's heading (see `Wheeled::tail_pose`) |
@@ -108,6 +109,7 @@ pub enum TermKind {
     Road,
     Route,
     OnRoad,
+    RoadClass,
     Articulation,
     TrailerGoal,
     Sinkage,
@@ -311,6 +313,7 @@ impl CompiledObs {
                     _,
                 ) => (1, 0.0),
                 (TermKind::Road, _) => (2 + LOOKAHEAD.len(), 0.0),
+                (TermKind::RoadClass, _) => (3, 0.0),
                 (TermKind::Articulation | TermKind::TrailerGoal, _) => (4, 0.0),
                 (TermKind::Route, _) => (2 * LOOKAHEAD.len(), 0.0),
                 (TermKind::NearestAgent, _) => (1, range),
@@ -531,6 +534,14 @@ impl CompiledObs {
                 TermKind::OnRoad => {
                     let on = inp.world.roads().on_road(k.position.truncate()).is_some();
                     put(dst, &[f64::from(u8::from(on))], t)
+                }
+                TermKind::RoadClass => {
+                    let roads = inp.world.roads();
+                    let mut v = [0.0; 3];
+                    if let Some(rp) = roads.on_road(k.position.truncate()) {
+                        v[roads.roads()[rp.road as usize].class as usize] = 1.0;
+                    }
+                    put(dst, &v, t)
                 }
                 _ => write_sensor(t, &inp.sensors[t.sensor], inp.goal, dst),
             }

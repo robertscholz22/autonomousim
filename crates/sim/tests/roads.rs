@@ -1,5 +1,5 @@
 //! Driving on rural roads: spawns in the lane, routes along the roads, and the `road`, `route`
-//! and `on_road` observation terms.
+//! `on_road` and `road_class` observation terms.
 
 use autonomousim_core::math::quat::{wrap_angle, yaw};
 use autonomousim_core::rng::Seed;
@@ -24,7 +24,7 @@ const RURAL: &str = r#"
     vehicle = "sedan_like"
     spawn = { on_road = true, min_separation = 10.0 }
     goals = { kind = "route", distance = [150.0, 400.0], radius = 5.0, route = { step = 20.0 } }
-    obs = [{ term = "road" }, { term = "route" }, { term = "on_road" }]
+    obs = [{ term = "road" }, { term = "route" }, { term = "on_road" }, { term = "road_class" }]
 "#;
 
 #[test]
@@ -61,10 +61,12 @@ fn road_spawns_start_in_the_lane_along_their_route() {
                 assert!(g.position.truncate().distance(q) < 1e-9);
                 assert!((g.position.z - map.terrain().height(q.x, q.y) - ride).abs() < 1e-9);
             }
-            // Every point of the route is on a road; it ends at a yard.
+            // Every point of the route is on a road, clear of the map's edges; it ends at a yard.
+            let (lo, hi) = map.extent();
             for i in 0..=(len as usize) {
                 let q = route.point_at(i as f64).truncate();
                 assert!(net.nearest(q, 2.5).is_some(), "{}: route point {q} off the roads", a.id);
+                assert!(q.cmpge(lo + 8.0).all() && q.cmple(hi - 8.0).all(), "{}: route point {q} at the edge", a.id);
             }
             let end = route.point_at(len).truncate();
             let yard = net.nodes().iter().filter(|n| n.kind == NodeKind::Yard);
@@ -78,7 +80,7 @@ fn road_terms_follow_the_route() {
     let sc = compile(RURAL);
     let w = WorldInstance::new(sc.clone(), Seed::from_u64(9));
     let dim = sc.groups[0].obs.dim();
-    assert_eq!(dim, 6 + 8 + 1);
+    assert_eq!(dim, 6 + 8 + 1 + 3);
     let mut obs = vec![0.0f32; 4 * dim];
     w.observe(0, &mut obs);
     for (a, o) in w.agents().iter().zip(obs.chunks_exact(dim)) {
@@ -96,6 +98,11 @@ fn road_terms_follow_the_route() {
             assert!(((x * x + yy * yy).sqrt() - ahead).abs() < 0.2 * ahead + 1.0, "{}: ({x}, {yy}) for {ahead}", a.id);
         }
         assert_eq!(o[14], 1.0);
+        // One-hot, the class of the road under the car.
+        let net = w.map().roads();
+        let class = net.roads()[net.on_road(p.truncate()).unwrap().road as usize].class as usize;
+        let expected: [f32; 3] = std::array::from_fn(|i| f32::from(u8::from(i == class)));
+        assert_eq!(o[15..18], expected, "{}", a.id);
     }
     // The state column: the same offset and heading error, on the road.
     let mut state = vec![0.0; 4 * STATE_DIM];

@@ -71,6 +71,13 @@ pub fn lane_line(net: &RoadNetwork, route: &Polyline) -> Polyline {
     Polyline::new(moved)
 }
 
+/// Least distance of a road-point destination from the map's edges (m).
+const EDGE_CLEARANCE: f64 = 20.0;
+
+/// Least distance of a route from the map's edges (m): roads may run along them, and agents
+/// meet `OUT_OF_BOUNDS` there.
+const ROUTE_EDGE_CLEARANCE: f64 = 10.0;
+
 /// A uniformly random point on the network (by length), away from the road ends: the road
 /// and the station.
 fn road_point(net: &RoadNetwork, rng: &mut SimRng) -> (usize, f64) {
@@ -101,20 +108,25 @@ pub(crate) fn plan_route(world: &StaticWorld, from: DVec2, spec: &GoalSpec, rng:
         }
         RouteDestination::Road => None,
     };
-    // Some maps have no farm (or none reachable): a road point instead.
+    // Some maps have no farm (or none reachable): a road point instead, clear of the map's
+    // edges (roads leave the map).
     route.or_else(|| {
+        let (lo, hi) = world.extent();
+        let inside = |p: DVec2| p.cmpge(lo + EDGE_CLEARANCE).all() && p.cmple(hi - EDGE_CLEARANCE).all();
         let points = (0..32)
             .map(|_| {
                 let (k, s) = road_point(net, rng);
                 net.roads()[k].line.point_at(s).truncate()
             })
+            .filter(|&p| inside(p))
             .collect();
         best_route(world, from, points, spec.distance, rng)
     })
 }
 
 /// The lane line of the shortest road route from `from` to one of `targets` whose length is in
-/// `[lo, hi]`, or else closest to it.
+/// `[lo, hi]`, or else closest to it; routes nearer the map's edges than
+/// [`ROUTE_EDGE_CLEARANCE`] are skipped.
 fn best_route(
     world: &StaticWorld,
     from: DVec2,
@@ -123,6 +135,8 @@ fn best_route(
     rng: &mut SimRng,
 ) -> Option<Polyline> {
     let net = world.roads();
+    let (lo_xy, hi_xy) = world.extent();
+    let clear = |p: DVec2| p.cmpge(lo_xy + ROUTE_EDGE_CLEARANCE).all() && p.cmple(hi_xy - ROUTE_EDGE_CLEARANCE).all();
     // Fisher–Yates, so that ties in the range go to a random destination.
     for i in (1..targets.len()).rev() {
         targets.swap(i, rng.below(i as u64 + 1) as usize);
@@ -132,7 +146,10 @@ fn best_route(
         let Some(route) = net.route(from, to, 50.0) else { continue };
         let len = route.line.length();
         let miss = (lo - len).max(len - hi).max(0.0);
-        if len < 1.0 || best.as_ref().is_some_and(|b| b.0 <= miss) {
+        if len < 1.0
+            || best.as_ref().is_some_and(|b| b.0 <= miss)
+            || !route.line.points().iter().all(|p| clear(p.truncate()))
+        {
             continue;
         }
         best = Some((miss, route.line));

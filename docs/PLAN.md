@@ -1755,7 +1755,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 | 5 ✅ | Rider controller and action modes: gain-scheduled LQR from the linear model, `vk`/`vw`/`raw`, rider lean servo, feet, launch from rest | Straight-line hold under a lateral impulse at 3, 10 and 25 m/s; curvature steps settle without falls; the initial countersteer has the right sign; launch from rest and stop with feet down; the bicycle stays up at walking speed |
 | 6 ✅ | Simulation: upright spawns with feet down (also on cross slopes), drive grid width, events, the `lean`/`rider_lean`/`feet` terms, recorded steer, lean and feet; Python `vehicle="motorcycle_sport"` | Scenarios with two-wheelers compile, spawn, ride and record; existing goldens unchanged; terms match references |
 | 7 ✅ | Viewer: two-wheeler visuals (frame, tank, fork, handlebar, toroidal tyres, rider with a leaning torso), HUD (roll, steer angle and torque, rider lean, feet, gear), keyboard riding in `vk`, replay | A motorcycle rides by keyboard over a rural map at ≥ 60 fps on the Iris Xe; recordings replay |
-| 8 | `MotorcycleRoadRural-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy rides in the viewer; a recorded episode replays |
+| 8 ✅ | `MotorcycleRoadRural-v0`: task, scripted driver, short training, export, viewer, replay | The task trains end to end; the exported policy rides in the viewer; a recorded episode replays |
 
 **To confirm while building**:
 - access to the motorcycle parameter set and tyre data;
@@ -1889,6 +1889,21 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
   - **Tests**:
     - Scene: torus volume and normals, ellipsoid volume, two-bone IK keeps segment lengths, both presets assembled around their geometry.
     - Viewer: rider parts follow the state (`rider_parts_follow_the_state`); the keys ride a motorcycle (launch, lean into a turn, stop on the feet); full-stick turns at 20–60 % of full speed stay up on both bikes; a replayed motorcycle leans, steers and stands.
+- **Step 8 (`MotorcycleRoadRural-v0`)** → **M5 done**:
+  - **Task** (`tasks/motorcycle_road.py`, `motorcycle_road`): `RoadFollowRural` with `motorcycle_sport`, `vk` with `speed = 25` m/s and `lean = 0.45` rad (full-scale curvature `g·tan(0.45)/v²`, or the steering lock's 0.33 1/m), 60 s episodes, the same goals, reward and end conditions (falls end as `ROLLOVER`/`CRASH_TERRAIN`). `action_mode="raw"` (throttle/brake, steering torque, rider lean) is the variant in which the agent balances. Observation (106): `road`, `route`, `on_road`, the new `road_class`, speed, body velocity and rates, `lean`, `steering` (angle and rate), `rider_lean`, `feet`, last action, LiDAR (2 × 36 beams, 40 m, at 1.2 m).
+  - **New observation term `road_class`** (3): one-hot paved/gravel/track of the road under the agent, all 0 off the road. The grip and the speeds that suit each class differ.
+  - **`BatchSim.group_info`** gains `full_scale` (speed, reverse, curvature, yaw rate of the ground action map), which the scripted rider needs.
+  - **Route planning fix** (`lane.rs`): routes nearer than 10 m to the map's edges are skipped, and road-point destinations (maps without a reachable yard) keep 20 m from them. Roads run along and out of the map, so the motorcycle met `OUT_OF_BOUNDS` while following its lane. Road goldens are unchanged.
+  - **Scripted rider** (`MotorcycleRoadRural.scripted`): pure pursuit of the route point `clip(1.5 v, 8, 40)` m ahead. Its curvature is low-passed over 0.5 s, using the last action as the filter state. Speed is capped by the steered curvature and by the lane's curvature 5–40 m ahead (with braking distance at 2.5 m/s²), for 2.5/1.5/1.2 m/s² of lateral acceleration and at most 18/12/8 m/s on paved/gravel/track, and floored at 2.5 m/s.
+    - Over 32 routes on two map pools it finishes 27, and 15 of 16 on an unseen pool. It falls in some tight track bends and hairpin junctions (radius about 1 m).
+    - Tried and dropped: pure pursuit at 5–10 m (weaves, because the lean lags the steering); a lane-tracking law (curvature feed-forward plus offset and heading feedback), which fell at low speed on kinks and weaved; more smoothing or a longer look-ahead; higher lateral acceleration.
+  - **Training**: PPO (256 × 64, 2×256, 3M steps, 7 min at 7–10k SPS) raised the return from −58 to +85. On unseen maps (`map_seed` 1000) it reached 8 % success with about 6 of the goals per episode. That is a pipeline check, still improving when it stopped: `runs/MotorcycleRoadRural-v0__moto__1__1790584603` with `policy.json`.
+  - **Viewer**: the exported policy rides in `policy` mode (17.6 m/s on the paved road, 125 fps at 1600×900). Its recording replays with the leaning bike and rider.
+  - **Tests** (`tests_py/test_envs.py`):
+    - The API and vector suites cover the new env.
+    - The scripted rider finishes at least 6 of 8 routes, leans more than 0.2 rad, and the episodes it does not finish end in a fall.
+    - In `raw` mode, throttle alone ends every episode, at least one of them in a fall.
+    - `sim/tests/roads.rs` checks `road_class` against the road under each car, and that routes keep clear of the map's edges.
 
 ## Roadmap after M1
 | M | Content | Validation |
@@ -1896,7 +1911,7 @@ Planned 2026-09-27. The user decided the following at the start: both a bicycle 
 | M2 | (Detailed above.) Ground vehicles I: `KcTravel` joint, MF 6.x tire (`.tir`, combined slip, relaxation length + low-speed damping), steering (prescribed or rack DoF), powertrain (engine map, clutch, gearbox, open/LSD/locked differentials), brakes; Ackermann car, diff-drive, skid-steer; ground action modes (raw, (v, ω), (v, κ)); 1 kHz preset | ISO 4138 constant radius, ISO 7401 step steer, braking, ISO 3888 lane change vs published or Chrono::Vehicle data |
 | M3 | (Detailed above.) Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations | pettingzoo API tests; 256 drones at ≥ 20× real time |
 | M4 | (Detailed above; split into M4a/b/c.) Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
-| M5 | (Detailed above.) Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
+| M5 ✅ | (Detailed above; done 2026-09-28.) Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
 | M6 | Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
