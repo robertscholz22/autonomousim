@@ -79,13 +79,15 @@ pub struct HelicopterInit {
 }
 
 impl HelicopterInit {
-    /// At rest at `pose`, rotors turning at the governed speed with the collective down.
-    pub fn at_rest(pose: Pose) -> Self {
+    /// At rest at `pose`, rotors turning at the governed speed with the collective at flat
+    /// pitch (zero, or the nearest end of its travel).
+    pub fn at_rest(def: &HelicopterDef, pose: Pose) -> Self {
+        let collective = def.controls.collective.input(0.0).clamp(-1.0, 1.0);
         Self {
             pose,
             lin_vel_world: DVec3::ZERO,
             ang_vel_body: DVec3::ZERO,
-            controls: HelicopterInput { collective: -1.0, ..Default::default() },
+            controls: HelicopterInput { collective, ..Default::default() },
             rotor_speed: None,
             density: AirData::default().density,
         }
@@ -197,7 +199,8 @@ impl Helicopter {
             contacts: Vec::new(),
             def,
         };
-        s.reset(&HelicopterInit::at_rest(Pose::IDENTITY));
+        let rest = HelicopterInit::at_rest(&s.def, Pose::IDENTITY);
+        s.reset(&rest);
         s
     }
 

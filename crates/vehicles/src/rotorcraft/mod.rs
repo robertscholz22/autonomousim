@@ -10,4 +10,4 @@ mod trim;
 pub use def::{EngineDef, FuselageDef, HelicopterControlsDef, HelicopterDef, PitchChannel, RotorMount};
 pub use model::{Helicopter, HelicopterInit, HelicopterInput, HelicopterLoads};
 pub use rotor::{Rotor, RotorDef, RotorInput, RotorLoads, RotorState, Spin};
-pub use trim::{HelicopterTrim, attitude};
+pub use trim::{HelicopterLinear, HelicopterTrim, attitude};

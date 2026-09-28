@@ -215,7 +215,7 @@ impl Agent {
                         rotor_speed: Some(s.rotor_speed),
                         density: s.density,
                     },
-                    None => HelicopterInit::at_rest(placement.pose),
+                    None => HelicopterInit::at_rest(v.def(), placement.pose),
                 };
                 v.reset(&init);
                 placement.pose

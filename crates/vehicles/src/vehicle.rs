@@ -379,7 +379,8 @@ impl Vehicle {
                 soc: 1.0,
             }),
             Vehicle::Helicopter(v) => {
-                v.reset(&HelicopterInit { lin_vel_world, ang_vel_body, ..HelicopterInit::at_rest(pose) })
+                let rest = HelicopterInit::at_rest(v.def(), pose);
+                v.reset(&HelicopterInit { lin_vel_world, ang_vel_body, ..rest })
             }
         }
     }

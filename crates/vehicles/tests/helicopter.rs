@@ -129,7 +129,8 @@ fn stands_on_its_skids() {
     for (name, _) in CASES {
         let mut h = heli(name);
         let z = h.def().skid_height().unwrap();
-        h.reset(&HelicopterInit::at_rest(Pose::new(DVec3::new(0.0, 0.0, z + 0.01), DQuat::IDENTITY)));
+        let rest = HelicopterInit::at_rest(h.def(), Pose::new(DVec3::new(0.0, 0.0, z + 0.01), DQuat::IDENTITY));
+        h.reset(&rest);
         let controls = *h.hold_input();
         for _ in 0..(5.0 / DT) as usize {
             let env = StepEnv { scene: Some(scene), gravity: GRAVITY, air: AirData::default(), ground: None };

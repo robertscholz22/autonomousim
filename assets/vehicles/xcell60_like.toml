@@ -75,7 +75,7 @@ roll = 1.5708
 cl_alpha = 2.0
 
 [controls]
-collective = { min = -0.10, max = 0.30, rate = 4.0, tau = 0.02 }
+collective = { min = -0.18, max = 0.30, rate = 4.0, tau = 0.02 }
 longitudinal = { min = -0.12, max = 0.12, rate = 4.0, tau = 0.02 }
 lateral = { min = -0.12, max = 0.12, rate = 4.0, tau = 0.02 }
 pedal = { min = -0.35, max = 0.35, rate = 8.0, tau = 0.02 }
