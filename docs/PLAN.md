@@ -2228,12 +2228,20 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 #### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | Rotor model: BEMT with forward-flight inflow, flapping, hub moments, ground effect, rotor speed | Hover and forward-flight thrust, torque and flapping match closed-form blade-element and momentum results; flapping lag matches `16/(γΩ)` |
+| 1 ✅ | Rotor model: BEMT with forward-flight inflow, flapping, hub moments, ground effect, rotor speed | Hover and forward-flight thrust, torque and flapping match closed-form blade-element and momentum results; flapping lag matches `16/(γΩ)` |
 | 2 | Helicopter family and presets; engine and governor; tail rotor; fins; skids; wiring | Both presets trim in hover and forward flight; stand on their skids; rotor speed recovers from load steps |
 | 3 | Validation against Padfield (Bo105) and Gavrilets (X-Cell) | Hover power, power curve, trim controls and attitudes within the tolerances above |
 | 4 | Control and action modes | Attitude and velocity steps settle in hover and at 20 m/s; hover holds position in wind |
 | 5 | Viewer: visuals, HUD, keyboard flight, replay | The helicopter flies by keyboard and lands on a large map; recordings replay |
 | 6 | `HeliLandingZone-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
+
+#### As built
+- **Step 1 (rotor model)**, `vehicles::rotorcraft::{Rotor, RotorDef, RotorState, RotorInput, RotorLoads, Spin}`:
+  - **Frame**: the shaft frame (z along positive thrust, x the disc reference, azimuth ψ counter-clockwise from −x). A clockwise rotor mirrors y internally (vectors flip y, pseudovectors x and z), so cyclic, flapping, forces and moments keep geometric meanings for either direction.
+  - **Blade element**: rigid blades with linear twist (collective at ¾R), root cut-out, tip-loss factor B (lift only), `δ = δ₀ + δ₂C_T²`; small-angle section forces with u_T, u_P including in-plane velocity in any direction, flapping (β′ and the radial-flow term) and shaft pitch/roll rates; yaw rate changes the effective Ω. The integrands are polynomials (degree ≤ 4 in r̄, ≤ 5 in ψ), so 3 Gauss–Legendre points × 8 azimuths evaluate the closed-form results exactly; no reverse flow or blade stall (μ ≲ 0.5).
+  - **Inflow**: C_T is affine in λ and independent of flapping; Glauert's uniform momentum inflow through the tip-path plane (`λ_c = μ_z + μ_xβ₁c + μ_yβ₁s`) is solved by Newton from the warm start in `RotorState::inflow`, with bisection on the working-state bracket as the fallback. Ground effect scales the blade-seen inflow by Cheeseman–Bennett `k_G = 1 − (R/4z)²/(1 + (μ/λ)²)` (z clamped ≥ R/2). A `vortex_ring` flag is raised for μ < λ_h and 0.28 < descent/λ_h < 2; the normal working state is kept there.
+  - **Flapping**: centre-spring flap equation (`ν² = 1 + K_β/(I_βΩ²)`, `γ = ρacR⁴/I_β` at the local density, gyroscopic `2(p̂ cos ψ + q̂ sin ψ)`), harmonically balanced as a 3×3 system for steady coning and tilt; coning is quasi-steady, the tilt lags with `τ = 16/(γΩ)` (exact exponential over a step), clamped to `flap_limit`. Hub moment `(N_b/2)K_β(−β₁s, β₁c, 0)`. The aerodynamic torque acts on the rotor: `I_Ω·Ω̇ = Q_drive − Q` in `Rotor::advance`; `angular_momentum` for gyroscopics.
+  - **Tests** (`crates/vehicles/tests/rotor.rs`): hover λ, C_T, C_Q = λC_T + σδ/8, coning against the closed forms (1e-10); forward flight C_T, Glauert inflow, β₀/β₁c/β₁s against Johnson's centrally hinged formulas (1e-10); a brute-force vector blade-element integration with numerically solved harmonic flapping for both spin directions, cut-out, tip loss, δ₂, spring, rates, sideslip and ground effect (1e-6); rate lag `−τq`, `+τp` with the spin-dependent cross-coupling; cyclic step reaches 63 % at `16/(γΩ)`; ground effect `λ_i = (15/16)√(C_T/2)` at z = R; rotor speed torque balance; windmilling (negative torque) in a descent; vortex-ring flag.
 
 ### M6c: Tiltrotor
 

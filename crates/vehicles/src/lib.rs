@@ -1,5 +1,5 @@
 //! Vehicle definitions and models (multirotors, wheeled ground vehicles and fixed-wing
-//! aircraft; rotorcraft later).
+//! aircraft; the rotor model of rotorcraft).
 //!
 //! A [`VehicleDef`] is immutable, loaded from TOML (`type = "multirotor"`, `"wheeled"`, …) and
 //! shared between instances by `Arc`; instances hold the per-agent state.
@@ -9,6 +9,7 @@ pub mod fixedwing;
 pub mod ground;
 pub mod multirotor;
 pub mod presets;
+pub mod rotorcraft;
 mod vehicle;
 
 pub use vehicle::{Family, SharedDef, Vehicle};
