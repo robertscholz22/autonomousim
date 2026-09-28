@@ -24,7 +24,7 @@ use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
-use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind};
+use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart};
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
@@ -34,6 +34,7 @@ use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::Vehicle;
 use autonomousim_vehicles::fixedwing::{FixedWing, FixedWingInput};
+use autonomousim_vehicles::rotorcraft::{Helicopter, HelicopterInput};
 use autonomousim_world::StaticWorld;
 use autonomousim_world::roads::Polyline;
 use glam::{DQuat, DVec2, DVec3};
@@ -245,6 +246,18 @@ impl WorldInstance {
                         placement.lin_vel += placement.pose.rot * v_body + self.env.config.wind.steady_at(agl, 0.0);
                         placement.fixed_wing = Some(start);
                     }
+                }
+                if g.def.as_helicopter().is_some() && !spawn.on_ground {
+                    let speed = match spawn.airspeed {
+                        Some([lo, hi]) => lo + (hi - lo) * spawn_rng.uniform(),
+                        None => 0.0,
+                    };
+                    let heli = self.agents[id].vehicle.as_helicopter().expect("helicopter group");
+                    let (attitude, v_body, start) = helicopter_start(heli, speed, density, self.env.config.gravity);
+                    let agl = (p.z - world.surface_height(p.x, p.y)).max(0.0);
+                    placement.pose.rot *= attitude;
+                    placement.lin_vel += placement.pose.rot * v_body + self.env.config.wind.steady_at(agl, 0.0);
+                    placement.helicopter = Some(start);
                 }
                 let mut route = road_spawn.and_then(|rs| rs.route);
                 if route_goals && route.is_none() {
@@ -621,6 +634,15 @@ impl WorldInstance {
                     f(v.rotor_speed());
                     v.surfaces().iter().for_each(|x| f(*x));
                 }
+                Vehicle::Helicopter(v) => {
+                    for x in [v.rotor_speed(), v.engine_torque()] {
+                        f(x);
+                    }
+                    v.pitches().iter().for_each(|x| f(*x));
+                    for r in [v.main_rotor_state(), v.tail_rotor_state()] {
+                        r.flap.iter().chain([&r.inflow]).for_each(|x| f(*x));
+                    }
+                }
             }
             f(f64::from(a.events.0));
             f(a.goal_index as f64);
@@ -645,6 +667,23 @@ fn fixed_wing_start(aircraft: &FixedWing, airspeed: f64, density: f64, gravity: 
             let rotor_speed = aircraft.propulsion().steady_omega(1.0, airspeed, density, supply);
             let controls = FixedWingInput { throttle: 1.0, ..FixedWingInput::default() };
             (DQuat::IDENTITY, DVec3::X * airspeed, FixedWingStart { controls, rotor_speed })
+        }
+    }
+}
+
+/// Attitude without heading, body-frame air velocity, controls and rotor speed of `heli`
+/// trimmed for straight and level flight at `speed`; where it cannot be trimmed, level at rest
+/// with the collective at mid travel.
+fn helicopter_start(heli: &Helicopter, speed: f64, density: f64, gravity: f64) -> (DQuat, DVec3, HelicopterStart) {
+    let rated = heli.def().engine.rated_speed;
+    match heli.trim(speed, density, gravity) {
+        Ok(t) => {
+            let start = HelicopterStart { controls: t.controls, rotor_speed: rated, density };
+            (t.attitude(0.0), t.velocity_body, start)
+        }
+        Err(_) => {
+            let controls = HelicopterInput::default();
+            (DQuat::IDENTITY, DVec3::X * speed, HelicopterStart { controls, rotor_speed: rated, density })
         }
     }
 }

@@ -318,7 +318,11 @@ fn rotor_speed_follows_the_torque_balance() {
     let l = rotor.loads(&state, &inp);
     rotor.advance(&mut state, &l, l.torque + 1000.0, 0.01);
     assert!(close(state.omega - OMEGA, 1000.0 * 0.01 / (4.0 * def.flap_inertia), 1e-12));
-    assert!(close(rotor.angular_momentum(&state).z, 4.0 * def.flap_inertia * state.omega, 1e-14));
+    // The blades' momentum acts through flapping: only a hub's adds rigid gyroscopics.
+    assert_eq!(rotor.angular_momentum(&state), DVec3::ZERO);
+    let hub = RotorDef { polar_inertia: Some(5.0 * def.flap_inertia), ..def.clone() };
+    let s = RotorState::spinning(OMEGA);
+    assert!(close(Rotor::new(hub).unwrap().angular_momentum(&s).z, def.flap_inertia * OMEGA, 1e-14));
     // A constant drive torque settles where the aerodynamic torque matches it (Q ∝ Ω²).
     let drive = 1.2 * l.torque;
     for _ in 0..20_000 {

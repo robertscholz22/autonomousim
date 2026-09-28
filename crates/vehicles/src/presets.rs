@@ -20,6 +20,8 @@ const PRESETS: &[(&str, &str)] = &[
     ("motorcycle_sport", include_str!("../../../assets/vehicles/motorcycle_sport.toml")),
     ("aerosonde_like", include_str!("../../../assets/vehicles/aerosonde_like.toml")),
     ("c172_like", include_str!("../../../assets/vehicles/c172_like.toml")),
+    ("xcell60_like", include_str!("../../../assets/vehicles/xcell60_like.toml")),
+    ("bo105_like", include_str!("../../../assets/vehicles/bo105_like.toml")),
 ];
 
 const TRAILERS: &[(&str, &str)] = &[
@@ -62,6 +64,14 @@ pub fn fixed_wing(name: &str) -> Result<crate::fixedwing::FixedWingDef, VehicleE
     match get(name)? {
         VehicleDef::FixedWing(f) => Ok(f),
         _ => Err(VehicleError::Invalid(format!("{name} is not a fixed-wing aircraft"))),
+    }
+}
+
+/// A built-in helicopter preset.
+pub fn helicopter(name: &str) -> Result<crate::rotorcraft::HelicopterDef, VehicleError> {
+    match get(name)? {
+        VehicleDef::Helicopter(h) => Ok(h),
+        _ => Err(VehicleError::Invalid(format!("{name} is not a helicopter"))),
     }
 }
 

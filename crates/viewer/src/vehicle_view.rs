@@ -193,6 +193,32 @@ pub fn spawn_vehicles(
                 ));
                 continue;
             }
+            Vehicle::Helicopter(h) => {
+                // Placeholder until the helicopter's own visual: a cabin and the rotor discs.
+                let d = h.def();
+                let root = commands.spawn(root).id();
+                let cabin = meshes.add(Sphere::new(0.25 * d.main_rotor.rotor.radius as f32));
+                commands.entity(root).with_child((Mesh3d(cabin), MeshMaterial3d(body_material.clone())));
+                for (k, m) in [&d.main_rotor, &d.tail_rotor].into_iter().enumerate() {
+                    let material = materials.add(StandardMaterial {
+                        base_color: Color::linear_rgba(0.1, 0.1, 0.1, 0.3),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        double_sided: true,
+                        unlit: true,
+                        ..default()
+                    });
+                    commands.entity(root).with_child((
+                        Mesh3d(meshes.add(convert::mesh(&props::rotor_disc(m.rotor.radius as f32, [1.0; 4])))),
+                        MeshMaterial3d(material),
+                        Transform::from_translation(convert::vec(m.hub))
+                            .with_rotation(convert::quat(glam::DQuat::from_rotation_arc(glam::DVec3::Z, m.axis))),
+                        RotorDisc { agent: i, rotor: k },
+                        bevy::light::NotShadowCaster,
+                    ));
+                }
+                continue;
+            }
             Vehicle::Wheeled(w) => {
                 let v = props::wheeled(w.def());
                 let link = meshes.add(convert::mesh(&v.link));
@@ -355,6 +381,8 @@ pub fn sync_vehicles(
             (v.motor_speeds().get(d.rotor).copied().unwrap_or(0.0), v.speed_range().1)
         } else if let Some(f) = vehicle.as_fixed_wing() {
             (f.rotor_speed(), f.full_throttle_speed())
+        } else if let Some(h) = vehicle.as_helicopter() {
+            (h.rotor_speed(), h.def().engine.rated_speed)
         } else {
             continue;
         };

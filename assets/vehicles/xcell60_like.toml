@@ -1,0 +1,138 @@
+# X-Cell 60-class 8.2 kg RC helicopter after Gavrilets, Mettler & Feron, "Nonlinear model
+# for a small-size acrobatic helicopter" (AIAA GNC 2001) and Gavrilets' thesis (MIT 2003).
+type = "helicopter"
+name = "xcell60_like"
+source = """
+Mass, inertia, main rotor (R 0.775 m, 2 blades, c 0.058 m, lift slope 5.5, C_D0 0.024, hub \
+stiffness 54 N m/rad, 1600 rpm, hub 0.235 m above the centre of mass, clockwise from above), \
+tail rotor (R 0.13 m, c 0.029 m, gear 4.66, 0.91 m aft, 0.08 m up), stabiliser (0.01 m^2, \
+0.71 m aft), fin (0.012 m^2, lift slope 2.0), fuselage frontal areas (0.1, 0.22, 0.15 m^2) \
+and the 2 kW engine from Gavrilets et al. The flap inertia is the effective value that gives \
+the paper's 0.1 s flybar-dominated flapping time constant (gamma ~ 1). Root cut-out, tail \
+flap inertia, control ranges, servos, skids and colliders are estimates."""
+
+# Tail rotor speed over main rotor speed.
+tail_gear_ratio = 4.66
+
+[body]
+mass = 8.2
+inertia = [0.18, 0.34, 0.28]
+
+[main_rotor]
+hub = [0.0, 0.0, 0.235]
+axis = [0.0, 0.0, 1.0]
+
+[main_rotor.rotor]
+radius = 0.775
+blades = 2
+chord = 0.058
+lift_slope = 5.5
+twist = 0.0
+root_cutout = 0.12
+tip_loss = 0.97
+profile_drag = 0.024
+flap_inertia = 0.147
+flap_stiffness = 54.0
+polar_inertia = 0.25
+spin = "cw"
+
+# Clockwise main rotor: its torque turns the fuselage left, so the tail rotor blows left
+# (thrust toward +y) to push the tail left and the nose right.
+[tail_rotor]
+hub = [-0.91, 0.0, 0.08]
+axis = [0.0, 1.0, 0.0]
+
+[tail_rotor.rotor]
+radius = 0.13
+blades = 2
+chord = 0.029
+lift_slope = 5.0
+twist = 0.0
+tip_loss = 0.97
+profile_drag = 0.024
+flap_inertia = 1.7e-5
+polar_inertia = 1e-4
+spin = "ccw"
+
+[fuselage]
+drag_area = [0.1, 0.22, 0.15]
+
+[[surfaces]]
+name = "stabiliser"
+area = 0.01
+span = 0.25
+chord = 0.04
+position = [-0.71, 0.0, 0.0]
+cl_alpha = 3.0
+
+[[surfaces]]
+name = "fin"
+area = 0.012
+span = 0.12
+chord = 0.1
+position = [-0.91, 0.0, 0.05]
+roll = 1.5708
+cl_alpha = 2.0
+
+[controls]
+collective = { min = -0.10, max = 0.30, rate = 4.0, tau = 0.02 }
+longitudinal = { min = -0.12, max = 0.12, rate = 4.0, tau = 0.02 }
+lateral = { min = -0.12, max = 0.12, rate = 4.0, tau = 0.02 }
+pedal = { min = -0.35, max = 0.35, rate = 8.0, tau = 0.02 }
+
+[engine]
+max_power = 2000.0
+rated_speed = 167.0
+lag = 0.1
+governor_bandwidth = 5.0
+
+# Contact stiffness per collider from the roll inertia about the skids (I_x / (y² + z²) of a skid point is about 1.9 kg over four points); the default
+# quarter of the mass would make the skid contacts too stiff in roll for the physics step.
+[contact]
+effective_mass = 0.25
+
+# Skids 0.24 m apart, 0.3 m below the centre of mass.
+[[colliders]]
+center = [0.15, 0.12, -0.285]
+radius = 0.015
+[[colliders]]
+center = [-0.15, 0.12, -0.285]
+radius = 0.015
+[[colliders]]
+center = [0.15, -0.12, -0.285]
+radius = 0.015
+[[colliders]]
+center = [-0.15, -0.12, -0.285]
+radius = 0.015
+
+# Fuselage and tail boom.
+[[colliders]]
+center = [0.05, 0.0, 0.0]
+radius = 0.14
+part = "frame"
+[[colliders]]
+center = [-0.5, 0.0, 0.05]
+radius = 0.05
+part = "frame"
+
+# Main rotor tips and the tail rotor disc.
+[[colliders]]
+center = [0.72, 0.0, 0.235]
+radius = 0.06
+part = "rotor"
+[[colliders]]
+center = [0.0, 0.72, 0.235]
+radius = 0.06
+part = "rotor"
+[[colliders]]
+center = [-0.72, 0.0, 0.235]
+radius = 0.06
+part = "rotor"
+[[colliders]]
+center = [0.0, -0.72, 0.235]
+radius = 0.06
+part = "rotor"
+[[colliders]]
+center = [-0.91, 0.03, 0.08]
+radius = 0.12
+part = "rotor"

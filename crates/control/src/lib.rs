@@ -4,13 +4,14 @@
 //! allocation) whose gains are derived from the vehicle definition, and the normalised action
 //! modes that learning agents use to drive it. [`ground`] holds the speed, steering and
 //! side-drive loops of wheeled vehicles and their action modes, [`fixedwing`] those of
-//! aircraft. The enums re-exported here hold any family, for agents that do not know which one
+//! aircraft, [`rotorcraft`] those of helicopters. The enums re-exported here hold any family, for agents that do not know which one
 //! they drive.
 
 mod family;
 pub mod fixedwing;
 pub mod ground;
 pub mod multirotor;
+pub mod rotorcraft;
 
 pub use family::{ActionMapping, AgentActionMode, Command, Controller};
 

@@ -390,6 +390,8 @@ impl Sim {
         match agent.vehicle.family() {
             Family::Multirotor => self.setpoint().into(),
             Family::FixedWing => self.flight_setpoint().into(),
+            // Held at the input it started with until helicopter piloting arrives.
+            Family::Rotorcraft => Command::hold(&agent.vehicle),
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();

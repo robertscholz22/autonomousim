@@ -266,6 +266,7 @@ impl Recorder {
                     SharedDef::Multirotor(m) => serde_json::to_value(&**m),
                     SharedDef::Wheeled(w) => serde_json::to_value(VehicleDef::Wheeled((**w).clone())),
                     SharedDef::FixedWing(f) => serde_json::to_value(VehicleDef::FixedWing((**f).clone())),
+                    SharedDef::Helicopter(h) => serde_json::to_value(VehicleDef::Helicopter((**h).clone())),
                 };
                 (g.spec.name.as_str(), def.expect("JSON"))
             })
@@ -464,6 +465,16 @@ impl Recorder {
                     m.insert("beta".into(), json!(flow.beta));
                     m.insert("gear_loads".into(), json!(loads));
                 }
+                Vehicle::Helicopter(v) => {
+                    let (main, tail) = (v.main_rotor_state(), v.tail_rotor_state());
+                    m.insert("controls".into(), json!(v.input().to_array()));
+                    m.insert("pitches".into(), json!(v.pitches()));
+                    m.insert("rotor_speed".into(), json!(v.rotor_speed()));
+                    m.insert("engine_power".into(), json!(v.engine_power()));
+                    m.insert("flap".into(), json!([main.flap, tail.flap]));
+                    m.insert("coning".into(), json!([v.loads().main.coning, v.loads().tail.coning]));
+                    m.insert("airspeed".into(), json!(v.flow().airspeed));
+                }
             }
             self.send(ch.state, &msg);
             let pose = json!({
@@ -544,6 +555,20 @@ pub struct RecordedState {
     pub beta: f64,
     #[serde(default)]
     pub gear_loads: Vec<f64>,
+    /// Helicopters (also `rotor_speed` and `airspeed`): pilot inputs (collective,
+    /// longitudinal, lateral, pedal), blade pitches (collective, cyclic θ₁c and θ₁s, tail
+    /// collective; rad), engine power (W), main and tail rotor flapping `[β₁c, β₁s]` and coning
+    /// (rad).
+    #[serde(default)]
+    pub controls: [f64; 4],
+    #[serde(default)]
+    pub pitches: [f64; 4],
+    #[serde(default)]
+    pub engine_power: f64,
+    #[serde(default)]
+    pub flap: [[f64; 2]; 2],
+    #[serde(default)]
+    pub coning: [f64; 2],
     pub wind: DVec3,
     pub goal: DVec3,
     pub goal_yaw: f64,

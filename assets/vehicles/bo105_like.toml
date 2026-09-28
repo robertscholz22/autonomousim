@@ -1,0 +1,175 @@
+# MBB Bo105-class light twin helicopter after Padfield, "Helicopter Flight Dynamics"
+# (2nd ed., 2007), Chapter 4 appendix configuration data.
+type = "helicopter"
+name = "bo105_like"
+source = """
+Mass, inertia, main rotor (R 4.91 m, 4 blades, c 0.27 m, a 6.113, twist -8 deg, delta0 0.0074, \
+delta2 38.66, I_beta 231.7 kg m^2, centre-spring K_beta 113330 N m/rad, Omega 44.4 rad/s, shaft \
+tilt 3 deg, hub 1.48 m above the centre of mass), tail rotor (R 0.95 m, 2 blades, c 0.18 m, \
+Omega 233.1 rad/s, 6.0 m aft, 1.72 m up), tailplane (0.803 m^2, a 3.262, 4.56 m aft) and fin \
+(0.805 m^2, a 2.704, 5.416 m aft) from Padfield's Bo105 data. Rotation direction, tip loss, \
+fuselage drag areas, engine limits (two 313 kW turboshafts, 500 kW transmission), control \
+ranges, skids and colliders are estimates."""
+
+# Tail rotor speed over main rotor speed.
+tail_gear_ratio = 5.25
+
+[body]
+mass = 2200.0
+inertia = [1433.0, 4973.0, 4099.0]
+product_xz = 660.0
+
+[main_rotor]
+hub = [0.0, 0.0, 1.48]
+# Shaft tilted 3 degrees forward.
+axis = [0.05234, 0.0, 0.99863]
+
+[main_rotor.rotor]
+radius = 4.91
+blades = 4
+chord = 0.27
+lift_slope = 6.113
+twist = -0.1396
+root_cutout = 0.0
+tip_loss = 0.97
+profile_drag = 0.0074
+profile_drag_thrust = 38.66
+flap_inertia = 231.7
+flap_stiffness = 113330.0
+spin = "ccw"
+
+# Tail rotor on the left of the fin, blowing right (it pushes the tail right against the
+# main rotor's torque).
+[tail_rotor]
+hub = [-6.0, 0.0, 1.72]
+axis = [0.0, -1.0, 0.0]
+
+[tail_rotor.rotor]
+radius = 0.95
+blades = 2
+chord = 0.18
+lift_slope = 5.7
+twist = 0.0
+tip_loss = 0.97
+profile_drag = 0.008
+flap_inertia = 0.2
+spin = "cw"
+
+[fuselage]
+drag_area = [1.3, 7.0, 9.0]
+
+[[surfaces]]
+name = "tailplane"
+area = 0.803
+span = 1.8
+chord = 0.45
+position = [-4.56, 0.0, 0.0]
+cl_alpha = 3.262
+
+[[surfaces]]
+name = "fin"
+area = 0.805
+span = 1.0
+chord = 0.8
+position = [-5.416, 0.0, 0.6]
+roll = 1.5708
+cl_alpha = 2.704
+
+[controls]
+collective = { min = -0.02, max = 0.30, rate = 0.5, tau = 0.05 }
+longitudinal = { min = -0.16, max = 0.16, rate = 0.5, tau = 0.05 }
+lateral = { min = -0.10, max = 0.10, rate = 0.5, tau = 0.05 }
+pedal = { min = -0.15, max = 0.35, rate = 1.0, tau = 0.05 }
+
+[engine]
+max_power = 500000.0
+rated_speed = 44.4
+lag = 0.3
+governor_bandwidth = 2.0
+
+# Contact stiffness per collider from the roll inertia about the skids (I_x / (y² + z²) of a skid point is about 440 kg over eight points); the default
+# quarter of the mass would make the skid contacts too stiff in roll for the physics step.
+[contact]
+effective_mass = 60.0
+
+# Skids: two tubes 2.4 m apart, 1.4 m below the centre of mass.
+[[colliders]]
+center = [1.3, 1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [0.4, 1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [-0.5, 1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [-1.2, 1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [1.3, -1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [0.4, -1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [-0.5, -1.2, -1.34]
+radius = 0.06
+[[colliders]]
+center = [-1.2, -1.2, -1.34]
+radius = 0.06
+
+# Cabin, nose, tail boom and fin.
+[[colliders]]
+center = [0.0, 0.0, -0.2]
+radius = 0.9
+part = "frame"
+[[colliders]]
+center = [1.8, 0.0, -0.5]
+radius = 0.5
+part = "frame"
+[[colliders]]
+center = [-3.3, 0.0, 0.3]
+radius = 0.3
+part = "frame"
+[[colliders]]
+center = [-5.6, 0.0, 0.9]
+radius = 0.4
+part = "frame"
+
+# Main rotor tips and the tail rotor disc.
+[[colliders]]
+center = [4.7, 0.0, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [3.32, 3.32, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [0.0, 4.7, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [-3.32, 3.32, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [-4.7, 0.0, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [-3.32, -3.32, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [0.0, -4.7, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [3.32, -3.32, 1.48]
+radius = 0.25
+part = "rotor"
+[[colliders]]
+center = [-6.0, -0.2, 1.72]
+radius = 0.8
+part = "rotor"

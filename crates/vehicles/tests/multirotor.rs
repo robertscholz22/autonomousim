@@ -49,7 +49,9 @@ fn presets_load_with_documented_numbers() {
             "bicycle_city",
             "motorcycle_sport",
             "aerosonde_like",
-            "c172_like"
+            "c172_like",
+            "xcell60_like",
+            "bo105_like"
         ]
     );
     let cf = presets::multirotor("cf2x").unwrap();

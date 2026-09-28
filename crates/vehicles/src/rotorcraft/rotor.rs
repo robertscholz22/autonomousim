@@ -65,6 +65,10 @@ const BISECTIONS: usize = 80;
 /// Floor inside the momentum-theory root `√(μ² + λ² + ε²)`.
 const MOMENTUM_EPS: f64 = 1e-9;
 
+/// Fixed-point iterations and tolerance of [`Rotor::settled`].
+const SETTLE_ITERATIONS: usize = 100;
+const SETTLE_TOL: f64 = 1e-14;
+
 /// Determinant below which the flapping balance is treated as singular.
 const MIN_FLAP_DET: f64 = 1e-12;
 
@@ -193,6 +197,13 @@ impl RotorDef {
 
     pub fn polar_inertia(&self) -> f64 {
         self.polar_inertia.unwrap_or(f64::from(self.blades) * self.flap_inertia)
+    }
+
+    /// Polar inertia of the parts that turn with the shaft without flapping (hub, shaft), about
+    /// the shaft (kg·m²): the blades' gyroscopic reaction reaches the hub through the flapping
+    /// equation and the hub spring, so only this share adds rigid-body gyroscopics.
+    pub fn hub_inertia(&self) -> f64 {
+        (self.polar_inertia() - f64::from(self.blades) * self.flap_inertia).max(0.0)
     }
 
     /// Sign of the rotation about +z: +1 counter-clockwise, −1 clockwise.
@@ -515,18 +526,44 @@ impl Rotor {
     /// a first-order lag held over the step), the rotor speed follows `drive_torque − Q`, and the
     /// inflow warm start is kept.
     pub fn advance(&self, state: &mut RotorState, loads: &RotorLoads, drive_torque: f64, dt: f64) {
+        self.advance_flapping(state, loads, dt);
+        let omega = state.omega + dt * (drive_torque - loads.torque) / self.def.polar_inertia();
+        state.omega = omega.max(0.0);
+    }
+
+    /// Advance the tip-path plane and the inflow warm start only (a drive train that integrates
+    /// the rotor speed itself).
+    pub fn advance_flapping(&self, state: &mut RotorState, loads: &RotorLoads, dt: f64) {
         let k = if loads.time_constant.is_finite() { 1.0 - (-dt / loads.time_constant).exp() } else { 0.0 };
         for (b, target) in state.flap.iter_mut().zip(loads.flap_steady) {
             *b += (target - *b) * k;
         }
         state.inflow = loads.momentum_inflow;
-        let omega = state.omega + dt * (drive_torque - loads.torque) / self.def.polar_inertia();
-        state.omega = omega.max(0.0);
     }
 
-    /// Angular momentum of the spinning rotor (shaft frame, kg·m²/s).
+    /// Loads with the tip-path plane and inflow settled (the steady flapping of the flow held):
+    /// the state is iterated to its fixed point and returned with the loads.
+    pub fn settled(&self, omega: f64, input: &RotorInput) -> (RotorLoads, RotorState) {
+        let mut state = RotorState::spinning(omega);
+        let mut loads = self.loads(&state, input);
+        for _ in 0..SETTLE_ITERATIONS {
+            let change = (loads.flap_steady[0] - state.flap[0]).abs()
+                + (loads.flap_steady[1] - state.flap[1]).abs()
+                + (loads.momentum_inflow - state.inflow).abs();
+            state.flap = loads.flap_steady;
+            state.inflow = loads.momentum_inflow;
+            loads = self.loads(&state, input);
+            if change < SETTLE_TOL {
+                break;
+            }
+        }
+        (loads, state)
+    }
+
+    /// Angular momentum of the non-flapping parts turning with the shaft (shaft frame,
+    /// kg·m²/s); see [`RotorDef::hub_inertia`].
     pub fn angular_momentum(&self, state: &RotorState) -> DVec3 {
-        DVec3::Z * (self.def.spin_sign() * self.def.polar_inertia() * state.omega)
+        DVec3::Z * (self.def.spin_sign() * self.def.hub_inertia() * state.omega)
     }
 }
 
