@@ -79,6 +79,9 @@ pub const AERIAL_PHYSICS_HZ: u32 = 500;
 
 /// Candidate positions tried before falling back to the best one seen.
 const MAX_ATTEMPTS: usize = 200;
+
+/// Height (m) above a landing zone up to which it must be clear (see `GoalSpec::landing_slope`).
+const LANDING_COLUMN: f64 = 40.0;
 /// Spawn candidates drawn from one tile of a tiled map before moving to another.
 const TILE_BATCH: usize = 25;
 /// Candidate centres of a spawn cluster.
@@ -827,6 +830,13 @@ pub struct GoalSpec {
     /// draws are used only when no draw meets it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grade: Option<f64>,
+    /// `Random` goals of aerial vehicles: landing zones, `agl` above the surface where no
+    /// obstacle or foliage comes within `clearance` of the vertical from 1 to 40 m above the
+    /// ground (the descent), no
+    /// water lies within it and the terrain within it rises or falls at most this much per
+    /// metre from the centre. Draws that fail rank below all that pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_slope: Option<f64>,
 }
 
 impl Default for GoalSpec {
@@ -847,6 +857,7 @@ impl Default for GoalSpec {
             path: false,
             off_road: false,
             grade: None,
+            landing_slope: None,
         }
     }
 }
@@ -1184,7 +1195,8 @@ impl CompiledGroup {
             && gl.spacing > 0.0
             && gl.route.step > 0.0
             && gl.count >= 1
-            && gl.grade.is_none_or(|g| g > 0.0))
+            && gl.grade.is_none_or(|g| g > 0.0)
+            && gl.landing_slope.is_none_or(|g| g > 0.0))
         {
             return Err(fail(format!("invalid goals {gl:?}")));
         }
@@ -1195,8 +1207,12 @@ impl CompiledGroup {
         if (gl.path || gl.off_road) && (gl.kind != GoalKind::Random || family != Family::Wheeled) {
             return Err(fail("`goals.path` and `goals.off_road` need `random` goals and a ground vehicle".into()));
         }
-        if gl.grade.is_some() && (gl.kind != GoalKind::Random || family == Family::Wheeled) {
-            return Err(fail("`goals.grade` needs `random` goals and an aerial vehicle".into()));
+        if (gl.grade.is_some() || gl.landing_slope.is_some())
+            && (gl.kind != GoalKind::Random || family == Family::Wheeled)
+        {
+            return Err(fail(
+                "`goals.grade` and `goals.landing_slope` need `random` goals and an aerial vehicle".into(),
+            ));
         }
         // Trailers in line behind the towing unit.
         let colliders = match def.as_wheeled() {
@@ -1603,7 +1619,11 @@ impl GoalSpec {
                                 let p = xy.extend(world.surface_height(xy.x, xy.y) + agl);
                                 // Too steep from the previous point: below any draw that is not.
                                 let steep = self.grade.is_some_and(|g| (p.z - prev3.z).abs() > g * xy.distance(prev));
-                                (p, self.free(world, p) - if steep { 1.5 } else { 0.0 })
+                                let free = match self.landing_slope {
+                                    Some(slope) => self.landing_zone(world, xy, slope),
+                                    None => self.free(world, p),
+                                };
+                                (p, free - if steep { 1.5 } else { 0.0 })
                             }
                         };
                         // A point moved onto the region's edge is off the distance range: only
@@ -1651,6 +1671,36 @@ impl GoalSpec {
                 Goal { position: xy.extend(z), yaw: heading }
             })
             .collect()
+    }
+
+    /// Score of a landing zone at `xy` (see `landing_slope`): the share of the clearance free
+    /// of obstacles and foliage (1 when clear), less 1.5 when the terrain is steeper than
+    /// `slope` and 2 when there is water.
+    fn landing_zone(&self, world: &StaticWorld, xy: DVec2, slope: f64) -> f64 {
+        let r = self.clearance.max(1.0);
+        let t = world.terrain();
+        let h = t.height(xy.x, xy.y);
+        // Rise or fall from the centre to 16 points on the rim and 8 halfway.
+        let rim = (0..16).map(|k| (f64::from(k) * std::f64::consts::FRAC_PI_8, r));
+        let half = (0..8).map(|k| (f64::from(k) * std::f64::consts::FRAC_PI_4, 0.5 * r));
+        let steepest = rim
+            .chain(half)
+            .map(|(a, d)| {
+                let q = xy + DVec2::from_angle(a) * d;
+                (t.height(q.x, q.y) - h).abs() / d
+            })
+            .fold(0.0, f64::max);
+        // Obstacles and foliage around the column the descent comes down (canopies overhang
+        // clearings), from 1 m to `LANDING_COLUMN` above the ground.
+        let steps = ((LANDING_COLUMN - 1.0) / (0.5 * r)).ceil() as usize;
+        let open = (0..=steps)
+            .map(|k| {
+                let p = xy.extend(h + (1.0 + 0.5 * r * k as f64).min(LANDING_COLUMN));
+                world.obstacles().nearest_distance(p, r, HitMask::SOLID | HitMask::FOLIAGE).map_or(1.0, |d| d / r)
+            })
+            .fold(1.0, f64::min);
+        let wet = dry_fraction(world, xy, DVec2::splat(r)) < 1.0;
+        open - if steepest > slope { 1.5 } else { 0.0 } - if wet { 2.0 } else { 0.0 }
     }
 
     /// 1 when a goal at `p` is free; otherwise how close it comes.

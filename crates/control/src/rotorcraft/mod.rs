@@ -139,6 +139,9 @@ impl Default for HelicopterConfig {
 /// Largest heading error the attitude loop acts on (rad).
 const HEADING_LAG: f64 = 0.5;
 
+/// Time (s) the velocity loop takes on the ground to lower the collective to zero thrust.
+const SETTLE_TIME: f64 = 1.0;
+
 /// One point of the gain schedule.
 #[derive(Clone, Copy, Debug)]
 struct Point {
@@ -206,6 +209,9 @@ pub struct HelicopterController {
     lead: Option<DVec2>,
     /// Touching the ground in the last update.
     grounded: bool,
+    /// Share (0…1) of the way from the velocity loop's collective to the zero-thrust one,
+    /// growing on the ground while no climb is asked for.
+    settle: f64,
 }
 
 impl HelicopterController {
@@ -282,6 +288,7 @@ impl HelicopterController {
             heading: None,
             lead: None,
             grounded: false,
+            settle: 0.0,
         })
     }
 
@@ -309,6 +316,7 @@ impl HelicopterController {
         self.i_vel = DVec3::ZERO;
         self.heading = None;
         self.lead = None;
+        self.settle = 0.0;
     }
 
     /// Trim inputs, pitch and roll at forward airspeed `speed` (m/s).
@@ -446,7 +454,13 @@ impl HelicopterController {
         let lift = (theta.cos() * phi.cos()).max(0.5);
         // Heave inverted about the trim: the climb rate's damping offsets the demand.
         let raw_col = p.controls[0] + (acc.z - p.heave_damping * v.z) / (p.heave * lift);
-        let collective = raw_col.clamp(-1.0, 1.0);
+        // Settled on the ground (no climb asked for), the collective goes down to zero thrust
+        // over `SETTLE_TIME`: with the rotor still carrying the weight the skids would skate
+        // and a skid that catches would roll the helicopter over.
+        self.settle =
+            if self.grounded && velocity.z <= 0.0 { (self.settle + self.dt / SETTLE_TIME).min(1.0) } else { 0.0 };
+        let flat = p.controls[0] - g / (p.heave * lift);
+        let collective = (raw_col + self.settle * (flat.min(raw_col) - raw_col)).clamp(-1.0, 1.0);
         let rates = self.attitude_loop(h, roll, pitch, yaw_rate, heading);
         let out = self.rate_loop(p, h, rates, collective);
         // Integrate (k²/4 per unit error) up to 0.3 g, holding the vertical while the

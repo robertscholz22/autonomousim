@@ -29,6 +29,7 @@ KWARGS = {
     "autonomousim/TrackedCrossCountry-v0": {"map": RURAL},
     "autonomousim/MotorcycleRoadRural-v0": {"map": RURAL},
     "autonomousim/FixedWingWaypoints-v0": {"map": LARGE},
+    "autonomousim/HeliLandingZone-v0": {"map_count": 1},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
@@ -38,6 +39,7 @@ OBS_DIM = {
     "autonomousim/TrackedCrossCountry-v0": 95,
     "autonomousim/MotorcycleRoadRural-v0": 106,
     "autonomousim/FixedWingWaypoints-v0": 46,
+    "autonomousim/HeliLandingZone-v0": 19,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
@@ -46,6 +48,7 @@ ACT_DIM = {
     "autonomousim/TrackedCrossCountry-v0": 2,
     "autonomousim/MotorcycleRoadRural-v0": 2,
     "autonomousim/FixedWingWaypoints-v0": 3,
+    "autonomousim/HeliLandingZone-v0": 4,
 }
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
@@ -731,3 +734,66 @@ def test_fixed_wing_waypoints_rewards():
     # 10 m made good: 0.1; half the safe height: 0.5·0.25; a stall: 0.5.
     np.testing.assert_allclose(r, [0.1, 0.1 - 0.125, -0.5])
     assert task.scenario()["groups"][0]["goals"]["grade"] == 0.08
+
+
+def test_heli_landing_zone_scripted_pilot_lands():
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/HeliLandingZone-v0",
+        num_envs=n,
+        num_threads=4,
+        map_count=2,
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    task = envs.unwrapped.task
+    assert [t[0] for t in envs.unwrapped.obs_layout] == [
+        "goal_rel_heading",
+        "agl",
+        "lin_vel_body",
+        "ang_vel_body",
+        "pitch_roll",
+        "last_action",
+        "goal_rel_heading",
+    ]
+    obs, _ = envs.reset(seed=0)
+    # In level forward flight 35–50 m above the ground, 100–300 m from the zone.
+    state = envs.unwrapped.state
+    agl = state[:, STATE["agl"]][:, 0]
+    assert ((agl > 34.0) & (agl < 51.0)).all(), agl
+    assert ((task.distance(state) > 95.0) & (task.distance(state) < 305.0)).all()
+    # Airspeed 4–10 m/s in up to 3 m/s of wind.
+    assert (obs[:, 4] / 0.1 > 0.9).all() and (np.abs(obs[:, 10:12]) < 0.15).all(), obs
+    ret, done, success = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(task.scripted(obs))
+        live = ~done
+        ret[live] += reward[live]
+        success |= live & task.success
+        done |= terminated | truncated
+    # The pilot flies over, stops, descends and lands on the zone: progress and the bonus pay.
+    assert success.all(), success
+    assert (task.distance(envs.unwrapped.state) < task.landing_radius).all()
+    assert (ret > task.landing_bonus + 3.0).all(), ret
+    envs.close()
+
+
+def test_heli_landing_zone_rewards():
+    task = make_task("heli_landing_zone", map_count=1)
+    task.bind(3, 0.05, 4)
+    state = np.zeros((3, autonomousim.STATE_DIM))
+    state[:, STATE["goal"]] = [100.0, 0.0, 0.0]
+    state[:, STATE["position"]] = [[0.0, 0.0, 40.0], [90.0, 0.0, 20.0], [99.0, 0.0, 0.3]]
+    state[:, STATE["agl"]] = [[40.0], [20.0], [0.3]]
+    task.reset(None, state)
+    # 10 m on in cruise (φ = √(d² + h²): 107.7 → 98.5); 10 m down at 10 m out (22.4 → 14.1);
+    # landed 1 m out: the bonus.
+    state[:, STATE["position"]] = [[10.0, 0.0, 40.0], [90.0, 0.0, 10.0], [99.0, 0.0, 0.3]]
+    state[:, STATE["agl"]] = [[40.0], [10.0], [0.3]]
+    events = np.array([0, 0, int(autonomousim.Event.LANDED)], np.uint32)
+    action = np.zeros((3, 4), np.float32)
+    r = task.reward(state, action, action, events)
+    progress = [np.hypot(100.0, 40.0) - np.hypot(90.0, 40.0), np.hypot(10.0, 20.0) - np.hypot(10.0, 10.0), 0.0]
+    np.testing.assert_allclose(r, np.array(progress) / 10.0 - 0.005 + [0.0, 0.0, 20.0])
+    assert task.succeeded(state, events).tolist() == [False, False, True]
+    goals = task.scenario()["groups"][0]["goals"]
+    assert goals["landing_slope"] == 0.1 and goals["clearance"] == 3.0

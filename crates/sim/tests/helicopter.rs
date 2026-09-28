@@ -1,7 +1,9 @@
 //! Helicopters in the simulation: trimmed air spawns (hover and forward flight), spawns on the
-//! skids, the `sticks` and `velocity` action modes and recordings.
+//! skids, the `sticks` and `velocity` action modes, recordings and landing-zone goals.
 
+use autonomousim_core::geometry::{HitMask, StaticGeometry};
 use autonomousim_core::rng::Seed;
+use autonomousim_core::terrain::Terrain;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
 use autonomousim_sim::{BatchSim, CompiledScenario, Events, Scenario, WorldInstance};
 use autonomousim_vehicles::rotorcraft::Helicopter;
@@ -128,4 +130,49 @@ fn velocity_mode_flies_forward_and_stops() {
     let e = run(&mut w, 20.0);
     assert!(e.is_empty(), "{e:?}");
     assert!(heli(&w).lin_vel_world().length() < 0.2, "{}", heli(&w).lin_vel_world());
+}
+
+/// Landing-zone goals on a generated wild map: flat within the slope, dry, and clear of trees
+/// and rocks within the clearance up to 40 m.
+#[test]
+fn landing_zones_are_flat_dry_and_open() {
+    let toml = r#"
+        name = "landing"
+        map = { type = "wild", preset = "offroad", seed = 3, cache = false }
+        [[groups]]
+        name = "heli"
+        count = 8
+        vehicle = "xcell60_like"
+        spawn = { agl = [40.0, 40.0], margin = 50.0 }
+        goals = { kind = "random", distance = [100.0, 300.0], agl = [0.0, 0.0], landing_slope = 0.1, clearance = 3.0, margin = 50.0, radius = 0.0 }
+    "#;
+    let sc = Arc::new(Scenario::from_toml(toml).unwrap().compile().unwrap());
+    for seed in 0..3 {
+        let w = WorldInstance::new(sc.clone(), Seed::from_u64(seed));
+        let map = w.map().clone();
+        let t = map.terrain();
+        for a in w.agents() {
+            let p = a.goals[0].position;
+            let h = t.height(p.x, p.y);
+            assert!((p.z - map.surface_height(p.x, p.y)).abs() < 1e-9, "goal {p} not on the surface");
+            for k in 0..16 {
+                let q = p.truncate() + glam::DVec2::from_angle(f64::from(k) * std::f64::consts::TAU / 16.0) * 3.0;
+                assert!((t.height(q.x, q.y) - h).abs() <= 0.1 * 3.0 + 0.05, "goal {p}: slope at {q}");
+                assert!(t.water_level(q.x, q.y).is_none_or(|l| l <= t.height(q.x, q.y)), "goal {p}: water at {q}");
+            }
+            for z in [1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 40.0] {
+                let c = glam::DVec3::new(p.x, p.y, h + z);
+                let near = map.obstacles().nearest_distance(c, 3.0, HitMask::SOLID | HitMask::FOLIAGE);
+                assert!(near.is_none(), "goal {p}: obstacle {near:?} m from {c}");
+            }
+        }
+    }
+    // Validated before the map is built: ground vehicles and non-positive slopes are rejected.
+    let flat = toml.replace(
+        r#"{ type = "wild", preset = "offroad", seed = 3, cache = false }"#,
+        r#"{ type = "testworld", kind = "flat", size = 200.0 }"#,
+    );
+    let err = |t: &str| Scenario::from_toml(t).unwrap().compile().expect_err("rejected").to_string();
+    assert!(err(&flat.replace("xcell60_like", "offroad_4x4")).contains("landing_slope"));
+    assert!(err(&flat.replace("landing_slope = 0.1", "landing_slope = 0.0")).contains("invalid goals"));
 }
