@@ -3,11 +3,11 @@
 //! are disjoint, so a mode name alone selects the family.
 
 use crate::ControlError;
+use crate::fixedwing::{FixedWingActionMap, FixedWingActionMode, FixedWingController, FixedWingSetpoint};
 use crate::ground::GroundSetpoint;
 use crate::ground::{GroundActionLimits, GroundActionMap, GroundActionMode, GroundConfig, GroundController};
 use crate::multirotor::{ActionLimits, ActionMap, ActionMode, ControllerConfig, MultirotorController};
 use crate::multirotor::{Setpoint, StateEstimate, YawCommand};
-use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_vehicles::{Family, SharedDef, Vehicle};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,6 +19,7 @@ use std::str::FromStr;
 pub enum AgentActionMode {
     Multirotor(ActionMode),
     Ground(GroundActionMode),
+    FixedWing(FixedWingActionMode),
 }
 
 impl AgentActionMode {
@@ -27,6 +28,7 @@ impl AgentActionMode {
         match family {
             Family::Multirotor => ActionMode::default().into(),
             Family::Wheeled => GroundActionMode::default().into(),
+            Family::FixedWing => FixedWingActionMode::default().into(),
         }
     }
 
@@ -34,6 +36,7 @@ impl AgentActionMode {
         match self {
             AgentActionMode::Multirotor(m) => m.name(),
             AgentActionMode::Ground(m) => m.name(),
+            AgentActionMode::FixedWing(m) => m.name(),
         }
     }
 
@@ -41,7 +44,9 @@ impl AgentActionMode {
     pub fn fits(self, family: Family) -> bool {
         matches!(
             (self, family),
-            (AgentActionMode::Multirotor(_), Family::Multirotor) | (AgentActionMode::Ground(_), Family::Wheeled)
+            (AgentActionMode::Multirotor(_), Family::Multirotor)
+                | (AgentActionMode::Ground(_), Family::Wheeled)
+                | (AgentActionMode::FixedWing(_), Family::FixedWing)
         )
     }
 }
@@ -55,6 +60,12 @@ impl From<ActionMode> for AgentActionMode {
 impl From<GroundActionMode> for AgentActionMode {
     fn from(m: GroundActionMode) -> Self {
         AgentActionMode::Ground(m)
+    }
+}
+
+impl From<FixedWingActionMode> for AgentActionMode {
+    fn from(m: FixedWingActionMode) -> Self {
+        AgentActionMode::FixedWing(m)
     }
 }
 
@@ -73,8 +84,15 @@ impl FromStr for AgentActionMode {
         if let Ok(m) = s.parse::<GroundActionMode>() {
             return Ok(m.into());
         }
-        let names: Vec<&str> =
-            ActionMode::ALL.iter().map(|m| m.name()).chain(GroundActionMode::ALL.iter().map(|m| m.name())).collect();
+        if let Ok(m) = s.parse::<FixedWingActionMode>() {
+            return Ok(m.into());
+        }
+        let names: Vec<&str> = ActionMode::ALL
+            .iter()
+            .map(|m| m.name())
+            .chain(GroundActionMode::ALL.iter().map(|m| m.name()))
+            .chain(FixedWingActionMode::ALL.iter().map(|m| m.name()))
+            .collect();
         Err(format!("unknown action mode {s:?} (expected one of {})", names.join(", ")))
     }
 }
@@ -100,6 +118,7 @@ impl<'de> Deserialize<'de> for AgentActionMode {
 pub enum Command {
     Multirotor(Setpoint),
     Ground(GroundSetpoint),
+    FixedWing(FixedWingSetpoint),
 }
 
 impl From<Setpoint> for Command {
@@ -114,14 +133,23 @@ impl From<GroundSetpoint> for Command {
     }
 }
 
+impl From<FixedWingSetpoint> for Command {
+    fn from(s: FixedWingSetpoint) -> Self {
+        Command::FixedWing(s)
+    }
+}
+
 impl Command {
-    /// Hold a vehicle of `family` at `pose`: hover there with its heading, or stand still.
-    pub fn hold(family: Family, pose: &Pose) -> Self {
-        match family {
-            Family::Multirotor => {
+    /// Hold `vehicle` where it is: hover there with its heading, stand still, or keep the
+    /// input an aircraft was reset with (trim, or idle on the brakes).
+    pub fn hold(vehicle: &Vehicle) -> Self {
+        match vehicle {
+            Vehicle::Multirotor(_) => {
+                let pose = vehicle.pose();
                 Setpoint::Position { position: pose.pos, yaw: YawCommand::Angle(yaw(pose.rot)) }.into()
             }
-            Family::Wheeled => GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 }.into(),
+            Vehicle::Wheeled(_) => GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 }.into(),
+            Vehicle::FixedWing(v) => FixedWingSetpoint::Surfaces(*v.hold_input()).into(),
         }
     }
 
@@ -138,6 +166,23 @@ impl Command {
             _ => None,
         }
     }
+
+    pub fn as_fixed_wing(&self) -> Option<&FixedWingSetpoint> {
+        match self {
+            Command::FixedWing(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Whether this command drives vehicles of `family`.
+    pub fn fits(&self, family: Family) -> bool {
+        matches!(
+            (self, family),
+            (Command::Multirotor(_), Family::Multirotor)
+                | (Command::Ground(_), Family::Wheeled)
+                | (Command::FixedWing(_), Family::FixedWing)
+        )
+    }
 }
 
 /// An agent's reference controller.
@@ -147,6 +192,7 @@ impl Command {
 pub enum Controller {
     Multirotor(MultirotorController),
     Ground(GroundController),
+    FixedWing(FixedWingController),
 }
 
 impl Controller {
@@ -160,6 +206,7 @@ impl Controller {
         Ok(match def {
             SharedDef::Multirotor(d) => Controller::Multirotor(MultirotorController::new(d, dt, multirotor)?),
             SharedDef::Wheeled(d) => Controller::Ground(GroundController::new(d, dt, ground)?),
+            SharedDef::FixedWing(_) => Controller::FixedWing(FixedWingController::new()),
         })
     }
 
@@ -170,7 +217,8 @@ impl Controller {
                 c.reset();
                 c.sync_motors(v.motor_speeds());
             }
-            (Controller::Ground(c), _) => c.reset(),
+            (Controller::Ground(c), Vehicle::Wheeled(_)) => c.reset(),
+            (Controller::FixedWing(c), Vehicle::FixedWing(_)) => c.reset(),
             (c, v) => panic!("{} controller for a {} vehicle", c.family(), v.family()),
         }
     }
@@ -179,6 +227,7 @@ impl Controller {
         match self {
             Controller::Multirotor(_) => Family::Multirotor,
             Controller::Ground(_) => Family::Wheeled,
+            Controller::FixedWing(_) => Family::FixedWing,
         }
     }
 
@@ -195,6 +244,13 @@ impl Controller {
             _ => None,
         }
     }
+
+    pub fn as_fixed_wing(&self) -> Option<&FixedWingController> {
+        match self {
+            Controller::FixedWing(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// Normalised actions → commands, for the action mode of a group.
@@ -202,6 +258,7 @@ impl Controller {
 pub enum ActionMapping {
     Multirotor(ActionMap),
     Ground(GroundActionMap),
+    FixedWing(FixedWingActionMap),
 }
 
 impl ActionMapping {
@@ -221,6 +278,9 @@ impl ActionMapping {
             (AgentActionMode::Ground(m), SharedDef::Wheeled(d), Controller::Ground(_)) => {
                 Ok(ActionMapping::Ground(GroundActionMap::new(m, ground, d)?))
             }
+            (AgentActionMode::FixedWing(m), SharedDef::FixedWing(_), Controller::FixedWing(_)) => {
+                Ok(ActionMapping::FixedWing(FixedWingActionMap::new(m)))
+            }
             _ => Err(ControlError::InvalidConfig(format!(
                 "action mode {mode} does not drive {} vehicles ({:?})",
                 def.family(),
@@ -233,6 +293,7 @@ impl ActionMapping {
         match self {
             ActionMapping::Multirotor(m) => m.mode().into(),
             ActionMapping::Ground(m) => m.mode().into(),
+            ActionMapping::FixedWing(m) => m.mode().into(),
         }
     }
 
@@ -241,6 +302,7 @@ impl ActionMapping {
         match self {
             ActionMapping::Multirotor(m) => m.dim(),
             ActionMapping::Ground(m) => m.dim(),
+            ActionMapping::FixedWing(m) => m.dim(),
         }
     }
 
@@ -258,11 +320,19 @@ impl ActionMapping {
         }
     }
 
+    pub fn as_fixed_wing(&self) -> Option<&FixedWingActionMap> {
+        match self {
+            ActionMapping::FixedWing(m) => Some(m),
+            _ => None,
+        }
+    }
+
     /// Command for `action` (length [`dim`](Self::dim)); `vehicle` anchors relative modes.
     pub fn command(&self, action: &[f64], vehicle: &Vehicle) -> Command {
         match (self, vehicle) {
             (ActionMapping::Multirotor(m), Vehicle::Multirotor(v)) => m.setpoint(action, &StateEstimate::of(v)).into(),
             (ActionMapping::Ground(m), _) => m.setpoint(action).into(),
+            (ActionMapping::FixedWing(m), _) => m.setpoint(action).into(),
             (m, v) => panic!("{} action mode for a {} vehicle", m.mode(), v.family()),
         }
     }

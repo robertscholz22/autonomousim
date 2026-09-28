@@ -139,6 +139,32 @@ pub fn spawn_vehicles(
         let root = (VehicleVisual(i), origin.transform(&pose), Visibility::default());
         let def = match &agent.vehicle {
             Vehicle::Multirotor(m) => m.def(),
+            Vehicle::FixedWing(f) => {
+                // Placeholder until the aircraft get their own visuals: wing, fuselage and
+                // wheels as boxes and spheres.
+                let d = f.def();
+                let g = &d.geometry;
+                let length = d.colliders.iter().map(|c| c.center.x).fold(0.0f64, f64::max)
+                    - d.colliders.iter().map(|c| c.center.x).fold(0.0f64, f64::min);
+                let wing = Cuboid::new(g.chord as f32, g.span as f32, (0.06 * g.chord) as f32);
+                let body = Cuboid::new(length.max(g.chord) as f32, (0.12 * g.span) as f32, (0.12 * g.span) as f32);
+                commands.spawn(root).with_children(|parent| {
+                    parent.spawn((
+                        Mesh3d(meshes.add(wing)),
+                        MeshMaterial3d(body_material.clone()),
+                        Transform::from_translation(convert::vec(g.aero_reference)),
+                    ));
+                    parent.spawn((Mesh3d(meshes.add(body)), MeshMaterial3d(body_material.clone())));
+                    for gear in &d.gear {
+                        parent.spawn((
+                            Mesh3d(meshes.add(Sphere::new(gear.wheel_radius as f32))),
+                            MeshMaterial3d(body_material.clone()),
+                            Transform::from_translation(convert::vec(gear.position)),
+                        ));
+                    }
+                });
+                continue;
+            }
             Vehicle::Wheeled(w) => {
                 let v = props::wheeled(w.def());
                 let link = meshes.add(convert::mesh(&v.link));

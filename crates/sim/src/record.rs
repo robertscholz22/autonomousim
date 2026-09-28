@@ -265,6 +265,7 @@ impl Recorder {
                 let def = match &g.def {
                     SharedDef::Multirotor(m) => serde_json::to_value(&**m),
                     SharedDef::Wheeled(w) => serde_json::to_value(VehicleDef::Wheeled((**w).clone())),
+                    SharedDef::FixedWing(f) => serde_json::to_value(VehicleDef::FixedWing((**f).clone())),
                 };
                 (g.spec.name.as_str(), def.expect("JSON"))
             })
@@ -452,6 +453,17 @@ impl Recorder {
                         m.insert("feet".into(), json!(v.feet_down()));
                     }
                 }
+                Vehicle::FixedWing(v) => {
+                    let flow = v.flow();
+                    let loads: Vec<f64> = v.wheels().iter().map(|w| w.map_or(0.0, |c| c.normal_force)).collect();
+                    m.insert("surfaces".into(), json!(v.surfaces()));
+                    m.insert("throttle".into(), json!(v.input().throttle));
+                    m.insert("rotor_speed".into(), json!(v.rotor_speed()));
+                    m.insert("airspeed".into(), json!(flow.airspeed));
+                    m.insert("alpha".into(), json!(flow.alpha));
+                    m.insert("beta".into(), json!(flow.beta));
+                    m.insert("gear_loads".into(), json!(loads));
+                }
             }
             self.send(ch.state, &msg);
             let pose = json!({
@@ -515,6 +527,23 @@ pub struct RecordedState {
     /// Two-wheelers: whether the feet are down.
     #[serde(default)]
     pub feet: bool,
+    /// Fixed-wing aircraft: aileron, elevator, rudder and flap deflections (rad), throttle,
+    /// propeller speed (rad/s), airspeed (m/s), angle of attack and sideslip (rad), and each
+    /// landing gear's load (N).
+    #[serde(default)]
+    pub surfaces: [f64; 4],
+    #[serde(default)]
+    pub throttle: f64,
+    #[serde(default)]
+    pub rotor_speed: f64,
+    #[serde(default)]
+    pub airspeed: f64,
+    #[serde(default)]
+    pub alpha: f64,
+    #[serde(default)]
+    pub beta: f64,
+    #[serde(default)]
+    pub gear_loads: Vec<f64>,
     pub wind: DVec3,
     pub goal: DVec3,
     pub goal_yaw: f64,

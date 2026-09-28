@@ -19,6 +19,14 @@ const MAX_EXPONENT: f64 = 60.0;
 /// Squared chord-plane speed below which a surface produces no force ((m/s)²).
 const MIN_SPEED_SQ: f64 = 1e-6;
 
+/// Beard & McLain's stall blend `σ(α)`: the weight of flat-plate flow at angle of attack
+/// `alpha` (0 attached, 1 fully stalled) for stall angle `alpha0` and sharpness `m` (1/rad).
+pub fn stall_blend(alpha: f64, alpha0: f64, m: f64) -> f64 {
+    let e1 = (-m * (alpha - alpha0)).clamp(-MAX_EXPONENT, MAX_EXPONENT).exp();
+    let e2 = (m * (alpha + alpha0)).clamp(-MAX_EXPONENT, MAX_EXPONENT).exp();
+    (1.0 + e1 + e2) / ((1.0 + e1) * (1.0 + e2))
+}
+
 /// Trailing-edge control surface (aileron, elevator, rudder, flap).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,11 +232,7 @@ impl AeroSurface {
 
     /// Weight of flat-plate flow at angle of attack `alpha` (0 attached, 1 fully stalled).
     pub fn stall_blend(&self, alpha: f64) -> f64 {
-        let m = self.stall_sharpness;
-        let a0 = self.alpha_stall;
-        let e1 = (-m * (alpha - a0)).clamp(-MAX_EXPONENT, MAX_EXPONENT).exp();
-        let e2 = (m * (alpha + a0)).clamp(-MAX_EXPONENT, MAX_EXPONENT).exp();
-        (1.0 + e1 + e2) / ((1.0 + e1) * (1.0 + e2))
+        stall_blend(alpha, self.alpha_stall, self.stall_sharpness)
     }
 
     /// Coefficients at angle of attack `alpha` (rad, any value) with the control surface

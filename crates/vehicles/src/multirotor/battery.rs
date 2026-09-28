@@ -43,7 +43,13 @@ impl BatteryDef {
 
     /// Advance by `dt` with the given total shaft power (W).
     pub fn step(&self, state: &mut BatteryState, shaft_power: f64, dt: f64) {
-        let power = shaft_power.max(0.0) / self.efficiency + self.idle_power;
+        self.step_electrical(state, shaft_power.max(0.0) / self.efficiency, dt);
+    }
+
+    /// Advance by `dt` drawing electrical power `power` (W) plus the idle load, for motor
+    /// models that account for their own losses.
+    pub fn step_electrical(&self, state: &mut BatteryState, power: f64, dt: f64) {
+        let power = power.max(0.0) + self.idle_power;
         let (v, i) = self.load(state.soc, power);
         state.voltage = v;
         state.current = i;

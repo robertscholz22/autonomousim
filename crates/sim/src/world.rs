@@ -24,7 +24,7 @@ use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
-use crate::scenario::{CompiledScenario, Goal, GoalKind};
+use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind};
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
@@ -33,9 +33,10 @@ use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::Vehicle;
+use autonomousim_vehicles::fixedwing::{FixedWing, FixedWingInput};
 use autonomousim_world::StaticWorld;
 use autonomousim_world::roads::Polyline;
-use glam::{DVec2, DVec3};
+use glam::{DQuat, DVec2, DVec3};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -220,6 +221,23 @@ impl WorldInstance {
                 }
                 if let Some(d) = g.def.as_wheeled() {
                     placement.pose = ground_pose(world, d, &g.rest, p.truncate(), yaw(placement.pose.rot));
+                }
+                if let Some(d) = g.def.as_fixed_wing() {
+                    if spawn.on_ground {
+                        placement.pose.rot *= g.rest.rot;
+                    } else {
+                        let gravity = self.env.config.gravity;
+                        let airspeed = match spawn.airspeed {
+                            Some([lo, hi]) => lo + (hi - lo) * spawn_rng.uniform(),
+                            None => 1.5 * d.stall_speed(density, gravity),
+                        };
+                        let aircraft = self.agents[id].vehicle.as_fixed_wing().expect("fixed-wing group");
+                        let (attitude, v_body, start) = fixed_wing_start(aircraft, airspeed, density, gravity);
+                        let agl = (p.z - world.surface_height(p.x, p.y)).max(0.0);
+                        placement.pose.rot *= attitude;
+                        placement.lin_vel += placement.pose.rot * v_body + self.env.config.wind.steady_at(agl, 0.0);
+                        placement.fixed_wing = Some(start);
+                    }
                 }
                 let mut route = road_spawn.and_then(|rs| rs.route);
                 if route_goals && route.is_none() {
@@ -568,6 +586,10 @@ impl WorldInstance {
                         f(x);
                     }
                 }
+                Vehicle::FixedWing(v) => {
+                    f(v.rotor_speed());
+                    v.surfaces().iter().for_each(|x| f(*x));
+                }
             }
             f(f64::from(a.events.0));
             f(a.goal_index as f64);
@@ -576,6 +598,23 @@ impl WorldInstance {
             }
         }
         *h.finalize().as_bytes()
+    }
+}
+
+/// Attitude without heading, body-frame air velocity, controls and rotor speed of `aircraft`
+/// trimmed for straight and level flight at `airspeed`; where it cannot be trimmed, level with
+/// the surfaces centred at full throttle.
+fn fixed_wing_start(aircraft: &FixedWing, airspeed: f64, density: f64, gravity: f64) -> (DQuat, DVec3, FixedWingStart) {
+    match aircraft.trim(airspeed, density, 0.0, 0.0, gravity) {
+        Ok(t) => {
+            (t.attitude(0.0), t.velocity_body(), FixedWingStart { controls: t.controls, rotor_speed: t.rotor_speed })
+        }
+        Err(_) => {
+            let supply = aircraft.def().battery.as_ref().map_or(0.0, |b| b.full_voltage());
+            let rotor_speed = aircraft.propulsion().steady_omega(1.0, airspeed, density, supply);
+            let controls = FixedWingInput { throttle: 1.0, ..FixedWingInput::default() };
+            (DQuat::IDENTITY, DVec3::X * airspeed, FixedWingStart { controls, rotor_speed })
+        }
     }
 }
 

@@ -1,0 +1,134 @@
+# 13.5 kg Aerosonde-class UAV after Beard & McLain, "Small Unmanned Aircraft" (2012), with
+# the electric propulsion of the book's 2nd-edition supplement.
+type = "fixed_wing"
+name = "aerosonde_like"
+source = """
+Mass, inertia, geometry and the stability and control derivatives from Beard & McLain, \
+Small Unmanned Aircraft (2012), Appendix E (Aerosonde), with the parasitic drag as C_D0 and \
+the induced polar with Oswald efficiency e. Propeller C_T(J), C_Q(J) and motor (Kv 145, \
+R 0.042 ohm, i0 1.5 A, 44.4 V) from the book's supplement (uavbook, aerosonde_parameters). \
+Current limit, servos, landing gear and colliders are estimates (the real aircraft is \
+catapult-launched)."""
+
+[body]
+mass = 13.5
+inertia = [0.8244, 1.135, 1.759]
+product_xz = 0.1204
+
+[geometry]
+area = 0.55
+span = 2.8956
+chord = 0.18994
+
+[aero]
+model = "derivatives"
+cl0 = 0.23
+cl_alpha = 5.61
+cl_q = 7.95
+cl_de = 0.13
+cd0 = 0.043
+oswald = 0.9
+cd_q = 0.0
+cd_de = 0.0135
+cm0 = 0.0135
+cm_alpha = -2.74
+cm_q = -38.21
+cm_de = -0.99
+cy_beta = -0.98
+cy_p = 0.0
+cy_r = 0.0
+cy_da = 0.075
+cy_dr = 0.19
+croll_beta = -0.13
+croll_p = -0.51
+croll_r = 0.25
+croll_da = 0.17
+croll_dr = 0.0024
+cn_beta = 0.073
+cn_p = -0.069
+cn_r = -0.095
+cn_da = -0.011
+cn_dr = -0.069
+alpha0 = 0.47
+stall_sharpness = 50.0
+
+# ±30° surfaces on hobby servos (≈ 0.1 s/60°).
+[controls]
+aileron = { max = 0.5236, rate = 10.0, tau = 0.02 }
+elevator = { max = 0.5236, rate = 10.0, tau = 0.02 }
+rudder = { max = 0.5236, rate = 10.0, tau = 0.02 }
+
+# Pusher propeller on the thrust line through the centre of mass.
+[propulsion]
+position = [-0.9, 0.0, 0.0]
+sense = 1
+
+[propulsion.propeller]
+diameter = 0.508
+inertia = 0.002
+ct = { poly = [0.09357, -0.06044, -0.1079] }
+cq = { poly = [0.005230, 0.004970, -0.01664] }
+
+[propulsion.engine]
+type = "electric"
+kv = 145.0
+resistance = 0.042
+no_load_current = 1.5
+max_current = 80.0
+voltage = 44.4
+
+# Light tricycle gear for runway operations (estimate).
+[[gear]]
+name = "nose"
+position = [0.55, 0.0, -0.3]
+spring = 1200.0
+damping = 60.0
+max_steer = 0.35
+wheel_radius = 0.05
+
+[[gear]]
+name = "left_main"
+position = [-0.12, 0.35, -0.3]
+spring = 3000.0
+damping = 180.0
+brake_friction = 0.5
+wheel_radius = 0.06
+
+[[gear]]
+name = "right_main"
+position = [-0.12, -0.35, -0.3]
+spring = 3000.0
+damping = 180.0
+brake_friction = 0.5
+wheel_radius = 0.06
+
+# Nose, tail, wing tips, fuselage and the propeller disc.
+[[colliders]]
+center = [0.6, 0.0, 0.0]
+radius = 0.08
+part = "frame"
+
+[[colliders]]
+center = [-1.2, 0.0, 0.1]
+radius = 0.08
+part = "frame"
+
+[[colliders]]
+center = [0.0, 1.4, 0.05]
+radius = 0.06
+part = "frame"
+
+[[colliders]]
+center = [0.0, -1.4, 0.05]
+radius = 0.06
+part = "frame"
+
+[[colliders]]
+center = [0.0, 0.0, 0.0]
+radius = 0.12
+part = "frame"
+
+[[colliders]]
+center = [-0.9, 0.0, 0.0]
+radius = 0.2
+part = "rotor"

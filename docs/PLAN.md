@@ -2001,7 +2001,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | 1 ✅ | `world::tiles` + `procgen::large`: coarse layer (terrain, erosion, hydrology, materials, rural roads and airstrips), detail tiles, `TiledWorld` with the tile LRU, hashes, `large` presets | Tiles are identical whatever the access order and thread count; heights and normals are continuous across tile seams; queries agree with a monolithic grid built from the same functions; the coarse 16 km layer generates in ≤ 15 s and a tile in ≤ 50 ms; memory stays under the cache bound; existing goldens are unchanged |
 | 2 ✅ | Viewer: floating origin, streamed tiles and far-field coarse chunks, aerial view distance | A drone flies across a 16 km map without jitter at the far edge; ≥ 60 fps at 1080p medium at 30 m/s and 200 m AGL on the Iris Xe |
 | 3 ✅ | Shared aero: `AirData` move, `AeroSurface`, medium/high-altitude Dryden, `pitot`, the `air_data`/`wind_body` terms, state columns | Lift, drag and moment of a surface match analytic thin-aerofoil and flat-plate values; Dryden spectra match MIL-F-8785C at altitude; goldens re-blessed after an A/B check |
-| 4 | `FixedWing` family: aero model (derivatives and tables), propeller and motor or engine, gear, presets, wiring through vehicles, sim, recorder and Python | Both presets trim in level flight; engine-off glide conserves energy with drag accounted for; they stand on their gear; scenarios spawn them in the air and on a runway |
+| 4 ✅ | `FixedWing` family: aero model (derivatives and tables), propeller and motor or engine, gear, presets, wiring through vehicles, sim, recorder and Python | Both presets trim in level flight; engine-off glide conserves energy with drag accounted for; they stand on their gear; scenarios spawn them in the air and on a runway |
 | 5 | JSBSim fixtures and validation | Trim α, elevator and throttle within 5 % (or 0.5°) of JSBSim over the airspeed sweep; mode frequencies and damping within 10 %; doublet responses close; c172 takeoff roll within 10 % of JSBSim and the POH |
 | 6 | Control and action modes (`raw`, `rates`, `attitude`, `guidance`) | Rate and attitude steps meet rise and overshoot bounds across the speed range; coordinated turns keep β small; altitude and airspeed hold under wind and turbulence; L1 follows a straight and a circular path |
 | 7 | Viewer: visuals, HUD, keyboard flight, cameras, replay | The Aerosonde flies by keyboard over a large map at ≥ 60 fps; recordings replay |
@@ -2105,6 +2105,47 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
     - `wind`: altitude scales (table values, continuity at 1000/2000 ft); PSDs at 3000 m of u, w, p_g, q_g, r_g against MIL-F-8785C (within 5 %, tolerance 12 %).
     - `sensors`: pitot through wind and crosswind, lever arm, offset statistics.
     - `obs`: `air_terms`.
+- **Step 4 (the `FixedWing` family)**:
+  - **Aerodynamic model** (`fixedwing::aero`, whole aircraft, `model = "derivatives" | "tables"`):
+    - `Derivatives` (Beard & McLain): stability axes; lift blended with the flat plate `2·sgn α·sin²α·cos α` through the stall sigmoid (`alpha0`, M = 50); drag `cd0 + cd_alpha·α +` induced polar, blended to `cd0 + cd90·sin²α`; side force, roll, pitch and yaw in β, p̂, q̂, r̂ and the surfaces.
+    - `Tables` (JSBSim-style): per axis a sum of `Term`s, each a scale times a product of variables (`Var`: α, β, |β|, p̂, q̂, r̂, α̇ĉ, surfaces, |δe|, flap, Mach, h/b, stall) and 1-D curves or 2-D tables (`table::Curve`, `table::Table`). Terms use free-stream or slipstream pressure (`Pressure::Slipstream`, ½ρ(v_axial + 2v_i)², JSBSim's `qbar-induced`). Wind-axis forces (−D, Y, −L) go to the body through the wind-to-body rotation; moments are FRD about `aero_reference`. `stall_hysteresis = [lo, hi]` drives the `stall` variable.
+    - Both are converted FRD → FLU (F = (Fx, −Fy, −Fz), M = (l, −m, −n)) plus `r_ref × F`. Rate terms use V ≥ 0.5 m/s.
+    - Control signs come from the sign of each surface's moment derivative, so +1 rolls right, pitches up and yaws right whatever the source's convention. The stall angles are found by scanning C_L over ±0.6 rad.
+  - **Propulsion** (`fixedwing::propulsion`):
+    - Propeller `T = ρn²D⁴C_T(J)`, `Q = ρn²D⁵C_Q(J)` (or `C_P/2π`). Polynomials of degree ≤ 2 are expanded in n so they stay finite at n = 0; tables read 0 below 10⁻³ rev/s.
+    - Electric motor (Kv, R, i₀, current limit, supply voltage or battery): the current is clamped to [0, i_max], with no regeneration.
+    - Piston engine: constant torque with friction fraction f (default 0.2), Gagg–Ferrar altitude factor, and an idle fraction set so the static propeller idles at `idle_rpm`.
+    - The rotor speed is integrated semi-implicitly, `Ω' = (JΩ/dt + a)/(J/dt + b + cΩ)` (engine torque a − bΩ, propeller cΩ²). The body gets the reaction torque and the rotor's angular momentum.
+  - **Gear** (`fixedwing::gear`): JSBSim-LGear-like strut spring and damper along the terrain normal (optional rebound damping). Tanh friction (0.1 m/s) holds a friction circle, with rolling, side and brake coefficients and a steerable wheel. Wheels are gear-group spheres that only other agents and water see. Gear loads enter as `ContactPoint`s (`HitKind::Terrain`/`Water`), so the crash rule (sinking faster than `crash_speed`), `GROUND_CONTACT` and `LANDED` apply unchanged.
+  - **Model** (`fixedwing::model`): the step is split into phases (`begin_step`, `apply_controls`, `apply_gear`, `apply_contacts`, `finish_step`). Servos are a first-order lag plus a rate limit. Ground effect for the aero terms uses h/b up to 1.2 spans (`Vehicle::ground_effect_range`). Also `energy(g)` and `external_power()` for the energy checks, and rotational gusts through `gust_span()`.
+  - **Trim** (`FixedWing::trim(V, ρ, γ, flap, g)`): an 8 × 8 Newton iteration with a finite-difference Jacobian and backtracking. Unknowns are α, θ, φ, δa, δe, δr, throttle and Ω; equations are the six body accelerations, the rotor torque balance and the flight-path angle. A Levenberg–Marquardt step takes over where a clamped motor current zeroes the throttle column. Trim fails when a command leaves [−1, 1] or the throttle leaves [0, 1]. The aerodynamics are evaluated on the unstalled hysteresis branch.
+  - **Presets**:
+    - `aerosonde_like`: Beard & McLain's Aerosonde, with the electric propulsion of the book's supplement, a pusher prop and an estimated tricycle gear. It trims from 18 to about 30 m/s; above that the motor lacks the thrust.
+    - `c172_like`: generated by `tools/gen_c172_like.py` from JSBSim's c172p (not c172x, which counts the lift slope twice), with mass properties from JSBSim at 1880 lb.
+      - JSBSim's IO-320 model makes about 575 N·m at full throttle at sea level (about 205 hp static, 2535 rpm, 2.1 kN), well above its 160 hp rating, so `max_power` is calibrated to JSBSim's static run.
+      - Takeoff at full throttle, rotating at 55 kt: lift-off after 278 m (JSBSim reaches 55 kt in 199 m; the POH gives about 270 m at 2400 lb).
+  - **Control** (`control::fixedwing`): the action mode is named `surfaces`, because mode names must be disjoint across families and `raw` belongs to ground vehicles. It has 4 components: aileron, elevator, rudder, and throttle mapped from [−1, 1] to [0, 1]; flaps stay up and the brakes off. `FixedWingSetpoint::Surfaces(FixedWingInput)` passes through `FixedWingController`, which is a placeholder for step 6. `Command::hold(&Vehicle)` holds an aircraft at the input it was reset with (trim, or idle on the brakes).
+  - **Sim**:
+    - **In the air**: spawns are trimmed for level flight at `spawn.airspeed` (a range; default 1.5 × `FixedWingDef::stall_speed` at the spawn density), turned to the spawn heading, with the steady wind added to the velocity. The `tilt_deg`, `speed` and `rates` perturbations apply on top. An aircraft that cannot be trimmed starts level at full throttle.
+    - **On the ground**: `spawn.on_ground` puts the aircraft on its gear at `FixedWingDef::resting_pose`, brakes set.
+    - Aerial groups keep the 500 Hz default.
+    - **Events**: new non-terminal `STALL` bit (15) while airborne beyond a stall angle.
+    - **Recordings**: state messages gain `surfaces`, `throttle`, `rotor_speed`, `airspeed`, `alpha`, `beta` and `gear_loads`.
+  - **Viewer**: a placeholder, a wing and fuselage box with wheel spheres, the multirotor chase camera, and keys on elevator and ailerons, until step 7.
+  - **Deferred**: airstrips on large maps. Runway starts use flat ground (the flat test world, or open terrain).
+  - **Goldens**: unchanged. New fields are optional, and the event names are not recorded.
+  - **Tests**:
+    - Unit tests: tables and curves; aero axes, signs, stall and slipstream terms; propeller polynomial expansion; the electric steady state and windmilling; piston idle and power; gear strut and friction.
+    - `vehicles/tests/fixedwing.rs`:
+      - presets consistent;
+      - trim over 18–28 m/s (Aerosonde) and 30–60 m/s (C172), faster flight needing less α, climb needing more throttle, flaps reducing α, and trims beyond the envelope failing;
+      - the trim held for 5 s (height within 1 m, speed within 0.3 m/s);
+      - control signs;
+      - engine-off glide, where the energy lost equals the work of the external forces within 2 %, with glide ratio 5–20;
+      - standing on the gear, where the wheel loads carry the weight within 2 % and no airframe contact occurs;
+      - the C172 takeoff.
+    - `sim/tests/fixedwing.rs`: trimmed air spawns hold level flight; trim in an 8 m/s wind (airspeed, not ground speed, at 1.5 × V_s); standing on the brakes (`LANDED`), then taking off with `surfaces` actions; full up elevator raises `STALL`; recorded fields match the live aircraft.
+    - `tests_py/test_native.py::test_fixed_wing`.
 
 ### M6b: Helicopter
 

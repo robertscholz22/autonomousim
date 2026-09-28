@@ -44,6 +44,8 @@ impl Events {
     /// An articulation angle of a ground vehicle with trailers exceeded
     /// `EventConfig::jackknife_deg`.
     pub const JACKKNIFE: Self = Self(1 << 14);
+    /// A fixed-wing aircraft flies beyond its stall angle of attack (not terminal).
+    pub const STALL: Self = Self(1 << 15);
 
     /// Events after which the vehicle cannot continue.
     pub const TERMINAL: Self = Self(
@@ -57,7 +59,7 @@ impl Events {
             | Self::JACKKNIFE.0,
     );
 
-    pub const NAMES: [(&'static str, Events); 15] = [
+    pub const NAMES: [(&'static str, Events); 16] = [
         ("crash_terrain", Self::CRASH_TERRAIN),
         ("crash_obstacle", Self::CRASH_OBSTACLE),
         ("crash_agent", Self::CRASH_AGENT),
@@ -73,6 +75,7 @@ impl Events {
         ("rollover", Self::ROLLOVER),
         ("stuck", Self::STUCK),
         ("jackknife", Self::JACKKNIFE),
+        ("stall", Self::STALL),
     ];
 
     #[inline]

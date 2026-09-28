@@ -1,10 +1,11 @@
-//! Vehicle definitions and models (multirotors and wheeled ground vehicles; fixed-wing and
-//! rotorcraft later).
+//! Vehicle definitions and models (multirotors, wheeled ground vehicles and fixed-wing
+//! aircraft; rotorcraft later).
 //!
 //! A [`VehicleDef`] is immutable, loaded from TOML (`type = "multirotor"`, `"wheeled"`, …) and
 //! shared between instances by `Arc`; instances hold the per-agent state.
 
 pub mod aero;
+pub mod fixedwing;
 pub mod ground;
 pub mod multirotor;
 pub mod presets;
@@ -35,6 +36,7 @@ pub enum VehicleError {
 pub enum VehicleDef {
     Multirotor(multirotor::MultirotorDef),
     Wheeled(ground::WheeledDef),
+    FixedWing(fixedwing::FixedWingDef),
 }
 
 impl VehicleDef {
@@ -43,6 +45,7 @@ impl VehicleDef {
         match &mut def {
             VehicleDef::Multirotor(m) => m.finish()?,
             VehicleDef::Wheeled(w) => w.finish()?,
+            VehicleDef::FixedWing(f) => f.finish()?,
         }
         Ok(def)
     }
@@ -55,6 +58,7 @@ impl VehicleDef {
         match self {
             VehicleDef::Multirotor(m) => &m.name,
             VehicleDef::Wheeled(w) => &w.name,
+            VehicleDef::FixedWing(f) => &f.name,
         }
     }
 
@@ -62,6 +66,7 @@ impl VehicleDef {
         match self {
             VehicleDef::Multirotor(_) => Family::Multirotor,
             VehicleDef::Wheeled(_) => Family::Wheeled,
+            VehicleDef::FixedWing(_) => Family::FixedWing,
         }
     }
 }

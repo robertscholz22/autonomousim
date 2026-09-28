@@ -47,7 +47,9 @@ fn presets_load_with_documented_numbers() {
             "farm_tractor",
             "bicycle_benchmark",
             "bicycle_city",
-            "motorcycle_sport"
+            "motorcycle_sport",
+            "aerosonde_like",
+            "c172_like"
         ]
     );
     let cf = presets::multirotor("cf2x").unwrap();

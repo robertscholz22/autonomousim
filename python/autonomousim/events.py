@@ -10,7 +10,7 @@ Event = enum.IntFlag("Event", {name.upper(): bit for name, bit in EVENTS})
 Event.__doc__ = (
     "Event bits: crashes, water, out of bounds, NaN (terminal), foliage, ground contact, landed, disabled,"
     " goal reached, finished (last goal reached), rollover (terminal), stuck and jackknife (terminal; ground"
-    " vehicles)."
+    " vehicles), and stall (fixed-wing aircraft)."
 )
 
 #: Bits that end an episode: crashes, water, out of bounds, NaN, rollover and jackknife.

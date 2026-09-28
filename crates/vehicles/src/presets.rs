@@ -18,6 +18,8 @@ const PRESETS: &[(&str, &str)] = &[
     ("bicycle_benchmark", include_str!("../../../assets/vehicles/bicycle_benchmark.toml")),
     ("bicycle_city", include_str!("../../../assets/vehicles/bicycle_city.toml")),
     ("motorcycle_sport", include_str!("../../../assets/vehicles/motorcycle_sport.toml")),
+    ("aerosonde_like", include_str!("../../../assets/vehicles/aerosonde_like.toml")),
+    ("c172_like", include_str!("../../../assets/vehicles/c172_like.toml")),
 ];
 
 const TRAILERS: &[(&str, &str)] = &[
@@ -52,6 +54,14 @@ pub fn multirotor(name: &str) -> Result<crate::multirotor::MultirotorDef, Vehicl
     match get(name)? {
         VehicleDef::Multirotor(m) => Ok(m),
         _ => Err(VehicleError::Invalid(format!("{name} is not a multirotor"))),
+    }
+}
+
+/// A built-in fixed-wing preset.
+pub fn fixed_wing(name: &str) -> Result<crate::fixedwing::FixedWingDef, VehicleError> {
+    match get(name)? {
+        VehicleDef::FixedWing(f) => Ok(f),
+        _ => Err(VehicleError::Invalid(format!("{name} is not a fixed-wing aircraft"))),
     }
 }
 

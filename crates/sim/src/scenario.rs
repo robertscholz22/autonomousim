@@ -56,6 +56,7 @@ use autonomousim_procgen::MapCache;
 use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
 use autonomousim_sensors::{Sensor, SensorConfig, SensorSpec};
+use autonomousim_vehicles::fixedwing::FixedWingInput;
 use autonomousim_vehicles::ground::{TrailerDef, Wheeled};
 use autonomousim_vehicles::multirotor::{MotorInit, MultirotorScales};
 use autonomousim_vehicles::presets;
@@ -677,9 +678,14 @@ pub struct SpawnSpec {
     pub cluster: Option<f64>,
     /// Height of the centre of mass above the ground or water surface (m).
     pub agl: [f64; 2],
-    /// Start resting on the ground (motors idle unless set otherwise); ignores `agl`. Ground
-    /// vehicles always do.
+    /// Start resting on the ground (motors idle unless set otherwise; aircraft on their gear
+    /// with the brakes set); ignores `agl`. Ground vehicles always do.
     pub on_ground: bool,
+    /// Fixed-wing aircraft in the air: airspeed range (m/s); they start trimmed for straight
+    /// and level flight at a sampled airspeed and the spawn heading, in the steady wind.
+    /// Default: 1.5 times the stall speed at the spawn altitude.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub airspeed: Option<[f64; 2]>,
     /// Start in a lane of a random road of the map, facing along it (along the route with
     /// `route` goals); ignores `layout`, `region`, `cluster` and `yaw_deg`. Needs a map with
     /// roads and a vehicle on the ground.
@@ -710,6 +716,7 @@ impl Default for SpawnSpec {
             cluster: None,
             agl: [1.0, 3.0],
             on_ground: false,
+            airspeed: None,
             on_road: false,
             clearance: 1.0,
             min_separation: 1.0,
@@ -905,8 +912,9 @@ pub struct CompiledGroup {
     pub radius: f64,
     /// Id of the group's first agent (agents are numbered group by group).
     pub first_agent: usize,
-    /// Ground vehicles: the rest pose on flat ground at the origin (heading +x), half the
-    /// vehicle's width (m), and where it can drive on each map of the pool.
+    /// Ground vehicles and aircraft: the rest pose on flat ground at the origin (heading +x);
+    /// ground vehicles: half the vehicle's width (m), and where it can drive on each map of
+    /// the pool.
     pub rest: Pose,
     pub half_width: f64,
     pub drive: Vec<Arc<DriveGrid>>,
@@ -945,7 +953,7 @@ impl CompiledScenario {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if spec.physics_hz == 0 {
-            let ground = defs.iter().any(|d| d.family() != Family::Multirotor);
+            let ground = defs.iter().any(|d| d.family() == Family::Wheeled);
             spec.physics_hz = if ground { GROUND_PHYSICS_HZ } else { AERIAL_PHYSICS_HZ };
         }
         let clock = Clock::new(spec.physics_hz);
@@ -1043,17 +1051,20 @@ impl CompiledGroup {
         let family = def.family();
         let name = spec.name.clone();
         let fail = move |what: String| SimError::Scenario(format!("group {name:?}: {what}"));
-        let foreign = match family {
-            Family::Multirotor => [
-                ("ground_controller", !is_default(&spec.ground_controller)),
-                ("ground_action_limits", !is_default(&spec.ground_action_limits)),
-                ("drivable", !is_default(&spec.drivable)),
-            ],
-            Family::Wheeled => [
-                ("controller", !is_default(&spec.controller)),
-                ("action_limits", !is_default(&spec.action_limits)),
-                ("randomize", !is_default(&spec.randomize)),
-            ],
+        let multirotor = [
+            ("controller", !is_default(&spec.controller)),
+            ("action_limits", !is_default(&spec.action_limits)),
+            ("randomize", !is_default(&spec.randomize)),
+        ];
+        let ground = [
+            ("ground_controller", !is_default(&spec.ground_controller)),
+            ("ground_action_limits", !is_default(&spec.ground_action_limits)),
+            ("drivable", !is_default(&spec.drivable)),
+        ];
+        let foreign: Vec<_> = match family {
+            Family::Multirotor => ground.to_vec(),
+            Family::Wheeled => multirotor.to_vec(),
+            Family::FixedWing => multirotor.into_iter().chain(ground).collect(),
         };
         if let Some((field, _)) = foreign.iter().find(|f| f.1) {
             return Err(fail(format!("`{field}` does not apply to {family} vehicles ({:?})", def.name())));
@@ -1098,12 +1109,16 @@ impl CompiledGroup {
             && valid_range(sp.yaw_deg)
             && sp.region.is_none_or(|[lo, hi]| lo.cmple(hi).all())
             && sp.cluster.is_none_or(|c| c > 0.0)
+            && sp.airspeed.is_none_or(|a| valid_range(a) && a[0] > 0.0)
             && !matches!(sp.layout, SpawnLayout::Grid { spacing } if spacing.is_nan() || spacing <= 0.0);
         if !spawn_ok {
             return Err(fail(format!("invalid spawn {sp:?}")));
         }
         if sp.on_road && !sp.on_ground {
             return Err(fail("`spawn.on_road` needs `spawn.on_ground`".into()));
+        }
+        if sp.airspeed.is_some() && family != Family::FixedWing {
+            return Err(fail("`spawn.airspeed` needs a fixed-wing aircraft".into()));
         }
         let gl = &spec.goals;
         if !(valid_range(gl.distance)
@@ -1130,16 +1145,23 @@ impl CompiledGroup {
             Some(d) => d.colliders_in_line(),
             None => def.sphere_colliders(),
         };
+        // Aircraft on the ground rest on their gear.
+        let fixed_wing_rest = def.as_fixed_wing().map(|d| {
+            let (rot, height) =
+                d.resting_pose(autonomousim_core::math::frames::STANDARD_GRAVITY).unwrap_or((DQuat::IDENTITY, 0.0));
+            Pose::new(DVec3::new(0.0, 0.0, height), rot)
+        });
         // Ground vehicles are placed from the ground point.
         let bottom = match family {
             Family::Multirotor => colliders.iter().map(|c| c.radius - c.center.z).fold(0.0, f64::max),
             Family::Wheeled => 0.0,
+            Family::FixedWing => fixed_wing_rest.map_or(0.0, |p| p.pos.z),
         };
         let radius = colliders.iter().map(|c| c.center.length() + c.radius).fold(0.0, f64::max);
         spec.drivable.validate().map_err(fail)?;
         let (rest, half_width) = match def.as_wheeled() {
             Some(d) => (Wheeled::new(d.clone(), clock.dt()).rest(DVec3::ZERO, 0.0, 0.0).pose, drive::half_width(d)),
-            None => (Pose::IDENTITY, 0.0),
+            None => (fixed_wing_rest.unwrap_or(Pose::IDENTITY), 0.0),
         };
         Ok(Self {
             spec,
@@ -1257,6 +1279,15 @@ pub(crate) struct Placement {
     pub lin_vel: DVec3,
     pub ang_vel: DVec3,
     pub motors: MotorInit,
+    /// Fixed-wing aircraft in the air: their trim (none: at rest on the brakes).
+    pub fixed_wing: Option<FixedWingStart>,
+}
+
+/// Controls and rotor speed a fixed-wing aircraft starts with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FixedWingStart {
+    pub controls: FixedWingInput,
+    pub rotor_speed: f64,
 }
 
 impl SpawnSpec {
@@ -1426,7 +1457,13 @@ impl SpawnSpec {
             (SpawnMotors::Hover, false) => MotorInit::Speed(hover_omega),
             _ => MotorInit::Idle,
         };
-        Placement { pose: Pose::new(position, rot), lin_vel: v_dir * speed, ang_vel: w_dir * rate, motors }
+        Placement {
+            pose: Pose::new(position, rot),
+            lin_vel: v_dir * speed,
+            ang_vel: w_dir * rate,
+            motors,
+            fixed_wing: None,
+        }
     }
 }
 

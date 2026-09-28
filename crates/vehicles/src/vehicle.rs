@@ -3,6 +3,7 @@
 //! are reached through [`Vehicle::as_multirotor`] and friends.
 
 use crate::VehicleDef;
+use crate::fixedwing::{FixedWing, FixedWingDef, FixedWingInit, FixedWingInput};
 use crate::ground::{GroundPart, Wheeled, WheeledDef, WheeledInit};
 use crate::multirotor::{ColliderPart, InitialState, MotorInit, Multirotor, MultirotorDef};
 use autonomousim_core::contact::{ContactModel, ContactPoint, SphereCollider, StaticScene};
@@ -18,6 +19,7 @@ use std::sync::Arc;
 pub enum Family {
     Multirotor,
     Wheeled,
+    FixedWing,
 }
 
 impl Family {
@@ -25,6 +27,7 @@ impl Family {
         match self {
             Family::Multirotor => "multirotor",
             Family::Wheeled => "wheeled",
+            Family::FixedWing => "fixed_wing",
         }
     }
 }
@@ -40,6 +43,7 @@ impl std::fmt::Display for Family {
 pub enum SharedDef {
     Multirotor(Arc<MultirotorDef>),
     Wheeled(Arc<WheeledDef>),
+    FixedWing(Arc<FixedWingDef>),
 }
 
 impl From<VehicleDef> for SharedDef {
@@ -47,6 +51,7 @@ impl From<VehicleDef> for SharedDef {
         match d {
             VehicleDef::Multirotor(m) => SharedDef::Multirotor(Arc::new(m)),
             VehicleDef::Wheeled(w) => SharedDef::Wheeled(Arc::new(w)),
+            VehicleDef::FixedWing(f) => SharedDef::FixedWing(Arc::new(f)),
         }
     }
 }
@@ -56,6 +61,7 @@ impl SharedDef {
         match self {
             SharedDef::Multirotor(m) => &m.name,
             SharedDef::Wheeled(w) => &w.name,
+            SharedDef::FixedWing(f) => &f.name,
         }
     }
 
@@ -63,6 +69,7 @@ impl SharedDef {
         match self {
             SharedDef::Multirotor(_) => Family::Multirotor,
             SharedDef::Wheeled(_) => Family::Wheeled,
+            SharedDef::FixedWing(_) => Family::FixedWing,
         }
     }
 
@@ -80,11 +87,19 @@ impl SharedDef {
         }
     }
 
+    pub fn as_fixed_wing(&self) -> Option<&Arc<FixedWingDef>> {
+        match self {
+            SharedDef::FixedWing(f) => Some(f),
+            _ => None,
+        }
+    }
+
     /// Nominal total mass (kg).
     pub fn mass(&self) -> f64 {
         match self {
             SharedDef::Multirotor(m) => m.body.mass,
             SharedDef::Wheeled(w) => w.total_mass(),
+            SharedDef::FixedWing(f) => f.body.mass,
         }
     }
 
@@ -93,6 +108,7 @@ impl SharedDef {
         match self {
             SharedDef::Multirotor(m) => m.contact.model(mass, dt),
             SharedDef::Wheeled(w) => w.contact.model(mass, dt),
+            SharedDef::FixedWing(f) => f.contact.model(mass, dt),
         }
     }
 
@@ -101,6 +117,7 @@ impl SharedDef {
         match self {
             SharedDef::Multirotor(m) => m.sphere_colliders(),
             SharedDef::Wheeled(w) => w.sphere_colliders(),
+            SharedDef::FixedWing(f) => f.sphere_colliders(),
         }
     }
 }
@@ -116,6 +133,7 @@ impl SharedDef {
 pub enum Vehicle {
     Multirotor(Multirotor),
     Wheeled(Wheeled),
+    FixedWing(FixedWing),
 }
 
 macro_rules! each {
@@ -123,6 +141,7 @@ macro_rules! each {
         match $self {
             Vehicle::Multirotor($v) => $e,
             Vehicle::Wheeled($v) => $e,
+            Vehicle::FixedWing($v) => $e,
         }
     };
 }
@@ -133,6 +152,7 @@ impl Vehicle {
         match def {
             SharedDef::Multirotor(m) => Vehicle::Multirotor(Multirotor::new(m.clone(), dt)),
             SharedDef::Wheeled(w) => Vehicle::Wheeled(Wheeled::new(w.clone(), dt)),
+            SharedDef::FixedWing(f) => Vehicle::FixedWing(FixedWing::new(f.clone(), dt)),
         }
     }
 
@@ -141,6 +161,7 @@ impl Vehicle {
         match self {
             Vehicle::Multirotor(_) => Family::Multirotor,
             Vehicle::Wheeled(_) => Family::Wheeled,
+            Vehicle::FixedWing(_) => Family::FixedWing,
         }
     }
 
@@ -177,6 +198,22 @@ impl Vehicle {
     pub fn as_wheeled_mut(&mut self) -> Option<&mut Wheeled> {
         match self {
             Vehicle::Wheeled(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_fixed_wing(&self) -> Option<&FixedWing> {
+        match self {
+            Vehicle::FixedWing(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_fixed_wing_mut(&mut self) -> Option<&mut FixedWing> {
+        match self {
+            Vehicle::FixedWing(f) => Some(f),
             _ => None,
         }
     }
@@ -230,6 +267,17 @@ impl Vehicle {
     pub fn gust_span(&self) -> Option<f64> {
         match self {
             Vehicle::Multirotor(_) | Vehicle::Wheeled(_) => None,
+            Vehicle::FixedWing(f) => Some(f.def().geometry.span),
+        }
+    }
+
+    /// Height above the surface (m) below which the vehicle feels ground effect: a span for
+    /// aircraft, `rotor` (the multirotor range) otherwise.
+    #[inline]
+    pub fn ground_effect_range(&self, rotor: f64) -> f64 {
+        match self {
+            Vehicle::FixedWing(f) => 1.2 * f.def().geometry.span,
+            _ => rotor,
         }
     }
 
@@ -269,6 +317,7 @@ impl Vehicle {
         match self {
             Vehicle::Multirotor(_) => ColliderPart::from_group(group) == Some(ColliderPart::Gear),
             Vehicle::Wheeled(_) => group == GroundPart::Skid as u8,
+            Vehicle::FixedWing(_) => ColliderPart::from_group(group) == Some(ColliderPart::Gear),
         }
     }
 
@@ -280,6 +329,14 @@ impl Vehicle {
                 v.reset(&InitialState { pose, lin_vel_world, ang_vel_body, motors: MotorInit::Idle, soc: 1.0 })
             }
             Vehicle::Wheeled(v) => v.reset(&WheeledInit { pose, lin_vel_world, ang_vel_body }),
+            Vehicle::FixedWing(v) => v.reset(&FixedWingInit {
+                pose,
+                lin_vel_world,
+                ang_vel_body,
+                controls: FixedWingInput::default(),
+                rotor_speed: None,
+                soc: 1.0,
+            }),
         }
     }
 
@@ -291,9 +348,12 @@ impl Vehicle {
         each!(self, v => v.begin_step())
     }
 
-    /// Penalty contacts of the colliders with the static world.
+    /// Penalty contacts of the colliders with the static world (and an aircraft's gear).
     #[inline]
     pub fn apply_contacts(&mut self, scene: &StaticScene) {
+        if let Vehicle::FixedWing(v) = self {
+            v.apply_gear(scene);
+        }
         each!(self, v => v.apply_contacts(scene))
     }
 

@@ -8,12 +8,14 @@ use crate::autopilot::{self, Autopilot};
 use crate::camera::{CameraMode, CameraRig};
 use crate::replay::Replay;
 use autonomousim_control::Command;
+use autonomousim_control::fixedwing::FixedWingSetpoint;
 use autonomousim_control::ground::{GroundActionMap, GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::Family;
+use autonomousim_vehicles::fixedwing::FixedWingInput;
 use autonomousim_vehicles::ground::PowertrainDef;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
@@ -304,6 +306,19 @@ impl Sim {
         let agent = self.world.agent(self.pilot);
         match agent.vehicle.family() {
             Family::Multirotor => self.setpoint().into(),
+            // Placeholder until the aircraft get their own pilot modes: forward/back is the
+            // elevator (forward pushes the nose down), left/right the ailerons, at the throttle
+            // the aircraft was reset with.
+            Family::FixedWing => {
+                let hold = agent.vehicle.as_fixed_wing().map_or_else(Default::default, |f| *f.hold_input());
+                FixedWingSetpoint::Surfaces(FixedWingInput {
+                    aileron: -self.steer,
+                    elevator: -self.stick[0],
+                    brake: if self.handbrake { 1.0 } else { 0.0 },
+                    ..hold
+                })
+                .into()
+            }
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();

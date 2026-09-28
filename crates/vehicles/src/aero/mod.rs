@@ -8,7 +8,7 @@
 
 mod surface;
 
-pub use surface::{AeroSurface, AlphaTable, Coefficients, Flap};
+pub use surface::{AeroSurface, AlphaTable, Coefficients, Flap, stall_blend};
 
 use autonomousim_core::terrain::Terrain;
 use glam::{DQuat, DVec3};

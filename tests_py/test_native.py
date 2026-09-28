@@ -235,3 +235,37 @@ def test_trailers():
     bad = deep_merge(rig, {"groups": [{"vehicle": "cf2x"}]})
     with pytest.raises(ValueError, match="tow"):
         BatchSim(json.dumps(bad), 1)
+
+
+def test_fixed_wing():
+    assert {"aerosonde_like", "c172_like"} <= set(autonomousim.vehicle_presets())
+    assert Event.STALL == 1 << 15 and not (TERMINAL & Event.STALL)
+    flight = {
+        "name": "flight",
+        "map": {"type": "testworld", "kind": "flat", "size": 3000.0},
+        "groups": [
+            {
+                "vehicle": "c172_like",
+                "spawn": {
+                    "agl": [300.0, 300.0],
+                    "airspeed": [40.0, 45.0],
+                    "region": [[-200.0, -200.0], [200.0, 200.0]],
+                },
+            }
+        ],
+    }
+    sim = BatchSim(json.dumps(flight), 2, num_threads=1)
+    info = sim.group_info(0)
+    assert (info["family"], info["action_mode"], info["act_dim"]) == ("fixed_wing", "surfaces", 4)
+    state = sim.state(0)[:, 0]
+    assert np.all((state[:, STATE["air_data"]][:, 0] >= 40.0) & (state[:, STATE["air_data"]][:, 0] <= 45.0))
+    # Full up elevator at idle: the aircraft stalls (not terminal).
+    stalled = np.zeros(2, bool)
+    for _ in range(300):
+        sim.step([np.array([[[0.0, 1.0, 0.0, -1.0]]] * 2, np.float32)])
+        stalled |= (sim.events(0)[:, 0] & Event.STALL) != 0
+        assert not (sim.events(0) & TERMINAL).any()
+    assert stalled.all()
+    bad = deep_merge(flight, {"groups": [{"vehicle": "cf2x"}]})
+    with pytest.raises(ValueError, match="airspeed"):
+        BatchSim(json.dumps(bad), 1)

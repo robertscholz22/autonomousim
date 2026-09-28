@@ -21,6 +21,7 @@ use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorEnv};
+use autonomousim_vehicles::fixedwing::FixedWingInit;
 use autonomousim_vehicles::ground::{Wheeled, WheeledInit};
 use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
 use autonomousim_vehicles::{Family, Vehicle};
@@ -30,7 +31,7 @@ use glam::{DQuat, DVec2, DVec3};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// Heights above the surface (m) below which rotors see ground effect.
+/// Heights above the surface (m) below which rotors see ground effect (wings: 1.2 spans).
 const GROUND_EFFECT_RANGE: f64 = 5.0;
 
 /// Environment of one episode.
@@ -123,12 +124,13 @@ impl Agent {
             .map(|s| Sensor::new(&s.config, clock, Seed::from_u64(0)).expect("validated when compiled"))
             .collect();
         let sensor_units = group.spec.sensors.iter().map(|s| s.unit).collect();
+        let vehicle = Vehicle::new(&group.def, clock.dt());
         Self {
             id,
             group: group_index,
-            vehicle: Vehicle::new(&group.def, clock.dt()),
+            command: Command::hold(&vehicle),
+            vehicle,
             controller: group.controller.clone(),
-            command: Command::hold(group.family(), &Pose::IDENTITY),
             cmd: [0.0; MAX_ROTORS],
             action: SmallVec::from_elem(0.0, group.act_dim()),
             sensors,
@@ -187,10 +189,25 @@ impl Agent {
                 });
                 placement.pose
             }
+            Vehicle::FixedWing(v) => {
+                let init = match placement.fixed_wing {
+                    Some(s) => FixedWingInit {
+                        pose: placement.pose,
+                        lin_vel_world: placement.lin_vel,
+                        ang_vel_body: placement.ang_vel,
+                        controls: s.controls,
+                        rotor_speed: Some(s.rotor_speed),
+                        soc: 1.0,
+                    },
+                    None => FixedWingInit::at_rest(placement.pose),
+                };
+                v.reset(&init);
+                placement.pose
+            }
         };
         self.controller.reset(&self.vehicle);
-        // Hold the spawn pose until the first action arrives.
-        self.command = Command::hold(group.family(), &pose);
+        // Hold the spawn pose (or the trim) until the first action arrives.
+        self.command = Command::hold(&self.vehicle);
         self.action.clear();
         self.action.resize(group.act_dim(), 0.0);
         let sensor_seed = seed.child("sensor");
@@ -226,11 +243,7 @@ impl Agent {
     /// the vehicle's family.
     pub fn set_command(&mut self, command: impl Into<Command>) {
         let command = command.into();
-        let fits = matches!(
-            (&command, &self.vehicle),
-            (Command::Multirotor(_), Vehicle::Multirotor(_)) | (Command::Ground(_), Vehicle::Wheeled(_))
-        );
-        assert!(fits, "command {command:?} for a {} vehicle", self.vehicle.family());
+        assert!(command.fits(self.vehicle.family()), "command {command:?} for a {} vehicle", self.vehicle.family());
         self.command = command;
     }
 
@@ -295,7 +308,7 @@ impl Agent {
         let p = self.vehicle.position();
         let plane = GroundPlane::below(world.terrain(), p, f64::INFINITY);
         self.agl = plane.map_or(f64::INFINITY, |g| p.z - g.point.z);
-        self.ground = plane.filter(|_| self.agl < GROUND_EFFECT_RANGE);
+        self.ground = plane.filter(|_| self.agl < self.vehicle.ground_effect_range(GROUND_EFFECT_RANGE));
         let Some(dt) = env_step else { return };
         let w = &env.config.wind;
         let agl = self.agl.max(0.0);
@@ -351,6 +364,13 @@ impl Agent {
                 v.begin_step();
                 v.apply_drive(&input, &self.air);
                 v.apply_tires(&scene);
+                v.apply_contacts(&scene);
+            }
+            (Vehicle::FixedWing(v), Controller::FixedWing(c), Command::FixedWing(sp)) => {
+                let input = c.update(sp, v);
+                v.begin_step();
+                v.apply_controls(&input, &self.air, self.ground.as_ref());
+                v.apply_gear(&scene);
                 v.apply_contacts(&scene);
             }
             (v, c, sp) => unreachable!("{} vehicle with a {} controller and {sp:?}", v.family(), c.family()),
@@ -512,6 +532,9 @@ impl Agent {
                 .any(|s| terrain.water_level(s.center.x, s.center.y).is_some_and(|w| s.center.z - s.radius < w))
         {
             e |= Events::WATER;
+        }
+        if v.as_fixed_wing().is_some_and(|f| f.stalled()) {
+            e |= Events::STALL;
         }
         let (lo, hi) = world.extent();
         let m = cfg.bounds_margin;

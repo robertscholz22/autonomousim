@@ -566,6 +566,10 @@ fn spawn_camera(
             let span = autonomousim_scene::props::multirotor(m.def()).span;
             (span, CameraRig::new(f64::from(span), heading))
         }
+        Vehicle::FixedWing(f) => {
+            let span = f.def().geometry.span as f32;
+            (span, CameraRig::new(f64::from(span), heading))
+        }
         Vehicle::Wheeled(w) => {
             let visual = autonomousim_scene::props::wheeled(w.def());
             let mut rig = CameraRig::ground(f64::from(visual.span), heading, visual.eye, visual.rear_eye);
