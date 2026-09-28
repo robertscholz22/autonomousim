@@ -101,6 +101,11 @@ pub struct PistonEngineDef {
     /// Friction and pumping torque at the rated speed as a fraction of the rated torque.
     #[serde(default = "default_friction")]
     pub friction: f64,
+    /// Gross torque as a fraction of the full-throttle torque against the throttle (0–1), as
+    /// manifold pressure makes it; its value at 0 sets the idle. Default: linear from the
+    /// fraction that idles the static propeller at `idle_rpm` to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle_curve: Option<Curve>,
 }
 
 fn default_idle_rpm() -> f64 {
@@ -145,6 +150,9 @@ impl PropulsionDef {
                 if !(e.max_power > 0.0 && e.rated_rpm > e.idle_rpm && e.idle_rpm > 0.0 && e.friction >= 0.0) {
                     return Err("piston engine needs positive power and 0 < idle_rpm < rated_rpm".into());
                 }
+                if let Some(c) = &e.throttle_curve {
+                    c.validate()?;
+                }
             }
         }
         Ok(())
@@ -188,7 +196,7 @@ pub struct Propulsion {
 #[derive(Clone, Debug)]
 enum Engine {
     Electric { k: f64, resistance: f64, i0: f64, i_max: f64, voltage: f64 },
-    Piston { rated_torque: f64, rated_omega: f64, friction: f64, idle_fraction: f64 },
+    Piston { rated_torque: f64, rated_omega: f64, friction: f64, idle_fraction: f64, throttle_curve: Option<Curve> },
 }
 
 /// Loads and state of the propulsion after a step.
@@ -223,7 +231,13 @@ impl Propulsion {
             EngineDef::Piston(e) => {
                 let rated_omega = e.rated_rpm * RPM;
                 let rated_torque = e.max_power / rated_omega;
-                Engine::Piston { rated_torque, rated_omega, friction: e.friction, idle_fraction: 0.0 }
+                Engine::Piston {
+                    rated_torque,
+                    rated_omega,
+                    friction: e.friction,
+                    idle_fraction: 0.0,
+                    throttle_curve: e.throttle_curve.clone(),
+                }
             }
         };
         let mut s = Self {
@@ -267,8 +281,8 @@ impl Propulsion {
         running: bool,
         supply: f64,
     ) -> (f64, f64) {
-        match self.engine {
-            Engine::Electric { k, resistance, i0, i_max, voltage } => {
+        match &self.engine {
+            &Engine::Electric { k, resistance, i0, i_max, voltage } => {
                 let v_in = if running { throttle * if supply > 0.0 { supply } else { voltage } } else { 0.0 };
                 let i = (v_in - k * omega) / resistance;
                 let (mut a, mut b) = if (0.0..=i_max).contains(&i) {
@@ -283,9 +297,13 @@ impl Propulsion {
                 }
                 (a, b)
             }
-            Engine::Piston { rated_torque, rated_omega, friction, idle_fraction } => {
+            Engine::Piston { rated_torque, rated_omega, friction, idle_fraction, throttle_curve } => {
+                let (rated_torque, rated_omega, friction) = (*rated_torque, *rated_omega, *friction);
                 let power_factor = (1.132 * density_ratio - 0.132).max(0.0);
-                let fraction = idle_fraction + (1.0 - idle_fraction) * throttle;
+                let fraction = match throttle_curve {
+                    Some(c) => c.eval(throttle).clamp(0.0, 1.0),
+                    None => idle_fraction + (1.0 - idle_fraction) * throttle,
+                };
                 let a = if running { rated_torque * (1.0 + friction) * fraction * power_factor } else { 0.0 };
                 (a, friction * rated_torque / rated_omega)
             }
@@ -458,6 +476,7 @@ mod tests {
                 rated_rpm: 2700.0,
                 idle_rpm: 600.0,
                 friction: 0.2,
+                throttle_curve: None,
             }),
         };
         def.validate().unwrap();
@@ -471,5 +490,15 @@ mod tests {
         assert!(q * w < 119_312.0);
         // Less power at altitude (σ = 0.74 at 10 000 ft).
         assert!(p.steady_omega(1.0, 0.0, 0.905, 0.0) < w);
+        // A throttle curve reshapes part throttle only: same idle and full power, less torque at
+        // half throttle when the curve sags.
+        let mut curved = def.clone();
+        if let EngineDef::Piston(e) = &mut curved.engine {
+            e.throttle_curve = Some(Curve::Table { x: vec![0.0, 0.5, 1.0], y: vec![0.1, 0.3, 1.0] });
+        }
+        curved.validate().unwrap();
+        let c = Propulsion::new(&curved);
+        assert!((c.steady_omega(1.0, 0.0, 1.225, 0.0) - w).abs() < 1e-6 * w);
+        assert!(c.steady_omega(0.5, 0.0, 1.225, 0.0) < p.steady_omega(0.5, 0.0, 1.225, 0.0));
     }
 }

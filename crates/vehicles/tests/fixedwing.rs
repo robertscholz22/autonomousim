@@ -204,7 +204,8 @@ fn stands_on_its_gear() {
         let pitch = (a.orientation() * DVec3::X).z.asin();
         assert!(pitch.abs() < 0.1, "{name}: pitch {pitch}");
         if name == "c172_like" {
-            assert!((idle * 60.0 / std::f64::consts::TAU - 550.0).abs() < 5.0, "idle {idle}");
+            // The throttle curve fitted to JSBSim idles at its static 767 rpm.
+            assert!((idle * 60.0 / std::f64::consts::TAU - 767.0).abs() < 15.0, "idle {idle}");
         }
     }
 }

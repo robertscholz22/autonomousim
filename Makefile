@@ -1,7 +1,7 @@
 # Development tasks for autonomousim. Cargo lives in ~/.cargo/bin, which is not always on PATH.
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
-.PHONY: check fmt test test-rust test-py test-viewer bench dev-py train-deps viewer clean fixtures-mfeval fixtures-chrono
+.PHONY: check fmt test test-rust test-py test-viewer bench dev-py train-deps viewer clean fixtures-mfeval fixtures-chrono fixtures-jsbsim
 
 check:            ## rustfmt + clippy (whole workspace, incl. viewer and bindings)
 	cargo fmt --all --check
@@ -64,6 +64,13 @@ fixtures-chrono:  ## PAC2002, full-vehicle, handling, truck and tracked referenc
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_truck_fixtures.py
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_truck_handling_fixtures.py
 	$(MICROMAMBA) run -n chrono python tools/gen_chrono_tracked_fixtures.py
+
+# JSBSim from PyPI in a plain venv: python3 -m venv $(ORACLES)/jsbsim-venv && .../pip install jsbsim numpy
+JSBSIM_PY ?= $(ORACLES)/jsbsim-venv/bin/python
+
+fixtures-jsbsim:  ## c172_like preset and c172p trim, mode, doublet and takeoff references from JSBSim (fixtures/jsbsim/)
+	$(JSBSIM_PY) tools/gen_c172_like.py
+	$(JSBSIM_PY) tools/gen_jsbsim_fixtures.py
 
 clean:
 	cargo clean

@@ -4,7 +4,7 @@ name = "c172_like"
 source = """
 JSBSim c172p (aircraft/c172p/c172p.xml, engine/eng_io320.xml, engine/prop_75in2f.xml): \
 aerodynamic coefficient build-up, stall hysteresis, gear and propeller tables; engine torque \
-calibrated to JSBSim's full-throttle static run (it exceeds the 160 hp rating). \
+and throttle map calibrated to JSBSim's static runs (it exceeds the 160 hp rating). \
 Mass properties from JSBSim at 1880 lb (1500 lb empty, two 90 lb occupants, 2 x 100 lb fuel). \
 Airframe colliders, servo rates and the simplified engine model (constant torque, \
 Gagg-Ferrar altitude factor) are estimates; P-factor and fuel burn are not modelled."""
@@ -42,6 +42,7 @@ type = "piston"
 max_power = 161390
 rated_rpm = 2700
 idle_rpm = 550
+throttle_curve = { x = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1], y = [0.124422, 0.150595, 0.183423, 0.225152, 0.279044, 0.349865, 0.444426, 0.571287, 0.735231, 0.911705, 1] }
 
 [[gear]]
 name = "nose"
