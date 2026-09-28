@@ -116,6 +116,10 @@ pub struct AeroSurface {
     pub area: f64,
     pub span: f64,
     pub chord: f64,
+    /// Aspect ratio for the lift-curve slope and induced drag (m²/m²): that of the whole wing
+    /// for one panel of it; `span²/area` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<f64>,
     /// Aerodynamic centre in the body frame (m).
     pub position: DVec3,
     /// Rotation about the body x axis (rad): 0 for a wing (lift up), ±π/2 for a fin.
@@ -175,6 +179,7 @@ impl AeroSurface {
             area,
             span,
             chord,
+            aspect_ratio: None,
             position,
             roll: 0.0,
             incidence: 0.0,
@@ -194,8 +199,10 @@ impl AeroSurface {
     pub fn validate(&self) -> Result<(), VehicleError> {
         let bad = |m: &str| Err(VehicleError::Invalid(format!("aero surface {:?}: {m}", self.name)));
         let positive = [self.area, self.span, self.chord, self.oswald, self.stall_sharpness];
-        if !positive.iter().all(|x| x.is_finite() && *x > 0.0) {
-            return bad("area, span, chord, oswald and stall_sharpness must be positive");
+        if !positive.iter().all(|x| x.is_finite() && *x > 0.0)
+            || self.aspect_ratio.is_some_and(|a| !(a.is_finite() && a > 0.0))
+        {
+            return bad("area, span, chord, aspect_ratio, oswald and stall_sharpness must be positive");
         }
         if !(self.alpha_stall > 0.0 && self.alpha_stall < FRAC_PI_2) || !(self.cd0 >= 0.0 && self.cd90 >= 0.0) {
             return bad("alpha_stall must be in (0, π/2), cd0 and cd90 non-negative");
@@ -214,7 +221,7 @@ impl AeroSurface {
     }
 
     pub fn aspect_ratio(&self) -> f64 {
-        self.span * self.span / self.area
+        self.aspect_ratio.unwrap_or(self.span * self.span / self.area)
     }
 
     /// Lift-curve slope (1/rad).
@@ -268,6 +275,12 @@ impl AeroSurface {
             cd: self.cd0 + (1.0 - sigma) * induced + sigma * cn * s,
             cm: (1.0 - sigma) * (self.cm0 + dcm) - sigma * cn * arm,
         }
+    }
+
+    /// Angle of attack (rad) of the flow in the chord plane; `None` without flow.
+    pub fn angle_of_attack(&self, flow: &AirFlow) -> Option<f64> {
+        let v = self.rotation().inverse() * flow.at(self.position);
+        (v.x * v.x + v.z * v.z >= MIN_SPEED_SQ).then(|| (-v.z).atan2(v.x))
     }
 
     /// Force and moment about the body origin (body frame; N, N·m) in the flow `flow` with

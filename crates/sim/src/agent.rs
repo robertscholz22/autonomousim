@@ -25,6 +25,7 @@ use autonomousim_vehicles::fixedwing::FixedWingInit;
 use autonomousim_vehicles::ground::{Wheeled, WheeledInit};
 use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
 use autonomousim_vehicles::rotorcraft::HelicopterInit;
+use autonomousim_vehicles::tiltrotor::TiltrotorInit;
 use autonomousim_vehicles::{Family, Vehicle};
 use autonomousim_world::environment::{Dryden, EnvironmentConfig, MagneticField};
 use autonomousim_world::{Polyline, StaticWorld};
@@ -220,6 +221,23 @@ impl Agent {
                 v.reset(&init);
                 placement.pose
             }
+            Vehicle::Tiltrotor(v) => {
+                let base = TiltrotorInit {
+                    lin_vel_world: placement.lin_vel,
+                    ang_vel_body: placement.ang_vel,
+                    ..TiltrotorInit::at_rest(placement.pose)
+                };
+                v.reset(&match placement.tiltrotor {
+                    Some(s) => TiltrotorInit {
+                        controls: s.controls,
+                        rotor_speed: Some(s.rotor_speed),
+                        density: s.density,
+                        ..base
+                    },
+                    None => base,
+                });
+                placement.pose
+            }
         };
         self.controller.reset(&self.vehicle);
         // Hold the spawn pose (or the trim) until the first action arrives.
@@ -390,6 +408,12 @@ impl Agent {
                 v.apply_contacts(&scene);
             }
             (Vehicle::Helicopter(v), Controller::Helicopter(c), Command::Helicopter(sp)) => {
+                let input = c.update(sp, v);
+                v.begin_step();
+                v.apply_controls(&input, &self.air, self.ground.as_ref());
+                v.apply_contacts(&scene);
+            }
+            (Vehicle::Tiltrotor(v), Controller::Tiltrotor(c), Command::Tiltrotor(sp)) => {
                 let input = c.update(sp, v);
                 v.begin_step();
                 v.apply_controls(&input, &self.air, self.ground.as_ref());

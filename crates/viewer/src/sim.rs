@@ -438,6 +438,8 @@ impl Sim {
             Family::Multirotor => self.setpoint().into(),
             Family::FixedWing => self.flight_setpoint().into(),
             Family::Rotorcraft => self.heli_setpoint().into(),
+            // Piloting comes with the transition modes; until then the inputs are held.
+            Family::Tiltrotor => Command::hold(&agent.vehicle),
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();

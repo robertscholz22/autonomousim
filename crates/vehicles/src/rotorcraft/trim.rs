@@ -219,7 +219,7 @@ impl Helicopter {
 
 /// Newton's method on `x` with a finite-difference Jacobian and a damped step (at most 0.5 in
 /// any unknown); returns the final residual norm (infinite when it breaks down).
-fn newton(x: &mut [f64], residual: impl Fn(&[f64]) -> Vec<f64>) -> f64 {
+pub(crate) fn newton(x: &mut [f64], residual: impl Fn(&[f64]) -> Vec<f64>) -> f64 {
     let n = x.len();
     let mut r = residual(x);
     for _ in 0..MAX_ITERATIONS {

@@ -51,7 +51,8 @@ fn presets_load_with_documented_numbers() {
             "aerosonde_like",
             "c172_like",
             "xcell60_like",
-            "bo105_like"
+            "bo105_like",
+            "quadtilt_like"
         ]
     );
     let cf = presets::multirotor("cf2x").unwrap();

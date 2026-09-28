@@ -63,6 +63,7 @@ use autonomousim_vehicles::ground::{TrailerDef, Wheeled};
 use autonomousim_vehicles::multirotor::{MotorInit, MultirotorScales};
 use autonomousim_vehicles::presets;
 use autonomousim_vehicles::rotorcraft::HelicopterInput;
+use autonomousim_vehicles::tiltrotor::TiltrotorInput;
 use autonomousim_vehicles::{Family, SharedDef, VehicleDef};
 use autonomousim_world::environment::{EnvironmentConfig, Gust};
 use autonomousim_world::testworlds;
@@ -701,10 +702,11 @@ pub struct SpawnSpec {
     /// Start resting on the ground (motors idle unless set otherwise; aircraft on their gear
     /// with the brakes set); ignores `agl`. Ground vehicles always do.
     pub on_ground: bool,
-    /// Fixed-wing aircraft and helicopters in the air: airspeed range (m/s); they start trimmed
-    /// for straight and level flight at a sampled airspeed and the spawn heading, in the steady
-    /// wind. Default: 1.5 times the stall speed at the spawn altitude for aircraft, hover for
-    /// helicopters.
+    /// Fixed-wing aircraft, helicopters and tiltrotors in the air: airspeed range (m/s); they
+    /// start trimmed for straight and level flight at a sampled airspeed and the spawn heading,
+    /// in the steady wind (tiltrotors with the rotors forward from 1.2 times the stall speed,
+    /// else up). Default: 1.5 times the stall speed at the spawn altitude for aircraft, hover
+    /// for helicopters and tiltrotors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub airspeed: Option<[f64; 2]>,
     /// Start in a lane of a random road of the map, facing along it (along the route with
@@ -1109,6 +1111,7 @@ impl CompiledGroup {
             Family::Wheeled => multirotor.into_iter().chain(fixed_wing).chain(helicopter).collect(),
             Family::FixedWing => multirotor.into_iter().chain(ground).chain(helicopter).collect(),
             Family::Rotorcraft => multirotor.into_iter().chain(ground).chain(fixed_wing).collect(),
+            Family::Tiltrotor => multirotor.into_iter().chain(ground).chain(fixed_wing).chain(helicopter).collect(),
         };
         if let Some((field, _)) = foreign.iter().find(|f| f.1) {
             return Err(fail(format!("`{field}` does not apply to {family} vehicles ({:?})", def.name())));
@@ -1178,12 +1181,12 @@ impl CompiledGroup {
             return Err(fail("`spawn.on_road` needs `spawn.on_ground`".into()));
         }
         match (sp.airspeed, family) {
-            (None, _) | (Some(_), Family::Rotorcraft) => {}
+            (None, _) | (Some(_), Family::Rotorcraft | Family::Tiltrotor) => {}
             (Some(a), Family::FixedWing) if a[0] > 0.0 => {}
             (Some(_), Family::FixedWing) => {
                 return Err(fail("`spawn.airspeed` of an aircraft must be positive".into()));
             }
-            _ => return Err(fail("`spawn.airspeed` needs a fixed-wing aircraft or a helicopter".into())),
+            _ => return Err(fail("`spawn.airspeed` needs an aircraft (fixed-wing, helicopter or tiltrotor)".into())),
         }
         let gl = &spec.goals;
         if !(valid_range(gl.distance)
@@ -1229,6 +1232,7 @@ impl CompiledGroup {
         let bottom = match family {
             Family::Multirotor => colliders.iter().map(|c| c.radius - c.center.z).fold(0.0, f64::max),
             Family::Rotorcraft => def.as_helicopter().and_then(|d| d.skid_height()).unwrap_or(0.0),
+            Family::Tiltrotor => def.as_tiltrotor().and_then(|d| d.gear_height()).unwrap_or(0.0),
             Family::Wheeled => 0.0,
             Family::FixedWing => fixed_wing_rest.map_or(0.0, |p| p.pos.z),
         };
@@ -1358,6 +1362,17 @@ pub(crate) struct Placement {
     pub fixed_wing: Option<FixedWingStart>,
     /// Helicopters in the air: their trim (none: on the skids, collective down).
     pub helicopter: Option<HelicopterStart>,
+    /// Tiltrotors in the air: their trim (none: on the gear, throttles closed).
+    pub tiltrotor: Option<TiltrotorStart>,
+}
+
+/// Controls and rotor speeds a tiltrotor starts with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TiltrotorStart {
+    pub controls: TiltrotorInput,
+    pub rotor_speed: [f64; 4],
+    /// Air density of the trim (kg/m³).
+    pub density: f64,
 }
 
 /// Controls and rotor speed a fixed-wing aircraft starts with.
@@ -1550,6 +1565,7 @@ impl SpawnSpec {
             motors,
             fixed_wing: None,
             helicopter: None,
+            tiltrotor: None,
         }
     }
 }

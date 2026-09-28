@@ -22,6 +22,7 @@ const PRESETS: &[(&str, &str)] = &[
     ("c172_like", include_str!("../../../assets/vehicles/c172_like.toml")),
     ("xcell60_like", include_str!("../../../assets/vehicles/xcell60_like.toml")),
     ("bo105_like", include_str!("../../../assets/vehicles/bo105_like.toml")),
+    ("quadtilt_like", include_str!("../../../assets/vehicles/quadtilt_like.toml")),
 ];
 
 const TRAILERS: &[(&str, &str)] = &[
@@ -72,6 +73,14 @@ pub fn helicopter(name: &str) -> Result<crate::rotorcraft::HelicopterDef, Vehicl
     match get(name)? {
         VehicleDef::Helicopter(h) => Ok(h),
         _ => Err(VehicleError::Invalid(format!("{name} is not a helicopter"))),
+    }
+}
+
+/// A built-in tiltrotor preset.
+pub fn tiltrotor(name: &str) -> Result<crate::tiltrotor::TiltrotorDef, VehicleError> {
+    match get(name)? {
+        VehicleDef::Tiltrotor(t) => Ok(t),
+        _ => Err(VehicleError::Invalid(format!("{name} is not a tiltrotor"))),
     }
 }
 

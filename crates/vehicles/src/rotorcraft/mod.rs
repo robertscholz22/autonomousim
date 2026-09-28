@@ -5,7 +5,7 @@
 mod def;
 mod model;
 mod rotor;
-mod trim;
+pub(crate) mod trim;
 
 pub use def::{EngineDef, FuselageDef, HelicopterControlsDef, HelicopterDef, PitchChannel, RotorMount};
 pub use model::{Helicopter, HelicopterDisplay, HelicopterInit, HelicopterInput, HelicopterLoads};

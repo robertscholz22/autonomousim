@@ -24,7 +24,7 @@ use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
-use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart};
+use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, TiltrotorStart};
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
@@ -35,6 +35,7 @@ use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::Vehicle;
 use autonomousim_vehicles::fixedwing::{FixedWing, FixedWingInput};
 use autonomousim_vehicles::rotorcraft::{Helicopter, HelicopterInput};
+use autonomousim_vehicles::tiltrotor::{Tiltrotor, TiltrotorInput, TrimLimits};
 use autonomousim_world::StaticWorld;
 use autonomousim_world::roads::Polyline;
 use glam::{DQuat, DVec2, DVec3};
@@ -258,6 +259,18 @@ impl WorldInstance {
                     placement.pose.rot *= attitude;
                     placement.lin_vel += placement.pose.rot * v_body + self.env.config.wind.steady_at(agl, 0.0);
                     placement.helicopter = Some(start);
+                }
+                if g.def.as_tiltrotor().is_some() && !spawn.on_ground {
+                    let speed = match spawn.airspeed {
+                        Some([lo, hi]) => lo + (hi - lo) * spawn_rng.uniform(),
+                        None => 0.0,
+                    };
+                    let tilt = self.agents[id].vehicle.as_tiltrotor().expect("tiltrotor group");
+                    let (attitude, v_body, start) = tiltrotor_start(tilt, speed, density, self.env.config.gravity);
+                    let agl = (p.z - world.surface_height(p.x, p.y)).max(0.0);
+                    placement.pose.rot *= attitude;
+                    placement.lin_vel += placement.pose.rot * v_body + self.env.config.wind.steady_at(agl, 0.0);
+                    placement.tiltrotor = Some(start);
                 }
                 let mut route = road_spawn.and_then(|rs| rs.route);
                 if route_goals && route.is_none() {
@@ -643,6 +656,9 @@ impl WorldInstance {
                         r.flap.iter().chain([&r.inflow]).for_each(|x| f(*x));
                     }
                 }
+                Vehicle::Tiltrotor(v) => {
+                    v.rotor_speeds().iter().chain(v.tilts()).chain(&v.channels()).for_each(|x| f(*x));
+                }
             }
             f(f64::from(a.events.0));
             f(a.goal_index as f64);
@@ -684,6 +700,35 @@ fn helicopter_start(heli: &Helicopter, speed: f64, density: f64, gravity: f64) -
         Err(_) => {
             let controls = HelicopterInput::default();
             (DQuat::IDENTITY, DVec3::X * speed, HelicopterStart { controls, rotor_speed: rated, density })
+        }
+    }
+}
+
+/// Attitude without heading, body-frame air velocity, controls and rotor speeds of `aircraft`
+/// trimmed for straight and level flight at `speed`: in aeroplane mode (rotors forward) from
+/// 1.2 times the stall speed, else with the rotors up, else at the first feasible tilt from
+/// forward to up; where none is feasible, level with the rotors up at the hover rotor speed.
+fn tiltrotor_start(aircraft: &Tiltrotor, speed: f64, density: f64, gravity: f64) -> (DQuat, DVec3, TiltrotorStart) {
+    let def = aircraft.def();
+    let range = &def.controls.tilt;
+    let fast = speed >= 1.2 * def.stall_speed(density, gravity);
+    let first = if fast { range.max } else { 0.0f64.clamp(range.min, range.max) };
+    let sweep = (0..=18).map(|i| range.max - (range.max - range.min) * f64::from(i) / 18.0);
+    let limits = TrimLimits::default();
+    let trim = std::iter::once(first)
+        .chain(sweep)
+        .filter_map(|tilt| aircraft.trim(speed, tilt, density, gravity).ok())
+        .find(|t| t.feasible(def, &limits));
+    match trim {
+        Some(t) => {
+            let start = TiltrotorStart { controls: t.controls, rotor_speed: t.rotor_speed, density };
+            (t.attitude(0.0), t.velocity_body, start)
+        }
+        None => {
+            let omega = aircraft.hover_rotor_speed(density, gravity);
+            let tilt = 0.0f64.clamp(range.min, range.max);
+            let controls = TiltrotorInput { throttle: [0.5; 4], tilt: [tilt; 4], ..TiltrotorInput::default() };
+            (DQuat::IDENTITY, DVec3::X * speed, TiltrotorStart { controls, rotor_speed: [omega; 4], density })
         }
     }
 }

@@ -102,7 +102,7 @@ impl PitchChannel {
         if self.rate > 0.0 { x + (next - x).clamp(-self.rate * dt, self.rate * dt) } else { next }
     }
 
-    fn validate(&self, name: &str) -> Result<(), String> {
+    pub(crate) fn validate(&self, name: &str) -> Result<(), String> {
         if !(self.min.is_finite() && self.max > self.min && self.rate >= 0.0 && self.tau >= 0.0) {
             return Err(format!("invalid `{name}` channel {self:?}"));
         }

@@ -1,5 +1,5 @@
 //! Vehicle definitions and models (multirotors, wheeled ground vehicles and fixed-wing
-//! aircraft and helicopters).
+//! aircraft, helicopters and tiltrotors).
 //!
 //! A [`VehicleDef`] is immutable, loaded from TOML (`type = "multirotor"`, `"wheeled"`, …) and
 //! shared between instances by `Arc`; instances hold the per-agent state.
@@ -10,6 +10,7 @@ pub mod ground;
 pub mod multirotor;
 pub mod presets;
 pub mod rotorcraft;
+pub mod tiltrotor;
 mod vehicle;
 
 pub use vehicle::{Family, SharedDef, Vehicle};
@@ -39,6 +40,7 @@ pub enum VehicleDef {
     Wheeled(ground::WheeledDef),
     FixedWing(fixedwing::FixedWingDef),
     Helicopter(rotorcraft::HelicopterDef),
+    Tiltrotor(tiltrotor::TiltrotorDef),
 }
 
 impl VehicleDef {
@@ -49,6 +51,7 @@ impl VehicleDef {
             VehicleDef::Wheeled(w) => w.finish()?,
             VehicleDef::FixedWing(f) => f.finish()?,
             VehicleDef::Helicopter(h) => h.finish()?,
+            VehicleDef::Tiltrotor(t) => t.finish()?,
         }
         Ok(def)
     }
@@ -63,6 +66,7 @@ impl VehicleDef {
             VehicleDef::Wheeled(w) => &w.name,
             VehicleDef::FixedWing(f) => &f.name,
             VehicleDef::Helicopter(h) => &h.name,
+            VehicleDef::Tiltrotor(t) => &t.name,
         }
     }
 
@@ -72,6 +76,7 @@ impl VehicleDef {
             VehicleDef::Wheeled(_) => Family::Wheeled,
             VehicleDef::FixedWing(_) => Family::FixedWing,
             VehicleDef::Helicopter(_) => Family::Rotorcraft,
+            VehicleDef::Tiltrotor(_) => Family::Tiltrotor,
         }
     }
 }

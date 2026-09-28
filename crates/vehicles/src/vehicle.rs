@@ -7,6 +7,7 @@ use crate::fixedwing::{FixedWing, FixedWingDef, FixedWingInit, FixedWingInput};
 use crate::ground::{GroundPart, Wheeled, WheeledDef, WheeledInit};
 use crate::multirotor::{ColliderPart, InitialState, MotorInit, Multirotor, MultirotorDef};
 use crate::rotorcraft::{Helicopter, HelicopterDef, HelicopterInit};
+use crate::tiltrotor::{Tiltrotor, TiltrotorDef, TiltrotorInit};
 use autonomousim_core::contact::{ContactModel, ContactPoint, SphereCollider, StaticScene};
 use autonomousim_core::dynamics::{DynamicsError, MbState};
 use autonomousim_core::math::Pose;
@@ -22,6 +23,7 @@ pub enum Family {
     Wheeled,
     FixedWing,
     Rotorcraft,
+    Tiltrotor,
 }
 
 impl Family {
@@ -31,6 +33,7 @@ impl Family {
             Family::Wheeled => "wheeled",
             Family::FixedWing => "fixed_wing",
             Family::Rotorcraft => "rotorcraft",
+            Family::Tiltrotor => "tiltrotor",
         }
     }
 }
@@ -48,6 +51,7 @@ pub enum SharedDef {
     Wheeled(Arc<WheeledDef>),
     FixedWing(Arc<FixedWingDef>),
     Helicopter(Arc<HelicopterDef>),
+    Tiltrotor(Arc<TiltrotorDef>),
 }
 
 impl From<VehicleDef> for SharedDef {
@@ -57,6 +61,7 @@ impl From<VehicleDef> for SharedDef {
             VehicleDef::Wheeled(w) => SharedDef::Wheeled(Arc::new(w)),
             VehicleDef::FixedWing(f) => SharedDef::FixedWing(Arc::new(f)),
             VehicleDef::Helicopter(h) => SharedDef::Helicopter(Arc::new(h)),
+            VehicleDef::Tiltrotor(t) => SharedDef::Tiltrotor(Arc::new(t)),
         }
     }
 }
@@ -68,6 +73,7 @@ impl SharedDef {
             SharedDef::Wheeled(w) => &w.name,
             SharedDef::FixedWing(f) => &f.name,
             SharedDef::Helicopter(h) => &h.name,
+            SharedDef::Tiltrotor(t) => &t.name,
         }
     }
 
@@ -77,6 +83,7 @@ impl SharedDef {
             SharedDef::Wheeled(_) => Family::Wheeled,
             SharedDef::FixedWing(_) => Family::FixedWing,
             SharedDef::Helicopter(_) => Family::Rotorcraft,
+            SharedDef::Tiltrotor(_) => Family::Tiltrotor,
         }
     }
 
@@ -108,6 +115,13 @@ impl SharedDef {
         }
     }
 
+    pub fn as_tiltrotor(&self) -> Option<&Arc<TiltrotorDef>> {
+        match self {
+            SharedDef::Tiltrotor(t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Nominal total mass (kg).
     pub fn mass(&self) -> f64 {
         match self {
@@ -115,6 +129,7 @@ impl SharedDef {
             SharedDef::Wheeled(w) => w.total_mass(),
             SharedDef::FixedWing(f) => f.body.mass,
             SharedDef::Helicopter(h) => h.body.mass,
+            SharedDef::Tiltrotor(t) => t.body.mass,
         }
     }
 
@@ -125,6 +140,7 @@ impl SharedDef {
             SharedDef::Wheeled(w) => w.contact.model(mass, dt),
             SharedDef::FixedWing(f) => f.contact.model(mass, dt),
             SharedDef::Helicopter(h) => h.contact.model(mass, dt),
+            SharedDef::Tiltrotor(t) => t.contact.model(mass, dt),
         }
     }
 
@@ -135,6 +151,7 @@ impl SharedDef {
             SharedDef::Wheeled(w) => w.sphere_colliders(),
             SharedDef::FixedWing(f) => f.sphere_colliders(),
             SharedDef::Helicopter(h) => h.sphere_colliders(),
+            SharedDef::Tiltrotor(t) => t.sphere_colliders(),
         }
     }
 }
@@ -152,6 +169,7 @@ pub enum Vehicle {
     Wheeled(Wheeled),
     FixedWing(FixedWing),
     Helicopter(Helicopter),
+    Tiltrotor(Tiltrotor),
 }
 
 macro_rules! each {
@@ -161,6 +179,7 @@ macro_rules! each {
             Vehicle::Wheeled($v) => $e,
             Vehicle::FixedWing($v) => $e,
             Vehicle::Helicopter($v) => $e,
+            Vehicle::Tiltrotor($v) => $e,
         }
     };
 }
@@ -173,6 +192,7 @@ impl Vehicle {
             SharedDef::Wheeled(w) => Vehicle::Wheeled(Wheeled::new(w.clone(), dt)),
             SharedDef::FixedWing(f) => Vehicle::FixedWing(FixedWing::new(f.clone(), dt)),
             SharedDef::Helicopter(h) => Vehicle::Helicopter(Helicopter::new(h.clone(), dt)),
+            SharedDef::Tiltrotor(t) => Vehicle::Tiltrotor(Tiltrotor::new(t.clone(), dt)),
         }
     }
 
@@ -183,6 +203,7 @@ impl Vehicle {
             Vehicle::Wheeled(_) => Family::Wheeled,
             Vehicle::FixedWing(_) => Family::FixedWing,
             Vehicle::Helicopter(_) => Family::Rotorcraft,
+            Vehicle::Tiltrotor(_) => Family::Tiltrotor,
         }
     }
 
@@ -255,6 +276,22 @@ impl Vehicle {
         }
     }
 
+    #[inline]
+    pub fn as_tiltrotor(&self) -> Option<&Tiltrotor> {
+        match self {
+            Vehicle::Tiltrotor(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_tiltrotor_mut(&mut self) -> Option<&mut Tiltrotor> {
+        match self {
+            Vehicle::Tiltrotor(t) => Some(t),
+            _ => None,
+        }
+    }
+
     // ---------------------------------------------------------------- state access
 
     /// Multibody state (the free base first: position, quaternion; angular, linear velocity).
@@ -299,22 +336,26 @@ impl Vehicle {
         each!(self, v => v.ang_vel_body())
     }
 
-    /// Wing span (m) for rotational gusts, if the vehicle wants them (fixed-wing aircraft).
+    /// Wing span (m) for rotational gusts, if the vehicle wants them (fixed-wing aircraft and
+    /// tiltrotors).
     #[inline]
     pub fn gust_span(&self) -> Option<f64> {
         match self {
             Vehicle::Multirotor(_) | Vehicle::Wheeled(_) | Vehicle::Helicopter(_) => None,
             Vehicle::FixedWing(f) => Some(f.def().geometry.span),
+            Vehicle::Tiltrotor(t) => Some(t.def().span()),
         }
     }
 
     /// Height above the surface (m) below which the vehicle feels ground effect: a span for
-    /// aircraft, three main rotor radii for helicopters, `rotor` (the multirotor range) otherwise.
+    /// aircraft, three main rotor radii for helicopters, four propeller radii for tiltrotors,
+    /// `rotor` (the multirotor range) otherwise.
     #[inline]
     pub fn ground_effect_range(&self, rotor: f64) -> f64 {
         match self {
             Vehicle::FixedWing(f) => 1.2 * f.def().geometry.span,
             Vehicle::Helicopter(h) => 3.0 * h.def().main_rotor.rotor.radius,
+            Vehicle::Tiltrotor(t) => 4.0 * t.def().rotor_radius(),
             _ => rotor,
         }
     }
@@ -355,15 +396,16 @@ impl Vehicle {
         match self {
             Vehicle::Multirotor(_) => ColliderPart::from_group(group) == Some(ColliderPart::Gear),
             Vehicle::Wheeled(_) => group == GroundPart::Skid as u8,
-            Vehicle::FixedWing(_) | Vehicle::Helicopter(_) => {
+            Vehicle::FixedWing(_) | Vehicle::Helicopter(_) | Vehicle::Tiltrotor(_) => {
                 ColliderPart::from_group(group) == Some(ColliderPart::Gear)
             }
         }
     }
 
     /// Put the vehicle at `pose` with the given velocities and clear its transient state
-    /// (rotors idle — a helicopter's turning at governed speed with the collective down; a
-    /// ground vehicle's suspension at its static travel, wheels rolling).
+    /// (rotors idle — a helicopter's turning at governed speed with the collective down, a
+    /// tiltrotor's stopped and pointing up; a ground vehicle's suspension at its static
+    /// travel, wheels rolling).
     pub fn place(&mut self, pose: Pose, lin_vel_world: DVec3, ang_vel_body: DVec3) {
         match self {
             Vehicle::Multirotor(v) => {
@@ -381,6 +423,9 @@ impl Vehicle {
             Vehicle::Helicopter(v) => {
                 let rest = HelicopterInit::at_rest(v.def(), pose);
                 v.reset(&HelicopterInit { lin_vel_world, ang_vel_body, ..rest })
+            }
+            Vehicle::Tiltrotor(v) => {
+                v.reset(&TiltrotorInit { lin_vel_world, ang_vel_body, ..TiltrotorInit::at_rest(pose) })
             }
         }
     }

@@ -267,6 +267,7 @@ impl Recorder {
                     SharedDef::Wheeled(w) => serde_json::to_value(VehicleDef::Wheeled((**w).clone())),
                     SharedDef::FixedWing(f) => serde_json::to_value(VehicleDef::FixedWing((**f).clone())),
                     SharedDef::Helicopter(h) => serde_json::to_value(VehicleDef::Helicopter((**h).clone())),
+                    SharedDef::Tiltrotor(t) => serde_json::to_value(VehicleDef::Tiltrotor((**t).clone())),
                 };
                 (g.spec.name.as_str(), def.expect("JSON"))
             })
@@ -475,6 +476,19 @@ impl Recorder {
                     m.insert("coning".into(), json!([v.loads().main.coning, v.loads().tail.coning]));
                     m.insert("airspeed".into(), json!(v.flow().airspeed));
                 }
+                Vehicle::Tiltrotor(v) => {
+                    let n = v.rotor_count();
+                    let [a, e, r] = v.channels();
+                    let flow = v.flow();
+                    m.insert("motors".into(), json!(v.rotor_speeds()));
+                    m.insert("throttles".into(), json!(&v.input().throttle[..n]));
+                    m.insert("tilts".into(), json!(v.tilts()));
+                    m.insert("surfaces".into(), json!([a, e, r, 0.0]));
+                    m.insert("engine_power".into(), json!(v.electric_power()));
+                    m.insert("airspeed".into(), json!(flow.airspeed));
+                    m.insert("alpha".into(), json!(flow.alpha));
+                    m.insert("beta".into(), json!(flow.beta));
+                }
             }
             self.send(ch.state, &msg);
             let pose = json!({
@@ -569,6 +583,12 @@ pub struct RecordedState {
     pub flap: [[f64; 2]; 2],
     #[serde(default)]
     pub coning: [f64; 2],
+    /// Tiltrotors (also `motors`, `surfaces` without the flap, `engine_power` drawn by the
+    /// motors, `airspeed`, `alpha` and `beta`): throttles and mount tilts (rad).
+    #[serde(default)]
+    pub throttles: Vec<f64>,
+    #[serde(default)]
+    pub tilts: Vec<f64>,
     pub wind: DVec3,
     pub goal: DVec3,
     pub goal_yaw: f64,

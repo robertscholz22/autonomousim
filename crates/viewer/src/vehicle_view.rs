@@ -274,6 +274,16 @@ pub fn spawn_vehicles(
                 ));
                 continue;
             }
+            Vehicle::Tiltrotor(t) => {
+                // Placeholder until the tiltrotor visual: a box the size of the airframe.
+                let d = t.def();
+                let span = d.span().max(0.5) as f32;
+                commands.spawn(root).with_child((
+                    Mesh3d(meshes.add(Cuboid::new(0.6 * span, 0.08 * span, 0.15 * span))),
+                    MeshMaterial3d(body_material.clone()),
+                ));
+                continue;
+            }
             Vehicle::Helicopter(h) => {
                 let v = props::helicopter(h.def());
                 let root = commands.spawn(root).id();
