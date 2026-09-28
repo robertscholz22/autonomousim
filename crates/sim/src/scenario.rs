@@ -783,6 +783,11 @@ pub enum GoalKind {
     /// (the spawn spec's position settings are ignored). Ground vehicles on maps with farm
     /// yards.
     Bay,
+    /// One goal: the pad of a farm yard `distance` (horizontally) from the pad of another
+    /// where the vehicle spawns, `agl` above the surface (the closest yard to the range when
+    /// none lies in it; the spawn spec's position settings are ignored, its height settings
+    /// and `on_ground` apply). Aerial vehicles on maps with at least two farm yards.
+    Yard,
 }
 
 /// Slot layout of `GoalKind::Formation`.
@@ -1052,6 +1057,15 @@ impl CompiledScenario {
                 )));
             }
         }
+        if let Some(g) = groups.iter().find(|g| g.spec.goals.kind == GoalKind::Yard) {
+            episode_maps.retain(|&k| crate::bay::yards(&maps[k]).len() >= 2);
+            if episode_maps.is_empty() {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: `yard` goals need two farm yards, no map has them",
+                    g.spec.name
+                )));
+            }
+        }
         if let Some(g) = groups.iter().find(|g| g.family() == Family::Wheeled)
             && maps.iter().any(|m| m.is_tiled())
         {
@@ -1220,6 +1234,9 @@ impl CompiledGroup {
         gl.bay.validate().map_err(&fail)?;
         if gl.kind == GoalKind::Bay && family != Family::Wheeled {
             return Err(fail("`bay` goals need a ground vehicle".into()));
+        }
+        if gl.kind == GoalKind::Yard && family == Family::Wheeled {
+            return Err(fail("`yard` goals need an aerial vehicle".into()));
         }
         if (gl.path || gl.off_road) && (gl.kind != GoalKind::Random || family != Family::Wheeled) {
             return Err(fail("`goals.path` and `goals.off_road` need `random` goals and a ground vehicle".into()));
@@ -1616,7 +1633,7 @@ impl GoalSpec {
         use autonomousim_core::math::quat::yaw;
         match self.kind {
             // Route goals come from `lane`; this is the fallback when no route is found.
-            GoalKind::Spawn | GoalKind::Formation | GoalKind::Route | GoalKind::Bay => {
+            GoalKind::Spawn | GoalKind::Formation | GoalKind::Route | GoalKind::Bay | GoalKind::Yard => {
                 vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }]
             }
             GoalKind::Random => {

@@ -17,6 +17,8 @@ use std::sync::Arc;
 const HEADING_LAG: f64 = 0.5;
 /// Time (s) the loops take on the ground to lower the thrust to nothing.
 const SETTLE_TIME: f64 = 1.0;
+/// Sideslip (rad) the weathervane leaves below the wing, for crabbing across a crosswind.
+const MAX_SIDESLIP: f64 = 0.25;
 /// Effector slots after the rotor thrusts: differential tilt, then aileron, elevator, rudder.
 const TILT: usize = MAX_ROTORS;
 const SURFACES: usize = MAX_ROTORS + 1;
@@ -365,9 +367,12 @@ impl TiltrotorController {
         let [ah, av] = self.config.accel;
         let step = DVec3::new(ah, ah, av) * self.dt;
         // The reference is kept within reach: no further from the velocity than the error
-        // that asks for the configured acceleration.
-        let leash = DVec3::new(ah, ah, av) / self.k_vel;
-        let next = (prev + (velocity - prev).clamp(-step, step)).clamp(v - leash, v + leash);
+        // that asks for the configured acceleration, with the integrator's trim (a trim held
+        // against a crosswind would otherwise cancel a leashed error for good).
+        let most = DVec3::new(ah, ah, av);
+        let (lo, hi) = ((-most - self.i_vel) / self.k_vel, (most - self.i_vel) / self.k_vel);
+        let next =
+            (prev + (velocity - prev).clamp(-step, step)).clamp(v + lo.min(DVec3::ZERO), v + hi.max(DVec3::ZERO));
         self.reference = Some(next);
         let feed = ((next - prev) / self.dt).clamp(-DVec3::new(ah, ah, av), DVec3::new(ah, ah, av));
         let err = next - v;
@@ -376,6 +381,10 @@ impl TiltrotorController {
         let vs = self.schedule.stall_speed();
         let wing = self.schedule.wing_share(f.air.x);
         let mut acc = err * self.k_vel + self.i_vel + feed;
+        // The heading frame turns with the yaw rate: holding a velocity in it takes ω × v
+        // (below the wing; there the turn is the coordinated one).
+        let r = (t.orientation() * t.ang_vel_body()).z;
+        acc += (1.0 - wing) * DVec3::new(-r * next.y, r * next.x, 0.0);
         acc.y = (1.0 - wing) * acc.y + wing * f.air.x.max(0.0) * yaw_rate;
         // The schedule tilts the mounts for the airspeed the reference asks for.
         let tilt = self.schedule.tilt(f.air.x + next.x - v.x);
@@ -391,8 +400,14 @@ impl TiltrotorController {
         // On the wing the pitch follows the flight path: its rate, from the vertical
         // acceleration asked for, leads the attitude loop.
         let path_rate = if self.grounded { 0.0 } else { wing * acc.z / f.air.x.max(vs) };
-        // Turn coordination: the nose follows the air-relative velocity on the wing.
-        let yaw_rate = yaw_rate - wing * self.k_att * t.flow().beta;
+        // Turn coordination: the nose follows the air-relative velocity on the wing. Below
+        // the wing, from half the stall speed, it weathervanes only against a sideslip beyond
+        // `MAX_SIDESLIP`: the velocity loop holds the track across a crosswind by crabbing
+        // with some sideslip, and taking all of it away would turn the nose into the wind.
+        let beta = t.flow().beta;
+        let excess = beta - beta.clamp(-MAX_SIDESLIP, MAX_SIDESLIP);
+        let vane = self.schedule.vane_share(f.air.x).max(wing);
+        let yaw_rate = yaw_rate - self.k_att * (wing * beta + (vane - wing) * excess);
         let rates = self.attitude_loop(t, [roll, pitch], path_rate, yaw_rate, heading);
         let out = self.rate_loop(t, rates, thrust, tilt);
         // Integrate (k²/4 per unit error) up to 0.3 g.
@@ -467,7 +482,10 @@ impl TiltrotorController {
         heading: Option<f64>,
     ) -> DVec3 {
         let (phi, theta, psi) = euler(t.orientation());
-        let (roll, pitch) = if self.grounded { (phi, theta) } else { (roll, pitch) };
+        // On the gear the attitude and heading stay as they stand: a yaw demand the gear's
+        // friction resists would saturate the allocation and hold the aircraft down.
+        let (roll, pitch, yaw_rate, heading) =
+            if self.grounded { (phi, theta, 0.0, Some(psi)) } else { (roll, pitch, yaw_rate, heading) };
         let reference = heading.unwrap_or_else(|| self.heading.unwrap_or(psi) + yaw_rate * self.dt);
         // Hold the reference within reach so that it does not wind up.
         let lag = wrap_angle(reference - psi).clamp(-HEADING_LAG, HEADING_LAG);

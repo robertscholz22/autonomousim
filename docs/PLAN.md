@@ -2325,7 +2325,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | 1 ✅ | Tilting rotor mounts, tiltrotor preset, trims | Hover and cruise trims match their references; the corridor is computed; energy balance holds |
 | 2 ✅ | Transition control and action modes | Scripted transitions both ways hold altitude within bounds without stall; hover and cruise steps settle |
 | 3 ✅ | Viewer: visuals, HUD, keyboard flight, replay | It flies by keyboard through both transitions; recordings replay |
-| 4 | `TiltrotorDelivery-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
+| 4 ✅ | `TiltrotorDelivery-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
 
 #### As built
 - **Step 1 (tilting mounts, preset, trims)**, `vehicles::tiltrotor::{TiltrotorDef, TiltMount, TiltrotorControlsDef, SurfaceMix, Tiltrotor, TiltrotorInput, TiltrotorInit, TiltrotorLoads, TiltrotorTrim, TrimLimits, CorridorPoint}`, `Family::Tiltrotor` (`"tiltrotor"`), `VehicleDef`/`SharedDef`/`Vehicle::Tiltrotor`:
@@ -2350,6 +2350,33 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
   - **HUD** (`tilt_status`): airspeed with the setpoint and climb, α (red past 85 % of the wing's stall margin, STALL past it) and β, electric power, throttle bars per rotor, mount tilts against the scheduled tilt with hover / converting / wing and the wing share, a corridor diagram (feasible band as one unfeathered mesh, stall speed, schedule line, the aircraft's point), horizon. Plots: velocity, position or bank/pitch/airspeed tracking (`Tracking::Attitude`), live and from recorded actions.
   - **Replay**: `Tiltrotor::show(&TiltrotorDisplay)` sets rotor speeds (interpolated), throttles, tilts, channels, electric power and air data from the recording; rotor momentum recomputed.
   - **Tests**: `keys_fly_a_tiltrotor` (hover hands off; W to 1.8·V_s converts with the mounts > 1.5 rad and height within 5 m; A turns on the wing; S back to 0 converts back to a still hover; attitude A banks), `replayed_tiltrotors_show_their_mounts`, `tilt_pods_and_flaps_follow_the_state`, `tiltrotor_visual_matches_its_definition`, `tiltrotor_quantities_match_their_setpoints`. Screenshot run on the training map: ~130 fps on the Iris Xe.
+- **Step 4: `TiltrotorDelivery-v0`** (`tasks/tiltrotor_delivery.py`):
+  - **Task**: `quadtilt_like` in `velocity` (speeds 25, 4 and 1.5 m/s; yaw rate 0.5 rad/s), spawned on the gear on one farm's pad of the `delivery` map (6 km of farmland at 2 m cells, farms about 400 m apart; about 100 s to generate cold), with the goal on another farm's pad 2–4 km away. Mean wind 0–4 m/s, turbulence W20 0–2; 10 Hz policy, 360 s. Success: `LANDED` within 3 m of the pad (ends the episode).
+  - **Observation (22)**: goal in the heading frame (1/1000), AGL, air data, body velocity and rates, pitch and roll, last action, and the goal again at 1/10 clipped to ±1 for the last metres.
+  - **Reward**: decrease of `φ = √(d² + h²)` per 100 m, −0.002 per step, smoothness 0.02, −0.2 on a stall step, +20 on success, −20 on a crash, water or leaving the map.
+  - **Yard goals** (`GoalKind::Yard`, aerial only; `bay::{pad, trip, YardTrip}`): a trip joins two farm yards, the destination drawn by the pad-to-yard distance within `goals.distance` (else the closest to it). Maps with fewer than two yards are dropped from the pool (an error if none is left). Each yard's pad is the most open point of a 2 m grid (±16 m along, ±12 m across the yard): the smallest obstacle-and-foliage distance over a column 1–40 m up (`PAD_COLUMN`, capped at 15 m), less 0.1 per metre off the centre. `StaticWorld::clearance` could not be used for this, since it includes the terrain. A ground spawn stands on the terrain under the pad.
+  - **Map shortcuts** (`tasks/base.py`): `farmland` (2 km rural showcase at 2 m cells, about 16 farms) and `delivery` (the demo map above). Rural maps take a `config` override.
+  - **Controller fixes** found by the scripted pilot:
+    - **On the gear**: a full-yaw demand saturated the allocation against the gear's friction, so the aircraft never lifted off. While grounded, the attitude and heading are now held with zero yaw rate.
+    - **Heading-frame rotation**: in hover and conversion, yawing while flying sideways was not compensated, so a yaw plus side command made the aircraft orbit. The velocity loop now adds `ω × v` (weighted by `1 − wing`).
+    - **Weathervane** (`TiltSchedule::vane_share`, 0 below 0.5·V_s, full from 0.9·V_s): in wind at about 10 m/s airspeed, below the wing share, nothing held the nose into the airflow. The sideslip grew to 1 rad and the aircraft departed. Below the wing, a sideslip beyond `MAX_SIDESLIP` (0.25 rad) now yaws the nose back. Full coordination (no deadband) stays with the wing share.
+    - The first version removed all sideslip. The velocity loop holds zero sideways ground speed in the heading frame, so the only steady state left was flying straight up- or downwind: the nose turned into the wind, the pilot stopped and turned back, and the loop repeated for minutes. The deadband leaves room to crab.
+    - **Leash and integrator**: the velocity reference's leash was symmetric. A crosswind trim in the integrator (up to 0.3 g, frozen while the reference moves) then cancelled the leashed error, and the aircraft stayed stuck at 11 m/s. The leash is now centred on the integrator, so error plus trim always reaches the configured acceleration.
+  - **Scripted pilot** (`scripted(obs)`):
+    - Climbs straight up to 25 m AGL, yawing toward the pad beyond 10 m.
+    - Once aligned within 0.3 rad (or within 50 m), flies toward the pad at the speed from which it can stop at 0.6 m/s² (at most 25 m/s; 0.4 × distance close in), holding 50 m AGL. The controller converts the mounts with the speed.
+    - Descends at 1.2 m/s within 1.5 m of the pad, and at 0.5 m/s below 4 m AGL.
+    - **Results**: `farmland`, 400–1200 m trips: 8 of 8 within 0.07 m in 115–149 s. `delivery`, 2.1–3.4 km trips: 8 of 8 within 0.07 m in 178–237 s.
+  - **Short training** (`ppo_continuous.py --hidden 256 --bound-coef 0.01 --gamma 0.995`, 64 worlds × 128 steps, 3M steps on `farmland` with 300–800 m trips, 20 min at 2.5k SPS; basic training only, to check the pipeline):
+    - The return rises from −78 (early crashes) to −12.4, and deterministic evaluation on unseen maps (`map_seed` 1000) survives all episodes.
+    - The policy learned to stay parked on its pad: the action is pinned at full down, which keeps the thrust off on the gear, and the time penalty (−7.2 over an episode) costs less than a crash (−20). No trip was flown in 3M steps.
+    - Left to the user's training: a curriculum from airborne spawns (as the aircraft tasks), a lift-off shaping term, or a longer run.
+  - **Export and viewer**: `policy.json` plays in `viewer policy` on map seed 1000 (160 fps). `eval_record.py` records two episodes that re-simulate bit for bit, and `viewer replay` plays them with plots (105 fps).
+  - **Tests**:
+    - `control/tests/tiltrotor.rs::slow_flight_in_the_conversion_band`: side and yaw commands at 5–14 m/s keep the sideslip < 0.45 rad above 8 m/s airspeed and track the speed. In a 7 m/s crosswind at ~11 m/s airspeed, the aircraft turns more than 3 rad and stops over the ground.
+    - `sim/tests/tiltrotor.rs::yard_goals_join_two_farm_pads`: spawns and goals are pads 300–700 m apart, clear of obstacles 1–30 m up; the aircraft stands still, then lifts off with full climb and yaw.
+    - Python: the generic env tests (on a 1 km farm map), `test_tiltrotor_delivery_scripted_pilot_lands` (8 of 8 within 3 m) and `test_tiltrotor_delivery_rewards`.
+- **M6c done 2026-09-29.**
 
 **To confirm while building**:
 - JSBSim's PyPI package and licence for generating fixtures offline (its aircraft data is LGPL; only derived fixtures are committed);
@@ -2365,7 +2392,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | M3 | (Detailed above.) Multi-agent: PettingZoo ParallelEnv + native group-batched API, mixed air/ground teams, full-shape agent contacts, swarm performance (SoA fast path if needed), neighbor observations | pettingzoo API tests; 256 drones at ≥ 20× real time |
 | M4 | (Detailed above; split into M4a/b/c.) Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
 | M5 ✅ | (Detailed above; done 2026-09-28.) Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
-| M6 | (Detailed above; split into M6a/b/c.) Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
+| M6 ✅ | (Detailed above; split into M6a/b/c; done 2026-09-29.) Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
 | M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export; live viewer attach to a running simulation (moved from M3, 2026-09-25) | Round trip with `ros2 topic echo` |

@@ -9,6 +9,7 @@ use autonomousim_vehicles::multirotor::StepEnv;
 use autonomousim_vehicles::presets;
 use autonomousim_vehicles::tiltrotor::Tiltrotor;
 use glam::DVec3;
+use std::f64::consts::{PI, TAU};
 use std::sync::Arc;
 
 const G: f64 = 9.80665;
@@ -44,12 +45,24 @@ fn fly(
     c: &mut TiltrotorController,
     seconds: f64,
     sp: TiltrotorSetpoint,
+    each: impl FnMut(f64, &Tiltrotor),
+) -> Flight {
+    fly_in(DVec3::ZERO, t, c, seconds, sp, each)
+}
+
+/// [`fly`] in a steady `wind` (m/s, world frame).
+fn fly_in(
+    wind: DVec3,
+    t: &mut Tiltrotor,
+    c: &mut TiltrotorController,
+    seconds: f64,
+    sp: TiltrotorSetpoint,
     mut each: impl FnMut(f64, &Tiltrotor),
 ) -> Flight {
     let env = StepEnv {
         scene: None,
         gravity: DVec3::new(0.0, 0.0, -G),
-        air: AirData { density: RHO, ..AirData::default() },
+        air: AirData { density: RHO, wind, ..AirData::default() },
         ground: None,
     };
     let (mut altitude, mut alpha) = (0.0f64, f64::NEG_INFINITY);
@@ -197,6 +210,59 @@ fn position_step_in_hover() {
     let (settled, f) = settle(&mut t, &mut c, 30.0, sp, 0.0, 0.2, |t| (t.position() - goal).length());
     let yaw = euler(t.orientation()).2;
     assert!(settled < 25.0 && (yaw - 0.5).abs() < 0.02, "settled {settled}, yaw {yaw}, {f:?}");
+}
+
+/// Slow flight in the conversion band, where the wing does not carry the turns yet: sideways
+/// and yaw commands keep the sideslip small (the nose weathervanes into the airflow), and in a
+/// crosswind the aircraft turns and stops over the ground (a velocity trim held against the
+/// wind does not cancel the command).
+#[test]
+fn slow_flight_in_the_conversion_band() {
+    let (mut t, mut c) = setup();
+    for (v0, vx, vy, r) in [
+        (12.0, 5.0, -1.0, -0.2),
+        (12.0, 5.0, -1.0, -0.5),
+        (12.0, 5.0, 0.0, -0.5),
+        (14.0, 8.0, -1.0, -0.3),
+        (10.0, 5.0, -1.0, -0.5),
+    ] {
+        start(&mut t, &mut c, v0);
+        let sp = TiltrotorSetpoint::Velocity { velocity: DVec3::new(vx, vy, 0.0), yaw_rate: r };
+        let mut beta = 0.0f64;
+        // Sideslip where the fin's weathercock moment counts (from ~0.7·V_s).
+        let f = fly(&mut t, &mut c, 15.0, sp, |_, t| {
+            if t.flow().airspeed > 8.0 {
+                beta = beta.max(t.flow().beta.abs());
+            }
+        });
+        // Sideways is flown up to ~5 m/s; faster, the nose follows the airflow instead.
+        let (want, got) = (DVec3::new(vx, vy, 0.0), f.velocity);
+        let side = if vx < 6.0 { (got.y - vy).abs() } else { 0.0 };
+        assert!(
+            beta < 0.45 && f.altitude < 2.0 && (got.x - vx).abs() < 0.6 && side < 0.2,
+            "{v0} {want} {r}: β {beta}, {f:?}"
+        );
+    }
+    // Crabbing across a crosswind in the hover regime, ~11 m/s through the air.
+    let wind = DVec3::new(-2.5, 6.7, 0.0);
+    let crab = |vx, vy, r| TiltrotorSetpoint::Velocity { velocity: DVec3::new(vx, vy, 0.0), yaw_rate: r };
+    for turn in [false, true] {
+        start(&mut t, &mut c, 0.0);
+        fly_in(wind, &mut t, &mut c, 25.0, crab(8.5, 6.7, 0.0), |_, _| {});
+        let yaw0 = euler(t.orientation()).2;
+        let mut yaw = 0.0;
+        let sp = if turn { crab(8.0, -4.0, -0.5) } else { crab(0.0, 0.0, 0.0) };
+        let f = fly_in(wind, &mut t, &mut c, 15.0, sp, |_, t| {
+            // Unwrapped heading change.
+            let d = (euler(t.orientation()).2 - yaw0 - yaw + PI).rem_euclid(TAU) - PI;
+            yaw += d;
+        });
+        if turn {
+            assert!(yaw < -3.0, "turned {yaw}, {f:?}");
+        } else {
+            assert!(t.lin_vel_world().length() < 1.0 && f.altitude < 3.0, "{f:?}");
+        }
+    }
 }
 
 /// Attitude mode: a bank and a pitch held in hover, and a climb rate; then the airspeed

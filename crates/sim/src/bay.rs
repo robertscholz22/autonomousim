@@ -1,13 +1,16 @@
 //! Bay goals (`GoalKind::Bay`): a ground vehicle starts in a farm yard facing the yard's road,
 //! and its last unit (the trailer of a rig) is to be reversed into a bay at the far side of the
-//! yard, in front of the buildings.
+//! yard, in front of the buildings. Yard goals (`GoalKind::Yard`): an aircraft starts on the
+//! pad of one farm yard and flies to the pad of another.
 //!
 //! Farm yards are the `Yard` nodes of the road network: rectangles centred on the node with
 //! their long side along the road leaving it. The yard's frame has x along that road (toward
 //! the exit) and y to its left.
 
 use crate::scenario::{Goal, GoalSpec};
+use autonomousim_core::geometry::{HitMask, StaticGeometry};
 use autonomousim_core::rng::SimRng;
+use autonomousim_core::terrain::Terrain;
 use autonomousim_vehicles::ground::WheeledDef;
 use autonomousim_world::{NodeKind, StaticWorld};
 use glam::{DVec2, DVec3};
@@ -118,4 +121,78 @@ pub fn sample(
     let xy = tail - DVec2::from_angle(yaw).rotate(behind);
     let z = world.surface_height(bay.x, bay.y) + lift;
     Some(BaySpawn { xy, yaw, goal: Goal { position: bay.extend(z), yaw: yard.heading } })
+}
+
+/// A yard-to-yard trip: the spawn pad and the goal pad (horizontal positions).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct YardTrip {
+    pub from: DVec2,
+    pub to: DVec2,
+}
+
+/// Heights above the ground (m) at which a pad's clearance is measured.
+const PAD_COLUMN: [f64; 5] = [1.0, 4.0, 10.0, 20.0, 40.0];
+
+/// The pad of a yard: the most open point of a 2 m grid over the yard (±16 m along it,
+/// ±12 m across), by the least distance to solid obstacles and foliage over [`PAD_COLUMN`]
+/// (up to 15 m),
+/// less 0.1 per metre from the centre, so that open yards land near the middle.
+pub fn pad(world: &StaticWorld, yard: &Yard) -> DVec2 {
+    let mut best = (f64::NEG_INFINITY, yard.centre.truncate());
+    for i in -8..=8 {
+        for j in -6..=6 {
+            let local = DVec2::new(2.0 * i as f64, 2.0 * j as f64);
+            let q = yard.point(local);
+            let ground = world.terrain().height(q.x, q.y);
+            let open = PAD_COLUMN
+                .iter()
+                .map(|h| {
+                    let p = q.extend(ground + h);
+                    world.obstacles().nearest_distance(p, 15.0, HitMask::SOLID | HitMask::FOLIAGE).unwrap_or(15.0)
+                })
+                .fold(f64::INFINITY, f64::min);
+            let score = open - 0.1 * local.length();
+            if score > best.0 {
+                best = (score, q);
+            }
+        }
+    }
+    best.1
+}
+
+/// Sample a trip between two of `yards` (at least two): a start (preferring one not in
+/// `used`, which it is added to) and a destination whose horizontal distance from it lies in
+/// `spec.distance`, or, when no yard does, the one closest to that range.
+pub fn trip(
+    world: &StaticWorld,
+    yards: &[Yard],
+    spec: &GoalSpec,
+    used: &mut Vec<usize>,
+    rng: &mut SimRng,
+) -> Option<YardTrip> {
+    if yards.len() < 2 {
+        return None;
+    }
+    let free: Vec<usize> = (0..yards.len()).filter(|k| !used.contains(k)).collect();
+    let k = if free.is_empty() {
+        rng.below(yards.len() as u64) as usize
+    } else {
+        free[rng.below(free.len() as u64) as usize]
+    };
+    used.push(k);
+    let from = pad(world, &yards[k]);
+    let [lo, hi] = spec.distance;
+    // Distance outside the range (0 inside) of every other yard.
+    let miss = |j: usize| {
+        let d = (yards[j].centre.truncate() - from).length();
+        (lo - d).max(d - hi).max(0.0)
+    };
+    let others: Vec<usize> = (0..yards.len()).filter(|&j| j != k).collect();
+    let inside: Vec<usize> = others.iter().copied().filter(|&j| miss(j) == 0.0).collect();
+    let j = if inside.is_empty() {
+        *others.iter().min_by(|a, b| miss(**a).total_cmp(&miss(**b)))?
+    } else {
+        inside[rng.below(inside.len() as u64) as usize]
+    };
+    Some(YardTrip { from, to: pad(world, &yards[j]) })
 }

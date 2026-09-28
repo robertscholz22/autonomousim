@@ -2,6 +2,7 @@
 //! spawns on the gear, the `raw` and the default `velocity` action modes, and recordings.
 
 use autonomousim_core::rng::Seed;
+use autonomousim_core::terrain::Terrain;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
 use autonomousim_sim::{BatchSim, CompiledScenario, Events, Scenario, WorldInstance};
 use autonomousim_vehicles::tiltrotor::Tiltrotor;
@@ -140,4 +141,52 @@ fn velocity_mode_flies_a_circuit() {
     let t = tilt(&w);
     assert!(e.contains(Events::LANDED) && !e.is_terminal(), "{e:?} {}", t.position());
     assert!(t.lin_vel_world().length() < 0.05 && t.input().throttle.iter().all(|x| *x < 0.2), "{:?}", t.input());
+}
+
+/// Yard goals: the tiltrotor starts on its gear on one farm yard's pad, clear of obstacles
+/// around it and overhead, and its goal is another yard's pad at a distance in the range; it
+/// lifts off straight up from there, turning.
+#[test]
+fn yard_goals_join_two_farm_pads() {
+    let sc = Scenario::from_toml(
+        r#"
+        name = "delivery"
+        map = { type = "rural", seed = 5, count = 2, preset = "training", config = { size = 1024.0, farms = { spacing = 200.0 } } }
+        [[groups]]
+        vehicle = "quadtilt_like"
+        spawn = { on_ground = true }
+        goals = { kind = "yard", distance = [300.0, 700.0], agl = [0.0, 0.0] }
+        "#,
+    )
+    .unwrap();
+    let sc = Arc::new(sc.compile().unwrap());
+    let mut w = WorldInstance::new(sc, Seed::from_u64(1));
+    for episode in 0..8u64 {
+        w.reset(Some(episode));
+        let yards = autonomousim_sim::bay::yards(w.map());
+        let pads: Vec<glam::DVec2> = yards.iter().map(|y| autonomousim_sim::bay::pad(w.map(), y)).collect();
+        let (p, goal) = (tilt(&w).position(), w.agent(0).goal().position);
+        let is_pad = |q: glam::DVec2| pads.iter().any(|x| (*x - q).length() < 1e-9);
+        assert!(is_pad(p.truncate()) && is_pad(goal.truncate()), "{episode}: {p} {goal}");
+        let d = (goal - p).truncate().length();
+        assert!((280.0..=720.0).contains(&d), "{episode}: {d}");
+        assert!((goal.z - w.map().surface_height(goal.x, goal.y)).abs() < 1e-9);
+        for h in [1.0, 10.0, 30.0] {
+            let q = p.truncate().extend(w.map().terrain().height(p.x, p.y) + h);
+            let c = w.map().obstacle_clearance(q, 20.0);
+            assert!(c > 6.0, "{episode}: clearance {c} at {h} m over the pad");
+        }
+        // Up 20 m turning at the full yaw rate (asked for on the gear too, which holds the
+        // heading until lift-off), no strike.
+        let events = run(&mut w, 1.0);
+        assert!(tilt(&w).lin_vel_world().length() < 0.05 && !events.is_terminal(), "{episode}: {events:?}");
+        let climb = 1.0 / w.scenario().groups[0].action_map.as_tiltrotor().unwrap().speeds()[2];
+        let z = tilt(&w).position().z;
+        for _ in 0..(10.0 / w.scenario().policy_dt()) as usize {
+            w.set_actions(0, &[0.0, 0.0, (2.0 * climb) as f32, -1.0]);
+            w.step();
+            assert!(!w.agent(0).events.is_terminal(), "{episode}: {:?}", w.agent(0).events);
+        }
+        assert!(tilt(&w).position().z > z + 15.0, "{episode}");
+    }
 }

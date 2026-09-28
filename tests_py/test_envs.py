@@ -20,6 +20,8 @@ IDS = [f"autonomousim/{name}" for name in autonomousim.ENVS]
 # Small maps for the API tests (the waypoint task defaults to a pool of 16 generated maps).
 RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
 # A 4 km tiled map (the aircraft task defaults to the 16 km one).
+# A 1 km rural map with farms every ~200 m (the delivery task defaults to a 6 km one).
+FARMS = {"type": "rural", "seed": 5, "count": 1, "cache": False, "config": {"size": 1024.0, "farms": {"spacing": 200.0}}}
 LARGE = {"type": "wild", "preset": "large", "seed": 0, "count": 1, "cache": False, "config": {"size": 4096.0}}
 KWARGS = {
     "autonomousim/QuadWaypointForest-v0": {"map": "forest"},
@@ -30,6 +32,7 @@ KWARGS = {
     "autonomousim/MotorcycleRoadRural-v0": {"map": RURAL},
     "autonomousim/FixedWingWaypoints-v0": {"map": LARGE},
     "autonomousim/HeliLandingZone-v0": {"map_count": 1},
+    "autonomousim/TiltrotorDelivery-v0": {"map": FARMS, "goal_distance": (300.0, 700.0)},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
@@ -40,6 +43,7 @@ OBS_DIM = {
     "autonomousim/MotorcycleRoadRural-v0": 106,
     "autonomousim/FixedWingWaypoints-v0": 46,
     "autonomousim/HeliLandingZone-v0": 19,
+    "autonomousim/TiltrotorDelivery-v0": 22,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
@@ -49,6 +53,7 @@ ACT_DIM = {
     "autonomousim/MotorcycleRoadRural-v0": 2,
     "autonomousim/FixedWingWaypoints-v0": 3,
     "autonomousim/HeliLandingZone-v0": 4,
+    "autonomousim/TiltrotorDelivery-v0": 4,
 }
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
@@ -797,3 +802,65 @@ def test_heli_landing_zone_rewards():
     assert task.succeeded(state, events).tolist() == [False, False, True]
     goals = task.scenario()["groups"][0]["goals"]
     assert goals["landing_slope"] == 0.1 and goals["clearance"] == 3.0
+
+
+def test_tiltrotor_delivery_scripted_pilot_lands():
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/TiltrotorDelivery-v0",
+        num_envs=n,
+        num_threads=4,
+        map="farmland",
+        map_count=2,
+        goal_distance=(400.0, 1200.0),
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    task = envs.unwrapped.task
+    assert [t[0] for t in envs.unwrapped.obs_layout] == [
+        "goal_rel_heading",
+        "agl",
+        "air_data",
+        "lin_vel_body",
+        "ang_vel_body",
+        "pitch_roll",
+        "last_action",
+        "goal_rel_heading",
+    ]
+    obs, _ = envs.reset(seed=0)
+    # On the gear on one farm's pad, 400–1200 m from another's.
+    state = envs.unwrapped.state
+    assert (state[:, STATE["agl"]][:, 0] < 0.5).all() and (np.abs(state[:, STATE["velocity"]]) < 0.1).all()
+    assert ((task.distance(state) > 380.0) & (task.distance(state) < 1220.0)).all()
+    ret, done, success = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(task.scripted(obs))
+        live = ~done
+        ret[live] += reward[live]
+        success |= live & task.success
+        done |= terminated | truncated
+    # Up, over on the wing and back down onto the pad: progress and the bonus pay.
+    assert success.all(), success
+    assert (task.distance(envs.unwrapped.state) < task.landing_radius).all()
+    assert (ret > task.landing_bonus).all(), ret
+    envs.close()
+
+
+def test_tiltrotor_delivery_rewards():
+    task = make_task("tiltrotor_delivery", map="flat")
+    task.bind(3, 0.1, 4)
+    state = np.zeros((3, autonomousim.STATE_DIM))
+    state[:, STATE["goal"]] = [1000.0, 0.0, 0.0]
+    state[:, STATE["position"]] = [[0.0, 0.0, 50.0], [990.0, 0.0, 20.0], [999.0, 0.0, 0.3]]
+    state[:, STATE["agl"]] = [[50.0], [20.0], [0.3]]
+    task.reset(None, state)
+    # 100 m on in cruise; 10 m down at 10 m out; landed 1 m out: the bonus. A stall costs.
+    state[:, STATE["position"]] = [[100.0, 0.0, 50.0], [990.0, 0.0, 10.0], [999.0, 0.0, 0.3]]
+    state[:, STATE["agl"]] = [[50.0], [10.0], [0.3]]
+    events = np.array([int(autonomousim.Event.STALL), 0, int(autonomousim.Event.LANDED)], np.uint32)
+    action = np.zeros((3, 4), np.float32)
+    r = task.reward(state, action, action, events)
+    progress = [np.hypot(1000.0, 50.0) - np.hypot(900.0, 50.0), np.hypot(10.0, 20.0) - np.hypot(10.0, 10.0), 0.0]
+    np.testing.assert_allclose(r, np.array(progress) / 100.0 - 0.002 + [-0.2, 0.0, 20.0])
+    assert task.succeeded(state, events).tolist() == [False, False, True]
+    group = task.scenario()["groups"][0]
+    assert group["spawn"]["on_ground"] and group["goals"]["kind"] == "yard"

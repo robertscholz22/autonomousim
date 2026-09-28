@@ -19,7 +19,9 @@ Importing the package registers the Gymnasium environments:
 - ``autonomousim/FixedWingWaypoints-v0``: fly a small fixed-wing UAV through waypoints
   kilometres apart over a large mountainous map in wind and turbulence;
 - ``autonomousim/HeliLandingZone-v0``: fly a model helicopter from forward flight to a flat,
-  open landing zone a few hundred metres away and set it down there.
+  open landing zone a few hundred metres away and set it down there;
+- ``autonomousim/TiltrotorDelivery-v0``: take a quad tiltrotor off from a farm yard, cruise
+  kilometres on the wing across farmland and land on another farm's yard.
 
 ``gym.make_vec(id, num_envs=N, ...)`` gives the native vector environment
 (``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Worlds with several
@@ -55,6 +57,7 @@ ENVS = {
     "MotorcycleRoadRural-v0": "motorcycle_road",
     "FixedWingWaypoints-v0": "fixed_wing_waypoints",
     "HeliLandingZone-v0": "heli_landing_zone",
+    "TiltrotorDelivery-v0": "tiltrotor_delivery",
 }
 
 for _name, _task in ENVS.items():

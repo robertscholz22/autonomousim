@@ -103,6 +103,14 @@ impl TiltSchedule {
         smoothstep((speed - 0.9 * self.stall_speed) / (0.4 * self.stall_speed))
     }
 
+    /// Share of weathervaning at airspeed `speed` (m/s): 0 below 0.5·V_s, 1 from 0.9·V_s,
+    /// before the wing takes over the manoeuvring. The fin's weathercock moment grows with the
+    /// airspeed, and a large sideslip held against it saturates the yaw; the controller turns
+    /// the nose against the sideslip beyond a crabbing allowance.
+    pub fn vane_share(&self, speed: f64) -> f64 {
+        smoothstep((speed - 0.5 * self.stall_speed) / (0.4 * self.stall_speed))
+    }
+
     /// Wing-borne stall speed (m/s).
     pub fn stall_speed(&self) -> f64 {
         self.stall_speed

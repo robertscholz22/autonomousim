@@ -180,6 +180,7 @@ impl WorldInstance {
             let lift = ground.map_or(g.bottom, |gs| gs.ride);
             let bay_goals = g.spec.goals.kind == GoalKind::Bay;
             let mut bays = Vec::new();
+            let mut trips = Vec::new();
             let (positions, mut road_spawns) = if bay_goals {
                 // Spawn and goal in a farm yard.
                 let d = g.def.as_wheeled().expect("bay goals are for ground vehicles");
@@ -192,6 +193,27 @@ impl WorldInstance {
                     bays.push(b);
                 }
                 let p: Vec<DVec3> = bays.iter().map(|b| b.xy.extend(0.0)).collect();
+                let n = p.len();
+                (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            } else if g.spec.goals.kind == GoalKind::Yard {
+                // Spawn on one yard's pad, the goal on another's.
+                let yards = crate::bay::yards(world);
+                let mut used = Vec::new();
+                let mut p = Vec::with_capacity(g.spec.count);
+                for _ in 0..g.spec.count {
+                    let t = crate::bay::trip(world, &yards, &g.spec.goals, &mut used, &mut goal_rng)
+                        .expect("maps of yard goals have two yards");
+                    let z = if spawn.on_ground {
+                        world.terrain().height(t.from.x, t.from.y) + g.bottom + 1e-3
+                    } else {
+                        world.surface_height(t.from.x, t.from.y) + spawn_rng.range(spawn.agl[0], spawn.agl[1])
+                    };
+                    let agl = goal_rng.range(g.spec.goals.agl[0], g.spec.goals.agl[1]);
+                    let goal = t.to.extend(world.surface_height(t.to.x, t.to.y) + agl);
+                    placed.push(t.from.extend(z));
+                    p.push(t.from.extend(z));
+                    trips.push(Goal { position: goal, yaw: (t.to - t.from).to_angle() });
+                }
                 let n = p.len();
                 (p, (0..n).map(|_| None).collect::<Vec<_>>())
             } else if spawn.on_road {
@@ -278,6 +300,7 @@ impl WorldInstance {
                 }
                 let goals = match (formation.next(), &route) {
                     _ if bay_goals => vec![bays[k].goal],
+                    _ if !trips.is_empty() => vec![trips[k]],
                     (Some(slot), _) => vec![slot],
                     (None, Some(lane)) => lane::route_goals(world, lane, g.spec.goals.route.step, lift),
                     (None, None) => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),
