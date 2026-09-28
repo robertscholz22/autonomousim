@@ -2231,7 +2231,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | 1 ✅ | Rotor model: BEMT with forward-flight inflow, flapping, hub moments, ground effect, rotor speed | Hover and forward-flight thrust, torque and flapping match closed-form blade-element and momentum results; flapping lag matches `16/(γΩ)` |
 | 2 ✅ | Helicopter family and presets; engine and governor; tail rotor; fins; skids; wiring | Both presets trim in hover and forward flight; stand on their skids; rotor speed recovers from load steps |
 | 3 ✅ | Validation against Padfield (Bo105) and Gavrilets (X-Cell) | Hover power, power curve, trim controls and attitudes within the tolerances above |
-| 4 | Control and action modes | Attitude and velocity steps settle in hover and at 20 m/s; hover holds position in wind |
+| 4 | Control and action modes | Attitude and velocity steps settle in hover and at 20 m/s; hover holds position in wind ✅ |
 | 5 | Viewer: visuals, HUD, keyboard flight, replay | The helicopter flies by keyboard and lands on a large map; recordings replay |
 | 6 | `HeliLandingZone-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
 
@@ -2259,6 +2259,21 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
   - **Rest input**: `HelicopterInit::at_rest(def, pose)` rests with the collective at flat (zero) pitch rather than full down, which with the wider range pressed the X-Cell into its skids.
   - **Not checked**: Padfield's Bo105 trim charts and derivative tables (Appendix 4B.3) were not available online; the Bo105 checks use his configuration data, first principles and published flight-manual magnitudes instead.
   - **Tests**: `crates/vehicles/tests/helicopter_validation.rs` (Bo105 rotor data; power curve and trim trends; autorotation energy balance for Bo105 at 20–50 m/s and X-Cell in vertical descent; X-Cell against Gavrilets; hover damping against the flapping lag; linear-model signs and a perturbation check against the nonlinear derivative within 2 %).
+- **Step 4 (control and action modes)**, `control::rotorcraft::{HelicopterController, HelicopterConfig, HelicopterActionMap, HelicopterActionLimits, HelicopterSetpoint}`:
+  - **Modes**: `sticks` (pass-through), `rates` (body rates and collective), `attitude` (roll, pitch, yaw rate and collective), `velocity` (heading-frame velocity and yaw rate; the default). `rates`, `attitude` and `velocity` share names with the other families and resolve per group. Internal `Position { position, yaw }` setpoint for scripted hover. `velocity` speeds default to 80 % of the fastest trim forward (Bo105 56 m/s, X-Cell 20 m/s), twice the hover induced velocity sideways and backward, and half of it vertically.
+  - **Gain schedule**: at construction the controller trims and linearises the helicopter every half hover induced velocity up to the fastest trim (X-Cell 25 m/s) and interpolates on the body forward airspeed: trim inputs and attitude, the rate, airspeed, cyclic/pedal and collective columns of the angular-acceleration model, and the heave derivatives.
+  - **Rate loop**: dynamic inversion of the linear model (cancels the rate, airspeed and collective terms) with PI correction (integral k²/4, frozen at saturation). Bandwidth `0.5/(α·τ_flap + τ_servo)` (Bo105 7.4, X-Cell 11 rad/s).
+  - **Flapping lag**: the quasi-steady model omits the tip-path plane's lag (X-Cell flybar 0.1 s). That lag destabilised climbs and accelerations in forward flight on the X-Cell. A lead `(τs + 1)/(ατs + 1)` (α = 0.25) on the demanded roll and pitch acceleration fixes it; the cancellation terms go without, since the rotor's own responses lag alike.
+  - **Outer loops** (each 4× slower): the attitude loop holds the heading that the yaw-rate command integrates to, which a rate loop alone cannot do where the fin is directionally unstable (sideways and backward flight). The velocity loop tilts from the trim attitude (`atan(a/g)`, 25° at most) and drives the collective through the heave model with integral action. Trim attitude and collective are scheduled on the *reference* airspeed: on the measured one the X-Cell's steep trim-pitch slope near 20 m/s fed speed back positively. The position loop feeds the velocity loop.
+  - **Wiring**: `Controller::new` and `ActionMapping::new` take the helicopter config and limits; groups have `helicopter_controller` and `helicopter_action_limits` fields, foreign to other families.
+  - **Tests**: `crates/control/tests/helicopter.rs`:
+    - bandwidth ordering;
+    - ±10° roll and pitch steps from hover and 20 m/s, within 15 % after 4/k_att, both presets;
+    - 2 m/s velocity steps on all axes from hover and 20 m/s, within 0.2 m/s after 15 s, rotor speed within 5 %;
+    - hover position hold within 0.3 m in 5 m/s (Bo105) or 3 m/s (X-Cell) wind from three directions;
+    - action maps.
+    - `crates/sim/tests/helicopter.rs` adds `velocity` mode flying forward and stopping.
+    - Full-scale single-axis velocity actions track on both presets; the Bo105's rotor droops 15 % while accelerating to 56 m/s (engine power limit).
 
 ### M6c: Tiltrotor
 

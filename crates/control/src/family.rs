@@ -11,7 +11,10 @@ use crate::ground::GroundSetpoint;
 use crate::ground::{GroundActionLimits, GroundActionMap, GroundActionMode, GroundConfig, GroundController};
 use crate::multirotor::{ActionLimits, ActionMap, ActionMode, ControllerConfig, MultirotorController};
 use crate::multirotor::{Setpoint, StateEstimate, YawCommand};
-use crate::rotorcraft::{HelicopterActionMap, HelicopterActionMode, HelicopterController, HelicopterSetpoint};
+use crate::rotorcraft::{
+    HelicopterActionLimits, HelicopterActionMap, HelicopterActionMode, HelicopterConfig, HelicopterController,
+    HelicopterSetpoint,
+};
 use autonomousim_core::math::quat::yaw;
 use autonomousim_vehicles::{Family, SharedDef, Vehicle};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -252,12 +255,13 @@ impl Controller {
         multirotor: &ControllerConfig,
         ground: &GroundConfig,
         fixed_wing: &FixedWingConfig,
+        helicopter: &HelicopterConfig,
     ) -> Result<Self, ControlError> {
         Ok(match def {
             SharedDef::Multirotor(d) => Controller::Multirotor(MultirotorController::new(d, dt, multirotor)?),
             SharedDef::Wheeled(d) => Controller::Ground(GroundController::new(d, dt, ground)?),
             SharedDef::FixedWing(d) => Controller::FixedWing(FixedWingController::new(d, dt, fixed_wing)?),
-            SharedDef::Helicopter(d) => Controller::Helicopter(HelicopterController::new(d, dt)?),
+            SharedDef::Helicopter(d) => Controller::Helicopter(HelicopterController::new(d, dt, helicopter)?),
         })
     }
 
@@ -330,6 +334,7 @@ impl ActionMapping {
         multirotor: &ActionLimits,
         ground: &GroundActionLimits,
         fixed_wing: &FixedWingActionLimits,
+        helicopter: &HelicopterActionLimits,
         def: &SharedDef,
         controller: &Controller,
     ) -> Result<Self, ControlError> {
@@ -343,8 +348,8 @@ impl ActionMapping {
             (AgentActionMode::FixedWing(m), SharedDef::FixedWing(_), Controller::FixedWing(c)) => {
                 Ok(ActionMapping::FixedWing(FixedWingActionMap::new(m, fixed_wing, c)?))
             }
-            (AgentActionMode::Helicopter(m), SharedDef::Helicopter(_), Controller::Helicopter(_)) => {
-                Ok(ActionMapping::Helicopter(HelicopterActionMap::new(m)))
+            (AgentActionMode::Helicopter(m), SharedDef::Helicopter(d), Controller::Helicopter(c)) => {
+                Ok(ActionMapping::Helicopter(HelicopterActionMap::new(m, helicopter, d, c)?))
             }
             _ => Err(ControlError::InvalidConfig(format!(
                 "action mode {mode} does not drive {} vehicles ({:?})",

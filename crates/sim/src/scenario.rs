@@ -45,6 +45,7 @@ use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
 use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
+use autonomousim_control::rotorcraft::{HelicopterActionLimits, HelicopterConfig};
 use autonomousim_control::{ActionMapping, AgentActionMode, Controller};
 use autonomousim_core::geometry::{HitMask, StaticGeometry};
 use autonomousim_core::material::MaterialId;
@@ -565,7 +566,8 @@ impl VehicleRef {
 ///
 /// `controller`, `action_limits` and `randomize` configure multirotors; `ground_controller`,
 /// `ground_action_limits` and `drivable` wheeled vehicles; `fixed_wing_controller` and
-/// `fixed_wing_action_limits` fixed-wing aircraft. Setting those of another family is an error.
+/// `fixed_wing_action_limits` fixed-wing aircraft; `helicopter_controller` and
+/// `helicopter_action_limits` helicopters. Setting those of another family is an error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GroupSpec {
@@ -590,6 +592,10 @@ pub struct GroupSpec {
     pub fixed_wing_controller: FixedWingConfig,
     #[serde(skip_serializing_if = "is_default")]
     pub fixed_wing_action_limits: FixedWingActionLimits,
+    #[serde(skip_serializing_if = "is_default")]
+    pub helicopter_controller: HelicopterConfig,
+    #[serde(skip_serializing_if = "is_default")]
+    pub helicopter_action_limits: HelicopterActionLimits,
     /// Terrain that ground vehicles can drive over: spawns and goals only use drivable cells,
     /// and goals must be reachable from the spawn.
     #[serde(skip_serializing_if = "is_default")]
@@ -619,6 +625,8 @@ impl Default for GroupSpec {
             ground_action_limits: GroundActionLimits::default(),
             fixed_wing_controller: FixedWingConfig::default(),
             fixed_wing_action_limits: FixedWingActionLimits::default(),
+            helicopter_controller: HelicopterConfig::default(),
+            helicopter_action_limits: HelicopterActionLimits::default(),
             drivable: DrivableSpec::default(),
             sensors: Vec::new(),
             obs: Vec::new(),
@@ -1081,10 +1089,14 @@ impl CompiledGroup {
             ("fixed_wing_controller", !is_default(&spec.fixed_wing_controller)),
             ("fixed_wing_action_limits", !is_default(&spec.fixed_wing_action_limits)),
         ];
+        let helicopter = [
+            ("helicopter_controller", !is_default(&spec.helicopter_controller)),
+            ("helicopter_action_limits", !is_default(&spec.helicopter_action_limits)),
+        ];
         let foreign: Vec<_> = match family {
-            Family::Multirotor => ground.into_iter().chain(fixed_wing).collect(),
-            Family::Wheeled => multirotor.into_iter().chain(fixed_wing).collect(),
-            Family::FixedWing => multirotor.into_iter().chain(ground).collect(),
+            Family::Multirotor => ground.into_iter().chain(fixed_wing).chain(helicopter).collect(),
+            Family::Wheeled => multirotor.into_iter().chain(fixed_wing).chain(helicopter).collect(),
+            Family::FixedWing => multirotor.into_iter().chain(ground).chain(helicopter).collect(),
             Family::Rotorcraft => multirotor.into_iter().chain(ground).chain(fixed_wing).collect(),
         };
         if let Some((field, _)) = foreign.iter().find(|f| f.1) {
@@ -1095,13 +1107,20 @@ impl CompiledGroup {
         if family == Family::Wheeled {
             spec.spawn.on_ground = true;
         }
-        let controller =
-            Controller::new(&def, clock.dt(), &spec.controller, &spec.ground_controller, &spec.fixed_wing_controller)?;
+        let controller = Controller::new(
+            &def,
+            clock.dt(),
+            &spec.controller,
+            &spec.ground_controller,
+            &spec.fixed_wing_controller,
+            &spec.helicopter_controller,
+        )?;
         let action_map = ActionMapping::new(
             mode,
             &spec.action_limits,
             &spec.ground_action_limits,
             &spec.fixed_wing_action_limits,
+            &spec.helicopter_action_limits,
             &def,
             &controller,
         )

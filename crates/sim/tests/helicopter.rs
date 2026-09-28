@@ -1,5 +1,5 @@
 //! Helicopters in the simulation: trimmed air spawns (hover and forward flight), spawns on the
-//! skids, the `sticks` action mode and recordings.
+//! skids, the `sticks` and `velocity` action modes and recordings.
 
 use autonomousim_core::rng::Seed;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
@@ -8,6 +8,10 @@ use autonomousim_vehicles::rotorcraft::Helicopter;
 use std::sync::Arc;
 
 fn scenario(vehicle: &str, spawn: &str) -> Arc<CompiledScenario> {
+    scenario_in(vehicle, spawn, "action_mode = \"sticks\"")
+}
+
+fn scenario_in(vehicle: &str, spawn: &str, mode: &str) -> Arc<CompiledScenario> {
     let toml = format!(
         r#"
         name = "heli"
@@ -15,6 +19,7 @@ fn scenario(vehicle: &str, spawn: &str) -> Arc<CompiledScenario> {
         [[groups]]
         name = "air"
         vehicle = "{vehicle}"
+        {mode}
         obs = [ {{ term = "rot6d" }}, {{ term = "last_action" }} ]
         spawn = {{ region = [[-100.0, -100.0], [100.0, 100.0]], {spawn} }}
         "#
@@ -103,4 +108,24 @@ fn records_the_helicopter_state() {
     assert_eq!((last.rotor_speed, last.engine_power), (live.rotor_speed(), live.engine_power()));
     assert_eq!(last.flap, [live.main_rotor_state().flap, live.tail_rotor_state().flap]);
     assert!(last.coning[0] > 0.0 && last.position.distance(live.position()) < 1e-9);
+}
+
+/// The default `velocity` mode: half forward speed, then back to a hover in place.
+#[test]
+fn velocity_mode_flies_forward_and_stops() {
+    let sc = scenario_in("xcell60_like", "agl = [50.0, 50.0], clearance = 0.0", "");
+    assert_eq!(sc.groups[0].spec.action_mode.unwrap().name(), "velocity");
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(3));
+    let fwd = sc.groups[0].action_map.as_helicopter().unwrap().speeds()[0];
+    w.set_actions(0, &[0.5, 0.0, 0.0, 0.0]);
+    let e = run(&mut w, 25.0);
+    assert!(e.is_empty(), "{e:?}");
+    let h = heli(&w);
+    let heading = h.orientation() * glam::DVec3::X;
+    let v = h.lin_vel_world();
+    assert!((v.dot(heading.with_z(0.0).normalize()) - 0.5 * fwd).abs() < 0.3, "{v} vs {fwd}");
+    w.set_actions(0, &[0.0; 4]);
+    let e = run(&mut w, 20.0);
+    assert!(e.is_empty(), "{e:?}");
+    assert!(heli(&w).lin_vel_world().length() < 0.2, "{}", heli(&w).lin_vel_world());
 }
