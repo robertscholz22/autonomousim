@@ -561,6 +561,7 @@ fn main() -> anyhow::Result<()> {
                 vehicle_view::sync_tracks,
                 vehicle_view::sync_riders,
                 vehicle_view::sync_rotors,
+                vehicle_view::sync_tiltrotors,
                 camera::update_camera,
                 world_view::stream_tiles,
                 world_view::update_view_distance,
@@ -603,8 +604,8 @@ fn spawn_camera(
             (visual.span, CameraRig::helicopter(f64::from(visual.span), heading, visual.eye))
         }
         Vehicle::Tiltrotor(t) => {
-            let span = t.def().span() as f32;
-            (span, CameraRig::new(f64::from(span), heading))
+            let visual = autonomousim_scene::props::tiltrotor(t.def());
+            (visual.span, CameraRig::helicopter(f64::from(visual.span), heading, visual.eye))
         }
         Vehicle::Wheeled(w) => {
             let visual = autonomousim_scene::props::wheeled(w.def());

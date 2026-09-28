@@ -12,6 +12,7 @@ use autonomousim_control::fixedwing::{FixedWingActionMap, FixedWingActionMode, F
 use autonomousim_control::ground::{GroundActionMap, GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_control::rotorcraft::{HelicopterActionMap, HelicopterActionMode, HelicopterSetpoint};
+use autonomousim_control::tiltrotor::{TiltrotorActionMap, TiltrotorActionMode, TiltrotorSetpoint};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
@@ -393,6 +394,76 @@ impl Sim {
         }
     }
 
+    /// The followed tiltrotor's `velocity` action map (its group's limits): its speeds and
+    /// limits scale the keys.
+    pub fn tilt_map(&self) -> Option<TiltrotorActionMap> {
+        let agent = self.world.agent(self.pilot);
+        let group = &self.world.scenario().groups[agent.group];
+        let (t, c) = (agent.vehicle.as_tiltrotor()?, agent.controller.as_tiltrotor()?);
+        TiltrotorActionMap::new(TiltrotorActionMode::Velocity, &group.spec.tiltrotor_action_limits, t.def(), c).ok()
+    }
+
+    /// The range of the tiltrotor's speed setpoint in the pilot mode (m/s): backwards to
+    /// forwards in `velocity`, an airspeed from 0 in `attitude`.
+    fn tilt_speed_range(&self, map: &TiltrotorActionMap) -> [f64; 2] {
+        let [forward, side, _] = map.speeds();
+        if self.pilot_mode == PilotMode::Velocity { [-side, forward] } else { [0.0, forward] }
+    }
+
+    /// The keys' setpoint for the followed tiltrotor. `velocity`: W/S move the forward speed
+    /// setpoint (the mounts convert with it), A/D fly sideways in hover and turn on the wing,
+    /// Space/Shift climb, Q/E yaw. `attitude`: W/S move the airspeed setpoint, A/D bank, the
+    /// pitch is the schedule's level-flight pitch at the airspeed, Space/Shift climb, Q/E yaw.
+    pub fn tilt_setpoint(&self) -> TiltrotorSetpoint {
+        let agent = self.world.agent(self.pilot);
+        let (Some(map), Some(t), Some(c)) =
+            (self.tilt_map(), agent.vehicle.as_tiltrotor(), agent.controller.as_tiltrotor())
+        else {
+            return TiltrotorSetpoint::Raw(Default::default());
+        };
+        let [_, left, up, yaw] = self.stick;
+        let [lo, hi] = self.tilt_speed_range(&map);
+        let speed = self.airspeed.unwrap_or_else(|| self.tilt_speed_now(t)).clamp(lo, hi);
+        let l = map.limits();
+        let [_, side, vertical] = map.speeds();
+        let schedule = c.schedule();
+        if self.pilot_mode == PilotMode::Velocity {
+            let wing = schedule.wing_share(t.flow().airspeed);
+            TiltrotorSetpoint::Velocity {
+                velocity: DVec3::new(speed, (1.0 - wing) * left * side, up * vertical),
+                yaw_rate: (yaw + wing * left).clamp(-1.0, 1.0) * l.yaw_rate,
+            }
+        } else {
+            TiltrotorSetpoint::Attitude {
+                roll: -left * l.roll,
+                pitch: schedule.pitch(speed),
+                yaw_rate: yaw * l.yaw_rate,
+                climb: up * l.climb,
+                airspeed: speed,
+            }
+        }
+    }
+
+    /// The tiltrotor's speed now as its setpoint in the pilot mode measures it: forward speed
+    /// in the heading frame (`velocity`) or airspeed (`attitude`).
+    fn tilt_speed_now(&self, t: &autonomousim_vehicles::tiltrotor::Tiltrotor) -> f64 {
+        if self.pilot_mode == PilotMode::Velocity {
+            let heading = autonomousim_core::math::quat::yaw(t.orientation());
+            (glam::DQuat::from_rotation_z(-heading) * t.lin_vel_world()).x
+        } else {
+            t.flow().airspeed
+        }
+    }
+
+    /// Move the tiltrotor's speed setpoint with W/S by `dt` of simulated time.
+    fn update_tilt(&mut self, dt: f64) {
+        let Some(map) = self.tilt_map() else { return };
+        let Some(t) = self.world.agent(self.pilot).vehicle.as_tiltrotor() else { return };
+        let [lo, hi] = self.tilt_speed_range(&map);
+        let v = self.airspeed.unwrap_or_else(|| self.tilt_speed_now(t)).clamp(lo, hi);
+        self.airspeed = Some((v + self.stick[0] * AIRSPEED_RATE * dt).clamp(lo, hi));
+    }
+
     /// The pilot mode's name for the followed vehicle.
     pub fn pilot_mode_name(&self) -> &'static str {
         self.pilot_mode.name_for(self.world.agent(self.pilot).vehicle.family())
@@ -438,8 +509,7 @@ impl Sim {
             Family::Multirotor => self.setpoint().into(),
             Family::FixedWing => self.flight_setpoint().into(),
             Family::Rotorcraft => self.heli_setpoint().into(),
-            // Piloting comes with the transition modes; until then the inputs are held.
-            Family::Tiltrotor => Command::hold(&agent.vehicle),
+            Family::Tiltrotor => self.tilt_setpoint().into(),
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();
@@ -468,6 +538,10 @@ impl Sim {
     fn update_steering(&mut self, dt: f64) {
         if self.world.agent(self.pilot).vehicle.family() == Family::FixedWing {
             self.update_flight(dt);
+            return;
+        }
+        if self.world.agent(self.pilot).vehicle.family() == Family::Tiltrotor {
+            self.update_tilt(dt);
             return;
         }
         if self.riding() {
@@ -665,6 +739,11 @@ pub fn pilot_input(
     if sim.replay.is_none() && !ground {
         if keys.just_pressed(KeyCode::KeyM) || mode {
             sim.pilot_mode = sim.pilot_mode.next();
+            // Tiltrotors fly `velocity` and `attitude` only.
+            if sim.pilot_mode == PilotMode::Rates && sim.world.agent(sim.pilot).vehicle.family() == Family::Tiltrotor {
+                sim.pilot_mode = sim.pilot_mode.next();
+            }
+            sim.airspeed = None;
         }
         if keys.just_pressed(KeyCode::Equal) {
             sim.max_speed = (sim.max_speed * 1.5).min(40.0);
@@ -876,6 +955,43 @@ mod tests {
             assert!(v.position().z > z + 3.0 && roll.abs() < 0.15, "{vehicle}: z {} roll {roll}", v.position().z);
             assert!(!s.latched[0].is_terminal(), "{vehicle}: {:?}", s.latched[0]);
         }
+    }
+
+    /// The keys fly a tiltrotor through both transitions: in `velocity` it hovers in place
+    /// hands off; W raises the speed setpoint and the mounts convert onto the wing; A turns
+    /// it left there; S brings the setpoint back to 0 and it converts back to a hover, the
+    /// height held all along. In `attitude` A banks it left.
+    #[test]
+    fn keys_fly_a_tiltrotor() {
+        let mut s = heli_sim("quadtilt_like");
+        assert_eq!((s.pilot_mode, s.pilot_mode_name()), (PilotMode::Velocity, "velocity"));
+        let z0 = s.world.agent(0).vehicle.position().z;
+        let height = |s: &Sim| (s.world.agent(0).vehicle.position().z - z0).abs();
+        let (moved, turn) = drive(&mut s, [0.0; 4], 3.0);
+        assert!(moved.abs() < 0.5 && turn.abs() < 0.05, "moved {moved}, turn {turn}");
+        let cruise = (1.8 * s.world.agent(0).controller.as_tiltrotor().unwrap().schedule().stall_speed()).round();
+        drive(&mut s, [1.0, 0.0, 0.0, 0.0], cruise / AIRSPEED_RATE);
+        assert!((s.airspeed.unwrap() - cruise).abs() < 0.2, "{:?}", s.airspeed);
+        drive(&mut s, [0.0; 4], 20.0);
+        let t = s.world.agent(0).vehicle.as_tiltrotor().unwrap();
+        assert!((t.flow().airspeed - cruise).abs() < 1.0, "{} vs {cruise}", t.flow().airspeed);
+        assert!(t.tilts().iter().all(|x| *x > 1.5) && height(&s) < 5.0, "{:?} dz {}", t.tilts(), height(&s));
+        let (_, turn) = drive(&mut s, [0.0, 1.0, 0.0, 0.0], 4.0);
+        let roll = euler(s.world.agent(0).vehicle.orientation()).0;
+        assert!(turn > 0.5 && roll < -0.1, "turn {turn} roll {roll}");
+        drive(&mut s, [0.0; 4], 5.0);
+        drive(&mut s, [-1.0, 0.0, 0.0, 0.0], cruise / AIRSPEED_RATE);
+        assert!(s.airspeed.unwrap().abs() < 0.2, "{:?}", s.airspeed);
+        drive(&mut s, [0.0; 4], 30.0);
+        let t = s.world.agent(0).vehicle.as_tiltrotor().unwrap();
+        assert!(t.lin_vel_world().length() < 0.3, "{}", t.lin_vel_world());
+        assert!(t.tilts().iter().all(|x| x.abs() < 0.05) && height(&s) < 5.0, "{:?} dz {}", t.tilts(), height(&s));
+        s.pilot_mode = PilotMode::Attitude;
+        s.airspeed = None;
+        drive(&mut s, [0.0, 1.0, 0.0, 0.0], 2.0);
+        let roll = euler(s.world.agent(0).vehicle.orientation()).0;
+        assert!(roll < -0.1 && s.world.agent(0).vehicle.lin_vel_body().y > 0.5, "roll {roll}");
+        assert!(!s.latched[0].is_terminal(), "{:?}", s.latched[0]);
     }
 
     /// Run `seconds` of 60 Hz frames with the given stick; returns the displacement along the

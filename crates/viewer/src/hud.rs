@@ -68,6 +68,14 @@ const HELI_HELP: &str = "velocity  W/S forward/back   A/D left/right   Space/Shi
                          O  goals/trails       G  plots\n\
                          H  hide HUD   F1  help   Esc  quit";
 
+const TILT_HELP: &str = "velocity  W/S speed setpoint   A/D sideways (hover) / turn (wing)   Space/Shift climb   Q/E yaw\n\
+                         attitude  W/S airspeed setpoint   A/D bank   Space/Shift climb   Q/E yaw\n\
+                         M  pilot mode         R  reset episode\n\
+                         Tab  next agent       P  pause   [/]  time scale\n\
+                         C  camera             mouse drag  look   wheel  zoom\n\
+                         O  goals/trails       G  plots\n\
+                         H  hide HUD   F1  help   Esc  quit";
+
 /// Shown above [`HELP`] while a policy flies.
 const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
 
@@ -258,6 +266,9 @@ fn status_window(
             if let Some(h) = v.as_helicopter() {
                 heli_status(ui, h);
             }
+            if let Some(t) = v.as_tiltrotor() {
+                tilt_status(ui, sim, t, agent.controller.as_tiltrotor().map(|c| c.schedule()));
+            }
             let latched = sim.latched[sim.pilot];
             let now = agent.events;
             let names: Vec<&str> = latched.names().collect();
@@ -295,6 +306,7 @@ fn status_window(
                     (true, _) => REPLAY_HELP,
                     (false, false) if v.as_fixed_wing().is_some() => FLIGHT_HELP,
                     (false, false) if v.as_helicopter().is_some() => HELI_HELP,
+                    (false, false) if v.as_tiltrotor().is_some() => TILT_HELP,
                     (false, true) if sim.riding() => RIDE_HELP,
                     (false, true) => GROUND_HELP,
                     (false, false) => HELP,
@@ -373,6 +385,132 @@ fn heli_status(ui: &mut egui::Ui, h: &autonomousim_vehicles::rotorcraft::Helicop
     ui.label(format!("disc tilt  forward {b1c:+4.1}°  left {b1s:+4.1}°"));
     let (roll, pitch, _) = autonomousim_control::fixedwing::euler(h.orientation());
     horizon(ui, roll, pitch);
+}
+
+/// A tiltrotor's air data, rotors, mounts and attitude: airspeed (and the keys' setpoint), α
+/// (red near the wing's stall) and β, climb rate, electric power, throttle per rotor, the
+/// mount tilts against the schedule's tilt at the airspeed and the flight state (hover,
+/// converting or on the wing), the conversion corridor and an artificial horizon.
+fn tilt_status(
+    ui: &mut egui::Ui,
+    sim: &Sim,
+    t: &autonomousim_vehicles::tiltrotor::Tiltrotor,
+    schedule: Option<&autonomousim_control::tiltrotor::TiltSchedule>,
+) {
+    let red = egui::Color32::from_rgb(230, 80, 60);
+    let flow = t.flow();
+    let setpoint = match sim.airspeed {
+        Some(v) if sim.replay.is_none() && sim.manual_agent().is_some() => format!("  (set {v:+5.1})"),
+        _ => String::new(),
+    };
+    ui.label(format!("airspeed {:5.1} m/s{setpoint}  climb {:+5.1} m/s", flow.airspeed, t.lin_vel_world().z));
+    let stall = t
+        .def()
+        .surfaces
+        .iter()
+        .filter(|s| s.roll.cos().abs() > 0.5)
+        .map(|s| s.alpha_stall - s.incidence)
+        .fold(f64::INFINITY, f64::min);
+    ui.horizontal(|ui| {
+        let alpha = format!("α {:+5.1}°", flow.alpha.to_degrees());
+        if flow.airspeed > 5.0 && flow.alpha > 0.85 * stall {
+            ui.colored_label(red, alpha);
+        } else {
+            ui.label(alpha);
+        }
+        ui.label(format!("β {:+5.1}°", flow.beta.to_degrees()));
+        if flow.airspeed > 5.0 && flow.alpha > stall {
+            ui.colored_label(red, egui::RichText::new("STALL").strong());
+        }
+        ui.label(format!("power {:.2} kW", 1e-3 * t.electric_power()));
+    });
+    ui.horizontal(|ui| {
+        ui.label("throttle");
+        for &u in &t.input().throttle[..t.rotor_count()] {
+            ui.add(egui::ProgressBar::new(u as f32).desired_width(40.0));
+        }
+    });
+    let tilts = t.tilts();
+    let tilt = tilts.iter().sum::<f64>() / tilts.len().max(1) as f64;
+    let mounts: Vec<String> = tilts.iter().map(|x| format!("{:3.0}", x.to_degrees())).collect();
+    match schedule {
+        Some(s) => {
+            let wing = s.wing_share(flow.airspeed);
+            let state = if wing < 0.05 {
+                "hover"
+            } else if wing > 0.95 {
+                "wing"
+            } else {
+                "converting"
+            };
+            ui.label(format!(
+                "tilt {}°  scheduled {:3.0}°  · {state} ({:3.0} % wing)",
+                mounts.join(" "),
+                s.tilt(flow.airspeed).to_degrees(),
+                100.0 * wing
+            ));
+            corridor(ui, s, t.def().controls.tilt.max, flow.airspeed, tilt);
+        }
+        None => {
+            ui.label(format!("tilt {}°", mounts.join(" ")));
+        }
+    }
+    let (roll, pitch, _) = autonomousim_control::fixedwing::euler(t.orientation());
+    horizon(ui, roll, pitch);
+}
+
+/// The conversion corridor: tilt (up, 0 to `max_tilt`) against airspeed (right), the band of
+/// tilts at which level flight is feasible (swept up to 1.4·V_s; faster, the rotors stay
+/// forward), the stall speed, the schedule's tilt and the aircraft's point.
+fn corridor(
+    ui: &mut egui::Ui,
+    s: &autonomousim_control::tiltrotor::TiltSchedule,
+    max_tilt: f64,
+    airspeed: f64,
+    tilt: f64,
+) {
+    const W: f32 = 220.0;
+    const H: f32 = 90.0;
+    let (response, painter) = ui.allocate_painter(egui::vec2(W, H), egui::Sense::hover());
+    let rect = response.rect;
+    let corridor = s.corridor();
+    let top = corridor.last().map_or(s.max_speed(), |p| p.speed).max(s.max_speed()).max(1.0);
+    let max_tilt = max_tilt.max(0.1);
+    let at = |v: f64, x: f64| {
+        let u = (v / top).clamp(0.0, 1.0) as f32;
+        let w = (x / max_tilt).clamp(0.0, 1.0) as f32;
+        egui::pos2(rect.left() + u * rect.width(), rect.bottom() - w * rect.height())
+    };
+    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(30));
+    // One mesh without feathering, so that the quads between sweep speeds join without seams.
+    let band = egui::Color32::from_rgb(55, 100, 70);
+    let mut mesh = egui::Mesh::default();
+    for pair in corridor.windows(2) {
+        if let (Some((a0, a1)), Some((b0, b1))) = (pair[0].tilt, pair[1].tilt) {
+            let k = mesh.vertices.len() as u32;
+            for p in [at(pair[0].speed, a0), at(pair[1].speed, b0), at(pair[1].speed, b1), at(pair[0].speed, a1)] {
+                mesh.colored_vertex(p, band);
+            }
+            mesh.add_triangle(k, k + 1, k + 2);
+            mesh.add_triangle(k, k + 2, k + 3);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    let line: Vec<egui::Pos2> = s.points().iter().map(|p| at(p.speed, p.tilt)).collect();
+    painter.add(egui::Shape::line(line, egui::Stroke::new(1.5, egui::Color32::WHITE)));
+    let vs = s.stall_speed();
+    painter.line_segment(
+        [at(vs, 0.0), at(vs, max_tilt)],
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(230, 80, 60, 160)),
+    );
+    painter.circle_filled(at(airspeed, tilt), 4.0, egui::Color32::from_rgb(250, 210, 40));
+    painter.text(
+        rect.right_bottom() + egui::vec2(-4.0, -2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("tilt vs airspeed 0–{top:.0} m/s"),
+        egui::FontId::monospace(10.0),
+        egui::Color32::LIGHT_GRAY,
+    );
 }
 
 /// Artificial horizon: sky and ground split by the horizon, rotated by the bank (right bank

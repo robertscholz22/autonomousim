@@ -566,7 +566,6 @@ impl Tiltrotor {
         &self.outputs[..self.rotors]
     }
 
-    /// Electric power drawn by all motors in the last step (W).
     /// Show recorded state without stepping (replay): rotor speeds (rad/s), throttles, mount
     /// tilts (rad), surface channel deflections (rad), electric power of all motors (W, shared
     /// evenly), airspeed (m/s), angle of attack and sideslip (rad). Entries beyond the
@@ -603,6 +602,7 @@ impl Tiltrotor {
         self.h_rotor
     }
 
+    /// Electric power drawn by all motors in the last step (W).
     pub fn electric_power(&self) -> f64 {
         self.rotor_outputs().iter().map(|o| o.electric_power).sum()
     }

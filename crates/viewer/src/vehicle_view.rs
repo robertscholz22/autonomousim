@@ -4,7 +4,9 @@
 //! each side, wrapped around its sprocket, road wheels and idler and running with the road
 //! wheels; an aircraft's airframe with its ailerons, flaps, elevator and rudder turned by the
 //! simulated (or recorded) deflections and a propeller disc; a helicopter's airframe with its
-//! rotor heads turning, tilted with the tip-path plane, and the blades coned. The units behind
+//! rotor heads turning, tilted with the tip-path plane, and the blades coned; a tiltrotor's
+//! airframe with its flaps turned by the mixed channel deflections and its rotor pods tilted
+//! with their mounts. The units behind
 //! a tractor (trailers, dollies, drawbars) are children of the root posed from the simulated
 //! joints, and carry their own wheels and links.
 
@@ -48,6 +50,29 @@ fn surface_transform(s: &props::SurfaceVisual, angle: f64) -> Transform {
 fn surface_angle(f: &FixedWing, s: &props::SurfaceVisual) -> f64 {
     let d = f.surfaces()[s.control];
     if s.control < 3 { d * f.control_signs()[s.control] } else { d }
+}
+
+/// A flapped surface of a tiltrotor agent, turned about its hinge by its mixed deflection.
+#[derive(Component)]
+pub struct TiltSurfacePart {
+    agent: usize,
+    visual: props::TiltSurfaceVisual,
+}
+
+fn tilt_surface_transform(s: &props::TiltSurfaceVisual, angle: f64) -> Transform {
+    convert::transform(&Pose { pos: s.hinge, rot: glam::DQuat::from_axis_angle(s.axis, angle) })
+}
+
+/// A tiltrotor's rotor pod, turned about the body y axis through its pivot by the mount tilt.
+#[derive(Component)]
+pub struct Nacelle {
+    agent: usize,
+    rotor: usize,
+    pivot: glam::DVec3,
+}
+
+fn nacelle_transform(pivot: glam::DVec3, tilt: f64) -> Transform {
+    convert::transform(&Pose { pos: pivot, rot: glam::DQuat::from_rotation_y(tilt) })
 }
 
 /// Unit `unit` (≥ 1) of a wheeled agent; its transform is relative to the towing unit.
@@ -198,6 +223,24 @@ fn blade_transform(k: u32, count: u32, coning: f64) -> Transform {
 
 /// Turn the helicopters' rotor heads by the shown rotor speed over the frame's simulated time,
 /// tilt them with the tip-path plane and cone the blades.
+/// Turn the tiltrotors' flaps by their mixed deflections and their pods by the mount tilts.
+pub fn sync_tiltrotors(
+    sim: Res<Sim>,
+    mut surfaces: Query<(&TiltSurfacePart, &mut Transform), Without<Nacelle>>,
+    mut pods: Query<(&Nacelle, &mut Transform), Without<TiltSurfacePart>>,
+) {
+    for (sp, mut t) in &mut surfaces {
+        let Some(v) = sim.world.agent(sp.agent).vehicle.as_tiltrotor() else { continue };
+        let gains = v.surface_gains().get(sp.visual.surface).copied().unwrap_or_default();
+        let c = v.channels();
+        *t = tilt_surface_transform(&sp.visual, gains[0] * c[0] + gains[1] * c[1] + gains[2] * c[2]);
+    }
+    for (n, mut t) in &mut pods {
+        let Some(v) = sim.world.agent(n.agent).vehicle.as_tiltrotor() else { continue };
+        *t = nacelle_transform(n.pivot, v.tilts().get(n.rotor).copied().unwrap_or(0.0));
+    }
+}
+
 pub fn sync_rotors(
     time: Res<Time>,
     sim: Res<Sim>,
@@ -275,13 +318,48 @@ pub fn spawn_vehicles(
                 continue;
             }
             Vehicle::Tiltrotor(t) => {
-                // Placeholder until the tiltrotor visual: a box the size of the airframe.
-                let d = t.def();
-                let span = d.span().max(0.5) as f32;
-                commands.spawn(root).with_child((
-                    Mesh3d(meshes.add(Cuboid::new(0.6 * span, 0.08 * span, 0.15 * span))),
-                    MeshMaterial3d(body_material.clone()),
-                ));
+                let v = props::tiltrotor(t.def());
+                let root = commands.spawn(root).id();
+                commands
+                    .entity(root)
+                    .with_child((Mesh3d(meshes.add(convert::mesh(&v.body))), MeshMaterial3d(body_material.clone())));
+                for s in &v.surfaces {
+                    commands.entity(root).with_child((
+                        Mesh3d(meshes.add(convert::mesh(&s.mesh))),
+                        MeshMaterial3d(body_material.clone()),
+                        tilt_surface_transform(s, 0.0),
+                        TiltSurfacePart { agent: i, visual: s.clone() },
+                    ));
+                }
+                for (k, n) in v.nacelles.iter().enumerate() {
+                    let material = materials.add(StandardMaterial {
+                        base_color: Color::linear_rgba(0.1, 0.1, 0.1, 0.3),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        double_sided: true,
+                        unlit: true,
+                        ..default()
+                    });
+                    let pod = commands
+                        .spawn((
+                            nacelle_transform(n.pivot, t.tilts().get(k).copied().unwrap_or(0.0)),
+                            Visibility::default(),
+                            Nacelle { agent: i, rotor: k, pivot: n.pivot },
+                        ))
+                        .id();
+                    commands.entity(root).add_child(pod);
+                    commands.entity(pod).with_child((
+                        Mesh3d(meshes.add(convert::mesh(&n.mesh))),
+                        MeshMaterial3d(body_material.clone()),
+                    ));
+                    commands.entity(pod).with_child((
+                        Mesh3d(meshes.add(convert::mesh(&props::rotor_disc(n.radius, [1.0; 4])))),
+                        MeshMaterial3d(material),
+                        Transform::from_translation(convert::vec(glam::DVec3::Z * n.offset)),
+                        RotorDisc { agent: i, rotor: k },
+                        bevy::light::NotShadowCaster,
+                    ));
+                }
                 continue;
             }
             Vehicle::Helicopter(h) => {
@@ -475,6 +553,7 @@ pub fn sync_vehicles(
         let Some(f) = sim.world.agent(sp.agent).vehicle.as_fixed_wing() else { continue };
         *t = surface_transform(&sp.visual, surface_angle(f, &sp.visual));
     }
+
     for (v, mut t) in &mut roots {
         *t = origin.transform(&sim.render_pose(v.0));
     }
@@ -498,6 +577,8 @@ pub fn sync_vehicles(
             (f.rotor_speed(), f.full_throttle_speed())
         } else if let Some(h) = vehicle.as_helicopter() {
             (h.rotor_speed(), h.def().engine.rated_speed)
+        } else if let Some(v) = vehicle.as_tiltrotor() {
+            (v.rotor_speeds().get(d.rotor).copied().unwrap_or(0.0), v.full_throttle_speed())
         } else {
             continue;
         };
@@ -711,6 +792,72 @@ mod tests {
         assert!(coning > 0.01);
         for (_, _, q) in blades.iter().filter(|b| b.0 == 0 && b.1.is_some()) {
             assert!(((*q * glam::DVec3::X).z - coning.sin()).abs() < 1e-5);
+        }
+    }
+
+    /// A tiltrotor shown mid-conversion with deflected controls: each pod turns about its
+    /// pivot by its mount's tilt (the thrust axis tips forward), and each flap by the mixed
+    /// channel deflections.
+    #[test]
+    fn tilt_pods_and_flaps_follow_the_state() {
+        let sc = Scenario {
+            map: MapSource::Testworld(Testworld::Flat { size: 2000.0 }),
+            groups: vec![GroupSpec {
+                vehicle: VehicleRef::Name("quadtilt_like".into()),
+                spawn: autonomousim_sim::scenario::SpawnSpec { agl: [30.0, 30.0], ..Default::default() },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1));
+        let t = world.agent_mut(0).vehicle.as_tiltrotor_mut().unwrap();
+        let n = t.rotor_count();
+        let tilts: Vec<f64> = (0..n).map(|k| 0.3 + 0.2 * k as f64).collect();
+        t.show(&autonomousim_vehicles::tiltrotor::TiltrotorDisplay {
+            rotor_speeds: vec![300.0; n],
+            throttles: vec![0.5; n],
+            tilts: tilts.clone(),
+            channels: [0.1, -0.15, 0.05],
+            electric_power: 100.0,
+            airspeed: 10.0,
+            alpha: 0.05,
+            beta: 0.0,
+        });
+        let mut app = World::new();
+        app.insert_resource(Sim::new(world));
+        app.init_resource::<RenderOrigin>();
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.run_system_once(spawn_vehicles).unwrap();
+        app.run_system_once(sync_tiltrotors).unwrap();
+        let pose = |t: &Transform| {
+            Pose::new(
+                convert::enu(t.translation),
+                autonomousim_core::math::frames::bevy_to_enu_quat(t.rotation.to_array()),
+            )
+        };
+        let pods: Vec<(usize, glam::DVec3, Pose)> =
+            app.query::<(&Nacelle, &Transform)>().iter(&app).map(|(n, t)| (n.rotor, n.pivot, pose(t))).collect();
+        let flaps: Vec<(props::TiltSurfaceVisual, Pose)> = app
+            .query::<(&TiltSurfacePart, &Transform)>()
+            .iter(&app)
+            .map(|(s, t)| (s.visual.clone(), pose(t)))
+            .collect();
+        let sim = app.resource::<Sim>();
+        let t = sim.world.agent(0).vehicle.as_tiltrotor().unwrap();
+        assert_eq!(pods.len(), n);
+        for (k, pivot, p) in pods {
+            assert!((p.pos - pivot).length() < 1e-5 && (pivot - t.def().rotors[k].pivot).length() < 1e-12);
+            let axis = p.rot * glam::DVec3::Z;
+            assert!((axis - glam::DVec3::new(tilts[k].sin(), 0.0, tilts[k].cos())).length() < 1e-5, "{k}: {axis}");
+        }
+        assert!(!flaps.is_empty());
+        for (v, p) in flaps {
+            let g = t.surface_gains()[v.surface];
+            let angle = g[0] * 0.1 - g[1] * 0.15 + g[2] * 0.05;
+            let (axis, got) = p.rot.to_axis_angle();
+            let got = if axis.dot(v.axis) < 0.0 { -got } else { got };
+            assert!((got - angle).abs() < 1e-5 && (p.pos - v.hinge).length() < 1e-5, "{}: {got} vs {angle}", v.surface);
         }
     }
 

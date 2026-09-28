@@ -8,8 +8,10 @@
 
 use crate::replay::Replay;
 use crate::sim::Sim;
+use autonomousim_control::fixedwing::euler;
 use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_control::multirotor::{Frame, Setpoint, StateEstimate};
+use autonomousim_control::tiltrotor::TiltrotorSetpoint;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_sim::WorldInstance;
 use autonomousim_world::StaticWorld;
@@ -36,6 +38,8 @@ pub enum Tracking {
     Position,
     /// Ground vehicles: yaw rate (°/s) and forward speed (m/s).
     Ground,
+    /// Tiltrotors in `attitude`: bank and pitch (°) and airspeed (m/s).
+    Attitude,
 }
 
 impl Tracking {
@@ -47,6 +51,7 @@ impl Tracking {
             Tracking::Velocity => "velocity (m/s)",
             Tracking::Position => "position (m)",
             Tracking::Ground => "yaw rate (°/s) and speed (m/s)",
+            Tracking::Attitude => "bank, pitch (°) and airspeed (m/s)",
         }
     }
 
@@ -58,6 +63,7 @@ impl Tracking {
             Tracking::Tilt => ["x", "y", "-"],
             Tracking::Velocity | Tracking::Position => ["x", "y", "z"],
             Tracking::Ground => ["yaw rate", "speed", "-"],
+            Tracking::Attitude => ["bank", "pitch", "airspeed"],
         }
     }
 }
@@ -157,6 +163,32 @@ pub fn tracking(setpoint: &Setpoint, est: &StateEstimate, motors: &[f64]) -> (Tr
     }
 }
 
+/// A tiltrotor's setpoint components and the measured quantities they ask for: velocity in the
+/// heading frame, world position, or bank, pitch and airspeed (none for raw inputs).
+pub fn tilt_tracking(
+    setpoint: &TiltrotorSetpoint,
+    position: DVec3,
+    velocity: DVec3,
+    attitude: DQuat,
+    airspeed: f64,
+) -> Option<(Tracking, [f64; 3], [f64; 3])> {
+    match *setpoint {
+        TiltrotorSetpoint::Raw(_) => None,
+        TiltrotorSetpoint::Velocity { velocity: v, .. } => {
+            let actual = DQuat::from_rotation_z(-yaw(attitude)) * velocity;
+            Some((Tracking::Velocity, v.to_array(), actual.to_array()))
+        }
+        TiltrotorSetpoint::Position { position: p, .. } => {
+            Some((Tracking::Position, p.to_array(), position.to_array()))
+        }
+        TiltrotorSetpoint::Attitude { roll, pitch, airspeed: v, .. } => {
+            let (r, p, _) = euler(attitude);
+            let command = [roll.to_degrees(), pitch.to_degrees(), v];
+            Some((Tracking::Attitude, command, [r.to_degrees(), p.to_degrees(), airspeed]))
+        }
+    }
+}
+
 /// Plot data of the followed agent.
 #[derive(Resource, Default)]
 pub struct History {
@@ -188,6 +220,13 @@ fn live_sample(world: &WorldInstance, i: usize) -> (Tracking, Sample) {
     let (mut sideslip_deg, mut wheels) = (f64::NAN, Vec::new());
     let (tracking, command, actual) = match (v.as_multirotor(), agent.command().as_multirotor()) {
         (Some(m), Some(sp)) => tracking(sp, &StateEstimate::of(m), m.motor_speeds()),
+        (None, _) if let (Some(t), Some(sp)) = (v.as_tiltrotor(), agent.command().as_tiltrotor()) => {
+            tilt_tracking(sp, t.position(), t.lin_vel_world(), t.orientation(), t.flow().airspeed).unwrap_or((
+                Tracking::default(),
+                [f64::NAN; 3],
+                [f64::NAN; 3],
+            ))
+        }
         _ => match v.as_wheeled() {
             Some(w) => {
                 let vb = w.lin_vel_body();
@@ -229,6 +268,9 @@ fn episode_samples(replay: &Replay, world: &WorldInstance, agent: usize) -> (Tra
     if let Some(ground) = group.action_map.as_ground() {
         return (Tracking::Ground, ground_episode_samples(replay, world, agent, map, ground));
     }
+    if let Some(tilt) = group.action_map.as_tiltrotor() {
+        return tilt_episode_samples(replay, agent, map, tilt);
+    }
     let Some(action_map) = group.action_map.as_multirotor() else { return (Tracking::default(), Vec::new()) };
     let (Some(states), actions) = (ep.states.get(agent), ep.actions.get(agent).map_or(&[][..], |a| &a[..])) else {
         return (Tracking::default(), Vec::new());
@@ -252,6 +294,46 @@ fn episode_samples(replay: &Replay, world: &WorldInstance, agent: usize) -> (Tra
                     (c, m)
                 }
                 _ => ([f64::NAN; 3], [f64::NAN; 3]),
+            };
+            Sample {
+                time: s.time,
+                agl: s.position.z - map.surface_height(s.position.x, s.position.y),
+                goal_distance: (s.position - s.goal).length(),
+                command,
+                actual,
+                sideslip: f64::NAN,
+                wheels: Vec::new(),
+            }
+        })
+        .collect();
+    (kind, samples)
+}
+
+/// Tiltrotor curves over the playback's episode, with the setpoints of the recorded actions.
+fn tilt_episode_samples(
+    replay: &Replay,
+    agent: usize,
+    map: &StaticWorld,
+    action_map: &autonomousim_control::tiltrotor::TiltrotorActionMap,
+) -> (Tracking, Vec<Sample>) {
+    let ep = replay.current();
+    let Some(states) = ep.states.get(agent) else { return (Tracking::default(), Vec::new()) };
+    let actions = ep.actions.get(agent).map_or(&[][..], |a| &a[..]);
+    let mut kind = Tracking::default();
+    let samples = states
+        .iter()
+        .map(|s| {
+            let k = actions.partition_point(|a| a.time <= s.time);
+            let tracked =
+                k.checked_sub(1).map(|k| &actions[k]).filter(|a| a.action.len() == action_map.dim()).and_then(|a| {
+                    tilt_tracking(&action_map.setpoint(&a.action), s.position, s.velocity, s.orientation, s.airspeed)
+                });
+            let (command, actual) = match tracked {
+                Some((t, c, m)) => {
+                    kind = t;
+                    (c, m)
+                }
+                None => ([f64::NAN; 3], [f64::NAN; 3]),
             };
             Sample {
                 time: s.time,
@@ -368,6 +450,23 @@ mod tests {
         let (kind, _, act) = tracking(&sp, &level(q), &[]);
         assert_eq!(kind, Tracking::Rates);
         assert!((act[0] - 0.1f64.to_degrees()).abs() < 1e-9);
+    }
+
+    /// Tiltrotor setpoints: velocity in the heading frame, bank, pitch and airspeed; raw
+    /// inputs have nothing to track.
+    #[test]
+    fn tiltrotor_quantities_match_their_setpoints() {
+        let q = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2) * DQuat::from_rotation_x(-0.2);
+        let v = DVec3::new(0.0, 15.0, 1.0);
+        let sp = TiltrotorSetpoint::Velocity { velocity: DVec3::new(15.0, 0.0, 0.0), yaw_rate: 0.1 };
+        let (kind, cmd, act) = tilt_tracking(&sp, DVec3::ZERO, v, q, 15.0).unwrap();
+        assert_eq!((kind, cmd), (Tracking::Velocity, [15.0, 0.0, 0.0]));
+        assert!((act[0] - 15.0).abs() < 1e-9 && act[1].abs() < 1e-9 && (act[2] - 1.0).abs() < 1e-12, "{act:?}");
+        let sp = TiltrotorSetpoint::Attitude { roll: -0.2, pitch: 0.05, yaw_rate: 0.0, climb: 0.0, airspeed: 16.0 };
+        let (kind, cmd, act) = tilt_tracking(&sp, DVec3::ZERO, v, q, 15.0).unwrap();
+        assert_eq!(kind, Tracking::Attitude);
+        assert!((cmd[0] - act[0]).abs() < 1e-9 && (cmd[2], act[2]) == (16.0, 15.0), "{cmd:?} {act:?}");
+        assert!(tilt_tracking(&TiltrotorSetpoint::Raw(Default::default()), DVec3::ZERO, v, q, 15.0).is_none());
     }
 
     #[test]

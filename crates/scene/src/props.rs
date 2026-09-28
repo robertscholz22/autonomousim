@@ -1184,6 +1184,32 @@ mod tests {
     }
 
     #[test]
+    fn tiltrotor_visual_matches_its_definition() {
+        let def = presets::tiltrotor("quadtilt_like").unwrap();
+        let v = tiltrotor(&def);
+        // One pod per rotor at its pivot, the disc at the hub with the propeller's radius.
+        assert_eq!(v.nacelles.len(), def.rotors.len());
+        for (n, r) in v.nacelles.iter().zip(&def.rotors) {
+            assert_eq!((n.pivot, n.offset), (r.pivot, r.offset));
+            assert!((f64::from(n.radius) - 0.5 * def.propeller.diameter).abs() < 1e-6);
+            let (lo, hi) = n.mesh.bounds().unwrap();
+            assert!(lo.z < 0.0 && f64::from(hi.z) >= r.offset - 0.05, "{lo} {hi}");
+        }
+        // Every flapped surface has a flap visual, hinged on its trailing edge.
+        let flapped: Vec<usize> = (0..def.surfaces.len()).filter(|&i| def.surfaces[i].flap.is_some()).collect();
+        assert_eq!(v.surfaces.iter().map(|s| s.surface).collect::<Vec<_>>(), flapped);
+        for s in &v.surfaces {
+            let d = &def.surfaces[s.surface];
+            assert!(s.hinge.x < d.position.x && (s.axis.length() - 1.0).abs() < 1e-12);
+        }
+        // The body spans the wings and the rotor pivots.
+        let (lo, hi) = v.body.bounds().unwrap();
+        let wing = def.surfaces.iter().map(|s| 0.5 * s.span).fold(0.0, f64::max);
+        assert!(f64::from(hi.y) >= 0.95 * wing && f64::from(lo.y) <= -0.95 * wing, "{lo} {hi}");
+        assert!(v.span as f64 >= wing && v.eye.x > 0.0);
+    }
+
+    #[test]
     fn multirotor_visual_matches_its_definition() {
         for name in ["cf2x", "iris_like"] {
             let def = presets::multirotor(name).unwrap();
