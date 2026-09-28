@@ -3,7 +3,7 @@
 
 use crate::mesh::{self, MeshData, srgb};
 use crate::terrain::Chunk;
-use autonomousim_core::material::MaterialId;
+use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_vehicles::ground::tire::TireModel;
 use autonomousim_world::obstacles::tags;
 use autonomousim_world::{HeightGrid, Obstacle, ObstacleClass, ObstacleShape, StaticWorld};
@@ -53,7 +53,7 @@ fn extent(shape: &ObstacleShape) -> f64 {
 }
 
 /// Base colour (sRGB) of an obstacle.
-fn base_color(world: &StaticWorld, o: &Obstacle) -> [u8; 3] {
+fn base_color(table: &MaterialTable, o: &Obstacle) -> [u8; 3] {
     match o.tag {
         tags::TRUNK => [92, 66, 46],
         tags::CANOPY => [44, 82, 50],
@@ -67,15 +67,18 @@ fn base_color(world: &StaticWorld, o: &Obstacle) -> [u8; 3] {
             _ => [166, 170, 176],
         },
         _ => {
-            let table = world.materials();
-            if (o.material.0 as usize) < table.len() { table.get(o.material).color } else { [200, 0, 200] }
+            if (o.material.0 as usize) < table.len() {
+                table.get(o.material).color
+            } else {
+                [200, 0, 200]
+            }
         }
     }
 }
 
 /// Brightness factor in [0.82, 1.18] that varies from obstacle to obstacle.
-fn variation(index: usize) -> f32 {
-    let mut h = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+fn variation(index: u64) -> f32 {
+    let mut h = index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^= h >> 29;
     0.82 + 0.36 * ((h & 0xFFFF) as f32 / 65535.0)
 }
@@ -162,18 +165,36 @@ pub fn chunk_index(grid: &HeightGrid, size: usize, p: DVec3) -> usize {
 /// chunk has no obstacles).
 pub fn props_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize, detail: PropDetail) -> Vec<MeshData> {
     let grid = world.grid();
-    let mut out = vec![MeshData::new(); chunks.len()];
-    for (i, o) in world.obstacle_set().obstacles().iter().enumerate() {
+    let obstacles = world.obstacle_set().obstacles().iter().enumerate();
+    props_grouped(
+        world.materials(),
+        obstacles.map(|(i, o)| (i as u64, o, chunk_index(grid, size, o.pose.pos))),
+        chunks.len(),
+        detail,
+        DVec3::ZERO,
+    )
+}
+
+/// Obstacle meshes merged into `n` groups, relative to `anchor`: `items` are
+/// `(key, obstacle, group)`; the key varies the brightness from obstacle to obstacle.
+pub fn props_grouped<'a>(
+    materials: &MaterialTable,
+    items: impl Iterator<Item = (u64, &'a Obstacle, usize)>,
+    n: usize,
+    detail: PropDetail,
+    anchor: DVec3,
+) -> Vec<MeshData> {
+    let mut out = vec![MeshData::new(); n];
+    for (key, o, k) in items {
         // Hedges hide their woody cores.
         let hidden = o.tag == tags::HEDGE && o.class == ObstacleClass::Solid;
         if hidden || (detail.min_size > 0.0 && extent(&o.shape) < detail.min_size) {
             continue;
         }
-        let k = chunk_index(grid, size, o.pose.pos);
-        let color = srgb(base_color(world, o));
+        let color = srgb(base_color(materials, o));
         let mut m = obstacle_visual(o, color, detail);
-        m.tint(variation(i));
-        out[k].append_transformed(&m, o.pose.rot, o.pose.pos);
+        m.tint(variation(key));
+        out[k].append_transformed(&m, o.pose.rot, o.pose.pos - anchor);
     }
     out
 }

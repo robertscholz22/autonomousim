@@ -36,3 +36,22 @@ pub fn mesh(m: &MeshData) -> Mesh {
 pub fn transform(p: &autonomousim_core::math::Pose) -> Transform {
     Transform::from_translation(vec(p.pos)).with_rotation(quat(p.rot))
 }
+
+/// Where render space is centred (ENU). Far from the map origin f32 coordinates lose
+/// precision (a centimetre at 100 km, jitter long before), so everything is placed relative to
+/// this point, computed in f64; it follows the camera in steps (see
+/// [`recenter`](crate::world_view::recenter)).
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderOrigin(pub glam::DVec3);
+
+impl RenderOrigin {
+    /// ENU position → Bevy position.
+    pub fn pos(&self, p: glam::DVec3) -> Vec3 {
+        vec(p - self.0)
+    }
+
+    /// ENU pose → Bevy transform.
+    pub fn transform(&self, p: &autonomousim_core::math::Pose) -> Transform {
+        Transform::from_translation(self.pos(p.pos)).with_rotation(quat(p.rot))
+    }
+}

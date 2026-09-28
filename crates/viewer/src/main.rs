@@ -6,6 +6,7 @@
 //! cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4 --record drive.mcap
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle truck_6x4 --trailer semitrailer_3axle
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle motorcycle_sport
+//! cargo run -p autonomousim-viewer --release -- --preset large --demo --demo-speed 30 --demo-agl 200 --demo-turn 0
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
 //! cargo run -p autonomousim-viewer --release -- policy runs/run/policy.json --agents 4
@@ -117,7 +118,7 @@ struct LiveArgs {
     /// Map generator.
     #[arg(long, value_enum, default_value_t = MapKind::Wild)]
     map: MapKind,
-    /// Map preset: `training`, `showcase` or (wild maps) `offroad`.
+    /// Map preset: `training`, `showcase` or (wild maps) `offroad` and `large` (16 km, tiled).
     #[arg(long, default_value = "showcase")]
     preset: String,
     /// Map seed.
@@ -145,6 +146,19 @@ struct LiveArgs {
     /// and performance checks).
     #[arg(long)]
     demo: bool,
+    /// Speed of the demo flight (m/s).
+    #[arg(long, default_value_t = 8.0)]
+    demo_speed: f64,
+    /// Height of the demo flight above the ground (m).
+    #[arg(long, default_value_t = 40.0)]
+    demo_agl: f64,
+    /// Turn rate of the demo flight (rad/s).
+    #[arg(long, default_value_t = 0.1)]
+    demo_turn: f64,
+    /// With `--demo`: the free camera flies the demo flight on its own (at any speed; the
+    /// vehicle keeps its own demo), for streaming and frame-rate checks on large maps.
+    #[arg(long)]
+    demo_camera: bool,
     /// Record the session to this MCAP file (replay it with `replay`).
     #[arg(long)]
     record: Option<PathBuf>,
@@ -210,6 +224,25 @@ impl Quality {
             Quality::Low => 500.0,
             Quality::Medium => 900.0,
             Quality::High => 1600.0,
+        }
+    }
+
+    /// View distance at ground level on tiled (large) maps (m), where the coarse layer is
+    /// cheap to draw far out.
+    fn far_view_distance(self) -> f32 {
+        match self {
+            Quality::Low => 2500.0,
+            Quality::Medium => 4000.0,
+            Quality::High => 6000.0,
+        }
+    }
+
+    /// Radius around the camera within which tiled maps show their detail tiles (m).
+    fn tile_radius(self) -> f64 {
+        match self {
+            Quality::Low => 500.0,
+            Quality::Medium => 900.0,
+            Quality::High => 1400.0,
         }
     }
 
@@ -322,7 +355,7 @@ struct Capture {
     /// Frames of the run and frames left.
     total: u32,
     frames: u32,
-    demo: bool,
+    demo: Option<DemoFlight>,
     /// Start of the measured frames (after a warm-up) and their count.
     measured: Option<(std::time::Instant, u32)>,
 }
@@ -394,7 +427,7 @@ fn main() -> anyhow::Result<()> {
             let mut replay = replay::Replay::new(recording, episode.saturating_sub(1));
             replay.looping = !once;
             let title = format!("autonomousim · replay {}", file.file_name().unwrap_or_default().to_string_lossy());
-            (sim::Sim::replay(world, replay), display, None, false, title)
+            (sim::Sim::replay(world, replay), display, None, None, title)
         }
         Some(Command::Policy { file, map_seed, agents, episode_seed, no_cache, record, display }) => {
             let policy = PolicyFile::read(&file)?;
@@ -414,7 +447,7 @@ fn main() -> anyhow::Result<()> {
             start_recording(&mut sim, record.as_ref())?;
             let regen = Regenerate { seed: map_seed, scenario: sc, pending: None, error: None };
             let title = format!("autonomousim · policy {}", policy.name);
-            (sim, display, Some(regen), false, title)
+            (sim, display, Some(regen), None, title)
         }
         command => {
             let (live, display) = match command {
@@ -427,7 +460,13 @@ fn main() -> anyhow::Result<()> {
             let regen = Regenerate { seed: live.seed, scenario: sc, pending: None, error: None };
             let mut sim = sim::Sim::new(world);
             start_recording(&mut sim, live.record.as_ref())?;
-            (sim, display, Some(regen), live.demo, "autonomousim".to_owned())
+            let demo = live.demo.then_some(DemoFlight {
+                speed: live.demo_speed,
+                agl: live.demo_agl,
+                turn: live.demo_turn,
+                camera: live.demo_camera,
+            });
+            (sim, display, Some(regen), demo, "autonomousim".to_owned())
         }
     };
     let map = sim.world.map().clone();
@@ -444,6 +483,7 @@ fn main() -> anyhow::Result<()> {
     let mut app = App::new();
     app.insert_resource(ClearColor(sky))
         .insert_resource(quality)
+        .init_resource::<convert::RenderOrigin>()
         .insert_resource(world_view::MapView::new(map, quality))
         .insert_resource(history::History::default())
         .insert_resource(overlay::Overlay::default())
@@ -488,11 +528,14 @@ fn main() -> anyhow::Result<()> {
                 demo_pilot,
                 sim::step,
                 history::record,
+                world_view::recenter,
                 world_view::sync_map,
                 vehicle_view::sync_vehicles,
                 vehicle_view::sync_tracks,
                 vehicle_view::sync_riders,
                 camera::update_camera,
+                world_view::stream_tiles,
+                world_view::update_view_distance,
                 world_view::update_lod,
                 overlay::draw,
                 capture,
@@ -509,7 +552,13 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_camera(mut commands: Commands, sim: Res<sim::Sim>, view: Res<world_view::MapView>, quality: Res<Quality>) {
+fn spawn_camera(
+    mut commands: Commands,
+    sim: Res<sim::Sim>,
+    view: Res<world_view::MapView>,
+    quality: Res<Quality>,
+    capture: Res<Capture>,
+) {
     let v = &sim.world.agent(sim.pilot).vehicle;
     let heading = yaw(v.orientation());
     let (span, rig) = match v {
@@ -527,6 +576,14 @@ fn spawn_camera(mut commands: Commands, sim: Res<sim::Sim>, view: Res<world_view
             (visual.span, rig)
         }
     };
+    let mut rig = rig;
+    if let Some(d) = capture.demo.filter(|d| d.camera) {
+        rig.mode = camera::CameraMode::Free;
+        rig.flythrough = Some([d.speed, d.agl, d.turn]);
+        rig.pitch = 0.25;
+        let p = v.position();
+        rig.eye = p.truncate().extend(view.surface_height(p.x, p.y) + d.agl);
+    }
     let far = view.view_distance;
     commands.spawn((
         Camera3d::default(),
@@ -569,20 +626,31 @@ fn finish_recording(mut exits: MessageReader<AppExit>, mut sim: ResMut<sim::Sim>
     }
 }
 
-/// With `--demo`: fly forward at 8 m/s, turning slowly, 40 m above the ground (above the
-/// tallest trees); ground vehicles drive to random reachable places along drivable paths.
+/// The demo flight: speed (m/s), height above the ground (m) and turn rate (rad/s).
+#[derive(Clone, Copy, Debug)]
+struct DemoFlight {
+    speed: f64,
+    agl: f64,
+    turn: f64,
+    /// The camera flies it, not the vehicle.
+    camera: bool,
+}
+
+/// With `--demo`: fly forward (by default at 8 m/s, turning slowly, 40 m above the ground,
+/// above the tallest trees); ground vehicles drive to random reachable places along drivable
+/// paths.
 fn demo_pilot(capture: Res<Capture>, mut sim: ResMut<sim::Sim>, mut route: ResMut<DemoRoute>) {
-    if !capture.demo {
-        return;
-    }
+    let Some(demo) = capture.demo else { return };
     if sim.world.agent(sim.pilot).vehicle.family() == autonomousim_vehicles::Family::Wheeled {
         drive_demo(&mut sim, &mut route);
         return;
     }
     let agl = sim.world.agent(sim.pilot).agl_now(sim.world.map());
-    let climb = (40.0 - agl).clamp(-2.0, 3.0);
+    let demo = if demo.camera { DemoFlight { speed: 8.0, agl: 40.0, turn: 0.1, camera: false } } else { demo };
+    let climb = (demo.agl - agl).clamp(-2.0, 3.0);
     sim.pilot_mode = sim::PilotMode::Velocity;
-    sim.stick = [8.0 / sim.max_speed, 0.0, climb / sim.max_climb, 0.1 / sim.max_yaw_rate];
+    sim.max_speed = sim.max_speed.max(demo.speed);
+    sim.stick = [demo.speed / sim.max_speed, 0.0, climb / sim.max_climb, demo.turn / sim.max_yaw_rate];
 }
 
 /// The demo driver's route: grid path points still ahead, and its random state.
@@ -785,6 +853,7 @@ mod tests {
         let first = world.map().clone();
         let mut app = World::new();
         app.insert_resource(world_view::MapView::new(first.clone(), Quality::Low));
+        app.init_resource::<convert::RenderOrigin>();
         app.insert_resource(sim::Sim::new(world));
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
@@ -810,6 +879,88 @@ mod tests {
         assert!(Arc::ptr_eq(&view.world, app.resource::<sim::Sim>().world.map()));
         let after: Vec<Entity> = app.query_filtered::<Entity, With<MapEntity>>().iter(&app).collect();
         assert!(!after.is_empty() && before.iter().all(|e| app.get_entity(*e).is_err()));
+    }
+
+    /// On a tiled map the coarse layer is drawn at once and the detail tiles around the camera
+    /// are built in the background, hide their coarse chunks, and are dropped once the camera
+    /// has moved away; the render origin follows the camera in 1 km steps and moves the map
+    /// with it.
+    #[test]
+    fn tiled_maps_stream_tiles_around_the_camera() {
+        use world_view::{Anchor, CoarseOf, DetailOf};
+        let cli = Cli::parse_from(["viewer", "--preset", "large", "--size", "2048", "--no-cache", "--seed", "2"]);
+        let sc = scenario(&cli.live).unwrap();
+        let world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(0));
+        let map = world.map().clone();
+        let layout = *map.terrain().tiled().unwrap().layout();
+        let mut app = World::new();
+        app.insert_resource(world_view::MapView::new(map, Quality::Low));
+        app.init_resource::<convert::RenderOrigin>();
+        app.insert_resource(sim::Sim::new(world));
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.run_system_once(world_view::spawn_map).unwrap();
+        let coarse = app.query_filtered::<(), (With<CoarseOf>, With<world_view::TerrainChunk>)>().iter(&app).count();
+        assert_eq!(coarse, 64);
+        let rig = app.spawn(CameraRig { eye: glam::DVec3::new(0.0, 0.0, 300.0), ..CameraRig::new(1.0, 0.0) }).id();
+
+        // Stream until every tile within the radius (500 m on low quality) is shown; tiles
+        // are dropped only beyond 1.25 radii.
+        let distance = |key: (u32, u32), eye: glam::DVec3| {
+            let (lo, hi) = layout.core(key.0, key.1);
+            (eye.truncate().clamp(lo, hi) - eye.truncate()).length()
+        };
+        let shown = |app: &mut World| -> std::collections::HashSet<(u32, u32)> {
+            app.query::<&DetailOf>().iter(app).map(|d| d.0).collect()
+        };
+        let stream = |app: &mut World, eye: glam::DVec3| {
+            let wanted: Vec<(u32, u32)> = (0..8u32)
+                .flat_map(|ty| (0..8u32).map(move |tx| (tx, ty)))
+                .filter(|&k| distance(k, eye) <= 500.0)
+                .collect();
+            let start = std::time::Instant::now();
+            loop {
+                app.run_system_once(world_view::stream_tiles).unwrap();
+                let building = app.resource::<world_view::MapView>().streamed_tiles().unwrap().1;
+                let on = shown(app);
+                if building == 0 && wanted.iter().all(|k| on.contains(k)) {
+                    assert!(on.iter().all(|&k| distance(k, eye) <= 625.0));
+                    return wanted.len();
+                }
+                assert!(start.elapsed().as_secs() < 60, "{} tiles shown, {building} building", on.len());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        assert_eq!(stream(&mut app, glam::DVec3::ZERO), 16);
+        let detail = app.query::<&DetailOf>().iter(&app).count();
+        assert!(detail > 16 * 16, "{detail} detail entities");
+        // Detail meshes sit at their tile's corner.
+        for (a, d) in app.query::<(&Anchor, &DetailOf)>().iter(&app) {
+            let (lo, _) = layout.core(d.0.0, d.0.1);
+            assert_eq!(a.0, lo.extend(0.0));
+        }
+        // Coarse chunks under detail tiles are hidden, the others shown.
+        app.run_system_once(world_view::update_lod).unwrap();
+        let on = shown(&mut app);
+        for (c, v) in app.query_filtered::<(&CoarseOf, &Visibility), With<world_view::TerrainChunk>>().iter(&app) {
+            assert_eq!(*v == Visibility::Hidden, on.contains(&c.0), "{:?}", c.0);
+        }
+
+        // Far away, the old tiles go and the new ones come.
+        let far = glam::DVec3::new(-900.0, -900.0, 300.0);
+        app.get_mut::<CameraRig>(rig).unwrap().eye = far;
+        assert_eq!(stream(&mut app, far), 8);
+
+        // The origin stays within 1 km of the camera and carries the map along.
+        app.run_system_once(world_view::recenter).unwrap();
+        assert_eq!(app.resource::<convert::RenderOrigin>().0, glam::DVec3::ZERO);
+        app.get_mut::<CameraRig>(rig).unwrap().eye = glam::DVec3::new(-900.0, 1600.0, 300.0);
+        app.run_system_once(world_view::recenter).unwrap();
+        let origin = *app.resource::<convert::RenderOrigin>();
+        assert_eq!(origin.0, glam::DVec3::new(-1000.0, 2000.0, 0.0));
+        for (a, t) in app.query::<(&Anchor, &Transform)>().iter(&app) {
+            assert_eq!(t.translation, origin.pos(a.0));
+        }
     }
 
     /// A wheeled vehicle gets a driver group; `--record` writes the drive, wheels included.

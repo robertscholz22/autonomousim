@@ -129,6 +129,9 @@ fn status_window(
         .collapsible(true)
         .show(ctx, |ui| {
             ui.label(format!("map {} · seed {} · {} maps in pool", meta.name, meta.seed, world.scenario().maps.len()));
+            if let Some((shown, building)) = view.streamed_tiles() {
+                ui.label(format!("detail tiles {shown} (+{building} building) · view {:.1} km", view.far / 1000.0));
+            }
             let (episode, episodes) = sim.episode();
             let of = episodes.map_or(String::new(), |n| format!(" of {n}"));
             ui.label(format!("agent {} ({}) · episode {episode}{of}", sim.pilot, v.name()));

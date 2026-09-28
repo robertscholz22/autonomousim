@@ -6,7 +6,7 @@
 //!
 //! Angles and positions are computed in ENU and converted once.
 
-use crate::convert;
+use crate::convert::{self, RenderOrigin};
 use crate::sim::Sim;
 use crate::world_view::MapView;
 use autonomousim_core::geometry::{HitMask, Ray};
@@ -71,6 +71,9 @@ pub struct CameraRig {
     /// Where the camera is (ENU), and the speed of the free camera (m/s).
     pub eye: DVec3,
     pub speed: f64,
+    /// The free camera flies on its own: speed (m/s), height above the ground (m) and turn
+    /// rate (rad/s) (for demos and streaming checks).
+    pub flythrough: Option<[f64; 3]>,
 }
 
 impl CameraRig {
@@ -87,6 +90,7 @@ impl CameraRig {
             rear_eye: None,
             eye: DVec3::ZERO,
             speed: 10.0,
+            flythrough: None,
         }
     }
 
@@ -114,6 +118,7 @@ pub fn update_camera(
     time: Res<Time>,
     sim: Res<Sim>,
     view: Res<MapView>,
+    origin: Res<RenderOrigin>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
@@ -170,7 +175,7 @@ pub fn update_camera(
                 .map_or(rig.distance, |hit| (hit.toi - 0.15).max(0.75 * rig.min_distance));
             let mut eye = focus - dir * distance;
             // Stay above the ground and water.
-            let floor = view.world.surface_height(eye.x, eye.y) + (0.3 * rig.span).max(0.15);
+            let floor = view.surface_height(eye.x, eye.y) + (0.3 * rig.span).max(0.15);
             eye.z = eye.z.max(floor);
             (eye, focus, DVec3::Z)
         }
@@ -196,6 +201,16 @@ pub fn update_camera(
             let eye = unit.transform_point(rig.rear_eye.unwrap_or_default());
             (eye, eye + camera_rot * DVec3::X, camera_rot * DVec3::Z)
         }
+        CameraMode::Free if let Some([speed, agl, turn]) = rig.flythrough => {
+            rig.heading += turn * dt;
+            let ahead = DVec3::new(rig.heading.cos(), rig.heading.sin(), 0.0);
+            let mut eye = rig.eye + ahead * speed * dt;
+            // Follow the ground (smoothed over about 2 s), never below the chosen height.
+            let floor = view.surface_height(eye.x, eye.y) + agl;
+            eye.z += (floor - eye.z) * (1.0 - (-dt / 2.0).exp());
+            eye.z = eye.z.max(floor - 0.5 * agl);
+            (eye, eye + rig.look(), DVec3::Z)
+        }
         CameraMode::Free => {
             let dir = rig.look();
             let right = dir.cross(DVec3::Z).normalize_or(DVec3::X);
@@ -207,10 +222,10 @@ pub fn update_camera(
                     + right * axis(KeyCode::KeyD, KeyCode::KeyA)
                     + DVec3::Z * axis(KeyCode::Space, KeyCode::ShiftLeft))
                     * (rig.speed * fast * dt);
-            eye.z = eye.z.max(view.world.surface_height(eye.x, eye.y) + 0.3);
+            eye.z = eye.z.max(view.surface_height(eye.x, eye.y) + 0.3);
             (eye, eye + dir, DVec3::Z)
         }
     };
     rig.eye = eye;
-    *transform = Transform::from_translation(convert::vec(eye)).looking_at(convert::vec(look), convert::vec(up));
+    *transform = Transform::from_translation(origin.pos(eye)).looking_at(origin.pos(look), convert::vec(up));
 }

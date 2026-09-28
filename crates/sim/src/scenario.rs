@@ -75,6 +75,8 @@ pub const AERIAL_PHYSICS_HZ: u32 = 500;
 
 /// Candidate positions tried before falling back to the best one seen.
 const MAX_ATTEMPTS: usize = 200;
+/// Spawn candidates drawn from one tile of a tiled map before moving to another.
+const TILE_BATCH: usize = 25;
 /// Candidate centres of a spawn cluster.
 const CLUSTER_ATTEMPTS: usize = 32;
 
@@ -1333,9 +1335,22 @@ impl SpawnSpec {
                 }
             }
             SpawnLayout::Random => {
+                // On tiled maps candidates come in batches from one tile each, so that a
+                // crowded map does not generate a tile per attempt.
+                let layout = world.terrain().tiled().map(|t| *t.layout());
                 for _ in 0..count {
                     let mut best = (f64::NEG_INFINITY, DVec3::ZERO);
-                    for _ in 0..MAX_ATTEMPTS {
+                    let mut area = [lo, hi];
+                    for attempt in 0..MAX_ATTEMPTS {
+                        if let Some(l) = &layout
+                            && attempt % TILE_BATCH == 0
+                        {
+                            let p = DVec2::new(sample(rng, [lo.x, hi.x]), sample(rng, [lo.y, hi.y]));
+                            let (tx, ty) = l.tile_at(p.x, p.y);
+                            let (a, b) = l.core(tx, ty);
+                            area = [a.max(lo), b.min(hi).max(a.max(lo))];
+                        }
+                        let [lo, hi] = area;
                         let xy = DVec2::new(sample(rng, [lo.x, hi.x]), sample(rng, [lo.y, hi.y]));
                         let p = xy.extend(height(xy, rng));
                         let score = self.score(world, p, ground, placed.iter().chain(&out));

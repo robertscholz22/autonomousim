@@ -3,7 +3,7 @@
 //! and the hits of the latest LiDAR scan.
 //! O toggles the goals and trails, L the LiDAR points.
 
-use crate::convert;
+use crate::convert::RenderOrigin;
 use crate::sim::Sim;
 use autonomousim_core::math::Pose;
 use autonomousim_sensors::{LidarConfig, Sensor};
@@ -78,7 +78,13 @@ pub fn latest_scan(sim: &Sim, agent: usize) -> Option<Scan<'_>> {
     Some(Scan { config: lidar.config(), directions: lidar.directions(), pose, ranges })
 }
 
-pub fn draw(keys: Res<ButtonInput<KeyCode>>, sim: Res<Sim>, mut overlay: ResMut<Overlay>, mut gizmos: Gizmos) {
+pub fn draw(
+    keys: Res<ButtonInput<KeyCode>>,
+    sim: Res<Sim>,
+    origin: Res<RenderOrigin>,
+    mut overlay: ResMut<Overlay>,
+    mut gizmos: Gizmos,
+) {
     if keys.just_pressed(KeyCode::KeyO) {
         overlay.markers = !overlay.markers;
     }
@@ -124,31 +130,31 @@ pub fn draw(keys: Res<ButtonInput<KeyCode>>, sim: Res<Sim>, mut overlay: ResMut<
             let radius = if bay { 1.0 } else { (1.5 * arm).max(0.05) as f32 };
             let current = agent.goal_index.min(agent.goals.len().saturating_sub(1));
             for (k, g) in agent.goals.iter().enumerate().skip(current) {
-                let p = convert::vec(g.position);
+                let p = origin.pos(g.position);
                 let color = if k == current { GOAL } else { NEXT_GOALS };
                 gizmos.sphere(Isometry3d::from_translation(p), radius, color);
                 if bay {
                     let ahead = g.position + 4.0 * DVec3::new(g.yaw.cos(), g.yaw.sin(), 0.0);
-                    gizmos.arrow(p, convert::vec(ahead), color);
+                    gizmos.arrow(p, origin.pos(ahead), color);
                 }
                 if let Some(next) = agent.goals.get(k + 1) {
-                    gizmos.line(p, convert::vec(next.position), NEXT_GOALS);
+                    gizmos.line(p, origin.pos(next.position), NEXT_GOALS);
                 }
             }
             if let Some(g) = agent.goals.get(current) {
-                gizmos.line(convert::vec(pos), convert::vec(g.position), TO_GOAL);
+                gizmos.line(origin.pos(pos), origin.pos(g.position), TO_GOAL);
             }
             // The route's lane, half a metre above the road.
             if let Some(route) = &agent.route {
                 let pts = route.points();
                 let last = pts.len().saturating_sub(1);
-                let lane = (0..pts.len()).step_by(2).chain([last]).map(|k| convert::vec(pts[k] + DVec3::Z * 0.5));
+                let lane = (0..pts.len()).step_by(2).chain([last]).map(|k| origin.pos(pts[k] + DVec3::Z * 0.5));
                 gizmos.linestrip(lane, ROUTE);
             }
             let color = if i == sim.pilot { PILOT_TRAIL } else { TRAIL_COLOR };
             let points: Vec<Vec3> = match &sim.replay {
-                Some(r) => r.trail(i, TRAIL).into_iter().map(convert::vec).collect(),
-                None => overlay.trails[i].iter().map(|&(_, p)| convert::vec(p)).chain([convert::vec(pos)]).collect(),
+                Some(r) => r.trail(i, TRAIL).into_iter().map(|p| origin.pos(p)).collect(),
+                None => overlay.trails[i].iter().map(|&(_, p)| origin.pos(p)).chain([origin.pos(pos)]).collect(),
             };
             gizmos.linestrip(points, color);
         }
@@ -163,7 +169,7 @@ pub fn draw(keys: Res<ButtonInput<KeyCode>>, sim: Res<Sim>, mut overlay: ResMut<
         let stride = hits.len().div_ceil(MAX_POINTS).max(1);
         for &(p, r) in hits.iter().step_by(stride) {
             let size = (0.012 * r).clamp(0.05, 0.6) as f32;
-            let p = convert::vec(scan.pose.transform_point(p));
+            let p = origin.pos(scan.pose.transform_point(p));
             gizmos.cross(Isometry3d::from_translation(p), size, range_color(r, max));
         }
     }

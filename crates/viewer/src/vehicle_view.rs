@@ -6,7 +6,7 @@
 //! (trailers, dollies, drawbars) are children of the root posed from the simulated joints, and
 //! carry their own wheels and links.
 
-use crate::convert;
+use crate::convert::{self, RenderOrigin};
 use crate::sim::Sim;
 use autonomousim_core::math::Pose;
 use autonomousim_scene::mesh::srgb;
@@ -124,6 +124,7 @@ fn wheel_local(w: &Wheeled, k: usize) -> Pose {
 pub fn spawn_vehicles(
     mut commands: Commands,
     sim: Res<Sim>,
+    origin: Res<RenderOrigin>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -135,11 +136,7 @@ pub fn spawn_vehicles(
     });
     for (i, agent) in sim.world.agents().iter().enumerate() {
         let pose = sim.render_pose(i);
-        let root = (
-            VehicleVisual(i),
-            Transform::from_translation(convert::vec(pose.pos)).with_rotation(convert::quat(pose.rot)),
-            Visibility::default(),
-        );
+        let root = (VehicleVisual(i), origin.transform(&pose), Visibility::default());
         let def = match &agent.vehicle {
             Vehicle::Multirotor(m) => m.def(),
             Vehicle::Wheeled(w) => {
@@ -255,6 +252,7 @@ pub fn spawn_vehicles(
 #[allow(clippy::type_complexity)]
 pub fn sync_vehicles(
     sim: Res<Sim>,
+    origin: Res<RenderOrigin>,
     mut roots: Query<
         (&VehicleVisual, &mut Transform),
         (Without<WheelVisual>, Without<LinkVisual>, Without<UnitVisual>),
@@ -275,7 +273,7 @@ pub fn sync_vehicles(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for (v, mut t) in &mut roots {
-        *t = convert::transform(&sim.render_pose(v.0));
+        *t = origin.transform(&sim.render_pose(v.0));
     }
     for (uv, mut t) in &mut units {
         let Some(w) = sim.world.agent(uv.agent).vehicle.as_wheeled() else { continue };
@@ -399,6 +397,7 @@ mod tests {
         v.show(&init, &[0.25], 0.2, &wheels, powertrain);
         let mut app = World::new();
         app.insert_resource(Sim::new(world));
+        app.init_resource::<RenderOrigin>();
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
         app.run_system_once(spawn_vehicles).unwrap();
@@ -472,6 +471,7 @@ mod tests {
         }
         let mut app = World::new();
         app.insert_resource(Sim::new(world));
+        app.init_resource::<RenderOrigin>();
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
         app.run_system_once(spawn_vehicles).unwrap();

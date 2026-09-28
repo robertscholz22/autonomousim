@@ -1999,7 +1999,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | # | Step | Done when |
 |---|---|---|
 | 1 ✅ | `world::tiles` + `procgen::large`: coarse layer (terrain, erosion, hydrology, materials, rural roads and airstrips), detail tiles, `TiledWorld` with the tile LRU, hashes, `large` presets | Tiles are identical whatever the access order and thread count; heights and normals are continuous across tile seams; queries agree with a monolithic grid built from the same functions; the coarse 16 km layer generates in ≤ 15 s and a tile in ≤ 50 ms; memory stays under the cache bound; existing goldens are unchanged |
-| 2 | Viewer: floating origin, streamed tiles and far-field coarse chunks, aerial view distance | A drone flies across a 16 km map without jitter at the far edge; ≥ 60 fps at 1080p medium at 30 m/s and 200 m AGL on the Iris Xe |
+| 2 ✅ | Viewer: floating origin, streamed tiles and far-field coarse chunks, aerial view distance | A drone flies across a 16 km map without jitter at the far edge; ≥ 60 fps at 1080p medium at 30 m/s and 200 m AGL on the Iris Xe |
 | 3 | Shared aero: `AirData` move, `AeroSurface`, medium/high-altitude Dryden, `pitot`, the `air_data`/`wind_body` terms, state columns | Lift, drag and moment of a surface match analytic thin-aerofoil and flat-plate values; Dryden spectra match MIL-F-8785C at altitude; goldens re-blessed after an A/B check |
 | 4 | `FixedWing` family: aero model (derivatives and tables), propeller and motor or engine, gear, presets, wiring through vehicles, sim, recorder and Python | Both presets trim in level flight; engine-off glide conserves energy with drag accounted for; they stand on their gear; scenarios spawn them in the air and on a runway |
 | 5 | JSBSim fixtures and validation | Trim α, elevator and throttle within 5 % (or 0.5°) of JSBSim over the airspeed sweep; mode frequencies and damping within 10 %; doublet responses close; c172 takeoff roll within 10 % of JSBSim and the POH |
@@ -2047,6 +2047,34 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
       - scatter and water invariants, a bounded cache, and the cached coarse layer;
       - an ignored timing test.
     - `sim/tests/large.rs`: 16 drones hold position on a 4 km tiled map; a ground group is rejected.
+- **Step 2 (viewer on large maps)**:
+  - **Render origin**:
+    - `convert::RenderOrigin` (ENU f64) is subtracted before the f32 conversion of every world position: vehicle roots, the camera, gizmos and map entities.
+    - Each map entity carries an `Anchor`; its mesh is built relative to it (`scene::terrain::terrain_mesh` / `water_mesh` and `props::props_grouped` take an anchor).
+    - `world_view::recenter` moves the origin to the camera, snapped to 1 km, once the camera is more than 1 km away on either axis, and re-places the anchored entities. The camera eye is kept in ENU (`CameraRig::eye`), so nothing else changes.
+    - Monolithic maps keep their meshes in map coordinates (anchor 0).
+  - **Streaming** (`world_view::Streamer`):
+    - The coarse layer is meshed at start as one chunk per tile (32 × 32 cells of 8 m; about 20 ms for 4096 chunks), with its own LOD bands (8 m out to 1.5 km, then 16, 32 and 64 m).
+    - Forest floor is drawn there in canopy green, so distant forest does not turn into bare ground where the detail tiles end.
+    - Detail tiles within the tile radius (low 500 m, medium 900 m, high 1400 m) are built nearest first, at most four at a time, on a 2-thread pool. A job generates or fetches the tile (`TiledMap::tile`), meshes its 4 × 4 chunks (terrain at the stride for its distance, water, near and far props) and sends them over a channel.
+    - Props are drawn with the tile that owns them (`TileSource::owner`), so obstacles stored in several tiles are drawn once.
+    - A detail tile hides the coarse chunk it replaces (`CoarseOf`) and is dropped beyond 1.25 radii. The view holds each shown tile's `Arc<Tile>` for LOD rebuilds, independently of the map's LRU.
+    - `MapView::surface_height` answers from shown tiles or the coarse layer, so the camera never generates tiles on the main thread.
+  - **View distance**:
+    - Base: `Quality::far_view_distance` on tiled maps (2.5/4/6 km), unchanged on monolithic maps.
+    - It grows with the camera's height above ground (10 m per metre on tiled maps, 4 on monolithic ones) up to 12 km. Fog and the far plane follow (`update_view_distance`).
+    - The HUD shows the detail tiles on screen and being built, and the view distance.
+  - **Demo options**: `--demo-speed`, `--demo-agl`, `--demo-turn`, and `--demo-camera`, where the free camera flies the demo so speeds above the multirotor's 12 m/s velocity limit are possible.
+  - **Spawns on tiled maps**: random spawn candidates now come in batches of 25 from one tile each. The viewer's 2 m AGL spawn in dense forest had generated a tile per rejected candidate (8.5 s to start; now 0.7 s). Monolithic maps draw as before.
+  - **Measured** (Iris Xe, 1080p medium):
+    - camera flying 30 m/s at 200 m AGL across the 16 km map: 73–74 fps after warm-up, about 65 detail tiles on screen, none waiting;
+    - showcase map unchanged at 69 fps.
+    - The jitter-free far edge follows from the origin (checked by the test); a flight by the fixed-wing in step 7 will repeat the check with a real aircraft.
+  - **Tests**: `tiled_maps_stream_tiles_around_the_camera` (viewer, on a 2 km tiled map):
+    - all 64 coarse chunks are spawned;
+    - the tiles within the radius are streamed, and coarse chunks under them hidden;
+    - moving away drops the old tiles and brings the new ones;
+    - the origin snaps and carries every anchored entity.
 
 ### M6b: Helicopter
 

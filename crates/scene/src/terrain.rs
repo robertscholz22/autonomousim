@@ -63,15 +63,27 @@ fn samples(start: usize, n: usize, stride: usize) -> Vec<usize> {
 }
 
 /// Linear colour of every material of the map.
-fn material_colors(world: &StaticWorld) -> Vec<[f32; 4]> {
+pub fn material_colors(world: &StaticWorld) -> Vec<[f32; 4]> {
     let table = world.materials();
     (0..table.len()).map(|i| srgb(table.get(MaterialId(i as u8)).color)).collect()
 }
 
 /// Terrain mesh of `chunk` sampling every `stride`-th vertex, with a skirt `skirt` metres deep.
 pub fn terrain_chunk(world: &StaticWorld, chunk: &Chunk, stride: usize, skirt: f32) -> MeshData {
-    let grid = world.grid();
-    let colors = material_colors(world);
+    terrain_mesh(world.grid(), &material_colors(world), chunk, stride, skirt, DVec3::ZERO)
+}
+
+/// Terrain mesh of `chunk` of `grid` (colours by material id), with vertex positions relative
+/// to `anchor` (computed in f64, then rounded), so that far from the map origin they keep
+/// their precision.
+pub fn terrain_mesh(
+    grid: &HeightGrid,
+    colors: &[[f32; 4]],
+    chunk: &Chunk,
+    stride: usize,
+    skirt: f32,
+    anchor: DVec3,
+) -> MeshData {
     let (cw, ch) = grid.cells();
     let (vw, vh) = grid.dims();
     let c = grid.cell_size();
@@ -82,7 +94,11 @@ pub fn terrain_chunk(world: &StaticWorld, chunk: &Chunk, stride: usize, skirt: f
     m.positions.reserve(xs.len() * ys.len() + 2 * (xs.len() + ys.len()));
 
     let pos = |ix: usize, iy: usize| {
-        Vec3::new((o.x + ix as f64 * c) as f32, (o.y + iy as f64 * c) as f32, grid.vertex_height(ix, iy) as f32)
+        Vec3::new(
+            (o.x + ix as f64 * c - anchor.x) as f32,
+            (o.y + iy as f64 * c - anchor.y) as f32,
+            (grid.vertex_height(ix, iy) - anchor.z) as f32,
+        )
     };
     // Normal from central differences over the stride (one-sided at the map edge).
     let normal = |ix: usize, iy: usize| {
@@ -149,15 +165,19 @@ pub fn terrain_chunk(world: &StaticWorld, chunk: &Chunk, stride: usize, skirt: f
 
 /// Water surface of `chunk`: one quad per run of wet cells with the same level in a row.
 pub fn water_chunk(world: &StaticWorld, chunk: &Chunk, color: [f32; 4]) -> MeshData {
-    let grid = world.grid();
+    water_mesh(world.grid(), chunk, color, DVec3::ZERO)
+}
+
+/// Water surface of `chunk` of `grid`, relative to `anchor` (see [`terrain_mesh`]).
+pub fn water_mesh(grid: &HeightGrid, chunk: &Chunk, color: [f32; 4], anchor: DVec3) -> MeshData {
     let mut m = MeshData::new();
     if grid.water().is_none() {
         return m;
     }
     let c = grid.cell_size();
     let o = grid.origin();
-    let x = |ix: usize| (o.x + ix as f64 * c) as f32;
-    let y = |iy: usize| (o.y + iy as f64 * c) as f32;
+    let x = |ix: usize| (o.x + ix as f64 * c - anchor.x) as f32;
+    let y = |iy: usize| (o.y + iy as f64 * c - anchor.y) as f32;
     for cy in chunk.y0..chunk.y0 + chunk.ny {
         let mut cx = chunk.x0;
         let end = chunk.x0 + chunk.nx;
@@ -170,7 +190,7 @@ pub fn water_chunk(world: &StaticWorld, chunk: &Chunk, color: [f32; 4]) -> MeshD
             while cx < end && grid.cell_water(cx, cy) == Some(level) {
                 cx += 1;
             }
-            let z = level as f32;
+            let z = (level - anchor.z) as f32;
             let i = m.push_vertex(Vec3::new(x(start), y(cy), z), Vec3::Z, color);
             m.push_vertex(Vec3::new(x(cx), y(cy), z), Vec3::Z, color);
             m.push_vertex(Vec3::new(x(cx), y(cy + 1), z), Vec3::Z, color);
