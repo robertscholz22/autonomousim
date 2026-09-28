@@ -47,6 +47,13 @@ pub const PARALLEL_AGENTS: usize = 32;
 /// turned by its sampled heading.
 const PATH_HEADING_REACH: f64 = 8.0;
 
+/// Look-ahead times (s) at whose predicted positions agents on tiled maps have tiles
+/// prefetched (a small aircraft covers a 256 m tile in about 10 s).
+const PREFETCH_AHEAD: [f64; 3] = [3.0, 6.0, 10.0];
+
+/// Tiles within this distance (m) of those positions are prefetched.
+const PREFETCH_RADIUS: f64 = 150.0;
+
 /// Per-agent state row written by [`WorldInstance::write_state`]: `(name, length)` in order.
 /// `goal_index` equals the number of goals once the last one has been reached; `clearance` is
 /// the distance to the nearest terrain or solid obstacle surface, up to 20 m (for ground
@@ -327,6 +334,7 @@ impl WorldInstance {
 
     /// One policy step, calling `after_tick` after every physics tick (e.g. a recorder).
     pub fn step_with(&mut self, after_tick: &mut dyn FnMut(&WorldInstance)) {
+        self.prefetch_tiles();
         for a in &mut self.agents {
             a.events = if a.disabled { Events::DISABLED } else { Events::NONE };
         }
@@ -336,6 +344,29 @@ impl WorldInstance {
         }
         self.steps += 1;
         self.grid.build(&self.shapes);
+    }
+
+    /// On tiled maps: have the tiles ahead of each moving agent generated in the background.
+    fn prefetch_tiles(&self) {
+        let Some(tiles) = self.map.terrain().tiled() else { return };
+        for a in self.agents.iter().filter(|a| !a.disabled) {
+            let p = a.vehicle.position().truncate();
+            let v = a.vehicle.lin_vel_world().truncate();
+            if !v.is_finite() {
+                continue;
+            }
+            for t in PREFETCH_AHEAD {
+                let q = p + v * t;
+                // Tiles within PREFETCH_RADIUS of the point (rays and turns reach them).
+                let (lo, hi) = (q - PREFETCH_RADIUS, q + PREFETCH_RADIUS);
+                let ((x0, y0), (x1, y1)) = (tiles.layout().tile_at(lo.x, lo.y), tiles.layout().tile_at(hi.x, hi.y));
+                for ty in y0..=y1 {
+                    for tx in x0..=x1 {
+                        tiles.prefetch(tx, ty);
+                    }
+                }
+            }
+        }
     }
 
     /// One physics tick.

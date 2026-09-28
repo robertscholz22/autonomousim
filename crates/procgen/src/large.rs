@@ -51,8 +51,10 @@ const RING_CELLS: usize = autonomousim_world::heightgrid::MAX_SEARCH_CELLS as us
 /// Obstacles are stored with every tile whose core grown by this much (m) they overlap.
 const REACH: f64 = 4.0;
 
-/// Rays use the tiles up to this distance and the coarse layer beyond it (m).
-const DETAIL_RANGE: f64 = 2000.0;
+/// Rays use the tiles up to this distance and the coarse layer beyond it (m): about one tile,
+/// so an aircraft's long-range LiDAR keeps only the few tiles around it in use; farther
+/// terrain comes from the coarse layer (8 m) and misses trees and rocks.
+const DETAIL_RANGE: f64 = 300.0;
 
 /// Default number of tiles kept in memory (about 2.5 MB each with forest); override
 /// with `$AUTONOMOUSIM_TILE_CACHE`.

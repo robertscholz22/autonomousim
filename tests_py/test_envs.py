@@ -19,6 +19,8 @@ from autonomousim.vector_env import AutonomousimVectorEnv
 IDS = [f"autonomousim/{name}" for name in autonomousim.ENVS]
 # Small maps for the API tests (the waypoint task defaults to a pool of 16 generated maps).
 RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
+# A 4 km tiled map (the aircraft task defaults to the 16 km one).
+LARGE = {"type": "wild", "preset": "large", "seed": 0, "count": 1, "cache": False, "config": {"size": 4096.0}}
 KWARGS = {
     "autonomousim/QuadWaypointForest-v0": {"map": "forest"},
     "autonomousim/CarWaypointOffroad-v0": {"map": "flat"},
@@ -26,6 +28,7 @@ KWARGS = {
     "autonomousim/TrailerReverse-v0": {"map": RURAL},
     "autonomousim/TrackedCrossCountry-v0": {"map": RURAL},
     "autonomousim/MotorcycleRoadRural-v0": {"map": RURAL},
+    "autonomousim/FixedWingWaypoints-v0": {"map": LARGE},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
@@ -34,6 +37,7 @@ OBS_DIM = {
     "autonomousim/TrailerReverse-v0": 31,
     "autonomousim/TrackedCrossCountry-v0": 95,
     "autonomousim/MotorcycleRoadRural-v0": 106,
+    "autonomousim/FixedWingWaypoints-v0": 46,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
@@ -41,6 +45,7 @@ ACT_DIM = {
     "autonomousim/TrailerReverse-v0": 2,
     "autonomousim/TrackedCrossCountry-v0": 2,
     "autonomousim/MotorcycleRoadRural-v0": 2,
+    "autonomousim/FixedWingWaypoints-v0": 3,
 }
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.
@@ -669,3 +674,60 @@ def test_motorcycle_rides_off_its_feet():
         assert not terminated, info
     assert obs[6] == 0.0 and abs(obs[7] - 10.0) < 0.5 and abs(obs[0]) < 0.05, obs
     env.close()
+
+
+def test_fixed_wing_waypoints_scripted_pilot_reaches_the_goal():
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/FixedWingWaypoints-v0",
+        num_envs=n,
+        num_threads=4,
+        map=LARGE,
+        goals=1,
+        goal_distance=(800.0, 1200.0),
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    task = envs.unwrapped.task
+    assert [t[0] for t in envs.unwrapped.obs_layout] == [
+        "goal_rel_heading",
+        "agl",
+        "air_data",
+        "lin_vel_body",
+        "ang_vel_body",
+        "pitch_roll",
+        "last_action",
+        "lidar",
+    ]
+    obs, _ = envs.reset(seed=0)
+    # Trimmed at 150 m above the ground at 1.5 times the stall speed, wings level.
+    state = envs.unwrapped.state
+    np.testing.assert_allclose(state[:, STATE["agl"]][:, 0], 150.0, atol=1.0)
+    assert (np.abs(obs[:, 14]) < 0.05).all() and (obs[:, 4] / 0.04 > 15.0).all()
+    ret, done, success = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(task.scripted(obs))
+        live = ~done
+        ret[live] += reward[live]
+        success |= live & task.success
+        done |= terminated | truncated
+    # The pilot climbs over or turns away from the terrain ahead and reaches the waypoint
+    # about a kilometre away in most episodes; progress and the bonus pay.
+    assert success.sum() >= n - 2, success
+    assert (ret[success] > task.goal_bonus + 3.0).all(), ret
+    envs.close()
+
+
+def test_fixed_wing_waypoints_rewards():
+    task = make_task("fixed_wing_waypoints", map=LARGE)
+    task.bind(3, 0.1, 3)
+    state = np.zeros((3, autonomousim.STATE_DIM))
+    state[:, STATE["goal"]] = [1000.0, 0.0, 200.0]
+    state[:, STATE["agl"]] = [[150.0], [25.0], [150.0]]
+    task.reset(None, state)
+    state[:, STATE["position"]] = [[10.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    events = np.array([0, 0, int(autonomousim.Event.STALL)], np.uint32)
+    action = np.zeros((3, 3), np.float32)
+    r = task.reward(state, action, action, events)
+    # 10 m made good: 0.1; half the safe height: 0.5·0.25; a stall: 0.5.
+    np.testing.assert_allclose(r, [0.1, 0.1 - 0.125, -0.5])
+    assert task.scenario()["groups"][0]["goals"]["grade"] == 0.08

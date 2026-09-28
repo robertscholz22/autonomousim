@@ -17,6 +17,7 @@
 //! Tiles live in a shared cache that keeps at most `capacity` tiles (least recently used go
 //! first; a tile in use stays alive through its `Arc`) and a small per-thread list of the
 //! tiles each thread used last, which answers most queries without touching shared state.
+//! [`TiledMap::prefetch`] has tiles generated ahead of need by a few background threads.
 
 use crate::heightgrid::{HeightGrid, MAX_SEARCH_CELLS};
 use crate::obstacles::ObstacleSet;
@@ -26,8 +27,8 @@ use autonomousim_core::terrain::Terrain;
 use glam::{DVec2, DVec3};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 
 /// One generated tile.
 #[derive(Clone, Debug)]
@@ -129,8 +130,9 @@ struct Entry {
 /// Tiles each thread used last: `(map id, tile index, entry, tile)`.
 type Recent = Vec<(u64, u32, Arc<Entry>, Arc<Tile>)>;
 
-/// Tiles a thread remembers (per thread, across maps).
-const RECENT: usize = 4;
+/// Tiles a thread remembers (per thread, across maps): enough for the few tiles each of
+/// several worlds uses, as a batch's threads take turns with the worlds.
+const RECENT: usize = 8;
 
 thread_local! {
     static RECENT_TILES: RefCell<Recent> = const { RefCell::new(Vec::new()) };
@@ -138,17 +140,46 @@ thread_local! {
 
 static NEXT_MAP_ID: AtomicU64 = AtomicU64::new(1);
 
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Queue of the background threads that generate prefetched tiles (shared by all maps; half
+/// the cores, 1–8 threads, started on first use).
+fn prefetch_queue() -> &'static mpsc::Sender<Job> {
+    static QUEUE: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 8));
+        for i in 0..threads {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("autonomousim-tiles-{i}"))
+                .spawn(move || {
+                    loop {
+                        let job = rx.lock().expect("tile queue").recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => return,
+                        }
+                    }
+                })
+                .expect("tile thread");
+        }
+        tx
+    })
+}
+
 /// A map made of tiles generated on demand (see the module docs).
 pub struct TiledMap {
     layout: TileLayout,
     coarse: HeightGrid,
     pad: f64,
     source: Box<dyn TileSource>,
-    capacity: usize,
+    capacity: AtomicUsize,
     id: u64,
     clock: AtomicU64,
     generated: AtomicU64,
-    cache: Mutex<HashMap<u32, Arc<Entry>>>,
+    cache: RwLock<HashMap<u32, Arc<Entry>>>,
 }
 
 impl std::fmt::Debug for TiledMap {
@@ -169,11 +200,11 @@ impl TiledMap {
             coarse,
             pad,
             source,
-            capacity: capacity.max(1),
+            capacity: AtomicUsize::new(capacity.max(1)),
             id: NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed),
             clock: AtomicU64::new(0),
             generated: AtomicU64::new(0),
-            cache: Mutex::new(HashMap::new()),
+            cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -197,7 +228,7 @@ impl TiledMap {
 
     /// Tiles currently in the shared cache.
     pub fn loaded(&self) -> usize {
-        self.cache.lock().expect("tile cache").values().filter(|e| e.tile.get().is_some()).count()
+        self.cache.read().expect("tile cache").values().filter(|e| e.tile.get().is_some()).count()
     }
 
     /// Tiles generated so far (a tile evicted and needed again counts twice).
@@ -206,7 +237,47 @@ impl TiledMap {
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.capacity.load(Ordering::Relaxed)
+    }
+
+    /// Raise the capacity to at least `tiles` (for many agents spread over the map, so that
+    /// tiles in use are not evicted and generated again all the time).
+    pub fn reserve(&self, tiles: usize) {
+        self.capacity.fetch_max(tiles, Ordering::Relaxed);
+    }
+
+    /// Start generating tile `(tx, ty)` on a background thread unless it is cached or under
+    /// way, so that [`tile`](Self::tile) finds it ready later instead of generating it on the
+    /// spot (a tile's content never depends on which thread generates it). Simulations call
+    /// this for the tiles ahead of moving agents, so that a batch step does not wait for the
+    /// one world whose agent enters a new tile.
+    pub fn prefetch(self: &Arc<Self>, tx: u32, ty: u32) {
+        let index = self.layout.index(tx, ty);
+        if self.cache.read().expect("tile cache").contains_key(&index) {
+            return;
+        }
+        let entry = {
+            let mut cache = self.cache.write().expect("tile cache");
+            if cache.contains_key(&index) {
+                return;
+            }
+            let clock = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+            let entry = Arc::new(Entry { tile: OnceLock::new(), used: AtomicU64::new(clock) });
+            cache.insert(index, entry.clone());
+            entry
+        };
+        let map = self.clone();
+        let job = move || {
+            entry.tile.get_or_init(|| {
+                map.generated.fetch_add(1, Ordering::Relaxed);
+                Arc::new(map.source.tile(tx, ty))
+            });
+            // Fresh: not the first to go.
+            entry.used.store(map.clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            map.evict(index);
+        };
+        // The queue lives as long as the process; a failed send only loses the head start.
+        let _ = prefetch_queue().send(Box::new(job));
     }
 
     /// Tile `(tx, ty)`, generated if it is not cached.
@@ -226,16 +297,25 @@ impl TiledMap {
         if let Some(tile) = hit {
             return tile;
         }
-        let entry = {
-            let mut cache = self.cache.lock().expect("tile cache");
-            let clock = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
-            let entry = cache
-                .entry(index)
-                .or_insert_with(|| Arc::new(Entry { tile: OnceLock::new(), used: AtomicU64::new(clock) }))
-                .clone();
-            entry.used.store(clock, Ordering::Relaxed);
-            entry
+        // Readers share the lock; only a tile not in the cache yet takes it exclusively.
+        let clock = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        let found = self.cache.read().expect("tile cache").get(&index).cloned();
+        let (entry, inserted) = match found {
+            Some(entry) => (entry, false),
+            None => {
+                let mut cache = self.cache.write().expect("tile cache");
+                let mut inserted = false;
+                let entry = cache
+                    .entry(index)
+                    .or_insert_with(|| {
+                        inserted = true;
+                        Arc::new(Entry { tile: OnceLock::new(), used: AtomicU64::new(clock) })
+                    })
+                    .clone();
+                (entry, inserted)
+            }
         };
+        entry.used.store(clock, Ordering::Relaxed);
         let tile = entry
             .tile
             .get_or_init(|| {
@@ -243,7 +323,9 @@ impl TiledMap {
                 Arc::new(self.source.tile(tx, ty))
             })
             .clone();
-        self.evict(index);
+        if inserted {
+            self.evict(index);
+        }
         RECENT_TILES.with_borrow_mut(|recent| {
             recent.insert(0, (self.id, index, entry, tile.clone()));
             recent.truncate(RECENT);
@@ -253,8 +335,8 @@ impl TiledMap {
 
     /// Drop least recently used tiles (never `keep`) until at most `capacity` are cached.
     fn evict(&self, keep: u32) {
-        let mut cache = self.cache.lock().expect("tile cache");
-        while cache.len() > self.capacity {
+        let mut cache = self.cache.write().expect("tile cache");
+        while cache.len() > self.capacity() {
             let oldest = cache
                 .iter()
                 .filter(|(k, e)| **k != keep && e.tile.get().is_some())
@@ -695,6 +777,33 @@ mod tests {
         let again: Vec<f64> = (0..10).rev().map(|i| Terrain::height(&m, -450.0 + 100.0 * i as f64, 7.0)).collect();
         assert_eq!(first, again.into_iter().rev().collect::<Vec<_>>());
         assert!(m.loaded() <= 3);
+    }
+
+    #[test]
+    fn prefetched_tiles_are_ready_and_the_same() {
+        let m = Arc::new(map(2));
+        m.reserve(8);
+        assert_eq!(m.capacity(), 8);
+        m.reserve(4);
+        assert_eq!(m.capacity(), 8);
+        let points = [(-450.0, 7.0), (-350.0, 7.0), (-250.0, -120.0)];
+        for &(x, y) in &points {
+            let (tx, ty) = m.layout().tile_at(x, y);
+            m.prefetch(tx, ty);
+            m.prefetch(tx, ty);
+        }
+        let start = std::time::Instant::now();
+        while m.generated() < 3 {
+            assert!(start.elapsed().as_secs() < 30, "prefetch stalled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let reference = map(100);
+        for &(x, y) in &points {
+            assert_eq!(Terrain::height(&*m, x, y), Terrain::height(&reference, x, y));
+        }
+        // Generated once each, in the background.
+        assert_eq!(m.generated(), 3);
+        assert_eq!(m.loaded(), 3);
     }
 
     #[test]

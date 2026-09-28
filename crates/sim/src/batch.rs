@@ -16,6 +16,9 @@ use autonomousim_core::rng::Seed;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+/// Tiles of a tiled map reserved in its cache per agent (see [`BatchSim::new`]).
+pub const TILES_PER_AGENT: usize = 8;
+
 /// One world with its output buffers (one per group).
 struct Slot {
     world: WorldInstance,
@@ -89,6 +92,14 @@ impl BatchSim {
         let state_len: Vec<usize> = groups.iter().map(|g| g.spec.count * STATE_DIM).collect();
         let events_len: Vec<usize> = groups.iter().map(|g| g.spec.count).collect();
         let base = Seed::from_u64(seed).child("env");
+        // On tiled maps every agent keeps a few tiles in use (its own and those its contacts
+        // and rays reach): room for all of them, so that tiles are not evicted while in use.
+        let agents: usize = groups.iter().map(|g| g.spec.count).sum();
+        for map in &scenario.maps {
+            if let Some(tiles) = map.terrain().tiled() {
+                tiles.reserve(TILES_PER_AGENT * agents * num_envs);
+            }
+        }
         let slots: Vec<Slot> = pool.install(|| {
             (0..num_envs)
                 .into_par_iter()

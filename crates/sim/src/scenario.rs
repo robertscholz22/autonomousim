@@ -812,6 +812,11 @@ pub struct GoalSpec {
     /// when no draw lands off them).
     #[serde(skip_serializing_if = "is_default")]
     pub off_road: bool,
+    /// `Random` goals of aerial vehicles: largest height difference to the previous point per
+    /// metre of horizontal distance (a climb or descent the vehicle can fly straight); steeper
+    /// draws are used only when no draw meets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grade: Option<f64>,
 }
 
 impl Default for GoalSpec {
@@ -831,6 +836,7 @@ impl Default for GoalSpec {
             bay: BayGoals::default(),
             path: false,
             off_road: false,
+            grade: None,
         }
     }
 }
@@ -1150,7 +1156,8 @@ impl CompiledGroup {
             && gl.radius >= 0.0
             && gl.spacing > 0.0
             && gl.route.step > 0.0
-            && gl.count >= 1)
+            && gl.count >= 1
+            && gl.grade.is_none_or(|g| g > 0.0))
         {
             return Err(fail(format!("invalid goals {gl:?}")));
         }
@@ -1160,6 +1167,9 @@ impl CompiledGroup {
         }
         if (gl.path || gl.off_road) && (gl.kind != GoalKind::Random || family != Family::Wheeled) {
             return Err(fail("`goals.path` and `goals.off_road` need `random` goals and a ground vehicle".into()));
+        }
+        if gl.grade.is_some() && (gl.kind != GoalKind::Random || family == Family::Wheeled) {
+            return Err(fail("`goals.grade` needs `random` goals and an aerial vehicle".into()));
         }
         // Trailers in line behind the towing unit.
         let colliders = match def.as_wheeled() {
@@ -1525,12 +1535,13 @@ impl GoalSpec {
             }
             GoalKind::Random => {
                 let [lo, hi] = region(world, None, self.margin);
-                let mut prev = spawn.pos.truncate();
+                let mut prev3 = spawn.pos;
                 let mut goals = Vec::with_capacity(self.count);
                 for _ in 0..self.count {
                     let mut best = (f64::NEG_INFINITY, DVec3::ZERO);
                     for _ in 0..MAX_ATTEMPTS {
                         let dir = DVec2::from_angle(rng.range(-std::f64::consts::PI, std::f64::consts::PI));
+                        let prev = prev3.truncate();
                         let raw = prev + dir * sample(rng, self.distance);
                         let xy = raw.clamp(lo, hi);
                         let agl = sample(rng, self.agl);
@@ -1550,7 +1561,9 @@ impl GoalSpec {
                             }
                             None => {
                                 let p = xy.extend(world.surface_height(xy.x, xy.y) + agl);
-                                (p, self.free(world, p))
+                                // Too steep from the previous point: below any draw that is not.
+                                let steep = self.grade.is_some_and(|g| (p.z - prev3.z).abs() > g * xy.distance(prev));
+                                (p, self.free(world, p) - if steep { 1.5 } else { 0.0 })
                             }
                         };
                         // A point moved onto the region's edge is off the distance range: only
@@ -1565,7 +1578,7 @@ impl GoalSpec {
                     }
                     let yaw = sample(rng, self.yaw_deg).to_radians();
                     goals.push(Goal { position: best.1, yaw });
-                    prev = best.1.truncate();
+                    prev3 = best.1;
                 }
                 goals
             }
