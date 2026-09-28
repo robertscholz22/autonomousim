@@ -425,6 +425,10 @@ impl FixedWingActionMap {
     }
 
     /// Airspeed range of the `attitude` and `guidance` modes (m/s).
+    pub fn limits(&self) -> &FixedWingActionLimits {
+        &self.limits
+    }
+
     pub fn airspeed_range(&self) -> [f64; 2] {
         self.airspeed
     }

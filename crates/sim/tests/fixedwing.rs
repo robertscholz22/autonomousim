@@ -166,3 +166,28 @@ fn guidance_mode_holds_course_and_altitude() {
         assert!(v.truncate().angle_to(track).abs() < 0.1, "{vehicle}: course {v} vs track {track}");
     }
 }
+
+/// `attitude` names a multirotor's and an aircraft's mode: it resolves by the group's vehicle
+/// (also when a recording's scenario is read back).
+#[test]
+fn attitude_resolves_by_family() {
+    use autonomousim_control::AgentActionMode;
+    use autonomousim_control::fixedwing::FixedWingActionMode;
+    use autonomousim_control::multirotor::ActionMode;
+    for (vehicle, expected) in [
+        ("aerosonde_like", AgentActionMode::FixedWing(FixedWingActionMode::Attitude)),
+        ("iris_like", AgentActionMode::Multirotor(ActionMode::Attitude)),
+    ] {
+        let sc = compile(&format!(
+            r#"
+            name = "fw"
+            map = {{ type = "testworld", kind = "flat", size = 2000.0 }}
+            [[groups]]
+            vehicle = "{vehicle}"
+            action_mode = "attitude"
+            spawn = {{ agl = [100.0, 100.0], clearance = 0.0 }}
+            "#
+        ));
+        assert_eq!(sc.groups[0].spec.action_mode, Some(expected), "{vehicle}");
+    }
+}

@@ -127,7 +127,8 @@ impl Replay {
     }
 
     /// Put the agents of `world` where the recording has them: the episode's map, the
-    /// interpolated state, rotor speeds, events, goals and route.
+    /// interpolated state, rotor speeds, an aircraft's controls and air data, events, goals and
+    /// route.
     pub fn apply(&self, world: &mut WorldInstance) {
         let ep = self.current();
         if world.map_index() != ep.map {
@@ -151,6 +152,10 @@ impl Replay {
                 }
             } else {
                 agent.vehicle.place(s.pose, s.velocity, s.rates);
+            }
+            if let Some(f) = agent.vehicle.as_fixed_wing_mut() {
+                let l = &s.last;
+                f.show(l.surfaces, l.throttle, l.rotor_speed, l.airspeed, l.alpha, l.beta);
             }
             if let Some(v) = agent.vehicle.as_multirotor_mut()
                 && s.motors.len() == v.motor_speeds().len()

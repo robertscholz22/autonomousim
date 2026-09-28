@@ -246,6 +246,162 @@ pub fn rotor_disc(radius: f32, color: [f32; 4]) -> MeshData {
     mesh::cylinder(radius, 0.004 * radius.max(0.05), 24, color)
 }
 
+/// A hinged control surface of a [`FixedWingVisual`]: the mesh about its hinge point, turned
+/// about `axis` by the deflection in pilot sense (see [`FixedWingVisual`]).
+#[derive(Clone, Debug)]
+pub struct SurfaceVisual {
+    pub mesh: MeshData,
+    /// Hinge point in the body frame (m).
+    pub hinge: DVec3,
+    /// Hinge axis: a positive rotation about it is the deflection that rolls right, pitches up,
+    /// yaws right or (flaps) lowers the trailing edge.
+    pub axis: DVec3,
+    /// Which control drives it: 0 aileron, 1 elevator, 2 rudder, 3 flaps.
+    pub control: usize,
+}
+
+/// Visual of a fixed-wing aircraft, derived from its definition (the preset files carry no
+/// shape): fuselage from the frame colliders, the wing from the reference geometry, a tail at
+/// the rear, the propeller and the wheels. Body frame FLU.
+#[derive(Clone, Debug)]
+pub struct FixedWingVisual {
+    pub body: MeshData,
+    pub surfaces: Vec<SurfaceVisual>,
+    /// Propeller hub and axis (body frame) and radius (m), for a spinning disc.
+    pub propeller: (DVec3, DVec3),
+    pub propeller_radius: f32,
+    /// Largest distance of any part from the centre of mass (m), for cameras.
+    pub span: f32,
+    /// Pilot's eye point (m), for the first-person camera.
+    pub eye: DVec3,
+}
+
+pub fn fixed_wing(def: &autonomousim_vehicles::fixedwing::FixedWingDef) -> FixedWingVisual {
+    use autonomousim_vehicles::multirotor::ColliderPart;
+    let g = &def.geometry;
+    let (b, c) = (g.span, g.chord);
+    let frame: Vec<_> = def.colliders.iter().filter(|k| k.part == ColliderPart::Frame).collect();
+    // A tractor propeller sits at the nose, a pusher's behind the wing (not necessarily at the
+    // tail).
+    let prop_x = def.propulsion.position.x;
+    let nose = frame.iter().map(|k| k.center.x + k.radius).fold((0.5 * c).max(prop_x), f64::max);
+    let tail = frame.iter().map(|k| k.center.x - k.radius).fold(-1.5 * c, f64::min);
+    let length = nose - tail;
+    let white = srgb([232, 234, 238]);
+    let trim = srgb([200, 50, 40]);
+    let grey = srgb([150, 154, 160]);
+    let dark = srgb([40, 42, 46]);
+    let glass = srgb([60, 90, 120]);
+    let mut body = MeshData::new();
+    // Fuselage: a cabin over the front half, tapering to a slim boom at the tail.
+    let (w, h) = ((0.09 * b).min(0.2 * length), (0.1 * b).min(0.22 * length));
+    let mid = nose - 0.45 * length;
+    let section = |x: f64, w: f64, h: f64, z: f64| {
+        [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)]
+            .map(|(sy, sz)| DVec3::new(x, sy * 0.5 * w, z + sz * 0.5 * h))
+    };
+    let front: Vec<_> = section(nose, 0.6 * w, 0.6 * h, 0.0).into_iter().chain(section(mid, w, h, 0.0)).collect();
+    body.append(&mesh::convex_hull(&front, white));
+    let boom: Vec<_> = section(mid, w, h, 0.0).into_iter().chain(section(tail, 0.3 * w, 0.35 * h, 0.15 * h)).collect();
+    body.append(&mesh::convex_hull(&boom, white));
+    // Canopy over the front of the cabin.
+    let eye = DVec3::new(nose - 0.3 * length, 0.0, 0.45 * h);
+    let canopy = mesh::ellipsoid(Vec3::new((0.12 * length) as f32, (0.4 * w) as f32, (0.25 * h) as f32), 1, glass);
+    body.append_transformed(&canopy, DQuat::IDENTITY, eye - DVec3::Z * 0.1 * h);
+    // Wing about the reference point: its quarter chord there, 12 % thick.
+    let r = g.aero_reference;
+    let (le, te) = (r.x + 0.25 * c, r.x - 0.75 * c);
+    let t = 0.06 * c;
+    let fixed_te = te + 0.25 * c;
+    body.append_transformed(
+        &mesh::cuboid(Vec3::new((0.5 * (le - fixed_te)) as f32, (0.5 * b) as f32, t as f32), white),
+        DQuat::IDENTITY,
+        DVec3::new(0.5 * (le + fixed_te), 0.0, r.z),
+    );
+    for side in [-1.0, 1.0] {
+        let tip = mesh::cuboid(Vec3::new((0.5 * c) as f32, (0.01 * b) as f32, (1.1 * t) as f32), trim);
+        body.append_transformed(&tip, DQuat::IDENTITY, DVec3::new(r.x - 0.25 * c, side * 0.5 * b, r.z));
+    }
+    let mut surfaces = Vec::new();
+    // A plate of half extents `half` just behind its hinge line.
+    let flap = |chord: f64, half: Vec3, color| {
+        let mut m = MeshData::new();
+        m.append_transformed(&mesh::cuboid(half, color), DQuat::IDENTITY, DVec3::new(-0.5 * chord, 0.0, 0.0));
+        m
+    };
+    // Trailing-edge surfaces: ailerons on the outer 45 %, flaps inboard of them.
+    let sc = 0.25 * c;
+    for side in [-1.0f64, 1.0] {
+        for (from, to, control) in [(0.55, 0.98, 0), (0.12, 0.55, 3)] {
+            let half = 0.25 * b * (to - from);
+            let y = side * 0.5 * b * 0.5 * (from + to);
+            let m = flap(sc, Vec3::new((0.5 * sc) as f32, half as f32, (0.8 * t) as f32), grey);
+            // Right aileron (y < 0) up and left down rolls right: rotations about +y raise the
+            // trailing edge, so the right one turns about +y, the left one about −y.
+            let axis = if control == 0 { DVec3::Y * -side } else { -DVec3::Y };
+            surfaces.push(SurfaceVisual { mesh: m, hinge: DVec3::new(fixed_te, y, r.z), axis, control });
+        }
+    }
+    // Tail: stabiliser and fin with elevator and rudder on their rear 35 %.
+    let (tail_span, tail_chord) = (0.34 * b, 0.65 * c);
+    let fin_h = 0.13 * b;
+    let tail_z = 0.15 * h;
+    let hinge_x = tail + 0.35 * tail_chord;
+    let stab_x = hinge_x + 0.325 * tail_chord;
+    let tail_t = (0.04 * tail_chord) as f32;
+    body.append_transformed(
+        &mesh::cuboid(Vec3::new((0.325 * tail_chord) as f32, (0.5 * tail_span) as f32, tail_t), white),
+        DQuat::IDENTITY,
+        DVec3::new(stab_x, 0.0, tail_z),
+    );
+    body.append_transformed(
+        &mesh::cuboid(Vec3::new((0.325 * tail_chord) as f32, tail_t, (0.5 * fin_h) as f32), trim),
+        DQuat::IDENTITY,
+        DVec3::new(stab_x, 0.0, tail_z + 0.5 * fin_h),
+    );
+    let ec = 0.35 * tail_chord;
+    surfaces.push(SurfaceVisual {
+        mesh: flap(ec, Vec3::new((0.5 * ec) as f32, (0.5 * tail_span) as f32, tail_t), grey),
+        hinge: DVec3::new(hinge_x, 0.0, tail_z),
+        // Trailing edge up pitches up: about +y.
+        axis: DVec3::Y,
+        control: 1,
+    });
+    surfaces.push(SurfaceVisual {
+        mesh: flap(ec, Vec3::new((0.5 * ec) as f32, tail_t, (0.5 * fin_h) as f32), trim),
+        hinge: DVec3::new(hinge_x, 0.0, tail_z + 0.5 * fin_h),
+        // Trailing edge right (−y) yaws right: about +z.
+        axis: DVec3::Z,
+        control: 2,
+    });
+    // Propeller hub with a spinner.
+    let p = &def.propulsion;
+    let axis = p.axis.normalize_or(DVec3::X);
+    let radius = (0.5 * p.propeller.diameter) as f32;
+    let spinner = mesh::cone((0.12 * radius).max(0.3 * w as f32), 0.15 * radius.max(0.5), 12, dark);
+    body.append_transformed(
+        &spinner,
+        DQuat::from_rotation_arc(DVec3::Z, axis),
+        p.position + axis * 0.05 * radius as f64,
+    );
+    // Wheels on struts to the fuselage.
+    for gear in &def.gear {
+        // The gear position is the contact point with the strut extended.
+        let wr = gear.wheel_radius as f32;
+        let centre = gear.position + DVec3::Z * gear.wheel_radius;
+        let wheel = mesh::cylinder(wr, 0.35 * wr, 14, dark);
+        body.append_transformed(&wheel, DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2), centre);
+        let top = DVec3::new(centre.x, centre.y * 0.3, -0.4 * h);
+        let d = top - centre;
+        if d.length() > 1e-3 {
+            let strut = mesh::cylinder(0.25 * wr, 0.5 * d.length() as f32, 6, grey);
+            body.append_transformed(&strut, DQuat::from_rotation_arc(DVec3::Z, d.normalize()), centre + 0.5 * d);
+        }
+    }
+    let span = (0.5 * b).max(nose.abs()).max(tail.abs()).max(p.position.length() + radius as f64) as f32;
+    FixedWingVisual { body, surfaces, propeller: (p.position, axis), propeller_radius: radius, span, eye }
+}
+
 /// Visual of a wheeled vehicle: the body in the chassis frame (FLU) and one mesh per wheel in
 /// its spinning link's frame (spin axis y), to be posed from the simulated wheels.
 #[derive(Clone, Debug)]
@@ -527,6 +683,7 @@ fn hull_2d(pts: &mut [DVec2]) -> Vec<DVec2> {
 mod tests {
     use super::*;
     use crate::terrain::chunks;
+    use autonomousim_vehicles::multirotor::ColliderPart;
     use autonomousim_vehicles::presets;
     use autonomousim_world::testworlds;
 
@@ -631,6 +788,35 @@ mod tests {
         .with_tag(tags::SILO);
         let (_, hi) = obstacle_visual(&silo, color, PropDetail::default()).bounds().unwrap();
         assert!((hi.z - 6.8).abs() < 1e-4, "{hi}");
+    }
+
+    #[test]
+    fn fixed_wing_visual_matches_its_definition() {
+        for name in ["aerosonde_like", "c172_like"] {
+            let def = presets::fixed_wing(name).unwrap();
+            let v = fixed_wing(&def);
+            // The wing reaches the span; the body spans nose to tail.
+            let half = v.body.positions.iter().map(|p| p[1].abs()).fold(0.0, f32::max);
+            let b = def.geometry.span as f32;
+            assert!((half - 0.5 * b).abs() < 0.02 * b, "{name}: {half} vs {b}");
+            let (lo, hi) = v.body.bounds().unwrap();
+            let frame = def.colliders.iter().filter(|c| c.part == ColliderPart::Frame).map(|c| c.center.x);
+            let (tail, nose) = (frame.clone().fold(f64::MAX, f64::min), frame.fold(f64::MIN, f64::max));
+            assert!(f64::from(lo.x) <= tail && f64::from(hi.x) >= nose, "{name}: {lo} {hi}");
+            // Two ailerons, two flaps, elevator and rudder; each hinged at the body.
+            let count = |k: usize| v.surfaces.iter().filter(|s| s.control == k).count();
+            assert_eq!([count(0), count(1), count(2), count(3)], [2, 1, 1, 2], "{name}");
+            for s in &v.surfaces {
+                assert!(!s.mesh.is_empty() && (s.axis.length() - 1.0).abs() < 1e-12);
+                let (lo, hi) = s.mesh.bounds().unwrap();
+                assert!(hi.x <= 1e-6 && lo.x < 0.0, "{name}: surfaces trail their hinge");
+            }
+            // The ailerons turn opposite ways.
+            let ailerons: Vec<_> = v.surfaces.iter().filter(|s| s.control == 0).collect();
+            assert_eq!(ailerons[0].axis, -ailerons[1].axis);
+            assert!(v.propeller_radius > 0.0 && v.span >= 0.5 * b);
+            assert!(v.eye.x > 0.0);
+        }
     }
 
     #[test]

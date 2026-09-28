@@ -1081,7 +1081,8 @@ impl CompiledGroup {
         if let Some((field, _)) = foreign.iter().find(|f| f.1) {
             return Err(fail(format!("`{field}` does not apply to {family} vehicles ({:?})", def.name())));
         }
-        let mode = *spec.action_mode.get_or_insert(AgentActionMode::default_for(family));
+        let mode = spec.action_mode.map_or(AgentActionMode::default_for(family), |m| m.resolve(family));
+        spec.action_mode = Some(mode);
         if family == Family::Wheeled {
             spec.spawn.on_ground = true;
         }

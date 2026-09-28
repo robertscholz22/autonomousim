@@ -6,6 +6,7 @@
 //! cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4 --record drive.mcap
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle truck_6x4 --trailer semitrailer_3axle
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle motorcycle_sport
+//! cargo run -p autonomousim-viewer --release -- --preset large --vehicle aerosonde_like
 //! cargo run -p autonomousim-viewer --release -- --preset large --demo --demo-speed 30 --demo-agl 200 --demo-turn 0
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
@@ -283,7 +284,17 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
         bail!("only ground vehicles tow trailers");
     }
     let rural = args.map == MapKind::Rural;
-    let group = if ground {
+    let aircraft = matches!(def, VehicleDef::FixedWing(_));
+    let group = if aircraft {
+        // In the air, 150 m up at 1.5 stall speeds, flown by attitude.
+        GroupSpec {
+            name: "pilot".into(),
+            vehicle,
+            spawn: SpawnSpec { agl: [150.0, 150.0], clearance: 20.0, margin: 300.0, ..Default::default() },
+            disable_on_terminal: false,
+            ..Default::default()
+        }
+    } else if ground {
         // On rural maps: start in a lane with a route to a farm yard.
         let (spawn, goals) = if rural {
             let goals = GoalSpec { kind: GoalKind::Route, distance: [150.0, 400.0], radius: 5.0, ..Default::default() };
@@ -567,8 +578,8 @@ fn spawn_camera(
             (span, CameraRig::new(f64::from(span), heading))
         }
         Vehicle::FixedWing(f) => {
-            let span = f.def().geometry.span as f32;
-            (span, CameraRig::new(f64::from(span), heading))
+            let visual = autonomousim_scene::props::fixed_wing(f.def());
+            (visual.span, CameraRig::aircraft(f64::from(visual.span), heading, visual.eye))
         }
         Vehicle::Wheeled(w) => {
             let visual = autonomousim_scene::props::wheeled(w.def());
@@ -650,6 +661,15 @@ fn demo_pilot(capture: Res<Capture>, mut sim: ResMut<sim::Sim>, mut route: ResMu
         return;
     }
     let agl = sim.world.agent(sim.pilot).agl_now(sim.world.map());
+    if let Some(map) = sim.flight_map() {
+        // Aircraft: in `guidance`, at the demo speed (within the airspeed range), turn rate and
+        // height.
+        let climb = (0.2 * (demo.agl - agl)).clamp(-map.climb_rate(), map.climb_rate());
+        sim.pilot_mode = sim::PilotMode::Velocity;
+        sim.airspeed = Some(demo.speed);
+        sim.stick = [0.0, (demo.turn / map.limits().course_rate).clamp(-1.0, 1.0), climb / map.climb_rate(), 0.0];
+        return;
+    }
     let demo = if demo.camera { DemoFlight { speed: 8.0, agl: 40.0, turn: 0.1, camera: false } } else { demo };
     let climb = (demo.agl - agl).clamp(-2.0, 3.0);
     sim.pilot_mode = sim::PilotMode::Velocity;
@@ -968,6 +988,36 @@ mod tests {
     }
 
     /// A wheeled vehicle gets a driver group; `--record` writes the drive, wheels included.
+    #[test]
+    fn a_recorded_flight_plays_back() {
+        let path = std::env::temp_dir().join(format!("autonomousim-viewer-flight-{}.mcap", std::process::id()));
+        let args = ["viewer", "--preset", "training", "--size", "1024", "--no-cache", "--vehicle", "aerosonde_like"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let sc = scenario(&cli.live).unwrap();
+        let world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(0));
+        let mut live = sim::Sim::new(world);
+        assert_eq!(live.pilot_mode_name(), "attitude");
+        start_recording(&mut live, Some(&path)).unwrap();
+        // Bank right.
+        live.stick = [0.0, -1.0, 0.0, 0.0];
+        for _ in 0..120 {
+            live.advance(1.0 / 60.0);
+        }
+        live.finish_recording().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut replay = sim::Sim::replay(world, replay::Replay::new(recording, 0));
+        replay.advance(1.9);
+        // The replayed aircraft shows the recorded aileron, throttle and air data.
+        let shown = replay.world.agent(0).vehicle.as_fixed_wing().unwrap();
+        let flown = live.world.agent(0).vehicle.as_fixed_wing().unwrap();
+        assert!(shown.surfaces()[0].abs() > 1e-3, "{:?}", shown.surfaces());
+        assert!(shown.flow().airspeed > 10.0 && shown.input().throttle > 0.0);
+        assert!((shown.flow().airspeed - flown.flow().airspeed).abs() < 2.0);
+        assert!(autonomousim_control::fixedwing::euler(shown.orientation()).0 > 0.2);
+    }
+
     #[test]
     fn a_recorded_drive_plays_back() {
         let path = std::env::temp_dir().join(format!("autonomousim-viewer-drive-{}.mcap", std::process::id()));

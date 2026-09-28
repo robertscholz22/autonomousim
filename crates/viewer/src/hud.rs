@@ -1,5 +1,6 @@
 //! Head-up display: flight data, events, rotor speeds (or a ground vehicle's powertrain,
-//! pedals and per-wheel load, slip and force), simulation controls and key help; a map seed
+//! pedals and per-wheel load, slip and force; or an aircraft's air data, controls and
+//! artificial horizon), simulation controls and key help; a map seed
 //! control (live), a timeline (replay), and plots of the followed agent. The LiDAR view is in
 //! `lidar_view`.
 
@@ -48,6 +49,15 @@ const RIDE_HELP: &str = "W/S  speed setpoint up/down (vk)   A/D  turn\n\
                          O  goals/trails       G  plots\n\
                          L  LiDAR hits         V  LiDAR view\n\
                          H  hide HUD   F1  help   Esc  quit";
+
+const FLIGHT_HELP: &str = "attitude  A/D bank   W/S pitch   Space/Shift airspeed\n\
+                           guidance  A/D turn   Space/Shift climb   W/S airspeed\n\
+                           rates     A/D roll   W/S pitch   Q/E yaw   Space/Shift throttle\n\
+                           M  pilot mode         R  reset episode\n\
+                           Tab  next agent       P  pause   [/]  time scale\n\
+                           C  camera             mouse drag  look   wheel  zoom\n\
+                           O  goals/trails       G  plots\n\
+                           H  hide HUD   F1  help   Esc  quit";
 
 /// Shown above [`HELP`] while a policy flies.
 const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
@@ -215,8 +225,10 @@ fn status_window(
                     row(ui, "driver", format!("{who}  pedal {:+.1}  steer {:+.2}{hb}", sim.stick[0], sim.steer));
                 } else if sim.replay.is_none() {
                     let [f, l, u, y] = sim.stick;
-                    row(ui, "pilot", format!("{}  {f:+.1} {l:+.1} {u:+.1} {y:+.1}", sim.pilot_mode.name()));
-                    row(ui, "max speed", format!("{:4.1} m/s", sim.max_speed));
+                    row(ui, "pilot", format!("{}  {f:+.1} {l:+.1} {u:+.1} {y:+.1}", sim.pilot_mode_name()));
+                    if v.as_multirotor().is_some() {
+                        row(ui, "max speed", format!("{:4.1} m/s", sim.max_speed));
+                    }
                 }
             });
             if let Some(m) = v.as_multirotor() {
@@ -230,6 +242,9 @@ fn status_window(
             }
             if let Some(w) = v.as_wheeled() {
                 ground_status(ui, sim, w);
+            }
+            if let Some(f) = v.as_fixed_wing() {
+                flight_status(ui, sim, f);
             }
             let latched = sim.latched[sim.pilot];
             let now = agent.events;
@@ -266,6 +281,7 @@ fn status_window(
                 }
                 let help = match (sim.replay.is_some(), v.as_wheeled().is_some()) {
                     (true, _) => REPLAY_HELP,
+                    (false, false) if v.as_fixed_wing().is_some() => FLIGHT_HELP,
                     (false, true) if sim.riding() => RIDE_HELP,
                     (false, true) => GROUND_HELP,
                     (false, false) => HELP,
@@ -273,6 +289,84 @@ fn status_window(
                 ui.monospace(help);
             }
         });
+}
+
+/// An aircraft's air data, engine, controls and attitude: airspeed (and the keys' setpoint), α
+/// and β (red past the stall angle), throttle and propeller speed, surface deflections, a stall
+/// warning and an artificial horizon.
+fn flight_status(ui: &mut egui::Ui, sim: &Sim, f: &autonomousim_vehicles::fixedwing::FixedWing) {
+    let flow = f.flow();
+    let (hi, lo) = f.stall_angles();
+    let stalled = f.stalled();
+    let red = egui::Color32::from_rgb(230, 80, 60);
+    let setpoint = match sim.airspeed {
+        Some(v) if sim.replay.is_none() && sim.manual_agent().is_some() => format!("  (set {v:4.1})"),
+        _ => String::new(),
+    };
+    ui.label(format!("airspeed {:5.1} m/s{setpoint}", flow.airspeed));
+    ui.horizontal(|ui| {
+        let alpha = format!("α {:+5.1}°", flow.alpha.to_degrees());
+        if flow.alpha > 0.85 * hi || flow.alpha < 0.85 * lo {
+            ui.colored_label(red, alpha);
+        } else {
+            ui.label(alpha);
+        }
+        ui.label(format!("β {:+5.1}°", flow.beta.to_degrees()));
+        if stalled {
+            ui.colored_label(red, egui::RichText::new("STALL").strong());
+        }
+    });
+    let throttle = f.input().throttle;
+    ui.horizontal(|ui| {
+        ui.label("throttle");
+        ui.add(egui::ProgressBar::new(throttle as f32).desired_width(80.0).text(format!("{:3.0} %", 100.0 * throttle)));
+        ui.label(format!("{:5.0} rpm", f.rotor_speed() * 30.0 / std::f64::consts::PI));
+    });
+    let [a, e, r, flap] = f.surfaces().map(f64::to_degrees);
+    ui.label(format!("aileron {a:+5.1}° elevator {e:+5.1}° rudder {r:+5.1}° flaps {flap:4.1}°"));
+    let (roll, pitch, _) = autonomousim_control::fixedwing::euler(f.orientation());
+    horizon(ui, roll, pitch);
+}
+
+/// Artificial horizon: sky and ground split by the horizon, rotated by the bank (right bank
+/// raises its right end) and moved down as the nose rises; a pitch ladder every 10° and the
+/// aircraft symbol fixed in the middle.
+fn horizon(ui: &mut egui::Ui, roll: f64, pitch: f64) {
+    const SIZE: f32 = 130.0;
+    // Screen pixels per radian of pitch.
+    let k = SIZE / 60f32.to_radians();
+    let (response, painter) = ui.allocate_painter(egui::vec2(SIZE, SIZE), egui::Sense::hover());
+    let rect = response.rect;
+    let c = rect.center();
+    let (sin, cos) = (roll as f32).sin_cos();
+    // Horizon frame (x right, y down, origin on the horizon) → screen.
+    let offset = pitch as f32 * k;
+    let at = |x: f32, y: f32| {
+        let y = y + offset;
+        c + egui::vec2(x * cos + y * sin, -x * sin + y * cos)
+    };
+    let l = 2.0 * SIZE;
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(70, 130, 200));
+    let ground = vec![at(-l, 0.0), at(l, 0.0), at(l, l), at(-l, l)];
+    painter.add(egui::Shape::convex_polygon(ground, egui::Color32::from_rgb(140, 95, 50), egui::Stroke::NONE));
+    let white = egui::Stroke::new(1.5, egui::Color32::WHITE);
+    painter.line_segment([at(-l, 0.0), at(l, 0.0)], white);
+    for deg in [-20i32, -10, 10, 20] {
+        let y = -(deg as f32).to_radians() * k;
+        let w = if deg.abs() == 10 { 0.15 * SIZE } else { 0.25 * SIZE };
+        painter.line_segment([at(-w, y), at(w, y)], egui::Stroke::new(1.0, egui::Color32::WHITE));
+    }
+    let yellow = egui::Stroke::new(3.0, egui::Color32::from_rgb(250, 210, 40));
+    painter.line_segment([c + egui::vec2(-0.3 * SIZE, 0.0), c + egui::vec2(-0.08 * SIZE, 0.0)], yellow);
+    painter.line_segment([c + egui::vec2(0.08 * SIZE, 0.0), c + egui::vec2(0.3 * SIZE, 0.0)], yellow);
+    painter.circle_filled(c, 3.0, yellow.color);
+    painter.text(
+        rect.left_bottom() + egui::vec2(4.0, -4.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("bank {:+3.0}° pitch {:+3.0}°", roll.to_degrees(), pitch.to_degrees()),
+        egui::FontId::monospace(10.0),
+        egui::Color32::WHITE,
+    );
 }
 
 /// Wheel names: FL, FR, RL, RR for two axles, else axle number and side (none for a single

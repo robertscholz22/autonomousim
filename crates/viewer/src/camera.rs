@@ -2,7 +2,8 @@
 //! (mouse-controlled around it), first-person (fixed to the airframe, or from the driver's
 //! seat) and, for ground vehicles, a reversing camera at the tail of the last unit (the
 //! trailer's, for a rig) looking back; and a free-flying camera (W/A/S/D, Space/Shift, mouse drag to look, wheel for speed,
-//! Ctrl for 4×). Ground vehicles are chased from lower and closer, relative to their size.
+//! Ctrl for 4×). Ground vehicles are chased from lower and closer, relative to their size;
+//! aircraft along their flight path (track and climb angle) rather than their heading.
 //!
 //! Angles and positions are computed in ENU and converted once.
 
@@ -74,6 +75,9 @@ pub struct CameraRig {
     /// The free camera flies on its own: speed (m/s), height above the ground (m) and turn
     /// rate (rad/s) (for demos and streaming checks).
     pub flythrough: Option<[f64; 3]>,
+    /// Aircraft: the chase camera follows the flight path (the track and the climb angle, the
+    /// latter kept here smoothed, rad) instead of the heading.
+    pub flight_path: Option<f64>,
 }
 
 impl CameraRig {
@@ -91,6 +95,21 @@ impl CameraRig {
             eye: DVec3::ZERO,
             speed: 10.0,
             flythrough: None,
+            flight_path: None,
+        }
+    }
+
+    /// For an aircraft of size `span` with the pilot's eye at `eye` (body frame): chased from
+    /// closer than a multirotor of that size, along its flight path.
+    pub fn aircraft(span: f64, heading: f64, eye: DVec3) -> Self {
+        Self {
+            pitch: 0.15,
+            distance: (2.2 * span).max(4.0),
+            min_distance: (1.0 * span).max(1.5),
+            focus_height: 0.1 * span,
+            eye_offset: Some(eye),
+            flight_path: Some(0.0),
+            ..Self::new(span, heading)
         }
     }
 
@@ -158,14 +177,27 @@ pub fn update_camera(
     let target = pose.pos;
     let (eye, look, up) = match rig.mode {
         CameraMode::Chase | CameraMode::Orbit => {
+            let velocity = sim.world.agent(sim.pilot).vehicle.lin_vel_world();
+            let flying = rig.flight_path.is_some() && velocity.length() > 3.0;
             if rig.mode == CameraMode::Chase && !buttons.pressed(MouseButton::Left) {
-                // Swing behind the vehicle with a time constant of about half a second.
-                let wanted = yaw(pose.rot);
+                // Swing behind the vehicle with a time constant of about half a second (behind
+                // an aircraft's track, faster).
+                let (wanted, tau) = if flying { (velocity.y.atan2(velocity.x), 0.3) } else { (yaw(pose.rot), 0.5) };
                 let err = (wanted - rig.heading + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
                     - std::f64::consts::PI;
-                rig.heading += err * (1.0 - (-dt / 0.5).exp());
+                rig.heading += err * (1.0 - (-dt / tau).exp());
             }
-            let dir = rig.look();
+            let mut dir = rig.look();
+            if let Some(previous) = rig.flight_path {
+                // Look along the climb or dive, smoothed over about half a second.
+                let wanted = if flying { (velocity.z / velocity.length()).clamp(-1.0, 1.0).asin() } else { 0.0 };
+                let gamma = previous + (wanted - previous) * (1.0 - (-dt / 0.5).exp());
+                rig.flight_path = Some(gamma);
+                if rig.mode == CameraMode::Chase {
+                    let pitch = (rig.pitch - gamma).clamp(-1.2, 1.45);
+                    dir = DVec3::new(rig.heading.cos() * pitch.cos(), rig.heading.sin() * pitch.cos(), -pitch.sin());
+                }
+            }
             let focus = target + DVec3::Z * rig.focus_height;
             // Move in front of terrain, trunks and crowns between the vehicle and the camera.
             let mask = HitMask(HitMask::TERRAIN.0 | HitMask::SOLID.0 | HitMask::FOLIAGE.0);

@@ -43,6 +43,19 @@ impl AgentActionMode {
         }
     }
 
+    /// The mode of `family` with this mode's name (`attitude` is a multirotor's and an
+    /// aircraft's mode; a name parses as the multirotor's first); `self` when that family has
+    /// no mode of the name.
+    pub fn resolve(self, family: Family) -> Self {
+        let name = self.name();
+        let found = match family {
+            Family::Multirotor => name.parse::<ActionMode>().ok().map(Self::from),
+            Family::Wheeled => name.parse::<GroundActionMode>().ok().map(Self::from),
+            Family::FixedWing => name.parse::<FixedWingActionMode>().ok().map(Self::from),
+        };
+        found.unwrap_or(self)
+    }
+
     /// Whether this mode drives vehicles of `family`.
     pub fn fits(self, family: Family) -> bool {
         matches!(

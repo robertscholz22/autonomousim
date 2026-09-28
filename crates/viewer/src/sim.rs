@@ -8,14 +8,13 @@ use crate::autopilot::{self, Autopilot};
 use crate::camera::{CameraMode, CameraRig};
 use crate::replay::Replay;
 use autonomousim_control::Command;
-use autonomousim_control::fixedwing::FixedWingSetpoint;
+use autonomousim_control::fixedwing::{FixedWingActionMap, FixedWingActionMode, FixedWingSetpoint, Lateral, Vertical};
 use autonomousim_control::ground::{GroundActionMap, GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::Family;
-use autonomousim_vehicles::fixedwing::FixedWingInput;
 use autonomousim_vehicles::ground::PowertrainDef;
 use bevy::prelude::*;
 use bevy_egui::EguiContexts;
@@ -46,8 +45,15 @@ pub const RIDE_LEAN: [f64; 2] = [0.35, 0.2];
 /// Below this speed (m/s) a rider's turn command fades in proportion: the bike hardly
 /// balances itself there.
 const RIDE_TURN_SPEED: f64 = 4.0;
+/// Keyboard flight of aircraft: how fast the keys move the airspeed setpoint (m/s per second)
+/// and the throttle in `rates` (full range per second × this).
+const AIRSPEED_RATE: f64 = 3.0;
+const THROTTLE_RATE: f64 = 0.5;
 
-/// How the keys fly the pilot.
+/// How the keys fly the pilot. Aircraft: `Velocity` is `guidance` (A/D course rate,
+/// Space/Shift climb rate, W/S airspeed setpoint), `Attitude` holds a bank (A/D) and a pitch
+/// (W/S, forward is nose down, about the level-flight pitch) at an airspeed setpoint
+/// (Space/Shift), and `Rates` flies body rates (Q/E yaw) with the throttle on Space/Shift.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PilotMode {
     /// Velocity in the heading frame and yaw rate (the cascade holds position and attitude).
@@ -75,6 +81,14 @@ impl PilotMode {
             PilotMode::Rates => "rates",
         }
     }
+
+    /// The name for a vehicle of `family` (aircraft fly `guidance` for `velocity`).
+    pub fn name_for(self, family: Family) -> &'static str {
+        match (self, family) {
+            (PilotMode::Velocity, Family::FixedWing) => "guidance",
+            _ => self.name(),
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -95,6 +109,10 @@ pub struct Sim {
     pub steer: f64,
     /// Single-track vehicles: the speed setpoint as a fraction of the `vk` full scale.
     pub ride_speed: f64,
+    /// Aircraft: the airspeed setpoint (m/s) and the throttle in `rates`; `None` until the
+    /// keys fly it (then from the current airspeed and throttle).
+    pub airspeed: Option<f64>,
+    pub throttle: Option<f64>,
     /// Drives the followed ground vehicle instead of the keys (`--demo`).
     pub drive_command: Option<GroundSetpoint>,
     /// Horizontal and vertical speed at full stick (m/s), yaw rate (rad/s).
@@ -125,16 +143,20 @@ pub struct Sim {
 impl Sim {
     pub fn new(world: WorldInstance) -> Self {
         let n = world.agents().len();
+        // Aircraft fly by attitude from the start.
+        let aircraft = world.agent(0).vehicle.family() == Family::FixedWing;
         let mut s = Self {
             world,
             pilot: 0,
             paused: false,
             time_scale: 1.0,
-            pilot_mode: PilotMode::Velocity,
+            pilot_mode: if aircraft { PilotMode::Attitude } else { PilotMode::Velocity },
             stick: [0.0; 4],
             handbrake: false,
             steer: 0.0,
             ride_speed: 0.0,
+            airspeed: None,
+            throttle: None,
             drive_command: None,
             max_speed: 8.0,
             max_climb: 3.0,
@@ -189,6 +211,7 @@ impl Sim {
         }
         self.world = world;
         self.ride_speed = 0.0;
+        (self.airspeed, self.throttle) = (None, None);
         self.pilot = self.pilot.min(self.world.agents().len() - 1);
         self.latched = vec![Events::NONE; self.world.agents().len()];
         self.accumulator = 0.0;
@@ -212,6 +235,7 @@ impl Sim {
         }
         self.world.reset(None);
         self.ride_speed = 0.0;
+        (self.airspeed, self.throttle) = (None, None);
         if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
             r.on_reset(&self.world);
         }
@@ -269,6 +293,65 @@ impl Sim {
         }
     }
 
+    /// The `attitude` action map of the followed aircraft's group: its airspeed range and
+    /// limits scale the keys.
+    pub fn flight_map(&self) -> Option<FixedWingActionMap> {
+        let agent = self.world.agent(self.pilot);
+        let group = &self.world.scenario().groups[agent.group];
+        let controller = agent.controller.as_fixed_wing()?;
+        FixedWingActionMap::new(FixedWingActionMode::Attitude, &group.spec.fixed_wing_action_limits, controller).ok()
+    }
+
+    /// The keys' setpoint for the followed aircraft in the pilot mode (see [`PilotMode`]).
+    pub fn flight_setpoint(&self) -> FixedWingSetpoint {
+        let agent = self.world.agent(self.pilot);
+        let (Some(map), Some(f), Some(c)) =
+            (self.flight_map(), agent.vehicle.as_fixed_wing(), agent.controller.as_fixed_wing())
+        else {
+            return FixedWingSetpoint::Surfaces(Default::default());
+        };
+        let l = map.limits();
+        let [forward, left, up, yaw] = self.stick;
+        let airspeed = self.airspeed.unwrap_or_else(|| f.flow().airspeed);
+        let [lo, hi] = map.airspeed_range();
+        let airspeed = airspeed.clamp(lo, hi);
+        match self.pilot_mode {
+            PilotMode::Velocity => FixedWingSetpoint::Guidance {
+                lateral: Lateral::CourseRate(left * l.course_rate),
+                vertical: Vertical::ClimbRate(up * map.climb_rate()),
+                airspeed,
+            },
+            PilotMode::Attitude => FixedWingSetpoint::Attitude {
+                roll: -left * l.roll,
+                pitch: c.model().trim_at(airspeed).alpha - forward * l.pitch,
+                airspeed,
+            },
+            PilotMode::Rates => FixedWingSetpoint::Rates {
+                rates: DVec3::new(-left, -forward, -yaw) * l.rate,
+                throttle: self.throttle.unwrap_or(f.input().throttle),
+            },
+        }
+    }
+
+    /// Move the aircraft's airspeed setpoint (or throttle) with the keys by `dt` of simulated
+    /// time.
+    fn update_flight(&mut self, dt: f64) {
+        let Some(f) = self.world.agent(self.pilot).vehicle.as_fixed_wing() else { return };
+        let (airspeed, throttle) = (f.flow().airspeed, f.input().throttle);
+        let Some(map) = self.flight_map() else { return };
+        let [lo, hi] = map.airspeed_range();
+        let key = if self.pilot_mode == PilotMode::Velocity { self.stick[0] } else { self.stick[2] };
+        let v = self.airspeed.unwrap_or(airspeed).clamp(lo, hi);
+        self.airspeed = Some((v + key * AIRSPEED_RATE * dt).clamp(lo, hi));
+        let t = self.throttle.unwrap_or(throttle);
+        self.throttle = Some((t + self.stick[2] * THROTTLE_RATE * dt).clamp(0.0, 1.0));
+    }
+
+    /// The pilot mode's name for the followed vehicle.
+    pub fn pilot_mode_name(&self) -> &'static str {
+        self.pilot_mode.name_for(self.world.agent(self.pilot).vehicle.family())
+    }
+
     /// Whether the followed vehicle is a single-track vehicle, ridden in `vk`.
     pub fn riding(&self) -> bool {
         self.world.agent(self.pilot).vehicle.as_wheeled().is_some_and(|w| w.def().is_single_track())
@@ -306,19 +389,7 @@ impl Sim {
         let agent = self.world.agent(self.pilot);
         match agent.vehicle.family() {
             Family::Multirotor => self.setpoint().into(),
-            // Placeholder until the aircraft get their own pilot modes: forward/back is the
-            // elevator (forward pushes the nose down), left/right the ailerons, at the throttle
-            // the aircraft was reset with.
-            Family::FixedWing => {
-                let hold = agent.vehicle.as_fixed_wing().map_or_else(Default::default, |f| *f.hold_input());
-                FixedWingSetpoint::Surfaces(FixedWingInput {
-                    aileron: -self.steer,
-                    elevator: -self.stick[0],
-                    brake: if self.handbrake { 1.0 } else { 0.0 },
-                    ..hold
-                })
-                .into()
-            }
+            Family::FixedWing => self.flight_setpoint().into(),
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();
@@ -345,6 +416,10 @@ impl Sim {
     /// Move the steering command toward the keys by `dt` of simulated time (and a rider's
     /// speed setpoint).
     fn update_steering(&mut self, dt: f64) {
+        if self.world.agent(self.pilot).vehicle.family() == Family::FixedWing {
+            self.update_flight(dt);
+            return;
+        }
         if self.riding() {
             let rate = match (self.handbrake, self.stick[0]) {
                 (true, _) => -RIDE_STOP,
@@ -530,6 +605,7 @@ pub fn pilot_input(
     }
     if keys.just_pressed(KeyCode::Tab) {
         sim.pilot = (sim.pilot + 1) % sim.world.agents().len();
+        (sim.airspeed, sim.throttle) = (None, None);
     }
     if let Some(a) = &mut sim.autopilot
         && keys.just_pressed(KeyCode::KeyT)
@@ -585,6 +661,7 @@ pub fn step(time: Res<Time>, mut sim: ResMut<Sim>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autonomousim_control::fixedwing::euler;
     use autonomousim_control::ground::GroundActionMode;
     use autonomousim_control::multirotor::ActionMode;
     use autonomousim_core::math::quat::yaw;
@@ -619,6 +696,60 @@ mod tests {
             ..Default::default()
         };
         Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1)))
+    }
+
+    /// An aircraft in the air, heading east at 1.5 V_s.
+    fn aircraft_sim(vehicle: &str) -> Sim {
+        let sc = Scenario::from_toml(&format!(
+            r#"
+            name = "fly"
+            map = {{ type = "testworld", kind = "flat", size = 8000.0 }}
+            [[groups]]
+            vehicle = "{vehicle}"
+            spawn = {{ region = [[-10.0, -10.0], [10.0, 10.0]], agl = [300.0, 300.0], yaw_deg = [0.0, 0.0], clearance = 0.0 }}
+            "#
+        ))
+        .unwrap();
+        Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1)))
+    }
+
+    #[test]
+    fn keys_fly_an_aircraft() {
+        let mut s = aircraft_sim("aerosonde_like");
+        assert_eq!((s.pilot_mode, s.pilot_mode_name()), (PilotMode::Attitude, "attitude"));
+        let z0 = s.world.agent(0).vehicle.position().z;
+        // Hands off: straight and level, speeding up to the setpoint's floor of the range.
+        let (_, turn) = drive(&mut s, [0.0; 4], 5.0);
+        let v = &s.world.agent(0).vehicle;
+        assert!(turn.abs() < 0.05 && (v.position().z - z0).abs() < 15.0, "turn {turn} z {}", v.position().z);
+        // A: bank left and turn left; released, the wings level.
+        let (_, turn) = drive(&mut s, [0.0, 1.0, 0.0, 0.0], 5.0);
+        let roll = euler(s.world.agent(0).vehicle.orientation()).0;
+        let limit = s.flight_map().unwrap().limits().roll;
+        assert!(turn > 0.5 && (roll + limit).abs() < 0.1, "turn {turn} roll {roll}");
+        drive(&mut s, [0.0; 4], 4.0);
+        assert!(euler(s.world.agent(0).vehicle.orientation()).0.abs() < 0.05);
+        // Space raises the airspeed setpoint, and the aircraft follows.
+        let v0 = s.airspeed.unwrap();
+        drive(&mut s, [0.0, 0.0, 1.0, 0.0], 2.0);
+        assert!((s.airspeed.unwrap() - v0 - 2.0 * AIRSPEED_RATE).abs() < 0.2, "{v0} → {:?}", s.airspeed);
+        drive(&mut s, [0.0; 4], 10.0);
+        let f = s.world.agent(0).vehicle.as_fixed_wing().unwrap();
+        assert!((f.flow().airspeed - s.airspeed.unwrap()).abs() < 1.0, "{} vs {:?}", f.flow().airspeed, s.airspeed);
+        // Guidance: Space climbs.
+        s.pilot_mode = PilotMode::Velocity;
+        assert_eq!(s.pilot_mode_name(), "guidance");
+        let z = s.world.agent(0).vehicle.position().z;
+        drive(&mut s, [0.0, 0.0, 1.0, 0.0], 5.0);
+        let climb = s.world.agent(0).vehicle.lin_vel_world().z;
+        assert!(s.world.agent(0).vehicle.position().z > z + 5.0 && climb > 1.0, "climb {climb}");
+        // Rates: Shift closes the throttle.
+        s.pilot_mode = PilotMode::Rates;
+        drive(&mut s, [0.0, 0.0, -1.0, 0.0], 3.0);
+        assert!(
+            s.throttle.unwrap() < 0.05 && s.world.agent(0).vehicle.as_fixed_wing().unwrap().input().throttle < 0.05
+        );
+        assert!(!s.latched[0].is_terminal(), "{:?}", s.latched[0]);
     }
 
     /// Run `seconds` of 60 Hz frames with the given stick; returns the displacement along the

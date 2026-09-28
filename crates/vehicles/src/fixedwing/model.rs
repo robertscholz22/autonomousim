@@ -492,6 +492,23 @@ impl FixedWing {
         self.rotor
     }
 
+    /// Static rotor speed at full throttle at sea level (rad/s), a scale for displays.
+    pub fn full_throttle_speed(&self) -> f64 {
+        self.propulsion.steady_omega(1.0, 0.0, crate::aero::SEA_LEVEL_DENSITY, self.supply_voltage())
+    }
+
+    /// Show recorded controls and air data without stepping (replay): surface deflections
+    /// (rad), throttle, propeller speed (rad/s), airspeed (m/s), angle of attack and sideslip
+    /// (rad).
+    pub fn show(&mut self, surfaces: [f64; 4], throttle: f64, rotor_speed: f64, airspeed: f64, alpha: f64, beta: f64) {
+        self.surfaces = surfaces;
+        self.input.throttle = throttle;
+        self.set_rotor_speed(rotor_speed);
+        self.flow.airspeed = airspeed;
+        self.flow.alpha = alpha;
+        self.flow.beta = beta;
+    }
+
     pub fn set_rotor_speed(&mut self, omega: f64) {
         self.rotor = omega.max(0.0);
         self.rotor_next = self.rotor;

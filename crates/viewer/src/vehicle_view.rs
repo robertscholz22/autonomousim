@@ -2,7 +2,8 @@
 //! a wheeled vehicle's body, wheels posed from the simulated steering, travel and spin, and a
 //! strut and lower arm per suspended wheel that follow the wheel; a tracked vehicle's band on
 //! each side, wrapped around its sprocket, road wheels and idler and running with the road
-//! wheels. The units behind a tractor
+//! wheels; an aircraft's airframe with its ailerons, flaps, elevator and rudder turned by the
+//! simulated (or recorded) deflections and a propeller disc. The units behind a tractor
 //! (trailers, dollies, drawbars) are children of the root posed from the simulated joints, and
 //! carry their own wheels and links.
 
@@ -13,6 +14,7 @@ use autonomousim_scene::mesh::srgb;
 use autonomousim_scene::props;
 use autonomousim_scene::single_track::{Limb, SingleTrackVisual};
 use autonomousim_vehicles::Vehicle;
+use autonomousim_vehicles::fixedwing::FixedWing;
 use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_vehicles::ground::tire::TireModel;
 use bevy::prelude::*;
@@ -25,6 +27,25 @@ pub struct VehicleVisual(pub usize);
 pub struct RotorDisc {
     agent: usize,
     rotor: usize,
+}
+
+/// A control surface of a fixed-wing agent, turned about its hinge by the deflection.
+#[derive(Component)]
+pub struct SurfacePart {
+    agent: usize,
+    visual: props::SurfaceVisual,
+}
+
+/// A surface's transform at `angle` (rad, pilot sense; see [`props::SurfaceVisual`]).
+fn surface_transform(s: &props::SurfaceVisual, angle: f64) -> Transform {
+    convert::transform(&Pose { pos: s.hinge, rot: glam::DQuat::from_axis_angle(s.axis, angle) })
+}
+
+/// Deflection of `s` in pilot sense (rad): positive commands roll right, pitch up and yaw
+/// right whatever the model's sign convention; flaps positive down.
+fn surface_angle(f: &FixedWing, s: &props::SurfaceVisual) -> f64 {
+    let d = f.surfaces()[s.control];
+    if s.control < 3 { d * f.control_signs()[s.control] } else { d }
 }
 
 /// Unit `unit` (≥ 1) of a wheeled agent; its transform is relative to the towing unit.
@@ -140,29 +161,36 @@ pub fn spawn_vehicles(
         let def = match &agent.vehicle {
             Vehicle::Multirotor(m) => m.def(),
             Vehicle::FixedWing(f) => {
-                // Placeholder until the aircraft get their own visuals: wing, fuselage and
-                // wheels as boxes and spheres.
-                let d = f.def();
-                let g = &d.geometry;
-                let length = d.colliders.iter().map(|c| c.center.x).fold(0.0f64, f64::max)
-                    - d.colliders.iter().map(|c| c.center.x).fold(0.0f64, f64::min);
-                let wing = Cuboid::new(g.chord as f32, g.span as f32, (0.06 * g.chord) as f32);
-                let body = Cuboid::new(length.max(g.chord) as f32, (0.12 * g.span) as f32, (0.12 * g.span) as f32);
-                commands.spawn(root).with_children(|parent| {
-                    parent.spawn((
-                        Mesh3d(meshes.add(wing)),
+                let v = props::fixed_wing(f.def());
+                let root = commands.spawn(root).id();
+                commands
+                    .entity(root)
+                    .with_child((Mesh3d(meshes.add(convert::mesh(&v.body))), MeshMaterial3d(body_material.clone())));
+                for s in &v.surfaces {
+                    commands.entity(root).with_child((
+                        Mesh3d(meshes.add(convert::mesh(&s.mesh))),
                         MeshMaterial3d(body_material.clone()),
-                        Transform::from_translation(convert::vec(g.aero_reference)),
+                        surface_transform(s, 0.0),
+                        SurfacePart { agent: i, visual: s.clone() },
                     ));
-                    parent.spawn((Mesh3d(meshes.add(body)), MeshMaterial3d(body_material.clone())));
-                    for gear in &d.gear {
-                        parent.spawn((
-                            Mesh3d(meshes.add(Sphere::new(gear.wheel_radius as f32))),
-                            MeshMaterial3d(body_material.clone()),
-                            Transform::from_translation(convert::vec(gear.position)),
-                        ));
-                    }
+                }
+                let (hub, axis) = v.propeller;
+                let material = materials.add(StandardMaterial {
+                    base_color: Color::linear_rgba(0.1, 0.1, 0.1, 0.3),
+                    alpha_mode: AlphaMode::Blend,
+                    cull_mode: None,
+                    double_sided: true,
+                    unlit: true,
+                    ..default()
                 });
+                commands.entity(root).with_child((
+                    Mesh3d(meshes.add(convert::mesh(&props::rotor_disc(v.propeller_radius, [1.0; 4])))),
+                    MeshMaterial3d(material),
+                    Transform::from_translation(convert::vec(hub))
+                        .with_rotation(convert::quat(glam::DQuat::from_rotation_arc(glam::DVec3::Z, axis))),
+                    RotorDisc { agent: i, rotor: 0 },
+                    bevy::light::NotShadowCaster,
+                ));
                 continue;
             }
             Vehicle::Wheeled(w) => {
@@ -295,9 +323,17 @@ pub fn sync_vehicles(
         (&LinkVisual, &mut Transform),
         (Without<VehicleVisual>, Without<WheelVisual>, Without<UnitVisual>),
     >,
+    mut surfaces: Query<
+        (&SurfacePart, &mut Transform),
+        (Without<VehicleVisual>, Without<WheelVisual>, Without<LinkVisual>, Without<UnitVisual>),
+    >,
     discs: Query<(&RotorDisc, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    for (sp, mut t) in &mut surfaces {
+        let Some(f) = sim.world.agent(sp.agent).vehicle.as_fixed_wing() else { continue };
+        *t = surface_transform(&sp.visual, surface_angle(f, &sp.visual));
+    }
     for (v, mut t) in &mut roots {
         *t = origin.transform(&sim.render_pose(v.0));
     }
@@ -314,9 +350,14 @@ pub fn sync_vehicles(
         *t = link_transform(l.mount, wheel_local(w, l.wheel).pos);
     }
     for (d, m) in &discs {
-        let Some(vehicle) = sim.world.agent(d.agent).vehicle.as_multirotor() else { continue };
-        let (_, max) = vehicle.speed_range();
-        let omega = vehicle.motor_speeds().get(d.rotor).copied().unwrap_or(0.0);
+        let vehicle = &sim.world.agent(d.agent).vehicle;
+        let (omega, max) = if let Some(v) = vehicle.as_multirotor() {
+            (v.motor_speeds().get(d.rotor).copied().unwrap_or(0.0), v.speed_range().1)
+        } else if let Some(f) = vehicle.as_fixed_wing() {
+            (f.rotor_speed(), f.full_throttle_speed())
+        } else {
+            continue;
+        };
         let alpha = (0.08 + 0.4 * (omega / max.max(1.0))).clamp(0.05, 0.5) as f32;
         if let Some(mut material) = materials.get_mut(&m.0) {
             let c = material.base_color.to_linear();
