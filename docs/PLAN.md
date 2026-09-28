@@ -2231,8 +2231,8 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | 1 ✅ | Rotor model: BEMT with forward-flight inflow, flapping, hub moments, ground effect, rotor speed | Hover and forward-flight thrust, torque and flapping match closed-form blade-element and momentum results; flapping lag matches `16/(γΩ)` |
 | 2 ✅ | Helicopter family and presets; engine and governor; tail rotor; fins; skids; wiring | Both presets trim in hover and forward flight; stand on their skids; rotor speed recovers from load steps |
 | 3 ✅ | Validation against Padfield (Bo105) and Gavrilets (X-Cell) | Hover power, power curve, trim controls and attitudes within the tolerances above |
-| 4 | Control and action modes | Attitude and velocity steps settle in hover and at 20 m/s; hover holds position in wind ✅ |
-| 5 | Viewer: visuals, HUD, keyboard flight, replay | The helicopter flies by keyboard and lands on a large map; recordings replay |
+| 4 ✅ | Control and action modes | Attitude and velocity steps settle in hover and at 20 m/s; hover holds position in wind |
+| 5 ✅ | Viewer: visuals, HUD, keyboard flight, replay | The helicopter flies by keyboard and lands on a large map; recordings replay |
 | 6 | `HeliLandingZone-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
 
 #### As built
@@ -2274,6 +2274,14 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
     - action maps.
     - `crates/sim/tests/helicopter.rs` adds `velocity` mode flying forward and stopping.
     - Full-scale single-axis velocity actions track on both presets; the Bo105's rotor droops 15 % while accelerating to 56 m/s (engine power limit).
+- **Step 5 (viewer)**:
+  - **Visual** (`scene::props::helicopter(def) -> HelicopterVisual { body, rotors: [RotorVisual; 2], span, eye }`), derived from the definition: a cabin hull over the forward frame colliders with a canopy, an engine cowling and the mast; a boom tapering to the tail rotor; fin and tailplane plates from the `AeroSurface`s; skids along the gear colliders with cross tubes; one blade mesh per rotor.
+  - **Rotor heads**: a head per rotor at the hub in the shaft frame, tilted with the simulated tip-path plane (`rotor_tilt([β₁c, β₁s])`) and turned at the rotor speed (at most 9 rad/s shown, against aliasing), with the blades coned up (`blade_rotation`) and a translucent disc whose opacity follows the rotor speed.
+  - **Keyboard flight** (`Sim::heli_setpoint`, `heli_map`): `velocity` through the group's action map; `attitude` tilts from the trim attitude at the airspeed; `rates` flies body rates; both with the trim collective ± 0.25 on Space/Shift. The viewer spawns helicopters hovering a metre above their skids in `velocity`; `--demo` flies them in `velocity`.
+  - **HUD**: rotor speed in per cent (LOW ROTOR below 90 %), engine power against its limit, airspeed and climb, the four inputs, the disc tilt, an artificial horizon; its own key help. The chase camera follows the heading (not the flight path), and the first-person camera sits behind the canopy.
+  - **Replay**: `Helicopter::show(&HelicopterDisplay)` applies the recorded inputs, pitches, rotor speed, engine power, flapping, coning and airspeed.
+  - **Ground logic** (controller): the first keyboard landings rolled the X-Cell over on lift-off. The loops wound up against the skids, holding the lateral cyclic at 0.65, and then rolled it over as a skid unloaded (dynamic rollover). While any contact touches, the rate and horizontal velocity integrators are cleared and the attitude loop holds the attitude as it stands. The vertical integrator keeps the helicopter down after a descent until the pilot climbs.
+  - **Tests**: `props` (visual covers nose, tail rotor and skids; blade span; shaft frames; tilt and coning signs); viewer `keys_fly_a_helicopter` (hover in place, half-stick forward speed and stop, attitude bank and return to trim, collective climb, yaw in rates); `keys_land_a_helicopter` (both presets descend at 1 m/s, `LANDED` upright and still, lift off level); `rotor_heads_follow_the_flapping`; `replayed_helicopters_show_their_rotors`.
 
 ### M6c: Tiltrotor
 

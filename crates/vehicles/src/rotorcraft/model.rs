@@ -94,6 +94,20 @@ impl HelicopterInit {
     }
 }
 
+/// A recorded state shown by [`Helicopter::show`]: pilot inputs, blade pitches (rad), main
+/// rotor speed (rad/s), engine power (W), main and tail rotor flapping `[β₁c, β₁s]` and coning
+/// (rad), and airspeed (m/s).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HelicopterDisplay {
+    pub input: HelicopterInput,
+    pub pitches: [f64; 4],
+    pub rotor_speed: f64,
+    pub engine_power: f64,
+    pub flap: [[f64; 2]; 2],
+    pub coning: [f64; 2],
+    pub airspeed: f64,
+}
+
 /// Aerodynamic loads on the airframe for one state (body frame, about the centre of mass),
 /// without the drive torque reactions.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -565,6 +579,20 @@ impl Helicopter {
     /// Air-relative flow at the centre of mass in the last step.
     pub fn flow(&self) -> &AirFlow {
         &self.flow
+    }
+
+    /// Show a recorded state without stepping (replay).
+    pub fn show(&mut self, d: &HelicopterDisplay) {
+        self.input = d.input;
+        self.pitches = d.pitches;
+        let omega = d.rotor_speed.max(0.0);
+        self.main_state.omega = omega;
+        self.tail_state.omega = self.def.tail_gear_ratio * omega;
+        self.omega_next = omega;
+        [self.main_state.flap, self.tail_state.flap] = d.flap;
+        [self.loads.main.coning, self.loads.tail.coning] = d.coning;
+        self.engine_torque = if omega > 0.0 { d.engine_power / omega } else { 0.0 };
+        self.flow.airspeed = d.airspeed;
     }
 
     /// Loads of the last step.

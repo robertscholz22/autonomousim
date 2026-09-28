@@ -59,6 +59,15 @@ const FLIGHT_HELP: &str = "attitude  A/D bank   W/S pitch   Space/Shift airspeed
                            O  goals/trails       G  plots\n\
                            H  hide HUD   F1  help   Esc  quit";
 
+const HELI_HELP: &str = "velocity  W/S forward/back   A/D left/right   Space/Shift climb   Q/E yaw\n\
+                         attitude  W/S pitch   A/D bank   Space/Shift collective   Q/E yaw\n\
+                         rates     W/S pitch   A/D roll   Space/Shift collective   Q/E yaw\n\
+                         M  pilot mode         R  reset episode\n\
+                         Tab  next agent       P  pause   [/]  time scale\n\
+                         C  camera             mouse drag  look   wheel  zoom\n\
+                         O  goals/trails       G  plots\n\
+                         H  hide HUD   F1  help   Esc  quit";
+
 /// Shown above [`HELP`] while a policy flies.
 const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
 
@@ -246,6 +255,9 @@ fn status_window(
             if let Some(f) = v.as_fixed_wing() {
                 flight_status(ui, sim, f);
             }
+            if let Some(h) = v.as_helicopter() {
+                heli_status(ui, h);
+            }
             let latched = sim.latched[sim.pilot];
             let now = agent.events;
             let names: Vec<&str> = latched.names().collect();
@@ -282,6 +294,7 @@ fn status_window(
                 let help = match (sim.replay.is_some(), v.as_wheeled().is_some()) {
                     (true, _) => REPLAY_HELP,
                     (false, false) if v.as_fixed_wing().is_some() => FLIGHT_HELP,
+                    (false, false) if v.as_helicopter().is_some() => HELI_HELP,
                     (false, true) if sim.riding() => RIDE_HELP,
                     (false, true) => GROUND_HELP,
                     (false, false) => HELP,
@@ -325,6 +338,40 @@ fn flight_status(ui: &mut egui::Ui, sim: &Sim, f: &autonomousim_vehicles::fixedw
     let [a, e, r, flap] = f.surfaces().map(f64::to_degrees);
     ui.label(format!("aileron {a:+5.1}° elevator {e:+5.1}° rudder {r:+5.1}° flaps {flap:4.1}°"));
     let (roll, pitch, _) = autonomousim_control::fixedwing::euler(f.orientation());
+    horizon(ui, roll, pitch);
+}
+
+/// A helicopter's rotor, engine, air data, controls and attitude: rotor speed in per cent of
+/// the governed speed (red below 90 %), engine power against its limit, airspeed and climb
+/// rate, the pilot inputs, the tip-path plane's tilt and an artificial horizon.
+fn heli_status(ui: &mut egui::Ui, h: &autonomousim_vehicles::rotorcraft::Helicopter) {
+    let d = h.def();
+    let red = egui::Color32::from_rgb(230, 80, 60);
+    let rpm = h.rotor_speed() / d.engine.rated_speed;
+    ui.horizontal(|ui| {
+        ui.label("rotor");
+        let bar = egui::ProgressBar::new((rpm / 1.2).clamp(0.0, 1.0) as f32).desired_width(80.0);
+        ui.add(bar.text(format!("{:3.0} %", 100.0 * rpm)));
+        if rpm < 0.9 {
+            ui.colored_label(red, egui::RichText::new("LOW ROTOR").strong());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("power");
+        let power = h.engine_power();
+        let bar = egui::ProgressBar::new((power / d.engine.max_power).clamp(0.0, 1.0) as f32).desired_width(80.0);
+        ui.add(bar.text(format!("{:.1} kW", 1e-3 * power)));
+    });
+    ui.label(format!("airspeed {:5.1} m/s  climb {:+5.1} m/s", h.flow().airspeed, h.lin_vel_world().z));
+    ui.horizontal(|ui| {
+        for (name, u) in ["coll", "lon", "lat", "ped"].into_iter().zip(h.input().to_array()) {
+            ui.label(name);
+            ui.add(egui::ProgressBar::new((0.5 * (u + 1.0)) as f32).desired_width(48.0).text(format!("{u:+.2}")));
+        }
+    });
+    let [b1c, b1s] = h.main_rotor_state().flap.map(f64::to_degrees);
+    ui.label(format!("disc tilt  forward {b1c:+4.1}°  left {b1s:+4.1}°"));
+    let (roll, pitch, _) = autonomousim_control::fixedwing::euler(h.orientation());
     horizon(ui, roll, pitch);
 }
 

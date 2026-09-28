@@ -204,6 +204,8 @@ pub struct HelicopterController {
     /// Hover flapping time constant (s) and the lead filter's state (lateral, longitudinal).
     tau_flap: f64,
     lead: Option<DVec2>,
+    /// Touching the ground in the last update.
+    grounded: bool,
 }
 
 impl HelicopterController {
@@ -279,6 +281,7 @@ impl HelicopterController {
             i_vel: DVec3::ZERO,
             heading: None,
             lead: None,
+            grounded: false,
         })
     }
 
@@ -328,6 +331,15 @@ impl HelicopterController {
     /// Pilot input for `setpoint`.
     pub fn update(&mut self, setpoint: &HelicopterSetpoint, h: &Helicopter) -> HelicopterInput {
         let point = self.point(h.flow().velocity.x);
+        // On the ground the skids hold the attitude: the loops would wind up against them and
+        // roll the helicopter over as a skid unloads. Clear the rate and horizontal integrators
+        // and hold the attitude as it stands (the vertical integrator keeps it down after a
+        // descent until the pilot climbs).
+        self.grounded = !h.contacts().is_empty();
+        if self.grounded {
+            self.i_rate = DVec3::ZERO;
+            self.i_vel = DVec3::new(0.0, 0.0, self.i_vel.z);
+        }
         match *setpoint {
             HelicopterSetpoint::Sticks(input) => input.clamped(),
             HelicopterSetpoint::Rates { rates, collective } => {
@@ -356,6 +368,7 @@ impl HelicopterController {
     /// directionally unstable (sideways and backward flight).
     fn attitude_loop(&mut self, h: &Helicopter, roll: f64, pitch: f64, yaw_rate: f64, heading: Option<f64>) -> DVec3 {
         let (phi, theta, psi) = euler(h.orientation());
+        let (roll, pitch) = if self.grounded { (phi, theta) } else { (roll, pitch) };
         let reference = heading.unwrap_or_else(|| self.heading.unwrap_or(psi) + yaw_rate * self.dt);
         // Hold the reference within reach so that it does not wind up.
         let lag = wrap_angle(reference - psi).clamp(-HEADING_LAG, HEADING_LAG);

@@ -113,6 +113,19 @@ impl CameraRig {
         }
     }
 
+    /// For a helicopter of size `span` (rotor tip to tail) with the pilot's eye at `eye`:
+    /// chased along its heading (it hovers and flies sideways), a little above the rotor.
+    pub fn helicopter(span: f64, heading: f64, eye: DVec3) -> Self {
+        Self {
+            pitch: 0.2,
+            distance: (2.0 * span).max(4.0),
+            min_distance: (1.0 * span).max(1.5),
+            focus_height: 0.15 * span,
+            eye_offset: Some(eye),
+            ..Self::new(span, heading)
+        }
+    }
+
     /// For a ground vehicle of size `span` with the driver's eye at `eye` (vehicle frame) and
     /// the reversing camera at `rear_eye` (the last unit's frame).
     pub fn ground(span: f64, heading: f64, eye: DVec3, rear_eye: DVec3) -> Self {

@@ -402,6 +402,195 @@ pub fn fixed_wing(def: &autonomousim_vehicles::fixedwing::FixedWingDef) -> Fixed
     FixedWingVisual { body, surfaces, propeller: (p.position, axis), propeller_radius: radius, span, eye }
 }
 
+/// A rotor of a [`HelicopterVisual`]: its hub and shaft frame, and one blade to be posed per
+/// blade from the rotor's azimuth, tip-path-plane tilt and coning.
+#[derive(Clone, Debug)]
+pub struct RotorVisual {
+    /// Hub (body frame, m) and the shaft frame's orientation in the body frame (z along the
+    /// shaft).
+    pub hub: DVec3,
+    pub frame: DQuat,
+    pub radius: f32,
+    pub blades: u32,
+    /// +1 when the rotor turns counter-clockwise seen from +z of the shaft frame, −1 otherwise.
+    pub spin: f64,
+    /// A blade along +x of the shaft frame from the root cut-out to the tip, its flapping hinge
+    /// at the hub.
+    pub blade: MeshData,
+}
+
+/// Visual of a helicopter, derived from its definition (the preset files carry no shape): a
+/// cabin over the forward frame colliders with a canopy and engine cowling, a tail boom to the
+/// tail rotor, the fin and tailplane from the aerodynamic surfaces, the mast and the skids from
+/// the gear colliders. The rotors are separate (see [`RotorVisual`]). Body frame FLU.
+#[derive(Clone, Debug)]
+pub struct HelicopterVisual {
+    pub body: MeshData,
+    /// Main and tail rotor.
+    pub rotors: [RotorVisual; 2],
+    /// Largest distance of any part from the centre of mass (m), for cameras.
+    pub span: f32,
+    /// Pilot's eye point (m), for the first-person camera.
+    pub eye: DVec3,
+}
+
+pub fn helicopter(def: &autonomousim_vehicles::rotorcraft::HelicopterDef) -> HelicopterVisual {
+    use autonomousim_vehicles::multirotor::ColliderPart;
+    let main = &def.main_rotor;
+    let tail_hub = def.tail_rotor.hub;
+    let r_main = main.rotor.radius;
+    let r_tail = def.tail_rotor.rotor.radius;
+    let body_color = srgb([214, 88, 40]);
+    let white = srgb([232, 234, 238]);
+    let grey = srgb([150, 154, 160]);
+    let dark = srgb([40, 42, 46]);
+    let glass = srgb([60, 90, 120]);
+    let frame: Vec<_> = def.colliders.iter().filter(|k| k.part == ColliderPart::Frame).collect();
+    // The cabin: the frame colliders ahead of 40 % of the way to the tail rotor (at least the
+    // foremost one).
+    let split = 0.4 * tail_hub.x;
+    let mut cabin: Vec<_> = frame.iter().filter(|k| k.center.x > split).collect();
+    if cabin.is_empty() {
+        cabin.extend(frame.iter().max_by(|a, b| a.center.x.total_cmp(&b.center.x)));
+    }
+    // Without frame colliders: a pod of a tenth of the rotor radius.
+    let fallback = autonomousim_vehicles::multirotor::ColliderDef {
+        center: DVec3::ZERO,
+        radius: 0.1 * r_main,
+        part: ColliderPart::Frame,
+    };
+    let fallback = [&fallback];
+    let cabin: Vec<_> = if cabin.is_empty() { fallback.to_vec() } else { cabin.into_iter().copied().collect() };
+    let largest = cabin.iter().max_by(|a, b| a.radius.total_cmp(&b.radius)).unwrap();
+    let r = largest.radius;
+    let mut body = MeshData::new();
+    // Cabin: the hull of the colliders, a little slimmer than tall.
+    let dirs = mesh::icosphere(1.0, 1, false, white).positions;
+    let points: Vec<DVec3> = cabin
+        .iter()
+        .flat_map(|k| {
+            dirs.iter()
+                .map(move |d| k.center + k.radius * DVec3::new(1.1 * d[0] as f64, 0.8 * d[1] as f64, d[2] as f64))
+        })
+        .collect();
+    body.append(&mesh::convex_hull(&points, body_color));
+    let front = cabin.iter().max_by(|a, b| (a.center.x + a.radius).total_cmp(&(b.center.x + b.radius))).unwrap();
+    let nose = front.center.x + 1.1 * front.radius;
+    let rear = cabin.iter().map(|k| k.center.x - 1.1 * k.radius).fold(f64::MAX, f64::min);
+    let top = cabin.iter().map(|k| k.center.z + k.radius).fold(f64::MIN, f64::max);
+    let bottom = cabin.iter().map(|k| k.center.z - k.radius).fold(f64::MAX, f64::min);
+    // Canopy on the upper front of the foremost collider; the pilot sits behind it.
+    let rf = front.radius;
+    let canopy_at = front.center + rf * DVec3::new(0.5, 0.0, 0.4);
+    let canopy = mesh::ellipsoid(Vec3::new((0.6 * rf) as f32, (0.7 * rf) as f32, (0.5 * rf) as f32), 1, glass);
+    body.append_transformed(&canopy, DQuat::IDENTITY, canopy_at);
+    let eye = DVec3::new(canopy_at.x - 0.2 * rf, 0.0, canopy_at.z + 0.1 * rf);
+    // Engine cowling on the cabin roof, under the mast.
+    let cowl = mesh::ellipsoid(Vec3::new((0.7 * r) as f32, (0.4 * r) as f32, (0.3 * r) as f32), 1, body_color);
+    body.append_transformed(&cowl, DQuat::IDENTITY, DVec3::new(main.hub.x - 0.2 * r, 0.0, top - 0.1 * r));
+    // Mast from the cowling up the shaft to the hub, and the hub.
+    let axis = main.axis.normalize_or(DVec3::Z);
+    let length = ((main.hub.z - top + 0.2 * r) / axis.z.max(0.2)).max(0.05 * r_main);
+    let mast = mesh::cylinder((0.08 * r) as f32, (0.5 * length) as f32, 10, grey);
+    let tilt = DQuat::from_rotation_arc(DVec3::Z, axis);
+    body.append_transformed(&mast, tilt, main.hub - axis * 0.5 * length);
+    let hub = mesh::cylinder((0.18 * r) as f32, (0.06 * r) as f32, 12, dark);
+    body.append_transformed(&hub, tilt, main.hub);
+    // Tail boom from the upper back of the cabin, tapering to the tail rotor (about half its
+    // radius below the hub), and a gearbox there.
+    let section = |x: f64, s: f64, z: f64| {
+        [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)]
+            .map(|(sy, sz)| DVec3::new(x, sy * 0.5 * s, z + sz * 0.5 * s))
+    };
+    let root_z = largest.center.z + 0.3 * r;
+    let end = DVec3::new(tail_hub.x, 0.0, tail_hub.z - 0.5 * r_tail);
+    let boom: Vec<_> =
+        section(rear + 0.5 * r, 0.4 * r, root_z).into_iter().chain(section(end.x, 0.15 * r, end.z)).collect();
+    body.append(&mesh::convex_hull(&boom, body_color));
+    let gearbox = (tail_hub - end).length().max(0.1 * r);
+    let stub: Vec<_> = section(end.x + 0.1 * r, 0.18 * r, end.z)
+        .into_iter()
+        .chain(section(tail_hub.x, 0.12 * r, tail_hub.z))
+        .collect();
+    if gearbox > 1e-6 {
+        body.append(&mesh::convex_hull(&stub, body_color));
+    }
+    let tail_axis = def.tail_rotor.axis.normalize_or(DVec3::Y);
+    let tail_hub_mesh = mesh::cylinder((0.12 * r_tail) as f32, (0.08 * r_tail) as f32, 10, dark);
+    body.append_transformed(&tail_hub_mesh, DQuat::from_rotation_arc(DVec3::Z, tail_axis), tail_hub);
+    // Fin and tailplane: plates of the surfaces' span and chord, rolled like them.
+    for s in &def.surfaces {
+        let t = (0.08 * s.chord).max(0.004);
+        let plate = mesh::cuboid(Vec3::new((0.5 * s.chord) as f32, (0.5 * s.span) as f32, t as f32), white);
+        body.append_transformed(&plate, DQuat::from_rotation_x(s.roll), s.position);
+    }
+    // Skids: a tube along each row of gear colliders (a quarter longer, turned up at the front)
+    // and two cross tubes up to the cabin floor.
+    let gear: Vec<_> = def.colliders.iter().filter(|k| k.part == ColliderPart::Gear).collect();
+    let mut reach = 0.0f64;
+    for side in [1.0f64, -1.0] {
+        let row: Vec<_> = gear.iter().filter(|k| k.center.y * side > 1e-9).collect();
+        let (Some(first), Some(last)) = (
+            row.iter().max_by(|a, b| a.center.x.total_cmp(&b.center.x)),
+            row.iter().min_by(|a, b| a.center.x.total_cmp(&b.center.x)),
+        ) else {
+            continue;
+        };
+        let rad = first.radius;
+        let (a, b) = (first.center, last.center);
+        let extra = 0.12 * (a.x - b.x).max(4.0 * rad);
+        let (a, b) = (a + DVec3::X * extra, b - DVec3::X * extra);
+        let tube = |from: DVec3, to: DVec3, radius: f64| {
+            let d = to - from;
+            let m = mesh::cylinder(radius as f32, (0.5 * d.length()) as f32, 8, grey);
+            (m, DQuat::from_rotation_arc(DVec3::Z, d.normalize_or(DVec3::Z)), 0.5 * (from + to))
+        };
+        let mut add = |(m, rot, at): (MeshData, DQuat, DVec3)| body.append_transformed(&m, rot, at);
+        add(tube(b, a, rad));
+        let tip = a + DVec3::new(2.0 * extra, 0.0, 1.5 * extra);
+        add(tube(a, tip, rad));
+        for f in [0.25, 0.75] {
+            let foot = b.lerp(a, f);
+            add(tube(foot, DVec3::new(foot.x, 0.4 * foot.y, bottom + 0.2 * r), 0.8 * rad));
+        }
+        reach = reach.max(tip.length());
+    }
+    let blade = |rotor: &autonomousim_vehicles::rotorcraft::RotorDef| {
+        let (root, tip) = (rotor.root_cutout.max(0.08) * rotor.radius, rotor.radius);
+        let c = rotor.chord;
+        let mut m = MeshData::new();
+        let half = Vec3::new((0.5 * (tip - root)) as f32, (0.5 * c) as f32, (0.06 * c) as f32);
+        m.append_transformed(&mesh::cuboid(half, dark), DQuat::IDENTITY, DVec3::new(0.5 * (root + tip), 0.0, 0.0));
+        // White tips.
+        let cap = Vec3::new((0.03 * tip) as f32, (0.52 * c) as f32, (0.07 * c) as f32);
+        m.append_transformed(&mesh::cuboid(cap, white), DQuat::IDENTITY, DVec3::new(0.97 * tip, 0.0, 0.0));
+        m
+    };
+    let rotor = |m: &autonomousim_vehicles::rotorcraft::RotorMount| RotorVisual {
+        hub: m.hub,
+        frame: DQuat::from_mat3(&m.frame()),
+        radius: m.rotor.radius as f32,
+        blades: m.rotor.blades,
+        spin: m.rotor.spin_sign(),
+        blade: blade(&m.rotor),
+    };
+    let span = (main.hub.length() + r_main).max(tail_hub.length() + r_tail).max(nose.abs()).max(reach) as f32;
+    HelicopterVisual { body, rotors: [rotor(main), rotor(&def.tail_rotor)], span, eye }
+}
+
+/// Rotation of a rotor's shaft frame to its tip-path plane, tilted by `flap` (`[β₁c, β₁s]`
+/// rad, toward +x and +y of the shaft frame).
+pub fn rotor_tilt(flap: [f64; 2]) -> DQuat {
+    DQuat::from_rotation_arc(DVec3::Z, DVec3::new(flap[0], flap[1], 1.0).normalize())
+}
+
+/// Rotation (in the tip-path-plane frame, turned with the rotor) of blade `k` of `count`, coned
+/// up by `coning` (rad).
+pub fn blade_rotation(k: u32, count: u32, coning: f64) -> DQuat {
+    let azimuth = std::f64::consts::TAU * f64::from(k) / f64::from(count.max(1));
+    DQuat::from_rotation_z(azimuth) * DQuat::from_rotation_y(-coning)
+}
+
 /// Visual of a wheeled vehicle: the body in the chassis frame (FLU) and one mesh per wheel in
 /// its spinning link's frame (spin axis y), to be posed from the simulated wheels.
 #[derive(Clone, Debug)]
@@ -817,6 +1006,34 @@ mod tests {
             assert!(v.propeller_radius > 0.0 && v.span >= 0.5 * b);
             assert!(v.eye.x > 0.0);
         }
+    }
+
+    #[test]
+    fn helicopter_visual_matches_its_definition() {
+        for name in ["bo105_like", "xcell60_like"] {
+            let def = presets::helicopter(name).unwrap();
+            let v = helicopter(&def);
+            // The body reaches from the nose collider to the tail rotor and down to the skids.
+            let (lo, hi) = v.body.bounds().unwrap();
+            let frame = def.colliders.iter().filter(|c| c.part == ColliderPart::Frame);
+            let nose = frame.map(|c| c.center.x + c.radius).fold(f64::MIN, f64::max);
+            assert!(f64::from(hi.x) >= nose && f64::from(lo.x) <= def.tail_rotor.hub.x, "{name}: {lo} {hi}");
+            let skid = def.colliders.iter().filter(|c| c.part == ColliderPart::Gear).map(|c| c.center.z);
+            assert!(f64::from(lo.z) <= skid.fold(f64::MAX, f64::min), "{name}: {lo}");
+            // The rotors: a blade from near the hub to the tip, the shaft frame along the axis.
+            for (r, m) in v.rotors.iter().zip([&def.main_rotor, &def.tail_rotor]) {
+                assert_eq!((r.blades, r.hub), (m.rotor.blades, m.hub));
+                assert!(((r.frame * DVec3::Z) - m.axis.normalize()).length() < 1e-12, "{name}");
+                let (blo, bhi) = r.blade.bounds().unwrap();
+                assert!((bhi.x - r.radius).abs() < 0.05 * r.radius && blo.x > 0.0 && blo.x < 0.3 * r.radius, "{name}");
+                assert_eq!(r.spin, m.rotor.spin_sign());
+            }
+            assert!(v.span as f64 >= def.main_rotor.rotor.radius && v.eye.x > 0.0, "{name}");
+        }
+        // Coning raises the blade tips; a positive β₁c tilts the disc toward +x.
+        assert!((blade_rotation(0, 4, 0.1) * DVec3::X).z > 0.09);
+        assert!(((blade_rotation(1, 4, 0.0) * DVec3::X) - DVec3::Y).length() < 1e-12);
+        assert!((rotor_tilt([0.1, 0.0]) * DVec3::Z).x > 0.09 && (rotor_tilt([0.0, 0.1]) * DVec3::Z).y > 0.09);
     }
 
     #[test]

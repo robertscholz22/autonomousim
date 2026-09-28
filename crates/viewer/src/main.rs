@@ -294,6 +294,22 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
             disable_on_terminal: false,
             ..Default::default()
         }
+    } else if let VehicleDef::Helicopter(h) = &def {
+        // Hovering a metre above its skids, clear of trees by the rotor, in `velocity`.
+        let skids = h.colliders.iter().map(|c| c.center.z - c.radius).fold(0.0, f64::min);
+        let agl = 1.0 - skids;
+        GroupSpec {
+            name: "pilot".into(),
+            vehicle,
+            spawn: SpawnSpec {
+                agl: [agl, agl],
+                clearance: h.main_rotor.rotor.radius + 2.0,
+                margin: 60.0,
+                ..Default::default()
+            },
+            disable_on_terminal: false,
+            ..Default::default()
+        }
     } else if ground {
         // On rural maps: start in a lane with a route to a farm yard.
         let (spawn, goals) = if rural {
@@ -544,6 +560,7 @@ fn main() -> anyhow::Result<()> {
                 vehicle_view::sync_vehicles,
                 vehicle_view::sync_tracks,
                 vehicle_view::sync_riders,
+                vehicle_view::sync_rotors,
                 camera::update_camera,
                 world_view::stream_tiles,
                 world_view::update_view_distance,
@@ -582,8 +599,8 @@ fn spawn_camera(
             (visual.span, CameraRig::aircraft(f64::from(visual.span), heading, visual.eye))
         }
         Vehicle::Helicopter(h) => {
-            let span = 2.0 * h.def().main_rotor.rotor.radius;
-            (span as f32, CameraRig::new(span, heading))
+            let visual = autonomousim_scene::props::helicopter(h.def());
+            (visual.span, CameraRig::helicopter(f64::from(visual.span), heading, visual.eye))
         }
         Vehicle::Wheeled(w) => {
             let visual = autonomousim_scene::props::wheeled(w.def());
@@ -675,6 +692,15 @@ fn demo_pilot(capture: Res<Capture>, mut sim: ResMut<sim::Sim>, mut route: ResMu
         return;
     }
     let demo = if demo.camera { DemoFlight { speed: 8.0, agl: 40.0, turn: 0.1, camera: false } } else { demo };
+    if let Some(map) = sim.heli_map() {
+        // Helicopters: in `velocity`, within its speeds and yaw rate.
+        let [forward, _, vertical] = map.speeds();
+        let climb = (0.3 * (demo.agl - agl)).clamp(-vertical, vertical);
+        sim.pilot_mode = sim::PilotMode::Velocity;
+        let turn = (demo.turn / map.limits().yaw_rate).clamp(-1.0, 1.0);
+        sim.stick = [(demo.speed / forward).min(1.0), 0.0, climb / vertical.max(1e-3), turn];
+        return;
+    }
     let climb = (demo.agl - agl).clamp(-2.0, 3.0);
     sim.pilot_mode = sim::PilotMode::Velocity;
     sim.max_speed = sim.max_speed.max(demo.speed);

@@ -3,9 +3,10 @@
 //! strut and lower arm per suspended wheel that follow the wheel; a tracked vehicle's band on
 //! each side, wrapped around its sprocket, road wheels and idler and running with the road
 //! wheels; an aircraft's airframe with its ailerons, flaps, elevator and rudder turned by the
-//! simulated (or recorded) deflections and a propeller disc. The units behind a tractor
-//! (trailers, dollies, drawbars) are children of the root posed from the simulated joints, and
-//! carry their own wheels and links.
+//! simulated (or recorded) deflections and a propeller disc; a helicopter's airframe with its
+//! rotor heads turning, tilted with the tip-path plane, and the blades coned. The units behind
+//! a tractor (trailers, dollies, drawbars) are children of the root posed from the simulated
+//! joints, and carry their own wheels and links.
 
 use crate::convert::{self, RenderOrigin};
 use crate::sim::Sim;
@@ -17,6 +18,7 @@ use autonomousim_vehicles::Vehicle;
 use autonomousim_vehicles::fixedwing::FixedWing;
 use autonomousim_vehicles::ground::Wheeled;
 use autonomousim_vehicles::ground::tire::TireModel;
+use autonomousim_vehicles::rotorcraft::Helicopter;
 use bevy::prelude::*;
 
 /// Root entity of agent `0`'s visual.
@@ -142,6 +144,85 @@ fn wheel_local(w: &Wheeled, k: usize) -> Pose {
     w.unit_pose(w.def().wheel_unit(k)).inverse() * w.wheel_pose(k)
 }
 
+/// Fastest apparent rotor turn (rad/s): faster rotors are drawn turning at this rate, since
+/// blades at the true speed alias at frame rates.
+const MAX_SHOWN_SPIN: f64 = 9.0;
+
+/// A helicopter's rotor head (0 main, 1 tail): at the hub, the shaft frame tilted with the
+/// tip-path plane and turned by the shown azimuth; its blades and disc are children.
+#[derive(Component)]
+pub struct RotorHead {
+    agent: usize,
+    rotor: usize,
+    hub: glam::DVec3,
+    frame: glam::DQuat,
+    spin: f64,
+    /// Shown azimuth (rad).
+    azimuth: f64,
+}
+
+/// Blade `Some(k)` of `count` of a [`RotorHead`], coned up; `None` for the disc, raised to
+/// the blades' mean height.
+#[derive(Component)]
+pub struct Blade {
+    agent: usize,
+    rotor: usize,
+    blade: Option<u32>,
+    count: u32,
+    radius: f32,
+}
+
+/// Tip-path-plane tilt `[β₁c, β₁s]` and coning (rad) of rotor 0 (main) or 1 (tail).
+fn flapping(h: &Helicopter, rotor: usize) -> ([f64; 2], f64) {
+    if rotor == 0 {
+        (h.main_rotor_state().flap, h.loads().main.coning)
+    } else {
+        (h.tail_rotor_state().flap, h.loads().tail.coning)
+    }
+}
+
+/// Transform (body frame) of a rotor head: at the hub, the shaft frame tilted with the
+/// tip-path plane and turned to `azimuth` in the rotor's sense.
+fn rotor_head_transform(r: &props::RotorVisual, azimuth: f64, flap: [f64; 2]) -> Transform {
+    head_transform(r.hub, r.frame, r.spin * azimuth, flap)
+}
+
+fn head_transform(hub: glam::DVec3, frame: glam::DQuat, angle: f64, flap: [f64; 2]) -> Transform {
+    convert::transform(&Pose { pos: hub, rot: frame * props::rotor_tilt(flap) * glam::DQuat::from_rotation_z(angle) })
+}
+
+/// Transform (head frame) of blade `k` of `count`, coned up by `coning` (rad).
+fn blade_transform(k: u32, count: u32, coning: f64) -> Transform {
+    convert::transform(&Pose { pos: glam::DVec3::ZERO, rot: props::blade_rotation(k, count, coning) })
+}
+
+/// Turn the helicopters' rotor heads by the shown rotor speed over the frame's simulated time,
+/// tilt them with the tip-path plane and cone the blades.
+pub fn sync_rotors(
+    time: Res<Time>,
+    sim: Res<Sim>,
+    mut heads: Query<(&mut RotorHead, &mut Transform), Without<Blade>>,
+    mut blades: Query<(&Blade, &mut Transform), Without<RotorHead>>,
+) {
+    let dt = if sim.paused { 0.0 } else { f64::from(time.delta_secs()) * sim.time_scale };
+    for (mut head, mut t) in &mut heads {
+        let Some(h) = sim.world.agent(head.agent).vehicle.as_helicopter() else { continue };
+        let omega = if head.rotor == 0 { h.rotor_speed() } else { h.tail_rotor_state().omega };
+        head.azimuth = (head.azimuth + dt * omega.min(MAX_SHOWN_SPIN)).rem_euclid(std::f64::consts::TAU);
+        *t = head_transform(head.hub, head.frame, head.spin * head.azimuth, flapping(h, head.rotor).0);
+    }
+    for (b, mut t) in &mut blades {
+        let Some(h) = sim.world.agent(b.agent).vehicle.as_helicopter() else { continue };
+        let coning = flapping(h, b.rotor).1;
+        *t = match b.blade {
+            Some(k) => blade_transform(k, b.count, coning),
+            None => {
+                Transform::from_translation(convert::vec(glam::DVec3::Z * (0.6 * f64::from(b.radius) * coning.sin())))
+            }
+        };
+    }
+}
+
 pub fn spawn_vehicles(
     mut commands: Commands,
     sim: Res<Sim>,
@@ -194,12 +275,17 @@ pub fn spawn_vehicles(
                 continue;
             }
             Vehicle::Helicopter(h) => {
-                // Placeholder until the helicopter's own visual: a cabin and the rotor discs.
-                let d = h.def();
+                let v = props::helicopter(h.def());
                 let root = commands.spawn(root).id();
-                let cabin = meshes.add(Sphere::new(0.25 * d.main_rotor.rotor.radius as f32));
-                commands.entity(root).with_child((Mesh3d(cabin), MeshMaterial3d(body_material.clone())));
-                for (k, m) in [&d.main_rotor, &d.tail_rotor].into_iter().enumerate() {
+                commands
+                    .entity(root)
+                    .with_child((Mesh3d(meshes.add(convert::mesh(&v.body))), MeshMaterial3d(body_material.clone())));
+                let blade_material = materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.16, 0.17, 0.18),
+                    perceptual_roughness: 0.6,
+                    ..default()
+                });
+                for (k, r) in v.rotors.iter().enumerate() {
                     let material = materials.add(StandardMaterial {
                         base_color: Color::linear_rgba(0.1, 0.1, 0.1, 0.3),
                         alpha_mode: AlphaMode::Blend,
@@ -208,14 +294,33 @@ pub fn spawn_vehicles(
                         unlit: true,
                         ..default()
                     });
-                    commands.entity(root).with_child((
-                        Mesh3d(meshes.add(convert::mesh(&props::rotor_disc(m.rotor.radius as f32, [1.0; 4])))),
+                    let head = commands
+                        .spawn((
+                            rotor_head_transform(r, 0.0, [0.0; 2]),
+                            Visibility::default(),
+                            RotorHead { agent: i, rotor: k, hub: r.hub, frame: r.frame, spin: r.spin, azimuth: 0.0 },
+                        ))
+                        .id();
+                    commands.entity(root).add_child(head);
+                    let blade =
+                        |b: Option<u32>| Blade { agent: i, rotor: k, blade: b, count: r.blades, radius: r.radius };
+                    commands.entity(head).with_child((
+                        Mesh3d(meshes.add(convert::mesh(&props::rotor_disc(r.radius, [1.0; 4])))),
                         MeshMaterial3d(material),
-                        Transform::from_translation(convert::vec(m.hub))
-                            .with_rotation(convert::quat(glam::DQuat::from_rotation_arc(glam::DVec3::Z, m.axis))),
+                        Transform::IDENTITY,
                         RotorDisc { agent: i, rotor: k },
+                        blade(None),
                         bevy::light::NotShadowCaster,
                     ));
+                    let mesh = meshes.add(convert::mesh(&r.blade));
+                    for b in 0..r.blades {
+                        commands.entity(head).with_child((
+                            Mesh3d(mesh.clone()),
+                            MeshMaterial3d(blade_material.clone()),
+                            blade_transform(b, r.blades, 0.0),
+                            blade(Some(b)),
+                        ));
+                    }
                 }
                 continue;
             }
@@ -543,6 +648,60 @@ mod tests {
         }
         // The fork and the torso; per side a slider, four limbs and a boot.
         assert_eq!(kinds, 2 + 2 * 6);
+    }
+
+    /// A helicopter in forward flight: a head per rotor with its blades and disc; the main
+    /// rotor head's axis is the shaft tilted with the simulated tip-path plane, and the blades
+    /// are coned up.
+    #[test]
+    fn rotor_heads_follow_the_flapping() {
+        use autonomousim_control::rotorcraft::HelicopterSetpoint;
+        let sc = Scenario {
+            map: MapSource::Testworld(Testworld::Flat { size: 2000.0 }),
+            groups: vec![GroupSpec {
+                vehicle: VehicleRef::Name("bo105_like".into()),
+                spawn: autonomousim_sim::scenario::SpawnSpec { agl: [30.0, 30.0], ..Default::default() },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1));
+        let setpoint = HelicopterSetpoint::Velocity { velocity: glam::DVec3::new(15.0, 0.0, 0.0), yaw_rate: 0.0 };
+        for _ in 0..(10.0 / world.scenario().policy_dt()) as usize {
+            world.set_command(0, setpoint);
+            world.step();
+        }
+        let mut app = World::new();
+        app.insert_resource(Sim::new(world));
+        app.init_resource::<RenderOrigin>();
+        app.init_resource::<Time>();
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        app.run_system_once(spawn_vehicles).unwrap();
+        app.run_system_once(sync_rotors).unwrap();
+        let rot = |t: &Transform| autonomousim_core::math::frames::bevy_to_enu_quat(t.rotation.to_array());
+        let heads: Vec<(usize, glam::DQuat)> =
+            app.query::<(&RotorHead, &Transform)>().iter(&app).map(|(h, t)| (h.rotor, rot(t))).collect();
+        let blades: Vec<(usize, Option<u32>, glam::DQuat)> =
+            app.query::<(&Blade, &Transform)>().iter(&app).map(|(b, t)| (b.rotor, b.blade, rot(t))).collect();
+        let sim = app.resource::<Sim>();
+        let h = sim.world.agent(0).vehicle.as_helicopter().unwrap();
+        let d = h.def();
+        assert_eq!(heads.len(), 2);
+        let count = |r: usize| blades.iter().filter(|b| b.0 == r && b.1.is_some()).count() as u32;
+        assert_eq!([count(0), count(1)], [d.main_rotor.rotor.blades, d.tail_rotor.rotor.blades]);
+        assert_eq!(blades.iter().filter(|b| b.1.is_none()).count(), 2);
+        let flap = h.main_rotor_state().flap;
+        assert!(flap[0].abs() > 1e-3, "{flap:?}");
+        let (_, main) = heads.iter().find(|h| h.0 == 0).unwrap();
+        let frame = glam::DQuat::from_mat3(&d.main_rotor.frame());
+        let want = frame * props::rotor_tilt(flap) * glam::DVec3::Z;
+        assert!((*main * glam::DVec3::Z - want).length() < 1e-5);
+        let coning = h.loads().main.coning;
+        assert!(coning > 0.01);
+        for (_, _, q) in blades.iter().filter(|b| b.0 == 0 && b.1.is_some()) {
+            assert!(((*q * glam::DVec3::X).z - coning.sin()).abs() < 1e-5);
+        }
     }
 
     /// A farm rig: the drawbar, dolly and trailer are children of the tractor posed from the

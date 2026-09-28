@@ -11,6 +11,7 @@ use autonomousim_control::Command;
 use autonomousim_control::fixedwing::{FixedWingActionMap, FixedWingActionMode, FixedWingSetpoint, Lateral, Vertical};
 use autonomousim_control::ground::{GroundActionMap, GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
+use autonomousim_control::rotorcraft::{HelicopterActionMap, HelicopterActionMode, HelicopterSetpoint};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
@@ -50,10 +51,15 @@ const RIDE_TURN_SPEED: f64 = 4.0;
 const AIRSPEED_RATE: f64 = 3.0;
 const THROTTLE_RATE: f64 = 0.5;
 
+/// Keyboard flight of helicopters in `attitude` and `rates`: the collective Space/Shift add
+/// to the trim's (of the full range).
+const COLLECTIVE_KEY: f64 = 0.25;
+
 /// How the keys fly the pilot. Aircraft: `Velocity` is `guidance` (A/D course rate,
 /// Space/Shift climb rate, W/S airspeed setpoint), `Attitude` holds a bank (A/D) and a pitch
 /// (W/S, forward is nose down, about the level-flight pitch) at an airspeed setpoint
 /// (Space/Shift), and `Rates` flies body rates (Q/E yaw) with the throttle on Space/Shift.
+/// Helicopters: see [`Sim::heli_setpoint`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PilotMode {
     /// Velocity in the heading frame and yaw rate (the cascade holds position and attitude).
@@ -347,6 +353,46 @@ impl Sim {
         self.throttle = Some((t + self.stick[2] * THROTTLE_RATE * dt).clamp(0.0, 1.0));
     }
 
+    /// The followed helicopter's `velocity` action map (its group's limits): its speeds and
+    /// limits scale the keys.
+    pub fn heli_map(&self) -> Option<HelicopterActionMap> {
+        let agent = self.world.agent(self.pilot);
+        let group = &self.world.scenario().groups[agent.group];
+        let (h, c) = (agent.vehicle.as_helicopter()?, agent.controller.as_helicopter()?);
+        HelicopterActionMap::new(HelicopterActionMode::Velocity, &group.spec.helicopter_action_limits, h.def(), c).ok()
+    }
+
+    /// The keys' setpoint for the followed helicopter in the pilot mode: `velocity` as the
+    /// action map has it (W/S forward, A/D sideways, Space/Shift climb, Q/E yaw); `attitude`
+    /// tilts from the trim attitude at the airspeed (W forward is nose down, A banks left) and
+    /// `rates` flies body rates, both with the trim collective raised or lowered by
+    /// Space/Shift.
+    pub fn heli_setpoint(&self) -> HelicopterSetpoint {
+        let agent = self.world.agent(self.pilot);
+        let (Some(map), Some(h), Some(c)) =
+            (self.heli_map(), agent.vehicle.as_helicopter(), agent.controller.as_helicopter())
+        else {
+            return HelicopterSetpoint::Sticks(Default::default());
+        };
+        let [forward, left, up, yaw] = self.stick;
+        if self.pilot_mode == PilotMode::Velocity {
+            return map.setpoint(&[forward, left, up, yaw]);
+        }
+        let l = map.limits();
+        let (trim, pitch, roll) = c.trim_at(h.flow().velocity.x);
+        let collective = (trim.collective + COLLECTIVE_KEY * up).clamp(-1.0, 1.0);
+        if self.pilot_mode == PilotMode::Attitude {
+            HelicopterSetpoint::Attitude {
+                roll: roll - left * l.roll,
+                pitch: pitch - forward * l.pitch,
+                yaw_rate: yaw * l.yaw_rate,
+                collective,
+            }
+        } else {
+            HelicopterSetpoint::Rates { rates: DVec3::new(-left, forward, yaw) * l.rates, collective }
+        }
+    }
+
     /// The pilot mode's name for the followed vehicle.
     pub fn pilot_mode_name(&self) -> &'static str {
         self.pilot_mode.name_for(self.world.agent(self.pilot).vehicle.family())
@@ -381,7 +427,8 @@ impl Sim {
     }
 
     /// The pilot's command for the followed vehicle: [`setpoint`](Self::setpoint) for a
-    /// multirotor. For a ground vehicle, forward/back is the pedal (brake, then reverse) and
+    /// multirotor, [`flight_setpoint`](Self::flight_setpoint) for an aircraft and
+    /// [`heli_setpoint`](Self::heli_setpoint) for a helicopter. For a ground vehicle, forward/back is the pedal (brake, then reverse) and
     /// the steering follows left/right; side drives turn by driving their sides apart. A
     /// single-track vehicle is ridden in `vk`: the speed setpoint and the curvature (left/right,
     /// at most what the lean allows at the speed).
@@ -390,8 +437,7 @@ impl Sim {
         match agent.vehicle.family() {
             Family::Multirotor => self.setpoint().into(),
             Family::FixedWing => self.flight_setpoint().into(),
-            // Held at the input it started with until helicopter piloting arrives.
-            Family::Rotorcraft => Command::hold(&agent.vehicle),
+            Family::Rotorcraft => self.heli_setpoint().into(),
             Family::Wheeled => {
                 if let Some(sp) = self.drive_command {
                     return sp.into();
@@ -752,6 +798,82 @@ mod tests {
             s.throttle.unwrap() < 0.05 && s.world.agent(0).vehicle.as_fixed_wing().unwrap().input().throttle < 0.05
         );
         assert!(!s.latched[0].is_terminal(), "{:?}", s.latched[0]);
+    }
+
+    /// A helicopter hovering 50 m up, heading east.
+    fn heli_sim(vehicle: &str) -> Sim {
+        let sc = Scenario::from_toml(&format!(
+            r#"
+            name = "hover"
+            map = {{ type = "testworld", kind = "flat", size = 4000.0 }}
+            [[groups]]
+            vehicle = "{vehicle}"
+            spawn = {{ region = [[-10.0, -10.0], [10.0, 10.0]], agl = [50.0, 50.0], yaw_deg = [0.0, 0.0], clearance = 0.0 }}
+            "#
+        ))
+        .unwrap();
+        Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1)))
+    }
+
+    /// The keys fly a helicopter: in `velocity` it holds its place hands off, flies forward at
+    /// the stick's share of the full speed and stops again; in `attitude` A banks it left from
+    /// the trim and Space climbs; in `rates` E yaws it right.
+    #[test]
+    fn keys_fly_a_helicopter() {
+        let mut s = heli_sim("xcell60_like");
+        assert_eq!((s.pilot_mode, s.pilot_mode_name()), (PilotMode::Velocity, "velocity"));
+        let full = s.heli_map().unwrap().speeds()[0];
+        let (moved, turn) = drive(&mut s, [0.0; 4], 3.0);
+        assert!(moved.abs() < 0.5 && turn.abs() < 0.05, "moved {moved}, turn {turn}");
+        let (moved, _) = drive(&mut s, [0.5, 0.0, 0.0, 0.0], 15.0);
+        let speed = s.world.agent(0).vehicle.lin_vel_world().x;
+        assert!((speed - 0.5 * full).abs() < 0.5 && moved > 0.25 * full * 15.0, "speed {speed} of {full}");
+        drive(&mut s, [0.0; 4], 15.0);
+        let v = s.world.agent(0).vehicle.lin_vel_world();
+        assert!(v.length() < 0.3, "{v}");
+        s.pilot_mode = PilotMode::Attitude;
+        let limit = s.heli_map().unwrap().limits().roll;
+        let roll = |s: &Sim| euler(s.world.agent(0).vehicle.orientation()).0;
+        let trim = s.world.agent(0).controller.as_helicopter().unwrap().trim_at(0.0).2;
+        drive(&mut s, [0.0, 1.0, 0.0, 0.0], 1.5);
+        assert!(roll(&s) < trim - 0.8 * limit, "roll {} trim {trim}", roll(&s));
+        assert!(s.world.agent(0).vehicle.lin_vel_body().y > 1.0);
+        drive(&mut s, [0.0; 4], 3.0);
+        let h = s.world.agent(0).vehicle.as_helicopter().unwrap();
+        let trim = s.world.agent(0).controller.as_helicopter().unwrap().trim_at(h.flow().velocity.x).2;
+        assert!((roll(&s) - trim).abs() < 0.05, "roll {} trim {trim}", roll(&s));
+        drive(&mut s, [0.0, 0.0, 1.0, 0.0], 2.0);
+        let climb = s.world.agent(0).vehicle.lin_vel_world().z;
+        assert!(climb > 0.5, "climb {climb}");
+        s.pilot_mode = PilotMode::Rates;
+        let (_, turn) = drive(&mut s, [0.0, 0.0, 0.0, -1.0], 1.0);
+        assert!(turn < -0.5, "turn {turn}");
+        assert!(!s.latched[0].is_terminal(), "{:?}", s.latched[0]);
+    }
+
+    /// Shift in `velocity` (descending at 1 m/s, below the crash speed) sets both helicopters
+    /// down on their skids, upright and still.
+    #[test]
+    fn keys_land_a_helicopter() {
+        for vehicle in ["xcell60_like", "bo105_like"] {
+            let mut s = heli_sim(vehicle);
+            let down = 1.0 / s.heli_map().unwrap().speeds()[2];
+            drive(&mut s, [0.0, 0.0, -down, 0.0], 70.0);
+            drive(&mut s, [0.0; 4], 5.0);
+            let v = &s.world.agent(0).vehicle;
+            let (roll, pitch, _) = euler(v.orientation());
+            assert!(s.latched[0].contains(Events::LANDED), "{vehicle}: {:?}", s.latched[0]);
+            assert!(!s.latched[0].is_terminal(), "{vehicle}: {:?}", s.latched[0]);
+            assert!(roll.abs() < 0.1 && pitch.abs() < 0.1, "{vehicle}: roll {roll} pitch {pitch}");
+            assert!(v.lin_vel_world().length() < 0.1, "{vehicle}: {}", v.lin_vel_world());
+            // Space lifts it off again, level (no rollover from the time on the skids).
+            let z = v.position().z;
+            drive(&mut s, [0.0, 0.0, 0.5, 0.0], 8.0);
+            let v = &s.world.agent(0).vehicle;
+            let (roll, _, _) = euler(v.orientation());
+            assert!(v.position().z > z + 3.0 && roll.abs() < 0.15, "{vehicle}: z {} roll {roll}", v.position().z);
+            assert!(!s.latched[0].is_terminal(), "{vehicle}: {:?}", s.latched[0]);
+        }
     }
 
     /// Run `seconds` of 60 Hz frames with the given stick; returns the displacement along the

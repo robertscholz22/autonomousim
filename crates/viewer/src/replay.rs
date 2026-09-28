@@ -7,6 +7,7 @@ use autonomousim_sim::record::{RecordedEpisode, RecordedState, RecordedWheel, Re
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::ground::tire::TireForces;
 use autonomousim_vehicles::ground::{PowertrainStatus, WheelState, WheeledInit};
+use autonomousim_vehicles::rotorcraft::{HelicopterDisplay, HelicopterInput};
 use glam::DVec3;
 
 pub struct Replay {
@@ -127,7 +128,7 @@ impl Replay {
     }
 
     /// Put the agents of `world` where the recording has them: the episode's map, the
-    /// interpolated state, rotor speeds, an aircraft's controls and air data, events, goals and
+    /// interpolated state, rotor speeds, an aircraft's or helicopter's controls and air data (and rotor flapping), events, goals and
     /// route.
     pub fn apply(&self, world: &mut WorldInstance) {
         let ep = self.current();
@@ -156,6 +157,18 @@ impl Replay {
             if let Some(f) = agent.vehicle.as_fixed_wing_mut() {
                 let l = &s.last;
                 f.show(l.surfaces, l.throttle, l.rotor_speed, l.airspeed, l.alpha, l.beta);
+            }
+            if let Some(h) = agent.vehicle.as_helicopter_mut() {
+                let l = &s.last;
+                h.show(&HelicopterDisplay {
+                    input: HelicopterInput::from_array(l.controls),
+                    pitches: l.pitches,
+                    rotor_speed: l.rotor_speed,
+                    engine_power: l.engine_power,
+                    flap: l.flap,
+                    coning: l.coning,
+                    airspeed: l.airspeed,
+                });
             }
             if let Some(v) = agent.vehicle.as_multirotor_mut()
                 && s.motors.len() == v.motor_speeds().len()
@@ -332,6 +345,51 @@ mod tests {
         }
         assert!(shown.wheels().next().unwrap().steer > 0.05);
         assert_eq!(shown.powertrain().gear, live.powertrain().gear);
+    }
+
+    /// A helicopter accelerating replays with its controls, rotor speed, power, flapping and
+    /// coning, which the rotor heads and the HUD show.
+    #[test]
+    fn replayed_helicopters_show_their_rotors() {
+        let sc = Scenario::from_toml(
+            r#"
+            name = "heli"
+            map = { type = "testworld", kind = "flat", size = 2000.0 }
+            [[groups]]
+            vehicle = "xcell60_like"
+            spawn = { agl = [30.0, 30.0] }
+            "#,
+        )
+        .unwrap();
+        let sc = Arc::new(sc.compile().unwrap());
+        let path = std::env::temp_dir().join(format!("autonomousim-replay-heli-{}.mcap", std::process::id()));
+        let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+        let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+        rec.on_reset(&w);
+        for _ in 0..100 {
+            w.set_actions(0, &[0.5, 0.2, 0.0, 0.0]);
+            rec.on_actions(&w);
+            w.step_with(&mut |w| rec.on_tick(w));
+        }
+        rec.finish().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut r = Replay::new(recording, 0);
+        r.seek(r.duration());
+        r.apply(&mut world);
+        let (live, shown) =
+            (w.agent(0).vehicle.as_helicopter().unwrap(), world.agent(0).vehicle.as_helicopter().unwrap());
+        assert!(live.main_rotor_state().flap[0].abs() > 1e-3);
+        assert_eq!(shown.input(), live.input());
+        assert_eq!(shown.pitches(), live.pitches());
+        assert_eq!(shown.rotor_speed(), live.rotor_speed());
+        assert_eq!(shown.tail_rotor_state().omega, live.tail_rotor_state().omega);
+        assert!((shown.engine_power() - live.engine_power()).abs() < 1e-9 * live.engine_power().abs().max(1.0));
+        assert_eq!(shown.main_rotor_state().flap, live.main_rotor_state().flap);
+        assert_eq!(shown.tail_rotor_state().flap, live.tail_rotor_state().flap);
+        assert_eq!(shown.loads().main.coning, live.loads().main.coning);
+        assert_eq!(shown.flow().airspeed, live.flow().airspeed);
     }
 
     /// A tracked APC on sand replays with its road wheels' spin and sinkage, so its bands run
