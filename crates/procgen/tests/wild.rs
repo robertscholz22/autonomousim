@@ -74,7 +74,7 @@ fn wild_map_invariants() {
     let (w, stats) = wild::generate(&c, 3).unwrap();
     assert_eq!((w.meta.generator.as_str(), w.meta.generator_version, w.meta.seed), ("wild", WILD_VERSION, 3));
     assert!(stats.trees > 1000 && stats.rocks > 50 && stats.lakes > 0, "{stats:?}");
-    let t = w.terrain();
+    let t = w.grid();
     assert_eq!(t.dims(), (513, 513));
     let (cw, ch) = t.cells();
     let cell_of = |x: f64, y: f64| {
@@ -106,7 +106,7 @@ fn wild_map_invariants() {
     // Trees stand on dry, moderately sloped ground, sunk slightly into it; rocks stay dry.
     let max_slope = c.trees.max_slope_deg.to_radians().tan();
     let mut trunks = 0;
-    for o in w.obstacles().obstacles() {
+    for o in w.obstacle_set().obstacles() {
         let p = o.pose.pos;
         let (cx, cy) = cell_of(p.x, p.y);
         match o.tag {
@@ -161,7 +161,7 @@ fn cache_stores_and_reloads_maps() {
     let second = cache.wild(&c, 5).unwrap();
     assert!(second.generated.is_none(), "second request must hit the cache");
     assert_eq!(second.hash, first.hash);
-    assert_eq!(second.world.obstacles().len(), first.world.obstacles().len());
+    assert_eq!(second.world.obstacle_set().len(), first.world.obstacle_set().len());
     // Another seed is another entry.
     assert_ne!(cache.wild(&c, 6).unwrap().path, first.path);
     // A damaged entry is regenerated.

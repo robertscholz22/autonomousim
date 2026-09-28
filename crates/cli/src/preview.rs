@@ -9,7 +9,12 @@ use std::path::Path;
 
 /// Write a binary PPM with one pixel per `stride` cells (north up).
 pub fn write_ppm(world: &StaticWorld, stride: usize, path: &Path) -> std::io::Result<()> {
-    let t = world.terrain();
+    // Tiled maps are previewed from their coarse grid, without obstacles.
+    let t = match world.terrain().grid() {
+        Some(g) => g,
+        None => world.terrain().tiled().expect("grid or tiles").coarse(),
+    };
+    let stride = if world.is_tiled() { stride.div_ceil(t.cell_size() as usize).max(1) } else { stride };
     let (cw, ch) = t.cells();
     let (w, h) = (cw / stride, ch / stride);
     let cell = t.cell_size() * stride as f64;
@@ -38,7 +43,8 @@ pub fn write_ppm(world: &StaticWorld, stride: usize, path: &Path) -> std::io::Re
         }
     }
     let origin = t.origin();
-    for o in world.obstacles().obstacles() {
+    let obstacles = world.obstacles().set().map_or(&[][..], |s| s.obstacles());
+    for o in obstacles {
         let footprint = match (o.tag, &o.shape) {
             (tags::HEDGE | tags::FENCE | tags::BUILDING, ObstacleShape::Cuboid { half_extents: he }) => {
                 Some((*he, [40u8, 90, 35]))

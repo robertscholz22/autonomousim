@@ -201,7 +201,7 @@ struct MapData {
 }
 
 fn view(world: &StaticWorld) -> MapRef<'_> {
-    let t = world.terrain();
+    let t = world.grid();
     let (nx, ny) = t.dims();
     MapRef {
         meta: &world.meta,
@@ -212,13 +212,16 @@ fn view(world: &StaticWorld) -> MapRef<'_> {
         heights: t.heights(),
         materials: t.materials(),
         water: t.water(),
-        obstacles: ObstaclesRef(world.obstacles().obstacles()),
+        obstacles: ObstaclesRef(world.obstacle_set().obstacles()),
         material_table: world.materials(),
     }
 }
 
 /// Content hash of a map.
 pub fn content_hash(world: &StaticWorld) -> MapHash {
+    if let Some(hash) = world.tiled_hash() {
+        return hash;
+    }
     let mut h = blake3::Hasher::new();
     h.update(HASH_DOMAIN);
     postcard::to_io(&view(world), &mut h).expect("hashing cannot fail");
@@ -230,6 +233,9 @@ pub fn content_hash(world: &StaticWorld) -> MapHash {
 
 /// Write a map file (zstd level `level`, 3 is a good default); returns the content hash.
 pub fn write(world: &StaticWorld, w: impl Write, level: i32) -> Result<MapHash, MapFileError> {
+    if world.is_tiled() {
+        return Err(MapFileError::Corrupt("tiled maps are not stored as map files".into()));
+    }
     let hash = content_hash(world);
     let mut w = w;
     w.write_all(MAGIC)?;
@@ -341,11 +347,11 @@ mod tests {
             assert_eq!(h, world.content_hash());
             let (back, h2) = read(&buf[..]).unwrap();
             assert_eq!(h2, h);
-            assert_eq!(back.terrain().heights(), world.terrain().heights());
+            assert_eq!(back.grid().heights(), world.grid().heights());
             // Dry cells are NaN: compare bit patterns.
-            let bits = |w: &StaticWorld| w.terrain().water().map(|w| w.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            let bits = |w: &StaticWorld| w.grid().water().map(|w| w.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
             assert_eq!(bits(&back), bits(&world));
-            assert_eq!(back.obstacles().obstacles(), world.obstacles().obstacles());
+            assert_eq!(back.obstacle_set().obstacles(), world.obstacle_set().obstacles());
             assert_eq!(back.meta, world.meta);
             // Corruption is detected.
             let n = buf.len();

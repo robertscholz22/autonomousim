@@ -94,7 +94,7 @@ fn strip(m: &mut MeshData, world: &StaticWorld, line: &Polyline, points: &[usize
         let l = left(d.y.atan2(d.x));
         for &off in &layer.offsets {
             let xy = pts[i].truncate() + off * l;
-            let (h, normal) = world.terrain().height_normal(xy.x, xy.y);
+            let (h, normal) = world.grid().height_normal(xy.x, xy.y);
             m.push_vertex(xy.extend(h + layer.lift).as_vec3(), normal.as_vec3(), layer.color);
         }
     }
@@ -112,7 +112,7 @@ fn strip(m: &mut MeshData, world: &StaticWorld, line: &Polyline, points: &[usize
 /// Road ribbons grouped by chunk: one merged mesh per entry of `chunks` (empty where no road
 /// passes). A road is cut where it crosses into another chunk.
 pub fn roads_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize) -> Vec<MeshData> {
-    let grid = world.terrain();
+    let grid = world.grid();
     let mut out = vec![MeshData::new(); chunks.len()];
     for road in world.roads().roads() {
         let line = &road.line;
@@ -183,7 +183,7 @@ mod tests {
             .iter()
             .map(|p| {
                 let p = Vec3::from_array(*p).as_dvec3();
-                p.z - world.terrain().height(p.x, p.y)
+                p.z - world.grid().height(p.x, p.y)
             })
             .fold(f64::INFINITY, f64::min)
     }
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn ribbons_cover_the_roads_just_above_the_terrain() {
         let w = world();
-        let cs = chunks(w.terrain(), 32);
+        let cs = chunks(w.grid(), 32);
         let meshes = roads_by_chunk(&w, &cs, 32);
         assert_eq!(meshes.len(), cs.len());
         let all = meshes.iter().fold(MeshData::new(), |mut m, c| {
@@ -250,7 +250,7 @@ mod tests {
         assert!((area - 180.0 * 6.0).abs() < 1.0, "{area}");
         // Every chunk the roads cross has ribbons, the others none.
         for (c, m) in cs.iter().zip(&meshes) {
-            let (lo, hi) = c.bounds(w.terrain());
+            let (lo, hi) = c.bounds(w.grid());
             let crossed = (lo.y < 0.0 && hi.y > 0.0 && lo.x < 90.0 && hi.x > -90.0)
                 || (lo.x < 0.0 && hi.x > 0.0 && hi.y > -60.0 && lo.y < 60.0);
             assert_eq!(!m.is_empty(), crossed, "chunk {c:?}");

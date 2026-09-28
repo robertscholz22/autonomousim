@@ -1998,7 +1998,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 #### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | `world::tiles` + `procgen::large`: coarse layer (terrain, erosion, hydrology, materials, rural roads and airstrips), detail tiles, `TiledWorld` with the tile LRU, hashes, `large` presets | Tiles are identical whatever the access order and thread count; heights and normals are continuous across tile seams; queries agree with a monolithic grid built from the same functions; the coarse 16 km layer generates in ≤ 15 s and a tile in ≤ 50 ms; memory stays under the cache bound; existing goldens are unchanged |
+| 1 ✅ | `world::tiles` + `procgen::large`: coarse layer (terrain, erosion, hydrology, materials, rural roads and airstrips), detail tiles, `TiledWorld` with the tile LRU, hashes, `large` presets | Tiles are identical whatever the access order and thread count; heights and normals are continuous across tile seams; queries agree with a monolithic grid built from the same functions; the coarse 16 km layer generates in ≤ 15 s and a tile in ≤ 50 ms; memory stays under the cache bound; existing goldens are unchanged |
 | 2 | Viewer: floating origin, streamed tiles and far-field coarse chunks, aerial view distance | A drone flies across a 16 km map without jitter at the far edge; ≥ 60 fps at 1080p medium at 30 m/s and 200 m AGL on the Iris Xe |
 | 3 | Shared aero: `AirData` move, `AeroSurface`, medium/high-altitude Dryden, `pitot`, the `air_data`/`wind_body` terms, state columns | Lift, drag and moment of a surface match analytic thin-aerofoil and flat-plate values; Dryden spectra match MIL-F-8785C at altitude; goldens re-blessed after an A/B check |
 | 4 | `FixedWing` family: aero model (derivatives and tables), propeller and motor or engine, gear, presets, wiring through vehicles, sim, recorder and Python | Both presets trim in level flight; engine-off glide conserves energy with drag accounted for; they stand on their gear; scenarios spawn them in the air and on a runway |
@@ -2006,6 +2006,47 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | 6 | Control and action modes (`raw`, `rates`, `attitude`, `guidance`) | Rate and attitude steps meet rise and overshoot bounds across the speed range; coordinated turns keep β small; altitude and airspeed hold under wind and turbulence; L1 follows a straight and a circular path |
 | 7 | Viewer: visuals, HUD, keyboard flight, cameras, replay | The Aerosonde flies by keyboard over a large map at ≥ 60 fps; recordings replay |
 | 8 | `FixedWingWaypoints-v0`: task, scripted pilot, short training, export, viewer, replay | The task trains end to end; the exported policy flies in the viewer; a recorded episode replays |
+
+#### As built
+- **Step 1 (tiled large maps)**:
+  - **`world::tiles`**:
+    - `TiledMap` implements both `Terrain` and `StaticGeometry` over a `TileSource` (`tile(tx, ty) -> Tile`, `owner(id)`).
+    - A `Tile` is a `HeightGrid` (its core plus a ring of `MAX_SEARCH_CELLS` = 16 cells, so normals and surface searches never cross a tile edge) and an `ObstacleSet`. An obstacle is stored with every tile whose core, grown by `reach` (4 m), it overlaps.
+    - Global obstacle ids are `(scatter cell << 8) | (k << 2) | (part << 1) | rock`, so contacts and caches keyed by ids work across tiles.
+    - **Queries**:
+      - Point queries clamp to the extent.
+      - Shape queries within one core ± reach go to that tile; others merge candidates from every overlapped tile, sorted and deduplicated.
+      - Rays walk tiles with a DDA up to `detail_range` (2 km) and continue on the coarse grid.
+      - `height_bounds` uses the tile where possible, otherwise coarse ± `pad` (a bound on Catmull–Rom overshoot plus noise amplitudes).
+    - **Cache**: a shared map of `OnceLock` entries with an LRU stamp and eviction above the capacity, plus a thread-local list of the 4 most recent tiles. Tiles are generated sequentially, with no rayon inside, so pool threads never wait on each other.
+  - **`StaticWorld`**:
+    - `terrain()` / `obstacles()` return the enums `MapTerrain { Grid, Tiled }` / `MapObstacles { Set, Tiled }`.
+    - `grid()` / `obstacle_set()` return the monolithic parts and panic on tiled maps.
+    - `tiled_hash` is the map hash of a tiled map.
+    - Map files cannot store tiled maps (the map is rebuilt from config and seed; only the coarse layer is cached).
+  - **`procgen::large`** (`WildPreset::Large`, `"large"`; `WildConfig.tiles: Option<TilesConfig>`, not serialised when absent):
+    - **Coarse layer**: the wild landform at 8 m, eroded and routed through the existing hydrology (lakes, moisture scaled by vertex area), plus coarse materials. It is cached as `{key}.coarse` (postcard + zstd, blake3-checked).
+    - **Tile heights**: Catmull–Rom of the coarse heights, plus mid-band fBm (1.2 m at 48 m), plus the wild detail noise.
+    - **Tile water**: the highest coarse lake level in the 3×3 neighbourhood wherever a cell's lowest corner lies below it.
+    - **Tile materials**: `MaterialRule`, factored out of `wild.rs` with `LineSeeds` and `terrain_seeds`, so the wild goldens are unchanged.
+    - **Scatter**:
+      - Candidates per 16 m scatter cell from `tree_seed.child_index(cell)` with a fixed number of draws.
+      - The conflict pass is a *local priority rule* instead of the monolithic fixed-order pass: a candidate survives if no candidate within `min_spacing` ranks higher. Every tile therefore decides the same trees without a global order.
+      - Rocks are kept clear of trees.
+    - The map hash covers the generator version, config, seed and coarse layer. The tiles follow from them and are checked by `fixtures/golden_hashes_tiled.toml` (hashes of sample tiles).
+  - **Numbers (laptop)**: 16 km coarse layer 1.8 s cold (target ≤ 15 s); one tile 33 ms (≤ 50 ms), about 2.5 MB with about 2300 obstacles. The default cache is 128 tiles (about 320 MB; `AUTONOMOUSIM_TILE_CACHE`).
+  - **Sim**: `map = { type = "wild", preset = "large" }` works for aerial groups (spawns sample tiles lazily). Ground groups on tiled maps are rejected at compile time, since drive grids would cover the whole map. The drive grid now uses `query_candidates` instead of iterating the obstacle set.
+  - **CLI**: `mapgen --preset large` prints the tile layout; `--preview` renders the coarse grid without obstacles; `--out` fails for tiled maps.
+  - **Deferred**: rural roads and airstrips on the coarse layer. Airstrips (a flattened, graded strip with a runway material) come with step 4, where fixed-wing spawns need a runway; large rural maps come later.
+  - **Tests**:
+    - `world/src/tiles.rs`, with an analytic source: queries against a single grid, a bounded cache, threads seeing identical tiles, and long rays.
+    - `procgen/tests/large.rs`:
+      - golden hashes independent of access order and threads;
+      - neighbouring tiles agree on their overlap;
+      - queries agree with a stitched 4×4-tile grid;
+      - scatter and water invariants, a bounded cache, and the cached coarse layer;
+      - an ignored timing test.
+    - `sim/tests/large.rs`: 16 drones hold position on a 4 km tiled map; a ground group is rejected.
 
 ### M6b: Helicopter
 

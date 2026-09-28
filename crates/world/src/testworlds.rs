@@ -182,9 +182,9 @@ mod tests {
         let a = forest_patch(200.0, 150.0, 7);
         let b = forest_patch(200.0, 150.0, 7);
         let c = forest_patch(200.0, 150.0, 8);
-        assert_eq!(a.obstacles().obstacles(), b.obstacles().obstacles());
-        assert_ne!(a.obstacles().obstacles(), c.obstacles().obstacles());
-        let trunks: Vec<_> = a.obstacles().obstacles().iter().filter(|o| o.tag == tags::TRUNK).collect();
+        assert_eq!(a.obstacle_set().obstacles(), b.obstacle_set().obstacles());
+        assert_ne!(a.obstacle_set().obstacles(), c.obstacle_set().obstacles());
+        let trunks: Vec<_> = a.obstacle_set().obstacles().iter().filter(|o| o.tag == tags::TRUNK).collect();
         assert_eq!(trunks.len(), 600);
         for o in trunks {
             let ObstacleShape::Capsule { half_height, .. } = o.shape else { panic!() };
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn pillars_and_arena_block_rays() {
         let w = pillars(4, 10.0, 0.5, 8.0);
-        assert_eq!(w.obstacles().len(), 16);
+        assert_eq!(w.obstacle_set().len(), 16);
         let hit = w.raycast(&Ray::new(DVec3::new(-30.0, -15.0, 2.0), DVec3::X), 100.0, HitMask::ALL).unwrap();
         assert!(matches!(hit.kind, HitKind::Solid(0)));
         assert!((hit.point.x + 15.5).abs() < 1e-9);

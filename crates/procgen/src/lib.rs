@@ -8,6 +8,7 @@
 pub mod cache;
 mod farmland;
 mod hydrology;
+pub mod large;
 pub mod noise;
 pub mod rural;
 mod scatter;
@@ -19,7 +20,7 @@ pub use farmland::{FieldsConfig, ScatterConfig};
 pub use rural::{RuralConfig, RuralPreset, RuralStats};
 pub use scatter::{RocksConfig, TreesConfig};
 pub use terrain::{ErosionConfig, TerrainConfig};
-pub use wild::{WildConfig, WildPreset, WildStats};
+pub use wild::{TilesConfig, WildConfig, WildPreset, WildStats};
 
 use autonomousim_world::MapFileError;
 

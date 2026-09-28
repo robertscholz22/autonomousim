@@ -8,12 +8,12 @@
 //!
 //! Also here: [`ground_pose`], the pose of a ground vehicle resting on uneven terrain.
 
+use autonomousim_core::geometry::{HitMask, StaticGeometry};
 use autonomousim_core::material::{Material, MaterialId};
 use autonomousim_core::math::Pose;
 use autonomousim_core::terrain::Terrain;
 use autonomousim_vehicles::ground::WheeledDef;
 use autonomousim_world::StaticWorld;
-use autonomousim_world::obstacles::ObstacleClass;
 use glam::{DMat3, DQuat, DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -139,12 +139,13 @@ impl DriveGrid {
                 let m = DVec2::splat(r + half_width + spec.margin);
                 let (hmin, hmax) = terrain.height_bounds(c - m, c + m);
                 hits.clear();
-                obstacles.query_aabb(
+                obstacles.query_candidates(
                     (c - m).extend(hmin + spec.obstacle_height),
                     (c + m).extend(hmax + BLOCKING_HEIGHT),
+                    HitMask::SOLID,
                     &mut hits,
                 );
-                if hits.iter().any(|&i| obstacles.obstacles()[i].class == ObstacleClass::Solid) {
+                if !hits.is_empty() {
                     continue;
                 }
                 open[iy * nx + ix] = true;

@@ -161,9 +161,9 @@ pub fn chunk_index(grid: &HeightGrid, size: usize, p: DVec3) -> usize {
 /// Obstacle meshes grouped by chunk: one merged mesh per entry of `chunks` (empty where a
 /// chunk has no obstacles).
 pub fn props_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize, detail: PropDetail) -> Vec<MeshData> {
-    let grid = world.terrain();
+    let grid = world.grid();
     let mut out = vec![MeshData::new(); chunks.len()];
-    for (i, o) in world.obstacles().obstacles().iter().enumerate() {
+    for (i, o) in world.obstacle_set().obstacles().iter().enumerate() {
         // Hedges hide their woody cores.
         let hidden = o.tag == tags::HEDGE && o.class == ObstacleClass::Solid;
         if hidden || (detail.min_size > 0.0 && extent(&o.shape) < detail.min_size) {
@@ -560,12 +560,12 @@ mod tests {
     #[test]
     fn props_land_in_the_chunk_below_them() {
         let w = testworlds::forest_patch(120.0, 150.0, 3);
-        let g = w.terrain();
+        let g = w.grid();
         let cs = chunks(g, 32);
         let props = props_by_chunk(&w, &cs, 32, PropDetail::default());
         assert_eq!(props.len(), cs.len());
         let total: usize = props.iter().map(MeshData::triangle_count).sum();
-        assert!(total > 100 * w.obstacles().len() / 10, "{total}");
+        assert!(total > 100 * w.obstacle_set().len() / 10, "{total}");
         // The far level of detail has fewer triangles.
         let far: usize = props_by_chunk(&w, &cs, 32, PropDetail::far()).iter().map(MeshData::triangle_count).sum();
         assert!(far > 0 && 3 * far < 2 * total, "{far} of {total}");

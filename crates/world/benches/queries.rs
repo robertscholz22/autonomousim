@@ -106,7 +106,7 @@ fn queries(c: &mut Criterion) {
         })
         .unwrap();
     let in_canopy = world
-        .obstacles()
+        .obstacle_set()
         .obstacles()
         .iter()
         .find(|o| o.class == autonomousim_world::ObstacleClass::Foliage)

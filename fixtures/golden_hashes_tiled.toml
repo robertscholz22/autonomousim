@@ -1,0 +1,21 @@
+map = "4f14910ecd85447d2752dbcba755017c1f2d6390abeb96f58522d65bca700ec2"
+
+[[tiles]]
+tx = 0
+ty = 0
+hash = "7e3f9d3ef76eedee406db78e50152a050cfbf6267e535096e5cbb63dbf1397b3"
+
+[[tiles]]
+tx = 3
+ty = 4
+hash = "0dfaf90f8be12a70cf15a0d305e4922d4d55749f310baff7a16303c6aeb1c8b4"
+
+[[tiles]]
+tx = 4
+ty = 4
+hash = "6545a301d930e0a550a062b0b7ae39d0548bf8c5c68ef8efc296ecaf5e65301b"
+
+[[tiles]]
+tx = 7
+ty = 2
+hash = "9f1f58d2edc71a18513fb8b1505d7003af463b164340af5ff7c14c77f650b943"

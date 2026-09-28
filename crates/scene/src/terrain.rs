@@ -70,7 +70,7 @@ fn material_colors(world: &StaticWorld) -> Vec<[f32; 4]> {
 
 /// Terrain mesh of `chunk` sampling every `stride`-th vertex, with a skirt `skirt` metres deep.
 pub fn terrain_chunk(world: &StaticWorld, chunk: &Chunk, stride: usize, skirt: f32) -> MeshData {
-    let grid = world.terrain();
+    let grid = world.grid();
     let colors = material_colors(world);
     let (cw, ch) = grid.cells();
     let (vw, vh) = grid.dims();
@@ -149,7 +149,7 @@ pub fn terrain_chunk(world: &StaticWorld, chunk: &Chunk, stride: usize, skirt: f
 
 /// Water surface of `chunk`: one quad per run of wet cells with the same level in a row.
 pub fn water_chunk(world: &StaticWorld, chunk: &Chunk, color: [f32; 4]) -> MeshData {
-    let grid = world.terrain();
+    let grid = world.grid();
     let mut m = MeshData::new();
     if grid.water().is_none() {
         return m;
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn chunks_tile_the_grid() {
         let w = testworlds::sine_hills(100.0, 3.0, 20.0);
-        let g = w.terrain();
+        let g = w.grid();
         let cs = chunks(g, 32);
         let (cw, ch) = g.cells();
         assert_eq!(cs.len(), cw.div_ceil(32) * ch.div_ceil(32));
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn chunk_meshes_follow_the_terrain() {
         let w = testworlds::sine_hills(100.0, 3.0, 20.0);
-        let g = w.terrain();
+        let g = w.grid();
         for stride in [1, 2, 4, 8, 64] {
             for chunk in chunks(g, 32) {
                 let m = terrain_chunk(&w, &chunk, stride, 2.0);
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn water_quads_cover_the_wet_cells() {
         let w = testworlds::lake(100.0, 4.0, -1.0);
-        let g = w.terrain();
+        let g = w.grid();
         let color = water_color();
         let mut area = 0.0;
         for chunk in chunks(g, 16) {

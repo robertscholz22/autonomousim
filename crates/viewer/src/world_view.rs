@@ -39,7 +39,7 @@ pub struct MapView {
 
 impl MapView {
     pub fn new(world: Arc<StaticWorld>, quality: Quality) -> Self {
-        let chunks = terrain::chunks(world.terrain(), CHUNK_CELLS);
+        let chunks = terrain::chunks(world.grid(), CHUNK_CELLS);
         Self {
             world,
             chunks,
@@ -90,7 +90,7 @@ fn stride_for(distance: f32) -> usize {
 }
 
 fn skirt(world: &StaticWorld, stride: usize) -> f32 {
-    (1.0 + 2.0 * stride as f64 * world.terrain().cell_size()) as f32
+    (1.0 + 2.0 * stride as f64 * world.grid().cell_size()) as f32
 }
 
 /// Distance from `p` to the box `[min, max]`.
@@ -112,7 +112,7 @@ fn aabb(min: Vec3, max: Vec3) -> Aabb {
 /// Sun and ambient light (the same for every map).
 pub fn spawn_lights(mut commands: Commands, view: Res<MapView>, quality: Res<Quality>) {
     let (min, max) = view.world.extent();
-    let centre = convert::vec(((min + max) / 2.0).extend(view.world.terrain().height_range().1));
+    let centre = convert::vec(((min + max) / 2.0).extend(view.world.grid().height_range().1));
     // Sun from the south-west, 40° high.
     let (elevation, azimuth) = (40f32.to_radians(), 225f32.to_radians());
     let to_sun = glam::DVec3::new(
@@ -196,7 +196,7 @@ pub fn sync_map(
         commands.entity(e).despawn();
     }
     view.world = map.clone();
-    view.chunks = terrain::chunks(map.terrain(), CHUNK_CELLS);
+    view.chunks = terrain::chunks(map.grid(), CHUNK_CELLS);
     build_map(&mut commands, &view, &mut meshes);
 }
 
@@ -241,7 +241,7 @@ fn build_map(commands: &mut Commands, view: &MapView, meshes: &mut Assets<Mesh>)
 
     let (mut triangles, mut prop_triangles, mut far_triangles) = (0, 0, 0);
     for (i, (c, (t, w))) in view.chunks.iter().zip(built).enumerate() {
-        let (lo, hi) = c.bounds(world.terrain());
+        let (lo, hi) = c.bounds(world.grid());
         let (a, b) = (convert::vec(lo), convert::vec(hi));
         let (cmin, cmax) = (a.min(b), a.max(b));
         let (mmin, mmax) = bevy_bounds(&t).unwrap_or((cmin, cmax));

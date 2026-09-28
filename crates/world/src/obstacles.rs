@@ -310,6 +310,13 @@ impl Obstacle {
         self.tag = tag;
         self
     }
+
+    /// Axis-aligned bounding box `(min, max)` in world coordinates.
+    pub fn aabb(&self) -> (DVec3, DVec3) {
+        let (shape, local) = self.shape.to_parry();
+        let b = shape.compute_aabb(&PPose::from_parts(self.pose.pos, self.pose.rot * local));
+        (b.mins, b.maxs)
+    }
 }
 
 /// Immutable set of obstacles with a bounding-volume hierarchy.

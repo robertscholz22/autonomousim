@@ -5,6 +5,7 @@
 //! so several processes can share a cache directory.
 
 use crate::ProcgenError;
+use crate::large;
 use crate::rural::{self, RURAL_VERSION, RuralConfig, RuralStats};
 use crate::wild::{self, WILD_VERSION, WildConfig, WildStats};
 use autonomousim_world::{MapHash, StaticWorld, mapfile};
@@ -87,11 +88,36 @@ impl MapCache {
         Ok(Cached { world, hash, path, generated: Some(stats) })
     }
 
-    /// A wild map from the cache, generated on a miss.
+    /// A wild map from the cache, generated on a miss (for tiled maps, the coarse layer is
+    /// cached and tiles are generated on demand).
     pub fn wild(&self, config: &WildConfig, seed: u64) -> Result<Cached<WildStats>, ProcgenError> {
         config.validate()?;
+        if config.tiles.is_some() {
+            return self.wild_tiled(config, seed);
+        }
         let key = Self::key("wild", WILD_VERSION, config, seed);
         self.load_or_generate(&key, || wild::generate(config, seed))
+    }
+
+    fn wild_tiled(&self, config: &WildConfig, seed: u64) -> Result<Cached<WildStats>, ProcgenError> {
+        let version = (WILD_VERSION << 16) | large::TILED_VERSION;
+        let key = Self::key("wild-tiled", version, config, seed);
+        let path = self.dir.join(format!("{key}.coarse"));
+        let mut stats = WildStats::default();
+        let (coarse, generated) = match std::fs::read(&path).ok().and_then(|b| large::decode_coarse(&b)) {
+            Some(c) => (c, false),
+            None => {
+                let c = large::coarse(config, seed, &mut stats)?;
+                std::fs::create_dir_all(&self.dir)?;
+                let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+                std::fs::write(&tmp, large::encode_coarse(&c))?;
+                std::fs::rename(&tmp, &path)?;
+                (c, true)
+            }
+        };
+        let world = large::assemble(config, seed, coarse, &mut stats)?;
+        let hash = world.content_hash();
+        Ok(Cached { world, hash, path, generated: generated.then_some(stats) })
     }
 
     /// A rural map from the cache, generated on a miss.

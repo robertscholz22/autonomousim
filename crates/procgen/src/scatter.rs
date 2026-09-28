@@ -18,7 +18,7 @@ use std::f64::consts::TAU;
 
 const TILE: f64 = 64.0;
 /// Candidates stay this far from the map edge.
-const EDGE_MARGIN: f64 = 2.0;
+pub(crate) const EDGE_MARGIN: f64 = 2.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -371,7 +371,7 @@ pub(crate) fn rocks(g: &Ground, c: &RocksConfig, trees: &Trees, seed: &Seed) -> 
 /// Perturbed ellipsoid with diameter `size`: 6 axis points (so the hull contains its centre)
 /// and 8 random directions, each pushed in or out by up to 20 %. Returns the shape and its
 /// lowest and highest `z`.
-fn rock_shape(rng: &mut SimRng, size: f64) -> (ObstacleShape, f64, f64) {
+pub(crate) fn rock_shape(rng: &mut SimRng, size: f64) -> (ObstacleShape, f64, f64) {
     let a = 0.5 * size;
     let axes = DVec3::new(a, a * rng.range(0.6, 1.0), a * rng.range(0.35, 0.75));
     let mut dirs = [DVec3::ZERO; 14];

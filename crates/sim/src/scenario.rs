@@ -997,6 +997,14 @@ impl CompiledScenario {
                 )));
             }
         }
+        if let Some(g) = groups.iter().find(|g| g.family() == Family::Wheeled)
+            && maps.iter().any(|m| m.is_tiled())
+        {
+            return Err(SimError::Scenario(format!(
+                "group {:?}: ground vehicles need drive grids, which tiled (large) maps do not have",
+                g.spec.name
+            )));
+        }
         build_drive_grids(&mut groups, &maps);
         // Defaults that depend on the vehicle, filled in.
         for (s, g) in spec.groups.iter_mut().zip(&groups) {

@@ -133,6 +133,30 @@ pub struct WildConfig {
     pub materials: MaterialsConfig,
     pub trees: TreesConfig,
     pub rocks: RocksConfig,
+    /// Tiled large map (see [`crate::large`]): terrain, erosion and water on a coarse grid,
+    /// the final grid and the scatter generated per tile on demand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiles: Option<TilesConfig>,
+}
+
+/// How a tiled wild map is split (see [`crate::large`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TilesConfig {
+    /// Cell of the coarse layer (m), an integer multiple (≥ 2) of the final `cell`; erosion
+    /// runs on cells twice as large.
+    pub coarse_cell: f64,
+    /// Edge length of a tile in final cells.
+    pub tile_cells: u32,
+    /// Noise that fills the band between the coarse layer and the fine detail (m).
+    pub mid_amplitude: f64,
+    pub mid_wavelength: f64,
+}
+
+impl Default for TilesConfig {
+    fn default() -> Self {
+        Self { coarse_cell: 8.0, tile_cells: 256, mid_amplitude: 1.2, mid_wavelength: 48.0 }
+    }
 }
 
 impl Default for WildConfig {
@@ -152,6 +176,8 @@ pub enum WildPreset {
     /// 512 m of gentle hills (40 m relief) with sparse forest, clearings and few rocks, for
     /// ground vehicles.
     Offroad,
+    /// 16 km with 900 m relief in 256 m tiles generated on demand, for aircraft.
+    Large,
 }
 
 impl WildPreset {
@@ -160,6 +186,7 @@ impl WildPreset {
             Self::Training => WildConfig::training(),
             Self::Showcase => WildConfig::showcase(),
             Self::Offroad => WildConfig::offroad(),
+            Self::Large => WildConfig::large(),
         }
     }
 }
@@ -171,7 +198,8 @@ impl std::str::FromStr for WildPreset {
             "training" => Ok(Self::Training),
             "showcase" => Ok(Self::Showcase),
             "offroad" => Ok(Self::Offroad),
-            _ => Err(format!("unknown preset {s:?} (training, showcase, offroad)")),
+            "large" => Ok(Self::Large),
+            _ => Err(format!("unknown preset {s:?} (training, showcase, offroad, large)")),
         }
     }
 }
@@ -188,6 +216,27 @@ impl WildConfig {
             materials: MaterialsConfig::default(),
             trees: TreesConfig::default(),
             rocks: RocksConfig::default(),
+            tiles: None,
+        }
+    }
+
+    /// 16 km of mountains, valleys and lakes (900 m relief) in tiles generated on demand.
+    pub fn large() -> Self {
+        Self {
+            size: 16384.0,
+            terrain: TerrainConfig {
+                relief: 900.0,
+                hills_wavelength: 3000.0,
+                mountains_wavelength: 6000.0,
+                mask_wavelength: 8000.0,
+                warp_wavelength: 3000.0,
+                warp_strength: 300.0,
+                ..TerrainConfig::default()
+            },
+            water: WaterConfig { min_area: 2000.0, ..WaterConfig::default() },
+            materials: MaterialsConfig { forest_wavelength: 700.0, ..MaterialsConfig::default() },
+            tiles: Some(TilesConfig::default()),
+            ..Self::showcase()
         }
     }
 
@@ -266,7 +315,9 @@ impl WildConfig {
                 return Err("cell must be in [0.25, 8] m".into());
             }
             let cells = self.size / self.cell;
-            if !(cells.fract() == 0.0 && (cells as u64).is_multiple_of(2) && (64.0..=16384.0).contains(&cells)) {
+            if let Some(t) = &self.tiles {
+                t.validate(self.size, self.cell)?;
+            } else if !(cells.fract() == 0.0 && (cells as u64).is_multiple_of(2) && (64.0..=16384.0).contains(&cells)) {
                 return Err("size / cell must be an even integer in [64, 16384]".into());
             }
             self.terrain.validate()?;
@@ -281,6 +332,34 @@ impl WildConfig {
             Ok(())
         };
         check().map_err(ProcgenError::Config)
+    }
+}
+
+impl TilesConfig {
+    fn validate(&self, size: f64, cell: f64) -> Result<(), String> {
+        let ratio = self.coarse_cell / cell;
+        if !(ratio.fract() == 0.0 && (2.0..=64.0).contains(&ratio)) {
+            return Err("tiles.coarse_cell must be 2–64 times the cell".into());
+        }
+        let coarse = size / self.coarse_cell;
+        if !(coarse.fract() == 0.0 && (coarse as u64).is_multiple_of(2) && (64.0..=16384.0).contains(&coarse)) {
+            return Err("size / tiles.coarse_cell must be an even integer in [64, 16384]".into());
+        }
+        if !(32..=2048).contains(&self.tile_cells) || !self.tile_cells.is_multiple_of(16) {
+            return Err("tiles.tile_cells must be a multiple of 16 in [32, 2048]".into());
+        }
+        let tile = self.tile_cells as f64 * cell;
+        let scatter = crate::large::SCATTER_CELL;
+        if (size / tile).fract() != 0.0 || (tile / scatter).fract() != 0.0 || size / scatter > 4096.0 {
+            return Err(format!(
+                "size must be a multiple of the tile ({tile} m), the tile of {scatter} m, and at most {} m",
+                4096.0 * scatter
+            ));
+        }
+        if !(self.mid_amplitude >= 0.0 && self.mid_wavelength > 0.0) {
+            return Err("tiles: mid_amplitude must be non-negative and mid_wavelength positive".into());
+        }
+        Ok(())
     }
 }
 
@@ -321,7 +400,7 @@ pub struct WildStats {
 }
 
 impl WildStats {
-    fn stage(&mut self, name: &'static str, t: &mut Instant) {
+    pub(crate) fn stage(&mut self, name: &'static str, t: &mut Instant) {
         self.stages.push((name, t.elapsed().as_secs_f64()));
         *t = Instant::now();
     }
@@ -332,10 +411,89 @@ impl WildStats {
 }
 
 /// Noise seeds of the material rules.
-struct LineSeeds {
+pub(crate) struct LineSeeds {
     treeline: u64,
     snowline: u64,
     forest: u64,
+}
+
+impl LineSeeds {
+    pub(crate) fn new(root: &Seed) -> Self {
+        let line_seed = root.child("lines");
+        Self {
+            treeline: line_seed.child("treeline").short(),
+            snowline: line_seed.child("snowline").short(),
+            forest: line_seed.child("forest").short(),
+        }
+    }
+
+    /// Treeline height (m) at `(x, y)`.
+    pub(crate) fn treeline(&self, m: &MaterialsConfig, relief: f64, x: f64, y: f64) -> f64 {
+        relief
+            * (m.treeline + m.line_noise * fbm(self.treeline, x / LINE_WAVELENGTH, y / LINE_WAVELENGTH, &LINE_FRACTAL))
+    }
+}
+
+/// The per-cell material rule of wild maps.
+pub(crate) struct MaterialRule<'a> {
+    m: &'a MaterialsConfig,
+    lines: &'a LineSeeds,
+    relief: f64,
+    rock: f64,
+    scree: f64,
+    snow_max: f64,
+}
+
+impl<'a> MaterialRule<'a> {
+    pub(crate) fn new(m: &'a MaterialsConfig, lines: &'a LineSeeds, relief: f64) -> Self {
+        let tan = |deg: f64| libm::tan(deg.to_radians());
+        Self {
+            m,
+            lines,
+            relief,
+            rock: tan(m.rock_slope_deg),
+            scree: tan(m.scree_slope_deg),
+            snow_max: tan(m.snow_max_slope_deg),
+        }
+    }
+
+    /// Material of a cell centred at `(x, y)` with mean height `z`, slope tangent `slope`,
+    /// water level `water` (NaN when dry), highest water level nearby `near` (if shores are
+    /// on) and moisture `wet`; `treeline` gives the treeline height (evaluated when needed).
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn material(
+        &self,
+        x: f64,
+        y: f64,
+        z: f64,
+        slope: f64,
+        water: f32,
+        near: Option<f32>,
+        wet: f64,
+        treeline: &dyn Fn(f64, f64) -> f64,
+    ) -> MaterialId {
+        let (m, lines, relief) = (self.m, self.lines, self.relief);
+        if !water.is_nan() {
+            if water as f64 - z < 0.5 { MaterialId::SAND } else { MaterialId::MUD }
+        } else if slope > self.rock {
+            MaterialId::ROCK
+        } else if z > relief
+            * (m.snowline + m.line_noise * fbm(lines.snowline, x / LINE_WAVELENGTH, y / LINE_WAVELENGTH, &LINE_FRACTAL))
+            && slope < self.snow_max
+        {
+            MaterialId::SNOW
+        } else if z > treeline(x, y) {
+            if slope > self.scree { MaterialId::SCREE } else { MaterialId::GRASS }
+        } else if near.is_some_and(|l| z < l as f64 + m.shore_height) {
+            MaterialId::SAND
+        } else if wet > m.marsh_moisture && slope < 0.05 {
+            MaterialId::MUD
+        } else {
+            let f = fbm(lines.forest, x / m.forest_wavelength, y / m.forest_wavelength, &Fractal::new(4));
+            if f + 0.3 * wet > m.forest_threshold { MaterialId::FOREST_FLOOR } else { MaterialId::GRASS }
+        }
+    }
 }
 
 const LINE_FRACTAL: Fractal = Fractal { octaves: 3, lacunarity: 2.0, gain: 0.5 };
@@ -358,18 +516,23 @@ pub(crate) struct Landform {
     pub droplets: u64,
 }
 
-/// Steps 1–4 of the wild pipeline (terrain, erosion, upsampling, hydrology), shared with the
-/// rural generator; `stage` is called after each step with its name.
-pub(crate) fn landform(c: &Land, root: &Seed, stage: &mut dyn FnMut(&'static str)) -> Landform {
+/// Noise seeds of the terrain layers under the generator's `root` seed.
+pub(crate) fn terrain_seeds(root: &Seed) -> TerrainSeeds {
     let terrain_seed = root.child("terrain");
     let layer = |name: &str| terrain_seed.child(name).short();
-    let ts = TerrainSeeds {
+    TerrainSeeds {
         warp: [0, 1, 2, 3].map(|i| terrain_seed.child("warp").child_index(i).short()),
         mask: layer("mask"),
         hills: layer("hills"),
         mountains: layer("mountains"),
         detail: layer("detail"),
-    };
+    }
+}
+
+/// Steps 1–4 of the wild pipeline (terrain, erosion, upsampling, hydrology), shared with the
+/// rural generator; `stage` is called after each step with its name.
+pub(crate) fn landform(c: &Land, root: &Seed, stage: &mut dyn FnMut(&'static str)) -> Landform {
+    let ts = terrain_seeds(root);
     let relief = c.terrain.relief;
     let n = (c.size / c.cell).round() as usize + 1;
     let nc = (n - 1) / 2 + 1;
@@ -427,6 +590,9 @@ pub(crate) fn landform(c: &Land, root: &Seed, stage: &mut dyn FnMut(&'static str
 /// Generate a wild map. Uses the current rayon pool; the output does not depend on its size.
 pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStats), ProcgenError> {
     config.validate()?;
+    if config.tiles.is_some() {
+        return crate::large::generate(config, seed);
+    }
     let c = config;
     let mut stats = WildStats::default();
     let mut t = Instant::now();
@@ -448,17 +614,9 @@ pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStat
     // 5. Moisture and materials.
     let moisture = moisture(&acc, n);
     drop(acc);
-    let line_seed = root.child("lines");
-    let lines = LineSeeds {
-        treeline: line_seed.child("treeline").short(),
-        snowline: line_seed.child("snowline").short(),
-        forest: line_seed.child("forest").short(),
-    };
+    let lines = LineSeeds::new(&root);
     let m = &c.materials;
-    let treeline = |x: f64, y: f64| {
-        relief
-            * (m.treeline + m.line_noise * fbm(lines.treeline, x / LINE_WAVELENGTH, y / LINE_WAVELENGTH, &LINE_FRACTAL))
-    };
+    let treeline = |x: f64, y: f64| lines.treeline(m, relief, x, y);
     let (materials, slope) = materials(c, origin, &heights, &lakes.water, &moisture, &lines, &treeline);
     drop(moisture);
     let mut counts = [0usize; 256];
@@ -506,8 +664,13 @@ pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStat
 
 /// Moisture in [0, 1] per vertex: log upstream area, blurred.
 pub(crate) fn moisture(acc: &[u32], n: usize) -> Vec<f32> {
+    moisture_scaled(acc, n, 1.0)
+}
+
+/// [`moisture`] on a grid whose vertices each stand for `vertex_area` 1 m cells.
+pub(crate) fn moisture_scaled(acc: &[u32], n: usize, vertex_area: f64) -> Vec<f32> {
     let scale = 1.0 / libm::log(MOISTURE_AREA);
-    let raw: Vec<f32> = acc.par_iter().map(|&a| (libm::log(a as f64) * scale).min(1.0) as f32).collect();
+    let raw: Vec<f32> = acc.par_iter().map(|&a| (libm::log(a as f64 * vertex_area) * scale).min(1.0) as f32).collect();
     box_blur(&raw, n, n, MOISTURE_BLUR)
 }
 
@@ -572,9 +735,7 @@ fn materials(
     let m = &c.materials;
     let n = c.vertices();
     let cw = n - 1;
-    let relief = c.terrain.relief;
-    let tan = |deg: f64| libm::tan(deg.to_radians());
-    let (rock, scree, snow_max) = (tan(m.rock_slope_deg), tan(m.scree_slope_deg), tan(m.snow_max_slope_deg));
+    let rule = MaterialRule::new(m, lines, c.terrain.relief);
     let near = if m.shore_width > 0.0 && water.iter().any(|w| !w.is_nan()) {
         Some(nearby_water(water, cw, (m.shore_width / c.cell).ceil() as usize))
     } else {
@@ -600,26 +761,7 @@ fn materials(
             let x = origin.x + (cx as f64 + 0.5) * c.cell;
             let k = cy * cw + cx;
             let wet = moisture[i].max(moisture[i + 1]).max(moisture[i + n]).max(moisture[i + n + 1]) as f64;
-            mrow[cx] = if !water[k].is_nan() {
-                if water[k] as f64 - z < 0.5 { MaterialId::SAND } else { MaterialId::MUD }
-            } else if slope > rock {
-                MaterialId::ROCK
-            } else if z > relief
-                * (m.snowline
-                    + m.line_noise * fbm(lines.snowline, x / LINE_WAVELENGTH, y / LINE_WAVELENGTH, &LINE_FRACTAL))
-                && slope < snow_max
-            {
-                MaterialId::SNOW
-            } else if z > treeline(x, y) {
-                if slope > scree { MaterialId::SCREE } else { MaterialId::GRASS }
-            } else if near.as_ref().is_some_and(|l| z < l[k] as f64 + m.shore_height) {
-                MaterialId::SAND
-            } else if wet > m.marsh_moisture && slope < 0.05 {
-                MaterialId::MUD
-            } else {
-                let f = fbm(lines.forest, x / m.forest_wavelength, y / m.forest_wavelength, &Fractal::new(4));
-                if f + 0.3 * wet > m.forest_threshold { MaterialId::FOREST_FLOOR } else { MaterialId::GRASS }
-            };
+            mrow[cx] = rule.material(x, y, z, slope, water[k], near.as_ref().map(|l| l[k]), wet, treeline);
         }
     });
     (materials, slopes)

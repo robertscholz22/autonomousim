@@ -38,7 +38,7 @@ struct MapgenArgs {
     #[arg(long, value_enum, default_value_t = Generator::Wild)]
     generator: Generator,
     /// Starting configuration: training (512 m) or showcase (2 km); wild maps also have
-    /// offroad (512 m, gentle).
+    /// offroad (512 m, gentle) and large (16 km, tiled).
     #[arg(long, default_value = "training")]
     preset: String,
     /// TOML file whose values override the preset (same layout as `--print-config`).
@@ -224,6 +224,10 @@ fn print_stats(s: &WildStats) {
         "erosion droplets {}, lakes {} ({} cells), trees {} ({} conifers), rocks {}",
         s.droplets, s.lakes, s.lake_cells, s.trees, s.conifers, s.rocks
     );
+    if s.materials.is_empty() {
+        // Tiled maps: only the coarse layer is generated here.
+        return;
+    }
     let [p50, p90, p99] = s.slope_percentiles_deg;
     println!(
         "heights {:.1} … {:.1} m, slope p50 {p50:.1}°, p90 {p90:.1}°, p99 {p99:.1}°",
@@ -255,12 +259,22 @@ fn print_rural_stats(s: &RuralStats) {
 }
 
 fn info(w: &StaticWorld, hash: &str) -> String {
-    let t = w.terrain();
+    if let Some(tiles) = w.terrain().tiled() {
+        let l = tiles.layout();
+        let (lo, hi) = w.terrain().height_range();
+        let (min, max) = w.extent();
+        return format!(
+            "map {hash}: {} by {} tiles of {:.0} m, extent ({:.0}, {:.0}) … ({:.0}, {:.0}) m, heights {lo:.1} … {hi:.1} m \
+             (tiles are generated on demand)",
+            l.tiles.0, l.tiles.1, l.tile_size, min.x, min.y, max.x, max.y
+        );
+    }
+    let t = w.grid();
     let (nx, ny) = t.dims();
     let (lo, hi) = t.height_range();
     let (min, max) = w.extent();
     let mut by_tag = std::collections::BTreeMap::<u16, usize>::new();
-    for o in w.obstacles().obstacles() {
+    for o in w.obstacle_set().obstacles() {
         *by_tag.entry(o.tag).or_default() += 1;
     }
     let tag = |t: u16| match t {

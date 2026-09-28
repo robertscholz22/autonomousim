@@ -4,11 +4,13 @@ use crate::geodesy::GeoOrigin;
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::ObstacleSet;
 use crate::roads::RoadNetwork;
-use autonomousim_core::geometry::{HitMask, Ray, RayHit, StaticGeometry};
+use crate::tiles::TiledMap;
+use autonomousim_core::geometry::{HitMask, Ray, RayHit, StaticGeometry, SurfacePoint};
 use autonomousim_core::material::{Material, MaterialId, MaterialTable};
 use autonomousim_core::terrain::Terrain;
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Provenance and georeference of a map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -33,6 +35,133 @@ impl MapMeta {
     }
 }
 
+/// The terrain of a map: one height grid, or tiles generated on demand.
+#[derive(Clone, Debug)]
+pub enum MapTerrain {
+    Grid(HeightGrid),
+    Tiled(Arc<TiledMap>),
+}
+
+impl MapTerrain {
+    /// The height grid of a single-grid map.
+    pub fn grid(&self) -> Option<&HeightGrid> {
+        match self {
+            Self::Grid(g) => Some(g),
+            Self::Tiled(_) => None,
+        }
+    }
+
+    /// The tiles of a tiled map.
+    pub fn tiled(&self) -> Option<&Arc<TiledMap>> {
+        match self {
+            Self::Grid(_) => None,
+            Self::Tiled(t) => Some(t),
+        }
+    }
+
+    /// Lowest ground and highest surface over the whole map (the coarse layer's, widened by
+    /// its bound on the tiles, for tiled maps).
+    pub fn height_range(&self) -> (f64, f64) {
+        match self {
+            Self::Grid(g) => g.height_range(),
+            Self::Tiled(t) => {
+                let (lo, hi) = t.coarse().height_range();
+                (lo - t.pad(), hi + t.pad())
+            }
+        }
+    }
+}
+
+macro_rules! terrain {
+    ($self:ident, $t:ident => $e:expr) => {
+        match $self {
+            MapTerrain::Grid($t) => $e,
+            MapTerrain::Tiled($t) => $e,
+        }
+    };
+}
+
+impl Terrain for MapTerrain {
+    fn extent(&self) -> (DVec2, DVec2) {
+        terrain!(self, t => t.extent())
+    }
+    #[inline]
+    fn height(&self, x: f64, y: f64) -> f64 {
+        terrain!(self, t => t.height(x, y))
+    }
+    #[inline]
+    fn height_normal(&self, x: f64, y: f64) -> (f64, DVec3) {
+        terrain!(self, t => t.height_normal(x, y))
+    }
+    #[inline]
+    fn material(&self, x: f64, y: f64) -> MaterialId {
+        terrain!(self, t => t.material(x, y))
+    }
+    #[inline]
+    fn water_level(&self, x: f64, y: f64) -> Option<f64> {
+        terrain!(self, t => t.water_level(x, y))
+    }
+    fn height_bounds(&self, min: DVec2, max: DVec2) -> (f64, f64) {
+        terrain!(self, t => t.height_bounds(min, max))
+    }
+    fn closest_point(&self, p: DVec3, max_dist: f64) -> Option<SurfacePoint> {
+        terrain!(self, t => t.closest_point(p, max_dist))
+    }
+    fn raycast(&self, ray: &Ray, max_toi: f64, mask: HitMask) -> Option<RayHit> {
+        match self {
+            Self::Grid(g) => g.raycast(ray, max_toi, mask),
+            Self::Tiled(t) => Terrain::raycast(&**t, ray, max_toi, mask),
+        }
+    }
+}
+
+/// The obstacles of a map: one set, or those of its tiles.
+#[derive(Clone, Debug)]
+pub enum MapObstacles {
+    Set(ObstacleSet),
+    Tiled(Arc<TiledMap>),
+}
+
+impl MapObstacles {
+    /// The obstacle set of a single-grid map.
+    pub fn set(&self) -> Option<&ObstacleSet> {
+        match self {
+            Self::Set(s) => Some(s),
+            Self::Tiled(_) => None,
+        }
+    }
+}
+
+macro_rules! obstacles {
+    ($self:ident, $o:ident => $e:expr) => {
+        match $self {
+            MapObstacles::Set($o) => $e,
+            MapObstacles::Tiled($o) => $e,
+        }
+    };
+}
+
+impl StaticGeometry for MapObstacles {
+    fn raycast(&self, ray: &Ray, max_toi: f64, mask: HitMask) -> Option<RayHit> {
+        match self {
+            Self::Set(s) => s.raycast(ray, max_toi, mask),
+            Self::Tiled(t) => StaticGeometry::raycast(&**t, ray, max_toi, mask),
+        }
+    }
+    fn sphere_contacts(&self, center: DVec3, radius: f64, margin: f64, mask: HitMask, out: &mut Vec<SurfacePoint>) {
+        obstacles!(self, o => o.sphere_contacts(center, radius, margin, mask, out))
+    }
+    fn nearest_distance(&self, p: DVec3, max_dist: f64, mask: HitMask) -> Option<f64> {
+        obstacles!(self, o => o.nearest_distance(p, max_dist, mask))
+    }
+    fn query_candidates(&self, min: DVec3, max: DVec3, mask: HitMask, out: &mut Vec<u32>) {
+        obstacles!(self, o => o.query_candidates(min, max, mask, out))
+    }
+    fn sphere_contact(&self, id: u32, center: DVec3, radius: f64, margin: f64) -> Option<SurfacePoint> {
+        obstacles!(self, o => o.sphere_contact(id, center, radius, margin))
+    }
+}
+
 /// Immutable map shared (by `Arc`) between all environments that use it.
 ///
 /// Contacts and sensors take the terrain ([`Terrain`]) and obstacles ([`StaticGeometry`])
@@ -40,15 +169,47 @@ impl MapMeta {
 #[derive(Clone, Debug)]
 pub struct StaticWorld {
     pub meta: MapMeta,
-    terrain: HeightGrid,
-    obstacles: ObstacleSet,
+    terrain: MapTerrain,
+    obstacles: MapObstacles,
     materials: MaterialTable,
     roads: RoadNetwork,
+    /// Content hash of a tiled map (fixed by its generator; grids are hashed from content).
+    tiled_hash: Option<crate::MapHash>,
 }
 
 impl StaticWorld {
     pub fn new(meta: MapMeta, terrain: HeightGrid, obstacles: ObstacleSet, materials: MaterialTable) -> Self {
-        Self { meta, terrain, obstacles, materials, roads: RoadNetwork::default() }
+        Self {
+            meta,
+            terrain: MapTerrain::Grid(terrain),
+            obstacles: MapObstacles::Set(obstacles),
+            materials,
+            roads: RoadNetwork::default(),
+            tiled_hash: None,
+        }
+    }
+
+    /// A tiled map; `hash` identifies its content (the generator's inputs).
+    pub fn tiled(meta: MapMeta, tiles: Arc<TiledMap>, materials: MaterialTable, hash: crate::MapHash) -> Self {
+        Self {
+            meta,
+            terrain: MapTerrain::Tiled(tiles.clone()),
+            obstacles: MapObstacles::Tiled(tiles),
+            materials,
+            roads: RoadNetwork::default(),
+            tiled_hash: Some(hash),
+        }
+    }
+
+    /// Content hash of a tiled map (`None` for single-grid maps, see
+    /// [`content_hash`](Self::content_hash)).
+    pub fn tiled_hash(&self) -> Option<crate::MapHash> {
+        self.tiled_hash
+    }
+
+    /// Whether the map is made of tiles.
+    pub fn is_tiled(&self) -> bool {
+        matches!(self.terrain, MapTerrain::Tiled(_))
     }
 
     /// The same map with a road network.
@@ -62,12 +223,28 @@ impl StaticWorld {
         &self.roads
     }
 
-    pub fn terrain(&self) -> &HeightGrid {
+    pub fn terrain(&self) -> &MapTerrain {
         &self.terrain
     }
 
-    pub fn obstacles(&self) -> &ObstacleSet {
+    /// The height grid of a single-grid map.
+    ///
+    /// # Panics
+    /// For tiled maps.
+    pub fn grid(&self) -> &HeightGrid {
+        self.terrain.grid().expect("a single-grid map (tiled maps have no single height grid)")
+    }
+
+    pub fn obstacles(&self) -> &MapObstacles {
         &self.obstacles
+    }
+
+    /// The obstacle set of a single-grid map.
+    ///
+    /// # Panics
+    /// For tiled maps.
+    pub fn obstacle_set(&self) -> &ObstacleSet {
+        self.obstacles.set().expect("a single-grid map (tiled maps keep obstacles per tile)")
     }
 
     pub fn materials(&self) -> &MaterialTable {
@@ -168,7 +345,7 @@ mod tests {
     #[test]
     fn water_surface() {
         let w = testworlds::lake(200.0, 5.0, -1.0);
-        let c = w.terrain().height(0.0, 0.0);
+        let c = w.grid().height(0.0, 0.0);
         assert!(c < -4.0);
         assert!((w.surface_height(0.0, 0.0) + 1.0).abs() < 1e-6);
         assert!(!w.is_free(DVec3::new(0.0, 0.0, -0.8), 0.5, false, true));

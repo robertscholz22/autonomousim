@@ -86,7 +86,7 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
     let (w, stats) = rural::generate(c, seed).unwrap();
     assert_eq!((w.meta.generator.as_str(), w.meta.generator_version, w.meta.seed), ("rural", RURAL_VERSION, seed));
     let net = w.roads();
-    let t = w.terrain();
+    let t = w.grid();
     assert!(stats.roads[0] >= 1 && stats.farms >= 1, "seed {seed}: {stats:?}");
     assert!(stats.farms * 2 >= stats.farm_sites, "seed {seed}: most farms connect: {stats:?}");
 
@@ -183,7 +183,7 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
 
     // No obstacle on a road (below 4 m above it), in a yard or in water.
     let mut by_tag = [0usize; 16];
-    for o in w.obstacles().obstacles() {
+    for o in w.obstacle_set().obstacles() {
         by_tag[o.tag as usize] += 1;
         let p = o.pose.pos;
         let (points, bottom): (Vec<DVec2>, f64) = match &o.shape {
@@ -234,7 +234,7 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
         rural::generate(&RuralConfig { ditches: rural::DitchesConfig { depth: 0.0, ..d.clone() }, ..c.clone() }, seed)
             .unwrap()
             .0;
-    let cut = |q: DVec2| flat.terrain().height(q.x, q.y) - t.height(q.x, q.y);
+    let cut = |q: DVec2| flat.grid().height(q.x, q.y) - t.height(q.x, q.y);
     let lines = &stats.ditch_lines;
     let dist = |p: DVec2, a: DVec2, b: DVec2| {
         let e = b - a;
@@ -275,7 +275,7 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
         }
     }
     assert!(checked > 20, "seed {seed}: only {checked} ditch points checked");
-    for o in w.obstacles().obstacles() {
+    for o in w.obstacle_set().obstacles() {
         if o.tag == tags::HEDGE || o.tag == tags::FENCE {
             let p = o.pose.pos.truncate();
             let near = lines.iter().map(|l| dist(p, l[0], l[1])).fold(f64::INFINITY, f64::min);

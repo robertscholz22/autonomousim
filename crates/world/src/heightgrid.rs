@@ -16,7 +16,7 @@ use autonomousim_core::terrain::Terrain;
 use glam::{DVec2, DVec3};
 
 /// Largest search radius (in cells) of [`HeightGrid::closest_point`].
-const MAX_SEARCH_CELLS: f64 = 16.0;
+pub const MAX_SEARCH_CELLS: f64 = 16.0;
 
 #[derive(Clone, Debug)]
 struct Level {

@@ -444,11 +444,13 @@ dependencies = [
  "blake3",
  "glam 0.33.8",
  "libm",
+ "postcard",
  "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "toml",
+ "zstd 0.14.0",
 ]
 
 [[package]]
