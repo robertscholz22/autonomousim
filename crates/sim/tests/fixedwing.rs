@@ -116,7 +116,10 @@ fn records_the_aircraft_state() {
     let sc = scenario("aerosonde_like", "agl = [80.0, 80.0], clearance = 0.0", "");
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("fixedwing.mcap");
     let mut b = BatchSim::from_compiled(sc, 1, 5, 1).unwrap();
-    b.attach_recorder(0, Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false }).unwrap());
+    b.attach_recorder(
+        0,
+        Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false, ..Default::default() }).unwrap(),
+    );
     for _ in 0..50 {
         b.step(&[&[0.2, 0.1, 0.0, 0.5]]);
     }

@@ -26,7 +26,7 @@ use autonomousim_render::{
     Shading, View, WorldOptions,
 };
 use autonomousim_scene::rig::{Placement, Rig};
-use autonomousim_sensors::{CameraImage, Sensor, SensorConfig};
+use autonomousim_sensors::{Camera, CameraImage, Sensor, SensorConfig};
 use autonomousim_vehicles::Vehicle;
 use glam::{DQuat, DVec3};
 use std::sync::{Arc, OnceLock};
@@ -112,11 +112,33 @@ impl Cameras {
 
     /// Render the cameras due in each world into its list, all in one GPU submission.
     pub fn capture_batch(&mut self, worlds: &mut [(&WorldInstance, &mut Vec<Capture>)]) -> Result<(), SimError> {
+        self.render_where(worlds, &|w, _, _, c| c.is_due(w.clock().tick))
+    }
+
+    /// Render camera `sensor` of `agent` now, whether due or not (e.g. in a replay); `None` if
+    /// the agent is disabled or the sensor is not a camera. No noise is added.
+    pub fn render(
+        &mut self,
+        world: &WorldInstance,
+        agent: usize,
+        sensor: usize,
+    ) -> Result<Option<CameraImage>, SimError> {
+        let mut out = Vec::new();
+        self.render_where(&mut [(world, &mut out)], &|_, i, k, _| (i, k) == (agent, sensor))?;
+        Ok(out.pop().map(|c| c.image))
+    }
+
+    /// Render the cameras of active agents chosen by `wanted` (world, agent, sensor, camera).
+    fn render_where(
+        &mut self,
+        worlds: &mut [(&WorldInstance, &mut Vec<Capture>)],
+        wanted: &dyn Fn(&WorldInstance, usize, usize, &Camera) -> bool,
+    ) -> Result<(), SimError> {
         let due = |w: &WorldInstance| {
-            let tick = w.clock().tick;
-            w.agents()
-                .iter()
-                .any(|a| !a.disabled && a.sensors.iter().any(|s| matches!(s, Sensor::Camera(c) if c.is_due(tick))))
+            w.agents().iter().enumerate().any(|(i, a)| {
+                !a.disabled
+                    && a.sensors.iter().enumerate().any(|(k, s)| matches!(s, Sensor::Camera(c) if wanted(w, i, k, c)))
+            })
         };
         let Self { ctx, renderer, options, shading, maps, rigs, placements, pads, pad } = self;
         for (w, _) in worlds.iter().filter(|(w, _)| due(w)) {
@@ -130,7 +152,6 @@ impl Cameras {
         // World, agent and sensor of each job.
         let mut owners = Vec::new();
         for (wi, (w, _)) in worlds.iter().enumerate().filter(|(_, (w, _))| due(w)) {
-            let tick = w.clock().tick;
             let map = maps[w.map_index()].as_ref().expect("uploaded above");
             let agents = w.agents();
             // Pads lie on the ground under the goals, tilted with it, 2 cm up.
@@ -154,7 +175,7 @@ impl Cameras {
             for (i, a) in agents.iter().enumerate().filter(|(_, a)| !a.disabled) {
                 for (k, s) in a.sensors.iter().enumerate() {
                     let Sensor::Camera(cam) = s else { continue };
-                    if !cam.is_due(tick) {
+                    if !wanted(w, i, k, cam) {
                         continue;
                     }
                     let c = cam.config();

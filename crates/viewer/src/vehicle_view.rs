@@ -855,7 +855,8 @@ mod tests {
         let sim = app.resource::<Sim>();
         let w = sim.world.agent(0).vehicle.as_wheeled().unwrap();
         assert!(w.articulation(3).0.abs() > 0.05, "{:?}", w.articulation(3));
-        let chassis = root * w.unit_pose(0).inverse();
+        let now = w.current_poses();
+        let chassis = root * now.unit(0).inverse();
         let mut seen = 0;
         for (k, local, parent) in wheels {
             let u = w.def().wheel_unit(k);
@@ -869,7 +870,7 @@ mod tests {
                     root
                 }
             };
-            let (shown, want) = (unit * local, chassis * w.wheel_pose(k));
+            let (shown, want) = (unit * local, chassis * now.wheel(k));
             assert!((shown.pos - want.pos).length() < 1e-4, "wheel {k}: {} vs {}", shown.pos, want.pos);
             seen += 1;
         }

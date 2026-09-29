@@ -14,6 +14,8 @@ use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_control::rotorcraft::{HelicopterActionMap, HelicopterActionMode, HelicopterSetpoint};
 use autonomousim_control::tiltrotor::{TiltrotorActionMap, TiltrotorActionMode, TiltrotorSetpoint};
 use autonomousim_core::math::Pose;
+use autonomousim_sensors::{CameraImage, Sensor};
+use autonomousim_sim::camera::{self, Cameras};
 use autonomousim_sim::record::Recorder;
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::Family;
@@ -145,6 +147,12 @@ pub struct Sim {
     pub autopilot: Option<Autopilot>,
     /// Recording of the live session (`--record`; in a mutex since the recorder is not `Sync`).
     recorder: Option<Mutex<Recorder>>,
+    /// Renders the camera sensors (scenarios with cameras; in a mutex since the GPU objects
+    /// are not `Sync`).
+    cameras: Option<Mutex<Cameras>>,
+    /// Replay: the last camera image rendered from the recorded state, with its episode,
+    /// playback time, agent and sensor.
+    replay_frame: Option<((usize, u64, usize, usize), CameraImage)>,
 }
 
 impl Sim {
@@ -178,9 +186,68 @@ impl Sim {
             replay: None,
             autopilot: None,
             recorder: None,
+            cameras: None,
+            replay_frame: None,
         };
+        s.start_cameras();
         s.snapshot_poses();
         s
+    }
+
+    /// Set up the camera renderer for the world's scenario (none without cameras) and render
+    /// the frames due now.
+    fn start_cameras(&mut self) {
+        self.cameras = None;
+        self.replay_frame = None;
+        if !camera::has_cameras(self.world.scenario()) {
+            return;
+        }
+        match camera::gpu() {
+            Ok(ctx) => self.cameras = Some(Mutex::new(Cameras::new(ctx, self.world.scenario()))),
+            Err(e) => warn!("no camera images: {e}"),
+        }
+        self.capture();
+    }
+
+    /// Render and deliver the camera frames due at the current tick (live).
+    fn capture(&mut self) {
+        let Some(Ok(cameras)) = self.cameras.as_mut().map(Mutex::get_mut) else { return };
+        if self.replay.is_none()
+            && let Err(e) = cameras.update(&mut self.world)
+        {
+            warn!("camera images off: {e}");
+            self.cameras = None;
+        }
+        if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
+            r.on_frames(&self.world);
+        }
+    }
+
+    /// The image of camera `sensor` of `agent` with its capture time: live the frame its
+    /// policy sees (noise and latency included), in a replay rendered from the recorded state
+    /// at the playback time.
+    pub fn camera_image(&mut self, agent: usize, sensor: usize) -> Option<(f64, &CameraImage)> {
+        if let Some(r) = &self.replay {
+            let key = (r.episode, r.time.to_bits(), agent, sensor);
+            if self.replay_frame.as_ref().is_none_or(|(k, _)| *k != key) {
+                let cameras = self.cameras.as_mut()?.get_mut().ok()?;
+                let image = match cameras.render(&self.world, agent, sensor) {
+                    Ok(image) => image?,
+                    Err(e) => {
+                        warn!("camera images off: {e}");
+                        self.cameras = None;
+                        return None;
+                    }
+                };
+                self.replay_frame = Some((key, image));
+            }
+            let time = r.time;
+            return self.replay_frame.as_ref().map(|(_, image)| (time, image));
+        }
+        match self.world.agents().get(agent)?.sensors.get(sensor)? {
+            Sensor::Camera(c) => c.latest().map(|f| (f.time, &f.value)),
+            _ => None,
+        }
     }
 
     /// Play `replay` back in `world` (built from the recorded scenario).
@@ -226,6 +293,7 @@ impl Sim {
         if let Some(a) = &mut self.autopilot {
             a.ended = None;
         }
+        self.start_cameras();
         self.snapshot_poses();
     }
 
@@ -241,6 +309,7 @@ impl Sim {
             return;
         }
         self.world.reset(None);
+        self.capture();
         self.ride_speed = 0.0;
         (self.airspeed, self.throttle) = (None, None);
         if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
@@ -272,6 +341,8 @@ impl Sim {
     pub fn manual_agent(&self) -> Option<usize> {
         match &self.autopilot {
             Some(a) if a.flies_pilot => None,
+            // Scripted agents drive themselves.
+            _ if self.world.agent(self.pilot).driver.is_some() => None,
             _ => Some(self.pilot),
         }
     }
@@ -597,6 +668,10 @@ impl Sim {
             if let Some(a) = &mut self.autopilot {
                 a.before_tick(&mut self.world, manual);
             }
+            // Scripted groups (`driver`) at every policy step.
+            if self.world.clock().tick.is_multiple_of(u64::from(self.world.scenario().decimation)) {
+                self.world.drive();
+            }
             for a in 0..self.world.agents().len() {
                 self.world.agent_mut(a).events = Events::NONE;
             }
@@ -604,6 +679,7 @@ impl Sim {
             if let Some(a) = &self.autopilot {
                 a.after_tick(&mut self.world, manual);
             }
+            self.capture();
             if let Some(Ok(r)) = self.recorder.as_mut().map(Mutex::get_mut) {
                 r.on_tick(&self.world);
             }
@@ -810,6 +886,69 @@ mod tests {
             ..Default::default()
         };
         Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(1)))
+    }
+
+    /// A drone hovering with a down camera over a scripted car on a rural map: live, the car
+    /// drives itself and the camera sees it; the recorded session replays the same images.
+    #[test]
+    fn camera_images_replay_as_seen_live() {
+        use crate::replay::Replay;
+        use autonomousim_sim::record::{RecorderConfig, Recording};
+        camera::use_adapter(&autonomousim_render::AdapterChoice::Software);
+        let sc = Scenario::from_toml(
+            r#"
+            name = "chase"
+            map = { type = "rural", seed = 3, count = 1, cache = false }
+            [[groups]]
+            name = "drone"
+            vehicle = "iris_like"
+            action_mode = "velocity"
+            sensors = [{ name = "down", type = "camera", width = 48, height = 40, fov_deg = 90.0, rate_hz = 25, mount = { rotation = [0.0, 1.5707963267948966, 0.0] } }]
+            [[groups]]
+            name = "cars"
+            vehicle = "sedan_like"
+            spawn = { on_road = true }
+            driver = { type = "road" }
+            "#,
+        )
+        .unwrap();
+        let mut world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(2));
+        // The drone 12 m above the car.
+        let car = world.agent(1).vehicle.position();
+        world.agent_mut(0).vehicle.place(
+            Pose::new(car + DVec3::Z * 12.0, glam::DQuat::IDENTITY),
+            DVec3::ZERO,
+            DVec3::ZERO,
+        );
+        let mut s = Sim::new(world);
+        let path = std::env::temp_dir().join(format!("autonomousim-camera-replay-{}.mcap", std::process::id()));
+        s.record(Recorder::create(&path, RecorderConfig { camera_hz: 25, ..Default::default() }).unwrap());
+        let mut frames: Vec<(u64, f64, CameraImage)> = Vec::new();
+        for _ in 0..120 {
+            s.advance(1.0 / 60.0);
+            let Sensor::Camera(c) = &s.world.agent(0).sensors[0] else { panic!("camera") };
+            let f = c.latest().unwrap();
+            if frames.last().is_none_or(|l| l.0 != f.tick) {
+                frames.push((f.tick, f.time, f.value.clone()));
+            }
+        }
+        s.finish_recording().unwrap();
+        assert!(frames.len() >= 45, "{} frames", frames.len());
+        assert!(s.world.agent(1).vehicle.position().distance(car) > 3.0, "the car drives itself");
+        let vehicle = autonomousim_render::SemanticClass::Vehicle as u8;
+        assert!(frames.iter().all(|(.., f)| f.class.contains(&vehicle)), "the camera sees the car");
+
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut replay = Sim::replay(world, Replay::new(recording, 0));
+        replay.paused = true;
+        for (tick, time, live) in &frames {
+            replay.replay.as_mut().unwrap().seek(*time);
+            replay.advance(0.0);
+            let shown = replay.camera_image(0, 0).expect("replayed image").1;
+            assert!(shown == live, "frame of tick {tick} replays differently");
+        }
     }
 
     /// A ground vehicle driven by the pedal, as the viewer's driver group.

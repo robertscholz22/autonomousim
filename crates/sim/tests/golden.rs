@@ -120,7 +120,7 @@ fn run(toml: &str) -> String {
     let sc = Arc::new(Scenario::from_toml(toml).unwrap().compile().unwrap());
     let mut b = BatchSim::from_compiled(sc.clone(), 3, 11, 2).unwrap();
     let sink = Arc::new(Mutex::new(MemorySink::default()));
-    let config = RecorderConfig { state_hz: 50, lidar: true };
+    let config = RecorderConfig { state_hz: 50, lidar: true, ..Default::default() };
     b.attach_recorder(1, Recorder::new(Box::new(sink.clone()), config));
     let mut h = blake3::Hasher::new();
     let outputs = |b: &BatchSim, h: &mut blake3::Hasher| {
@@ -199,7 +199,10 @@ fn record_hover() -> Vec<u8> {
     let sc = Arc::new(Scenario::from_toml(&std::fs::read_to_string(hover).unwrap()).unwrap().compile().unwrap());
     let mut b = BatchSim::from_compiled(sc.clone(), 1, 4, 1).unwrap();
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("golden_hover.mcap");
-    b.attach_recorder(0, Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: true }).unwrap());
+    b.attach_recorder(
+        0,
+        Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: true, ..Default::default() }).unwrap(),
+    );
     for k in 0..75u64 {
         if k == 50 {
             b.reset(None, None);

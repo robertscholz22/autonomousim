@@ -225,20 +225,22 @@ pub fn flapping(h: &Helicopter, rotor: usize) -> ([f64; 2], f64) {
     }
 }
 
-/// Pose of unit `u` relative to the towing unit. Unit and wheel poses are those of the last
-/// step's start, so they are related to each other rather than to the current chassis pose.
+/// Pose of unit `u` relative to the towing unit, at the current state (as a replay shows it).
 pub fn unit_local(w: &Wheeled, u: usize) -> Pose {
-    w.unit_pose(0).inverse() * w.unit_pose(u)
+    let p = w.current_poses();
+    p.unit(0).inverse() * p.unit(u)
 }
 
-/// Pose of wheel `k` relative to its unit.
+/// Pose of wheel `k` relative to its unit, at the current state.
 pub fn wheel_local(w: &Wheeled, k: usize) -> Pose {
-    w.unit_pose(w.def().wheel_unit(k)).inverse() * w.wheel_pose(k)
+    let p = w.current_poses();
+    p.unit(w.def().wheel_unit(k)).inverse() * p.wheel(k)
 }
 
 /// Pose of wheel `k` in the vehicle frame.
 fn wheel_in_root(w: &Wheeled, k: usize) -> Pose {
-    unit_local(w, w.def().wheel_unit(k)) * wheel_local(w, k)
+    let p = w.current_poses();
+    p.unit(0).inverse() * p.wheel(k)
 }
 
 /// Band of side `side` of a tracked vehicle around its sprocket, idler and road wheels as

@@ -555,6 +555,7 @@ dependencies = [
  "autonomousim-control",
  "autonomousim-core",
  "autonomousim-procgen",
+ "autonomousim-render",
  "autonomousim-scene",
  "autonomousim-sensors",
  "autonomousim-sim",

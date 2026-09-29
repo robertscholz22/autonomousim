@@ -22,6 +22,7 @@
 
 mod autopilot;
 mod camera;
+mod camera_view;
 mod convert;
 mod history;
 mod hud;
@@ -190,6 +191,9 @@ struct DisplayArgs {
     /// Show the LiDAR view from the start (V toggles it).
     #[arg(long)]
     lidar_view: bool,
+    /// Show the camera panel from the start (I toggles it).
+    #[arg(long)]
+    camera_view: bool,
     /// Save a screenshot (PNG) after `--frames` frames and exit.
     #[arg(long)]
     screenshot: Option<PathBuf>,
@@ -518,6 +522,7 @@ fn main() -> anyhow::Result<()> {
         .insert_resource(DemoRoute::default())
         .insert_resource(hud::Hud { visible: true, help: display.screenshot.is_none(), plots: display.plots })
         .insert_resource(lidar_view::LidarView { visible: display.lidar_view })
+        .insert_resource(camera_view::CameraView { visible: display.camera_view, ..default() })
         .insert_resource(Capture {
             path: display.screenshot.clone(),
             total: display.frames,
@@ -567,12 +572,13 @@ fn main() -> anyhow::Result<()> {
                 world_view::update_view_distance,
                 world_view::update_lod,
                 overlay::draw,
+                camera_view::draw_frustum,
                 capture,
                 quit_on_escape,
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, (hud::hud, lidar_view::lidar_view).chain())
+        .add_systems(EguiPrimaryContextPass, (hud::hud, lidar_view::lidar_view, camera_view::camera_view).chain())
         .add_systems(Last, finish_recording);
     if let Some(regen) = regen {
         app.insert_resource(regen).add_systems(Update, finish_regenerate.before(sim::step));

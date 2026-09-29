@@ -97,7 +97,10 @@ fn records_the_helicopter_state() {
     let sc = scenario("xcell60_like", "agl = [30.0, 30.0], clearance = 0.0");
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("helicopter.mcap");
     let mut b = BatchSim::from_compiled(sc, 1, 5, 1).unwrap();
-    b.attach_recorder(0, Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false }).unwrap());
+    b.attach_recorder(
+        0,
+        Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false, ..Default::default() }).unwrap(),
+    );
     for _ in 0..25 {
         b.step(&[&[0.1, 0.0, 0.0, 0.5]]);
     }

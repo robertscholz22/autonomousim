@@ -8,6 +8,8 @@
 //! | `/agent/<id>/pose` | `state_hz` | the pose as `foxglove.PoseInFrame` (frame `world`) |
 //! | `/agent/<id>/action` | each action | the normalised action |
 //! | `/agent/<id>/lidar` | each scan, if enabled | sensor pose and ranges |
+//! | `/agent/<id>/camera/<sensor>` | frames captured at multiples of `1/camera_hz`, if enabled | the visible RGB image as `foxglove.RawImage` (`rgb8`, base64) |
+//! | `/route` | when a scripted agent's route changes (scenarios with scripted groups) | time, agent id and the route's lane points |
 //! | `/events` | when an agent gets new event bits | agent id and event names |
 //!
 //! Vehicle definitions in `/meta` are a multirotor's fields alone (as in the first recordings),
@@ -145,15 +147,34 @@ pub struct RecorderConfig {
     pub state_hz: u32,
     /// Record LiDAR scans.
     pub lidar: bool,
+    /// Record the camera frames captured at multiples of `1 / camera_hz` (0: none; must
+    /// divide the physics rate). Replays re-render images from the recorded states; these are
+    /// for other tools (e.g. Foxglove).
+    #[serde(skip_serializing_if = "is_zero_hz")]
+    pub camera_hz: u32,
+}
+
+fn is_zero_hz(x: &u32) -> bool {
+    *x == 0
 }
 
 impl Default for RecorderConfig {
     fn default() -> Self {
-        Self { state_hz: 50, lidar: false }
+        Self { state_hz: 50, lidar: false, camera_hz: 0 }
     }
 }
 
 const OBJECT_SCHEMA: &str = r#"{"type":"object"}"#;
+
+const RAW_IMAGE_SCHEMA: &str = r#"{"title":"foxglove.RawImage","type":"object","properties":{"timestamp":{"type":"object","properties":{"sec":{"type":"integer","minimum":0},"nsec":{"type":"integer","minimum":0,"maximum":999999999}}},"frame_id":{"type":"string"},"width":{"type":"integer","minimum":0},"height":{"type":"integer","minimum":0},"encoding":{"type":"string"},"step":{"type":"integer","minimum":0},"data":{"type":"string","contentEncoding":"base64"}}}"#;
+
+/// A camera frame channel: the sensor, its channel and the tick of the last frame written.
+#[derive(Clone, Copy, Debug)]
+struct CameraChannel {
+    sensor: usize,
+    channel: u16,
+    last: Option<u64>,
+}
 
 const POSE_IN_FRAME_SCHEMA: &str = r#"{"title":"foxglove.PoseInFrame","type":"object","properties":{"timestamp":{"type":"object","properties":{"sec":{"type":"integer","minimum":0},"nsec":{"type":"integer","minimum":0,"maximum":999999999}}},"frame_id":{"type":"string"},"pose":{"type":"object","properties":{"position":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}}},"orientation":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"w":{"type":"number"}}}}}}}"#;
 
@@ -181,6 +202,13 @@ pub struct Recorder {
     episodes: u64,
     meta: Option<(u16, u16, u16)>,
     agents: Vec<AgentChannels>,
+    /// Per agent (empty unless `camera_hz` is set).
+    cameras: Vec<Vec<CameraChannel>>,
+    camera_divider: u64,
+    /// The `/route` channel (scenarios with scripted groups) and the route last written per
+    /// agent.
+    route: Option<u16>,
+    routes: Vec<Option<Arc<Polyline>>>,
     seen: Vec<u32>,
     error: Option<SimError>,
 }
@@ -196,6 +224,10 @@ impl Recorder {
             episodes: 0,
             meta: None,
             agents: Vec::new(),
+            cameras: Vec::new(),
+            camera_divider: 1,
+            route: None,
+            routes: Vec::new(),
             seen: Vec::new(),
             error: None,
         }
@@ -235,8 +267,24 @@ impl Recorder {
         let meta = self.sink.add_channel("/meta", "autonomousim.Meta", OBJECT_SCHEMA)?;
         let episode = self.sink.add_channel("/episode", "autonomousim.Episode", OBJECT_SCHEMA)?;
         let events = self.sink.add_channel("/events", "autonomousim.Events", OBJECT_SCHEMA)?;
+        if sc.groups.iter().any(|g| g.scripted()) {
+            self.route = Some(self.sink.add_channel("/route", "autonomousim.Route", OBJECT_SCHEMA)?);
+        }
+        if self.config.camera_hz > 0 {
+            self.camera_divider = u64::from(sc.clock.divider("recorder camera", self.config.camera_hz)?);
+        }
         for a in w.agents() {
             let p = format!("/agent/{}", a.id);
+            let mut cameras = Vec::new();
+            for (k, s) in a.sensors.iter().enumerate() {
+                if matches!(s, Sensor::Camera(_)) && self.config.camera_hz > 0 {
+                    let name = &sc.groups[a.group].spec.sensors[k].name;
+                    let channel =
+                        self.sink.add_channel(&format!("{p}/camera/{name}"), "foxglove.RawImage", RAW_IMAGE_SCHEMA)?;
+                    cameras.push(CameraChannel { sensor: k, channel, last: None });
+                }
+            }
+            self.cameras.push(cameras);
             let lidar = a.sensors.iter().any(|s| matches!(s, Sensor::Lidar(_))) && self.config.lidar;
             self.agents.push(AgentChannels {
                 state: self.sink.add_channel(&format!("{p}/state"), "autonomousim.AgentState", OBJECT_SCHEMA)?,
@@ -344,6 +392,8 @@ impl Recorder {
         });
         self.episodes += 1;
         self.send(episode, &msg);
+        self.routes = w.agents().iter().map(|a| a.route.clone()).collect();
+        self.cameras.iter_mut().flatten().for_each(|c| c.last = None);
         self.seen.fill(0);
         self.write_states(w);
     }
@@ -388,9 +438,51 @@ impl Recorder {
                 let msg = json!({"time": scan.time, "position": scan.pose.pos, "orientation": scan.pose.rot, "ranges": ranges});
                 self.send(ch, &msg);
             }
+            if let Some(ch) = self.route
+                && let Some(route) = &a.route
+                && !self.routes[i].as_ref().is_some_and(|r| Arc::ptr_eq(r, route))
+            {
+                self.routes[i] = Some(route.clone());
+                self.send(ch, &json!({"time": time, "agent": a.id, "route": route.points()}));
+            }
         }
+        self.on_frames(w);
         if w.clock().tick.is_multiple_of(self.divider) {
             self.write_states(w);
+        }
+    }
+
+    /// After camera frames were delivered ([`WorldInstance::deliver`]) outside a tick: records
+    /// those that became visible (also done by [`on_tick`](Self::on_tick)).
+    pub fn on_frames(&mut self, w: &WorldInstance) {
+        if self.meta.is_none() {
+            return;
+        }
+        for a in w.agents() {
+            let i = a.id as usize;
+            for k in 0..self.cameras[i].len() {
+                let c = self.cameras[i][k];
+                let Sensor::Camera(cam) = &a.sensors[c.sensor] else { continue };
+                let Some(frame) = cam.latest() else { continue };
+                if c.last == Some(frame.tick) || !frame.tick.is_multiple_of(self.camera_divider) {
+                    continue;
+                }
+                self.cameras[i][k].last = Some(frame.tick);
+                // Stamped with the capture time (logged when it became visible).
+                let age = u128::from(w.clock().tick.saturating_sub(frame.tick)) * 1_000_000_000;
+                let t_ns = self.time_ns().saturating_sub((age / u128::from(self.physics_hz)) as u64);
+                let image = &frame.value;
+                let msg = json!({
+                    "timestamp": {"sec": t_ns / 1_000_000_000, "nsec": t_ns % 1_000_000_000},
+                    "frame_id": w.scenario().groups[a.group].spec.sensors[c.sensor].name,
+                    "width": image.width,
+                    "height": image.height,
+                    "encoding": "rgb8",
+                    "step": 3 * image.width,
+                    "data": base64(&image.rgb),
+                });
+                self.send(c.channel, &msg);
+            }
         }
     }
 
@@ -512,6 +604,24 @@ impl Recorder {
 
 fn xyz(v: DVec3) -> Value {
     json!({"x": v.x, "y": v.y, "z": v.z})
+}
+
+/// Standard base64 with padding.
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for k in 0..4 {
+            if k <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * k) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------- reading
@@ -674,8 +784,11 @@ pub struct RecordedEpisode {
     /// Start as time since the recording started (s).
     pub start: f64,
     pub goals: Vec<Vec<Goal>>,
-    /// The lane each agent follows to its goals, if it has `route` goals.
+    /// The lane each agent follows to its goals, if it has `route` goals, or a scripted
+    /// agent's route at the start.
     pub routes: Vec<Option<Arc<Polyline>>>,
+    /// Later routes of scripted agents: (time, route) in time order.
+    pub route_updates: Vec<Vec<(f64, Arc<Polyline>)>>,
     pub states: Vec<Vec<RecordedState>>,
     pub actions: Vec<Vec<RecordedAction>>,
     pub scans: Vec<Vec<RecordedScan>>,
@@ -686,6 +799,13 @@ impl RecordedEpisode {
     /// Time of the last recorded state (s).
     pub fn duration(&self) -> f64 {
         self.states.iter().filter_map(|s| s.last()).map(|s| s.time).fold(0.0, f64::max)
+    }
+
+    /// The route of `agent` at `time` (s since the episode started).
+    pub fn route_at(&self, agent: usize, time: f64) -> Option<&Arc<Polyline>> {
+        let updates = self.route_updates.get(agent).map_or(&[][..], |u| &u[..]);
+        let k = updates.partition_point(|(t, _)| *t <= time);
+        if k > 0 { Some(&updates[k - 1].1) } else { self.routes.get(agent)?.as_ref() }
     }
 }
 
@@ -791,6 +911,7 @@ impl Recording {
                     start: m.log_time as f64 * 1e-9,
                     goals,
                     routes,
+                    route_updates: vec![Vec::new(); n],
                     states: vec![Vec::new(); n],
                     actions: vec![Vec::new(); n],
                     scans: vec![Vec::new(); n],
@@ -801,6 +922,20 @@ impl Recording {
             let Some(ep) = r.episodes.last_mut() else { return Err(record_err(format!("{topic} before /episode"))) };
             if topic == "/events" {
                 ep.events.push(parse(topic, &m.data)?);
+                continue;
+            }
+            if topic == "/route" {
+                #[derive(Deserialize)]
+                struct Route {
+                    time: f64,
+                    agent: usize,
+                    route: Vec<DVec3>,
+                }
+                let u: Route = parse(topic, &m.data)?;
+                if u.agent >= n {
+                    return Err(record_err(format!("{topic}: no agent {} in /meta", u.agent)));
+                }
+                ep.route_updates[u.agent].push((u.time, Arc::new(Polyline::new(u.route))));
                 continue;
             }
             let Some((id, kind)) = topic.strip_prefix("/agent/").and_then(|t| t.split_once('/')) else { continue };

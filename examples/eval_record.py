@@ -57,6 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", type=pathlib.Path, default=None, help="default: recordings/<run>.mcap")
     p.add_argument("--stochastic", action="store_true", help="sample actions instead of using the mean")
     p.add_argument("--lidar", action="store_true", help="also record LiDAR scans")
+    p.add_argument("--camera-hz", type=int, default=0, help="also record camera images at this rate (0: none)")
     p.add_argument("--env-kwargs", type=json.loads, default=None, help="task options (default: the training ones)")
     return p.parse_args(argv)
 
@@ -71,7 +72,7 @@ def run_episodes(policy, env_id: str, env_kwargs: dict[str, Any], args: argparse
         obs, _ = envs.reset(seed=args.seed + k)
         if k == 0:
             # One state per policy step (writes /meta and the first state).
-            sim.attach_recorder(0, str(path), state_hz=round(1.0 / sim.policy_dt), lidar=args.lidar)
+            sim.attach_recorder(0, str(path), state_hz=round(1.0 / sim.policy_dt), lidar=args.lidar, camera_hz=args.camera_hz)
         states = [envs.unwrapped.state[0].copy()]
         ret, seen = 0.0, 0
         while True:
@@ -174,7 +175,7 @@ def run_multi_episodes(policy, task: str, task_kwargs: dict[str, Any], group: st
     for k in range(args.episodes):
         obs, _ = envs.reset(seed=args.seed + k)
         if k == 0:
-            sim.attach_recorder(0, str(path), state_hz=round(1.0 / sim.policy_dt), lidar=args.lidar)
+            sim.attach_recorder(0, str(path), state_hz=round(1.0 / sim.policy_dt), lidar=args.lidar, camera_hz=args.camera_hz)
         rows = lambda: np.concatenate([envs.state[g][0] for g in envs.groups])  # noqa: E731
         states = [rows()]
         n = envs.count[group]

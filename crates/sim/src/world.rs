@@ -407,8 +407,9 @@ impl WorldInstance {
         self.grid.build(&self.shapes);
     }
 
-    /// Command the agents of scripted groups for the coming policy step.
-    fn drive(&mut self) {
+    /// Command the agents of scripted groups for the coming policy step. [`step`](Self::step)
+    /// does this; when ticking by hand, call it before the first tick of every policy step.
+    pub fn drive(&mut self) {
         if !self.agents.iter().any(|a| a.driver.is_some()) {
             return;
         }
@@ -498,6 +499,10 @@ impl WorldInstance {
         let g = &self.scenario.groups[group];
         let dim = g.obs_dim();
         assert_eq!(out.len(), g.spec.count * dim, "observation array of group {:?}", g.spec.name);
+        if dim == 0 {
+            // Camera terms only.
+            return;
+        }
         let write = |(k, o): (usize, &mut [f32])| {
             let me = g.first_agent + k;
             self.agents[me].observe(g, &self.map, &self.shapes, &self.grid, me, o);

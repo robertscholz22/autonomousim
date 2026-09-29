@@ -1,6 +1,7 @@
 """Camera observations: ``Dict`` spaces, in-place image buffers, vector semantics, seeding and
 the multi-agent and PettingZoo wrappers (rendered on lavapipe, see ``conftest.py``)."""
 
+import base64
 import json
 
 import gymnasium as gym
@@ -8,6 +9,7 @@ import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env
 from gymnasium.vector import AutoresetMode
+from mcap.reader import make_reader
 from pettingzoo.test import parallel_api_test
 
 import autonomousim
@@ -157,3 +159,33 @@ def test_pettingzoo_api_with_images():
     assert env.observation_space("drones_1").contains(obs["drones_1"])
     assert isinstance(obs["plain_0"], np.ndarray)
     env.close()
+
+
+def test_recorded_images(tmp_path):
+    sim = _native.BatchSim(json.dumps(QuadHoverPad(image_size=24).scenario()), 1, 0, 1)
+    assert sim.group_info(0)["image_layout"] == [("down/rgb", 0, 3)]
+    path = tmp_path / "cam.mcap"
+    sim.attach_recorder(0, str(path), camera_hz=50)
+    for _ in range(10):
+        sim.step(np.full((1, 1, 4), 0.5, np.float32))
+    shown = sim.images(0)[0, 0].copy()
+    assert sim.detach_recorder(0)
+    frames = []
+    with open(path, "rb") as f:
+        for schema, channel, message in make_reader(f).iter_messages(topics=["/agent/0/camera/down"]):
+            assert schema.name == "foxglove.RawImage"
+            frames.append(json.loads(message.data))
+    # The reset's and one per step (the camera's 50 Hz); the last one is the observed one.
+    assert len(frames) == 11, len(frames)
+    last = frames[-1]
+    assert (last["width"], last["height"], last["encoding"], last["step"]) == (24, 24, "rgb8", 72)
+    rgb = np.frombuffer(base64.b64decode(last["data"]), np.uint8).reshape(24, 24, 3)
+    assert np.array_equal(rgb, shown)
+
+
+def test_image_only_observations():
+    task = QuadHoverPad(obs=[SEMANTIC], image_size=16)
+    sim = _native.BatchSim(json.dumps(task.scenario()), 2, 0, 1)
+    assert sim.group_info(0)["obs_dim"] == 0 and sim.obs(0).shape == (2, 1, 0)
+    sim.step(np.zeros((2, 1, 4), np.float32))
+    assert (sim.images(0)[..., 0] == MARKER).any()

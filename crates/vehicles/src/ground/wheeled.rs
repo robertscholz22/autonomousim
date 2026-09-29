@@ -30,7 +30,8 @@ use autonomousim_core::contact::{
     ContactCache, ContactModel, ContactPoint, ContactScratch, SphereCollider, StaticScene, compute_contacts,
 };
 use autonomousim_core::dynamics::{
-    AbaWorkspace, DynamicsError, MbState, MultibodyModel, aba_with_kinematics, forward_kinematics, semi_implicit_euler,
+    AbaWorkspace, DynamicsError, KinCache, MbState, MultibodyModel, aba_with_kinematics, forward_kinematics,
+    semi_implicit_euler,
 };
 use autonomousim_core::math::{Pose, SpatialForce};
 use glam::{DQuat, DVec3};
@@ -71,6 +72,24 @@ pub struct WheelState {
     pub drive_torque: f64,
     pub brake_torque: f64,
     pub tire: TireForces,
+}
+
+/// Unit and wheel poses at the current state ([`Wheeled::current_poses`]).
+pub struct CurrentPoses<'a> {
+    vehicle: &'a Wheeled,
+    pose: Vec<Pose>,
+}
+
+impl CurrentPoses<'_> {
+    /// World pose of unit `u`'s frame (0: the chassis).
+    pub fn unit(&self, u: usize) -> Pose {
+        self.pose[self.vehicle.units[u].link]
+    }
+
+    /// World pose of wheel `k`.
+    pub fn wheel(&self, k: usize) -> Pose {
+        self.pose[self.vehicle.corners[k].wheel]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -883,6 +902,15 @@ impl Wheeled {
     /// World pose of wheel `w`'s spinning link (centre and orientation).
     pub fn wheel_pose(&self, w: usize) -> Pose {
         self.ws.kin.pose[self.corners[w].wheel]
+    }
+
+    /// Link poses at the current state, where [`unit_pose`](Self::unit_pose) and
+    /// [`wheel_pose`](Self::wheel_pose) are those of the last step's start: for drawing, which
+    /// then agrees with a replay ([`show`](Self::show)) of the recorded state.
+    pub fn current_poses(&self) -> CurrentPoses<'_> {
+        let mut kin = KinCache::new(&self.model);
+        forward_kinematics(&self.model, &self.state.q, &self.state.v, &mut kin);
+        CurrentPoses { vehicle: self, pose: kin.pose }
     }
 
     /// Unloaded tyre radius of wheel `w` (m).

@@ -39,6 +39,9 @@ struct Slot {
 impl Slot {
     fn write_outputs(&mut self) {
         self.world.deliver(self.captures.drain(..));
+        if let Some(r) = &mut self.recorder {
+            r.on_frames(&self.world);
+        }
         for g in 0..self.obs.len() {
             self.world.observe(g, &mut self.obs[g]);
             self.world.observe_images(g, &mut self.images[g]);

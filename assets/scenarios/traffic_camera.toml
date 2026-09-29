@@ -1,0 +1,25 @@
+# A drone with a 128×96 camera looking ahead and down over a rural map where four scripted
+# cars drive random routes on the roads. A scenario for the viewer (`--scenario
+# assets/scenarios/traffic_camera.toml --camera-view`; I toggles the camera panel, K cycles
+# RGB, depth and semantic classes) and a starting point for pixel tasks among traffic.
+name = "traffic_camera"
+physics_hz = 1000
+policy_hz = 50
+
+map = { type = "rural", seed = 3, count = 1, preset = "training" }
+
+[[groups]]
+name = "drone"
+vehicle = "iris_like"
+action_mode = "velocity"
+spawn = { agl = [15.0, 20.0] }
+sensors = [
+    { name = "front", type = "camera", width = 128, height = 96, fov_deg = 90.0, rate_hz = 25, mount = { position = [0.2, 0.0, -0.08], rotation = [0.0, 0.6, 0.0] } },
+]
+
+[[groups]]
+name = "cars"
+count = 4
+vehicle = "sedan_like"
+spawn = { on_road = true, min_separation = 40.0 }
+driver = { type = "road" }

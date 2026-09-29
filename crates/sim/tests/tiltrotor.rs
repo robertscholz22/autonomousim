@@ -91,7 +91,10 @@ fn records_the_tiltrotor_state() {
     let sc = scenario("agl = [30.0, 30.0], clearance = 0.0");
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tiltrotor.mcap");
     let mut b = BatchSim::from_compiled(sc, 1, 5, 1).unwrap();
-    b.attach_recorder(0, Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false }).unwrap());
+    b.attach_recorder(
+        0,
+        Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false, ..Default::default() }).unwrap(),
+    );
     let action = [0.0, 0.0, 0.0, 0.0, -0.8, -0.8, -0.8, -0.8, 0.1, 0.0, 0.0];
     for _ in 0..25 {
         b.step(&[&action]);

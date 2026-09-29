@@ -185,7 +185,10 @@ fn recordings_carry_the_joints() {
     let sc = rig("farm_trailer", "");
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("trailer.mcap");
     let mut b = BatchSim::from_compiled(sc.clone(), 1, 3, 1).unwrap();
-    b.attach_recorder(0, Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false }).unwrap());
+    b.attach_recorder(
+        0,
+        Recorder::create(&path, RecorderConfig { state_hz: 50, lidar: false, ..Default::default() }).unwrap(),
+    );
     for _ in 0..100 {
         b.step(&[&[0.3, 0.6]]);
     }

@@ -143,7 +143,10 @@ batch in one submission). A task with camera observation terms observes a `Dict`
 `{"state": float32 [obs_dim], "image": uint8 [H, W, C]}`, e.g. `QuadHoverPad-v0` (hover over a
 landing pad seen by a downward camera), trained with `examples/ppo_pixels.py` (a small CNN
 encoder). `AUTONOMOUSIM_RENDER_ADAPTER` picks the GPU (`auto`, `software` for Mesa's lavapipe,
-or part of an adapter name).
+or part of an adapter name). In the viewer, I opens the followed agent's camera image (K cycles
+RGB, depth and classes) with its frustum, live and in replays (try `--scenario
+assets/scenarios/traffic_camera.toml --demo --camera-view`); recordings keep the images with
+`camera_hz` (`eval_record.py --camera-hz 10`).
 
 Scripted groups drive themselves: a ground-vehicle group spawned `on_road` with
 `driver = { type = "road" }` drives random routes over the road network (pure pursuit in its

@@ -95,7 +95,12 @@ impl Replay {
         };
         let alpha = if b.time > a.time { ((self.time - a.time) / (b.time - a.time)).clamp(0.0, 1.0) } else { 0.0 };
         Some(Sample {
-            pose: Pose { pos: a.position.lerp(b.position, alpha), rot: a.orientation.slerp(b.orientation, alpha) },
+            // Exactly the recorded state at a sample's time (a slerp by 0 is not the identity
+            // in the last bits), so camera images replay bit for bit.
+            pose: Pose {
+                pos: a.position.lerp(b.position, alpha),
+                rot: if alpha == 0.0 { a.orientation } else { a.orientation.slerp(b.orientation, alpha) },
+            },
             velocity: a.velocity.lerp(b.velocity, alpha),
             rates: a.rates.lerp(b.rates, alpha),
             motors: a.motors.iter().zip(&b.motors).map(|(x, y)| x + (y - x) * alpha).collect(),
@@ -198,8 +203,9 @@ impl Replay {
                 }
                 agent.goal_index = goals.iter().position(|g| g.position == s.goal).unwrap_or(agent.goal_index);
             }
-            if let Some(route) = ep.routes.get(i) {
-                agent.route.clone_from(route);
+            // Scripted agents' routes change on the way.
+            if i < ep.routes.len() {
+                agent.route = ep.route_at(i, self.time).cloned();
             }
         }
     }
@@ -348,15 +354,14 @@ mod tests {
         r.apply(&mut world);
         let (live, shown) = (w.agent(0).vehicle.as_wheeled().unwrap(), world.agent(0).vehicle.as_wheeled().unwrap());
         assert!(live.lin_vel_body().x > 3.0);
-        // The wheels turn, steer and travel as they did; the drawn wheel poses agree (the live
-        // ones lag a tick).
+        // The wheels turn, steer and travel as they did; the drawn wheel poses agree.
+        let (now_live, now_shown) = (live.current_poses(), shown.current_poses());
         for (i, (a, b)) in live.wheels().zip(shown.wheels()).enumerate() {
             assert!((a.spin_angle - b.spin_angle).abs() < 1e-5, "wheel {i}");
             assert!((a.steer - b.steer).abs() < 1e-5 && (a.travel - b.travel).abs() < 1e-5, "wheel {i}");
             assert!((a.tire.fy - b.tire.fy).abs() < 1.0 && (a.tire.kappa - b.tire.kappa).abs() < 1e-5, "wheel {i}");
-            let (pa, pb) = (live.wheel_pose(i), shown.wheel_pose(i));
-            assert!((pa.pos - pb.pos).length() < 0.02, "wheel {i}: {} {}", pa.pos, pb.pos);
-            assert!(pa.rot.angle_between(pb.rot) < 0.05, "wheel {i}");
+            let (pa, pb) = (now_live.wheel(i), now_shown.wheel(i));
+            assert!((pa.pos - pb.pos).length() < 1e-9 && pa.rot.angle_between(pb.rot) < 1e-9, "wheel {i}");
         }
         assert!(shown.wheels().next().unwrap().steer > 0.05);
         assert_eq!(shown.powertrain().gear, live.powertrain().gear);

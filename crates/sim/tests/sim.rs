@@ -412,7 +412,7 @@ fn recording_round_trips_through_mcap() {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.mcap");
     let mut recorded = BatchSim::from_compiled(sc.clone(), 2, 7, 2).unwrap();
     let mut plain = BatchSim::from_compiled(sc.clone(), 2, 7, 2).unwrap();
-    let config = RecorderConfig { state_hz: 50, lidar: true };
+    let config = RecorderConfig { state_hz: 50, lidar: true, ..Default::default() };
     assert!(recorded.attach_recorder(1, Recorder::create(&path, config.clone()).unwrap()).is_none());
     // 1 s, a reset, 0.5 s.
     for k in 0..75 {

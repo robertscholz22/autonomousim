@@ -163,7 +163,8 @@ def test_scenario_helpers(tmp_path):
 def test_example_scenarios_build(path, tmp_path, monkeypatch):
     monkeypatch.setenv("AUTONOMOUSIM_MAP_CACHE", str(tmp_path))
     sim = BatchSim(json.dumps(load_scenario(path)), 2, num_threads=1)
-    sim.step([np.zeros((2, i["count"], i["act_dim"]), np.float32) for i in map(sim.group_info, range(sim.num_groups))])
+    infos = [sim.group_info(g) for g in range(sim.num_groups)]
+    sim.step([np.zeros((2, i["count"], i["act_dim"]), np.float32) for i in infos if not i["scripted"]])
     assert all(np.isfinite(sim.obs(g)).all() for g in range(sim.num_groups))
 
 

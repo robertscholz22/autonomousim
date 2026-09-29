@@ -2,6 +2,7 @@
 //! batches.
 
 use autonomousim_core::rng::Seed;
+use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
 use autonomousim_sim::{BatchSim, CompiledScenario, Events, Scenario, WorldInstance};
 use std::sync::Arc;
 
@@ -92,6 +93,39 @@ fn driving_is_deterministic() {
     let (a, b, c) = (run(5), run(5), run(6));
     assert_eq!(a, b);
     assert_ne!(a.0, c.0);
+}
+
+/// Recordings carry the routes as they extend, so replays draw the route a car followed at
+/// any time.
+#[test]
+fn recordings_carry_the_routes() {
+    let sc = compile(TRAFFIC);
+    let path = std::env::temp_dir().join(format!("autonomousim-routes-{}.mcap", std::process::id()));
+    let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+    let mut w = WorldInstance::new(sc, Seed::from_u64(4));
+    w.reset(None);
+    rec.on_reset(&w);
+    let route = |w: &WorldInstance, k: usize| w.agents()[k].route.clone().unwrap();
+    let mut seen: Vec<Vec<(f64, Arc<_>)>> = (0..2).map(|k| vec![(w.time(), route(&w, k))]).collect();
+    for _ in 0..12000 {
+        rec.on_actions(&w);
+        w.step_with(&mut |w| rec.on_tick(w));
+        for (k, s) in seen.iter_mut().enumerate() {
+            if !Arc::ptr_eq(&s.last().unwrap().1, &route(&w, k)) {
+                s.push((w.time(), route(&w, k)));
+            }
+        }
+    }
+    rec.finish().unwrap();
+    let recording = Recording::read(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    let ep = &recording.episodes[0];
+    for (k, s) in seen.iter().enumerate() {
+        assert!(s.len() > 2, "car {k}'s route never extended");
+        for (t, r) in s {
+            assert_eq!(ep.route_at(k, *t).unwrap().points(), r.points(), "car {k} at {t}");
+        }
+    }
 }
 
 /// A drone group learns among scripted cars: batches take no actions for the cars (an

@@ -433,12 +433,19 @@ impl BatchSim {
     }
 
     /// Record world `env` to an MCAP file from now on (state and pose at `state_hz`, actions,
-    /// events, episodes; LiDAR scans if `lidar`). A previous recording of the world is
-    /// finished first.
-    #[pyo3(signature = (env, path, state_hz = 50, lidar = false))]
-    fn attach_recorder(&mut self, env: usize, path: std::path::PathBuf, state_hz: u32, lidar: bool) -> PyResult<()> {
+    /// events, episodes; LiDAR scans if `lidar`; camera frames at `camera_hz`, 0 for none). A
+    /// previous recording of the world is finished first.
+    #[pyo3(signature = (env, path, state_hz = 50, lidar = false, camera_hz = 0))]
+    fn attach_recorder(
+        &mut self,
+        env: usize,
+        path: std::path::PathBuf,
+        state_hz: u32,
+        lidar: bool,
+        camera_hz: u32,
+    ) -> PyResult<()> {
         let i = self.env(env)?;
-        let recorder = Recorder::create(&path, RecorderConfig { state_hz, lidar }).map_err(sim_err)?;
+        let recorder = Recorder::create(&path, RecorderConfig { state_hz, lidar, camera_hz }).map_err(sim_err)?;
         let sim = self.sim.get_mut().unwrap_or_else(PoisonError::into_inner);
         match sim.attach_recorder(i, recorder) {
             Some(old) => old.finish().map_err(sim_err),
