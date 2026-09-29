@@ -141,8 +141,10 @@ passed as keyword arguments.
 Camera sensors render RGB, depth and semantic images on the GPU (headless wgpu; all worlds of a
 batch in one submission). A task with camera observation terms observes a `Dict`
 `{"state": float32 [obs_dim], "image": uint8 [H, W, C]}`, e.g. `QuadHoverPad-v0` (hover over a
-landing pad seen by a downward camera), trained with `examples/ppo_pixels.py` (a small CNN
-encoder). `AUTONOMOUSIM_RENDER_ADAPTER` picks the GPU (`auto`, `software` for Mesa's lavapipe,
+landing pad seen by a downward camera) and `DroneLandOnCar-v0` (find a car driving on rural
+roads with a downward camera, follow it and land on its roof; with `semantic=True`,
+`task.scripted(obs)` does so from the image alone in about two thirds of the episodes), trained
+with `examples/ppo_pixels.py` (a small CNN encoder). `AUTONOMOUSIM_RENDER_ADAPTER` picks the GPU (`auto`, `software` for Mesa's lavapipe,
 or part of an adapter name). In the viewer, I opens the followed agent's camera image (K cycles
 RGB, depth and classes) with its frustum, live and in replays (try `--scenario
 assets/scenarios/traffic_camera.toml --demo --camera-view`); recordings keep the images with

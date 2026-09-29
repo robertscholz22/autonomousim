@@ -37,6 +37,7 @@ from mcap.reader import make_reader
 from autonomousim import STATE, BatchSim, events
 from autonomousim.events import Event
 from autonomousim.multiagent import MultiAgentVectorEnv
+from autonomousim.vector_env import learning_group
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -98,12 +99,15 @@ def run_episodes(policy, env_id: str, env_kwargs: dict[str, Any], args: argparse
     if not sim.detach_recorder(0):
         raise RuntimeError("no recorder was attached")
     map_hashes = sim.map_hashes
+    # The learning agent's id: scripted groups (e.g. traffic) may come first.
+    learner = sum(sim.group_info(g)["count"] for g in range(envs.unwrapped.group))
     envs.close()
-    return results, live, map_hashes
+    return results, live, map_hashes, learner
 
 
-def read_recording(path: pathlib.Path) -> dict[str, Any]:
-    """Messages in file (write) order, split into episodes at each ``/episode`` message."""
+def read_recording(path: pathlib.Path, learner: int = 0) -> dict[str, Any]:
+    """Messages in file (write) order, split into episodes at each ``/episode`` message; each
+    episode's ``states`` and ``actions`` are those of agent ``learner``."""
     rec: dict[str, Any] = {"meta": None, "episodes": [], "counts": {}}
     with open(path, "rb") as f:
         for _schema, channel, message in make_reader(f).iter_messages(log_time_order=False):
@@ -117,7 +121,7 @@ def read_recording(path: pathlib.Path) -> dict[str, Any]:
                     {"info": data, "states": [], "actions": [], "agents": [{"states": [], "actions": []} for _ in range(n)]}
                 )
             elif channel.topic.startswith("/agent/"):
-                _, _, agent, kind = channel.topic.split("/")
+                _, _, agent, kind = channel.topic.split("/", 3)
                 ep = rec["episodes"][-1]
                 a = int(agent)
                 while len(ep["agents"]) <= a:
@@ -127,7 +131,7 @@ def read_recording(path: pathlib.Path) -> dict[str, Any]:
                 elif kind == "action":
                     ep["agents"][a]["actions"].append(data["action"])
     for ep in rec["episodes"]:
-        ep["states"], ep["actions"] = ep["agents"][0]["states"], ep["agents"][0]["actions"]
+        ep["states"], ep["actions"] = ep["agents"][learner]["states"], ep["agents"][learner]["actions"]
     return rec
 
 
@@ -144,19 +148,21 @@ def live_rows(states: np.ndarray) -> np.ndarray:
 
 
 def replay(rec: dict[str, Any], seeds: list[int]) -> list[np.ndarray]:
-    """Re-simulate every episode from the recording alone: scenario, seeds and actions."""
+    """Re-simulate every episode from the recording alone: scenario, seeds and actions (of the
+    learning agent; scripted groups drive themselves)."""
     meta = rec["meta"]
     sim = BatchSim(json.dumps(meta["scenario"]), 1, num_threads=1)
+    group, _ = learning_group(sim)
     hashes = [m["hash"] for m in meta["maps"]]
     if sim.map_hashes != hashes:
         raise AssertionError(f"rebuilt maps differ from the recording: {sim.map_hashes} != {hashes}")
     out = []
     for ep, seed in zip(rec["episodes"], seeds):
         sim.reset(seeds=[seed])
-        rows = [sim.state(0)[0, 0].copy()]
+        rows = [sim.state(group)[0, 0].copy()]
         for a in ep["actions"]:
             sim.step(np.asarray(a, np.float64).reshape(1, 1, -1))
-            rows.append(sim.state(0)[0, 0].copy())
+            rows.append(sim.state(group)[0, 0].copy())
         out.append(np.array(rows))
     sim.close()
     return out
@@ -312,7 +318,7 @@ def main(argv: list[str] | None = None) -> None:
     path = args.out or pathlib.Path("recordings") / f"{args.policy.resolve().parent.name}.mcap"
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    results, live, map_hashes = run_episodes(policy, env_id, env_kwargs, args, path)
+    results, live, map_hashes, learner = run_episodes(policy, env_id, env_kwargs, args, path)
     options = f" {json.dumps(env_kwargs)}" if env_kwargs else ""
     print(f"{env_id}{options}, {'stochastic' if args.stochastic else 'deterministic'} policy")
     print(f"{'seed':>5} {'return':>8} {'steps':>6} {'outcome':>11} {'error m':>8}  events")
@@ -322,7 +328,7 @@ def main(argv: list[str] | None = None) -> None:
             f"{r['final_error_m']:8.3f}  {','.join(r['events']) or '-'}"
         )
 
-    rec = read_recording(path)
+    rec = read_recording(path, learner)
     size = path.stat().st_size
     seconds = sum(r["steps"] for r in results) / rec["meta"]["policy_hz"]
     print(f"\nwrote {path} ({size / 1024:.0f} KiB, {seconds:.1f} s simulated, {size / 1024 / seconds:.1f} KiB/s)")

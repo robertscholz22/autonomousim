@@ -166,6 +166,46 @@ fn scripted_groups_in_batches() {
     assert!(a.vehicle.position().distance(start) > 10.0 && !a.events.intersects(Events::DISABLED));
 }
 
+/// Drones hovering over the cars (as when landing on their roofs) are not agents ahead: the
+/// cars drive off under them instead of braking to a stop.
+#[test]
+fn drones_over_a_car_do_not_stop_it() {
+    let toml = format!(
+        "{TRAFFIC}\n{}",
+        r#"
+        [[groups]]
+        name = "drones"
+        count = 2
+        vehicle = "iris_like"
+        action_mode = "velocity"
+        spawn = { agl = [2.0, 2.2], min_separation = 0.0, near = { group = "cars", offset = 0.6 } }
+        "#
+    );
+    let sc = compile(&toml);
+    let mut b = BatchSim::from_compiled(sc.clone(), 4, 5, 1).unwrap();
+    let start: Vec<_> =
+        (0..4).map(|e| b.world(e).agents()[..2].iter().map(|a| a.vehicle.position()).collect::<Vec<_>>()).collect();
+    for e in 0..4 {
+        for k in 0..2 {
+            let (car, drone) = (start[e][k], b.world(e).agents()[2 + k].vehicle.position());
+            assert!(
+                (drone - car).truncate().length() < 0.9 && drone.z - car.z < 2.5,
+                "drone at {} over car at {car}",
+                drone
+            );
+        }
+    }
+    for _ in 0..250 {
+        b.step(&[&[], &[0.0; 4 * 2 * 4]]);
+    }
+    for (e, cars) in start.iter().enumerate() {
+        for (k, p) in cars.iter().enumerate() {
+            let d = b.world(e).agents()[k].vehicle.position().distance(*p);
+            assert!(d > 10.0, "car {k} of world {e} drove only {d:.1} m");
+        }
+    }
+}
+
 #[test]
 fn drivers_need_cars_on_roads() {
     let err = |toml: String| Scenario::from_toml(&toml).unwrap().compile().unwrap_err().to_string();
@@ -179,4 +219,42 @@ fn drivers_need_cars_on_roads() {
     goals = { kind = "route", distance = [100.0, 200.0] }"#,
     ));
     assert!(e.contains("driver"), "{e}");
+}
+
+/// `spawn.near`: each drone starts in its square around its car (cycling over the cars), at
+/// the spawn height above the ground, in every episode; the other group must come first.
+#[test]
+fn drones_spawn_near_the_cars() {
+    let toml = format!(
+        "{TRAFFIC}\n{}",
+        r#"
+        [[groups]]
+        name = "drones"
+        count = 3
+        vehicle = "iris_like"
+        spawn = { agl = [15.0, 30.0], min_separation = 0.0, near = { group = "cars", offset = 10.0 } }
+        "#
+    );
+    let sc = compile(&toml);
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(4));
+    let mut offsets = Vec::new();
+    for _ in 0..8 {
+        w.reset(None);
+        let agents = w.agents();
+        for k in 0..3 {
+            let (car, drone) = (agents[k % 2].vehicle.position(), agents[2 + k].vehicle.position());
+            let d = drone - car;
+            let agl = drone.z - w.map().surface_height(drone.x, drone.y);
+            assert!(d.x.abs() <= 10.0 && d.y.abs() <= 10.0, "episode offset {d}");
+            assert!((15.0 - 1e-9..=30.0 + 1e-9).contains(&agl), "agl {agl}");
+            offsets.push(d.truncate().length());
+        }
+    }
+    assert!(offsets.iter().any(|&d| d > 4.0) && offsets.iter().any(|&d| d < 6.0), "{offsets:?}");
+
+    let err = |toml: String| Scenario::from_toml(&toml).unwrap().compile().unwrap_err().to_string();
+    let e = err(toml.replace(r#"group = "cars""#, r#"group = "drones""#));
+    assert!(e.contains("spawn.near"), "{e}");
+    let e = err(toml.replace("offset = 10.0", "offset = -1.0"));
+    assert!(e.contains("spawn.near"), "{e}");
 }

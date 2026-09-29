@@ -301,23 +301,29 @@ impl MultirotorController {
             Setpoint::Velocity { velocity, frame, yaw } => {
                 if outer {
                     // Shape the command in its own frame, so that a heading-frame reference
-                    // turns with the vehicle instead of lagging behind it.
+                    // turns with the vehicle instead of lagging behind it. The frame is that
+                    // of the heading setpoint, not the measured heading: turning the command
+                    // with every yaw wobble would feed it back as a lateral velocity error
+                    // (speed × wobble) that rolls the vehicle and, through the roll–yaw
+                    // coupling (rotor drag), wobbles the heading more, a limit cycle that
+                    // grows with speed.
                     if self.velocity_frame != Some(frame) {
                         self.position.reset_reference();
                         self.velocity_frame = Some(frame);
                     }
+                    let (yaw_sp, yaw_rate) = self.yaw_setpoint(yaw, est, outer_dt);
                     let rot = match frame {
                         Frame::World => DQuat::IDENTITY,
-                        Frame::Heading => from_yaw(self::yaw(est.attitude)),
+                        Frame::Heading => from_yaw(yaw_sp),
                     };
                     let cmd = self.position.limit_velocity(velocity);
                     let (v, a) = self.position.shape(cmd, rot.inverse() * est.velocity, outer_dt);
                     let (v, mut a) = (rot * v, rot * a);
                     if frame == Frame::Heading {
                         // Centripetal acceleration of a reference fixed in the turning frame.
-                        a += DVec3::Z.cross(v) * (est.attitude * est.rates).z;
+                        a += DVec3::Z.cross(v) * yaw_rate;
                     }
-                    self.outer_loop(v, a, yaw, est, outer_dt);
+                    self.outer_loop(v, a, (yaw_sp, yaw_rate), est, outer_dt);
                 }
                 self.position.record_applied(self.motors.acceleration(est.attitude));
                 (self.attitude.update(est.attitude, self.att_sp, self.yaw_ff), self.thrust_sp)
@@ -325,6 +331,7 @@ impl MultirotorController {
             Setpoint::Position { position, yaw } => {
                 if outer {
                     let v = self.position.velocity_setpoint(position, est.position);
+                    let yaw = self.yaw_setpoint(yaw, est, outer_dt);
                     self.outer_loop(v, DVec3::ZERO, yaw, est, outer_dt);
                 }
                 self.position.record_applied(self.motors.acceleration(est.attitude));
@@ -353,8 +360,7 @@ impl MultirotorController {
     /// Velocity loop (setpoint and feedforward acceleration, world) and heading. Velocity
     /// commands pass through the shaped reference first; the position loop's setpoints are
     /// continuous already, and the reference would add lag inside the position loop.
-    fn outer_loop(&mut self, vel_sp: DVec3, acc_ff: DVec3, yaw: YawCommand, est: &StateEstimate, dt: f64) {
-        let (yaw_sp, ff) = self.yaw_setpoint(yaw, est, dt);
+    fn outer_loop(&mut self, vel_sp: DVec3, acc_ff: DVec3, (yaw_sp, ff): (f64, f64), est: &StateEstimate, dt: f64) {
         let thrust = self.position.update(vel_sp, acc_ff, est.velocity, dt, !est.ground_contact);
         self.att_sp = attitude_from_thrust(thrust, yaw_sp);
         self.thrust_sp = thrust.length();

@@ -88,7 +88,7 @@ forward = [0.265, 0.489, 0.784, 1.063, 1.276, 1.499]
 reverse = -0.333
 shift = [[1000, 4000], [1200, 4500], [1400, 4500], [1600, 4500], [1800, 4500], [2000, 4500]]
 
-# Belly, bumpers and roof (the chassis frame is pitched: the ground is at z ≈ −0.231 + 0.046·x).
+# Belly and bumpers (the chassis frame is pitched: the ground is at z ≈ −0.231 + 0.046·x).
 [[colliders]]
 center = [0.7, 0.0, 0.13]
 radius = 0.2
@@ -105,10 +105,69 @@ radius = 0.25
 center = [-2.05, 0.0, 0.13]
 radius = 0.25
 
+# The roof: a grid of spheres whose tops lie at the drawn cabin's flat top (z = 0.764, x from
+# −0.69 to 0.35, y within ±0.55), dipping at most 3 cm between them, so that a drone can land
+# on it; their bottoms stay 0.33 m above the ground.
 [[colliders]]
-center = [-0.2, 0.4, 0.81]
-radius = 0.4
+center = [-0.5, -0.3, 0.434]
+radius = 0.33
 
 [[colliders]]
-center = [-0.2, -0.4, 0.81]
-radius = 0.4
+center = [-0.5, -0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.5, 0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.5, 0.3, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.3, -0.3, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.3, -0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.3, 0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.3, 0.3, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.1, -0.3, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.1, -0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.1, 0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [-0.1, 0.3, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [0.1, -0.3, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [0.1, -0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [0.1, 0.1, 0.434]
+radius = 0.33
+
+[[colliders]]
+center = [0.1, 0.3, 0.434]
+radius = 0.33

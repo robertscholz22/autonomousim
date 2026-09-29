@@ -305,6 +305,29 @@ fn yaw_rate_and_heading_frame() {
     }
 }
 
+/// Cruising on a heading-frame velocity command is as steady as on a world-frame one: the
+/// command turns with the heading setpoint, so heading wobbles (rotor drag couples roll into
+/// yaw) are not fed back as lateral velocity errors (formerly a limit cycle of ±40° roll at
+/// 7 m/s on the iris).
+#[test]
+fn heading_frame_cruise_is_steady() {
+    for name in PRESETS {
+        for speed in [4.0, 7.0, 10.0] {
+            let mut rig = Rig::new(name);
+            let sp = Setpoint::Velocity {
+                velocity: DVec3::new(speed, 0.0, 0.0),
+                frame: Frame::Heading,
+                yaw: YawCommand::Rate(0.0),
+            };
+            rig.run(&sp, 6.0, |_| 0.0);
+            let tilts = rig.run(&sp, 4.0, |r| tilt(r.quad.orientation()));
+            let (lo, hi) = tilts.iter().fold((f64::MAX, f64::MIN), |a, &(_, t)| (a.0.min(t), a.1.max(t)));
+            println!("{name} at {speed} m/s: tilt {:.2}–{:.2}°", lo.to_degrees(), hi.to_degrees());
+            assert!(hi - lo < 0.5f64.to_radians(), "{name} at {speed} m/s: tilt {lo}–{hi}");
+        }
+    }
+}
+
 /// Randomised mass, inertia, thrust coefficients and motor lag are rejected as disturbances.
 #[test]
 fn randomised_vehicle_holds_position() {

@@ -742,6 +742,22 @@ pub struct SpawnSpec {
     /// Largest initial body rate (rad/s), uniform axis.
     pub rates: f64,
     pub motors: SpawnMotors,
+    /// Start around the agents of an earlier group (e.g. a drone above a car); replaces
+    /// `region` and `cluster`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub near: Option<SpawnNear>,
+}
+
+/// Spawns around the agents of another group: agent `k` of the group starts in a square of
+/// half side `offset` (m) around agent `k` (cycling) of `group`, horizontally, inside the
+/// map's spawn region; the height, clearance and separation settings apply as usual. The
+/// other group must come earlier in the scenario (it is placed first).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnNear {
+    pub group: String,
+    #[serde(default)]
+    pub offset: f64,
 }
 
 impl Default for SpawnSpec {
@@ -763,6 +779,7 @@ impl Default for SpawnSpec {
             yaw_deg: [-180.0, 180.0],
             rates: 0.0,
             motors: SpawnMotors::Hover,
+            near: None,
         }
     }
 }
@@ -1051,6 +1068,21 @@ impl CompiledScenario {
             }
             if spec.groups[..gi].iter().any(|o| o.name == g.name) {
                 return Err(SimError::Scenario(format!("duplicate group name {:?}", g.name)));
+            }
+            if let Some(near) = &g.spawn.near {
+                let earlier = spec.groups[..gi].iter().any(|o| o.name == near.group);
+                if !earlier || !near.offset.is_finite() || near.offset < 0.0 {
+                    return Err(SimError::Scenario(format!(
+                        "group {:?}: `spawn.near` needs an earlier group and an offset ≥ 0, got {near:?}",
+                        g.name
+                    )));
+                }
+                if g.spawn.on_road || matches!(g.goals.kind, GoalKind::Bay | GoalKind::Yard) {
+                    return Err(SimError::Scenario(format!(
+                        "group {:?}: `spawn.near` does not go with `on_road` spawns or `bay` and `yard` goals",
+                        g.name
+                    )));
+                }
             }
             groups.push(CompiledGroup::new(g.clone(), def, &clock, decimation, first_agent)?);
             first_agent += g.count;
@@ -1411,7 +1443,7 @@ fn formation_slot(shape: FormationShape, n: usize, k: usize) -> DVec2 {
 }
 
 /// Region `[min, max]` inside the map, shrunk by `margin` (never inverted).
-fn region(world: &StaticWorld, region: Option<[DVec2; 2]>, margin: f64) -> [DVec2; 2] {
+pub(crate) fn region(world: &StaticWorld, region: Option<[DVec2; 2]>, margin: f64) -> [DVec2; 2] {
     let (lo, hi) = world.extent();
     let (lo, hi) = match region {
         Some([a, b]) => (a.max(lo), b.min(hi)),

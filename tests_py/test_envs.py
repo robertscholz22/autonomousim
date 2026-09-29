@@ -18,7 +18,7 @@ from autonomousim.vector_env import AutonomousimVectorEnv
 
 IDS = [f"autonomousim/{name}" for name in autonomousim.ENVS]
 # Environments with camera (``Dict``) observations; their vector tests are in test_cameras.py.
-IMAGE_IDS = {"autonomousim/QuadHoverPad-v0"}
+IMAGE_IDS = {"autonomousim/QuadHoverPad-v0", "autonomousim/DroneLandOnCar-v0"}
 # Small maps for the API tests (the waypoint task defaults to a pool of 16 generated maps).
 RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
 # A 4 km tiled map (the aircraft task defaults to the 16 km one).
@@ -35,6 +35,7 @@ KWARGS = {
     "autonomousim/FixedWingWaypoints-v0": {"map": LARGE},
     "autonomousim/HeliLandingZone-v0": {"map_count": 1},
     "autonomousim/TiltrotorDelivery-v0": {"map": FARMS, "goal_distance": (300.0, 700.0)},
+    "autonomousim/DroneLandOnCar-v0": {"map": RURAL, "image_size": 16},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,

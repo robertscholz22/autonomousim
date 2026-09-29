@@ -26,7 +26,7 @@ use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
-use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, TiltrotorStart};
+use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, SpawnSpec, TiltrotorStart};
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
@@ -235,6 +235,19 @@ impl WorldInstance {
                     &mut goal_rng,
                 );
                 (rs.iter().map(|r| r.position).collect(), rs.into_iter().map(Some).collect())
+            } else if let Some(near) = &spawn.near {
+                // One at a time, in a square around its agent of the other group.
+                let other = sc.groups.iter().find(|o| o.spec.name == near.group).expect("checked when compiled");
+                let [lo, hi] = crate::scenario::region(world, spawn.region, spawn.margin);
+                let mut p = Vec::with_capacity(g.spec.count);
+                for k in 0..g.spec.count {
+                    let at = self.agents[other.first_agent + k % other.spec.count].vehicle.pose().pos.truncate();
+                    let (a, b) = ((at - near.offset).clamp(lo, hi), (at + near.offset).clamp(lo, hi));
+                    let square = SpawnSpec { region: Some([a, b]), margin: 0.0, cluster: None, ..spawn.clone() };
+                    p.extend(square.sample_positions(world, 1, g.bottom, ground, &mut placed, &mut spawn_rng));
+                }
+                let n = p.len();
+                (p, (0..n).map(|_| None).collect::<Vec<_>>())
             } else {
                 let p = spawn.sample_positions(world, g.spec.count, g.bottom, ground, &mut placed, &mut spawn_rng);
                 let n = p.len();

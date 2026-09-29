@@ -158,6 +158,10 @@ class Task:
 
     # ------------------------------------------------------------------ episodes
 
+    def attach(self, sim: Any) -> None:
+        """Called with the ``BatchSim`` once it exists, before ``bind``; tasks that read other
+        groups (e.g. a scripted car's state rows, ``sim.state(g)``) keep views of them here."""
+
     def bind(self, num_envs: int, policy_dt: float, act_dim: int) -> None:
         """Allocate per-world buffers once the simulation exists."""
         self.num_envs = num_envs

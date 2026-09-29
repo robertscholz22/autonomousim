@@ -39,6 +39,7 @@ class AutonomousimEnv(gym.Env):
         self._view = self._obs if images is None else {"state": self._obs, "image": images[0, 0]}
         self._state = self.sim.state(self.group)[:, 0, :]
         self._events = self.sim.events(self.group)[:, 0]
+        self.task.attach(self.sim)
         self.task.bind(1, self.sim.policy_dt, self.act_dim)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:

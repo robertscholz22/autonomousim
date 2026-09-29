@@ -16,7 +16,9 @@ import autonomousim
 from autonomousim import SEMANTIC_CLASSES, _native
 from autonomousim.multiagent import MultiAgentVectorEnv
 from autonomousim.pettingzoo import parallel_env
-from autonomousim.tasks import QuadHover, QuadHoverPad
+from autonomousim.scenario import STATE
+from autonomousim.tasks import QuadHover, QuadHoverPad, make_task
+from autonomousim.tasks.land_on_car import ROOF
 from autonomousim.tasks.hover_pad import DEFAULT_OBS
 from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.vector_env import AutonomousimVectorEnv
@@ -24,6 +26,8 @@ from autonomousim.vector_env import AutonomousimVectorEnv
 SEMANTIC = {"term": "camera", "sensor": "down", "output": "semantic"}
 DEPTH = {"term": "camera", "sensor": "down", "output": "depth", "range": 10.0}
 MARKER = SEMANTIC_CLASSES.index("marker")
+VEHICLE = SEMANTIC_CLASSES.index("vehicle")
+RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
 
 
 def test_the_software_adapter_renders():
@@ -189,3 +193,81 @@ def test_image_only_observations():
     assert sim.group_info(0)["obs_dim"] == 0 and sim.obs(0).shape == (2, 1, 0)
     sim.step(np.zeros((2, 1, 4), np.float32))
     assert (sim.images(0)[..., 0] == MARKER).any()
+
+
+def test_drone_land_on_car_scripted_pilot():
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/DroneLandOnCar-v0",
+        num_envs=n,
+        num_threads=4,
+        semantic=True,
+        map=RURAL,
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    task = envs.unwrapped.task
+    assert envs.single_observation_space["image"] == gym.spaces.Box(0, 255, (64, 64, 5), np.uint8)
+    assert [t[0] for t in envs.unwrapped.obs_layout] == ["rot6d", "lin_vel_body", "ang_vel_body", "agl", "last_action"]
+    assert envs.single_observation_space["state"].shape == (17,) and envs.single_action_space.shape == (4,)
+    obs, _ = envs.reset(seed=0)
+    # Every drone starts 15–30 m up within 10 m (each axis) of its car, which is in its view
+    # (and visible, unless trees along the road hide it).
+    state = envs.unwrapped.state
+    d, h = task.relative(state)
+    assert (d < 10.0 * np.sqrt(2.0)).all() and (h > 10.0).all() and (h < 30.0).all()
+    assert task.in_view(state).all()
+    assert (obs["image"][..., 4] == VEHICLE).reshape(n, -1).any(axis=1).sum() >= n // 2
+    ret, done, success = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(task.scripted(obs))
+        live = ~done
+        ret[live] += reward[live]
+        success |= live & task.success
+        done |= terminated | truncated
+    # From the image alone, the pilot lands on the moving car's roof in some of the worlds
+    # (about two thirds on the training maps): at rest on it, earning the bonus; failures
+    # cost the terminal penalty.
+    assert success.sum() >= 2, success
+    assert (state[success, STATE["support"]][:, 0] == task.car_index).all()
+    assert (ret[success] > task.landing_bonus / 2).all() and (ret[~success] < 0.0).all(), ret
+    envs.close()
+
+    envs = gym.make_vec("autonomousim/DroneLandOnCar-v0", num_envs=1, map=RURAL, image_size=16)
+    obs, _ = envs.reset(seed=0)
+    with pytest.raises(ValueError, match="semantic"):
+        envs.unwrapped.task.scripted(obs)
+    envs.close()
+
+
+def test_drone_land_on_car_rewards_and_ends():
+    task = make_task("land_on_car", map=RURAL)
+    task.bind(4, 0.04, 4)
+    car = np.zeros((4, autonomousim.STATE_DIM))
+    car[:, STATE["orientation"]] = [0.0, 0.0, 0.0, 1.0]
+    task.car, task.car_index = car, 0
+    state = np.zeros((4, autonomousim.STATE_DIM))
+    state[:, STATE["orientation"]] = [0.0, 0.0, 0.0, 1.0]
+    state[:, STATE["support"]] = -1
+    state[:, STATE["position"]] = [[5.0, 0.0, 10.0], [0.0, 0.0, 3.0], [0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]
+    task.reset(None, state)
+    # Closer in; lower down; on the roof, at rest on the car; landed on something else.
+    state[:, STATE["position"]] = [[4.0, 0.0, 10.0], [0.0, 0.0, 2.0], [0.0, 0.0, ROOF], [3.0, 0.0, 0.3]]
+    state[2:, STATE["support"]] = [[0], [-1]]
+    landed = int(autonomousim.Event.LANDED)
+    events = np.array([0, 0, landed, landed], np.uint32)
+    action = np.zeros((4, 4), np.float32)
+    r = task.reward(state, action, action, events)
+    h = 10.0 - ROOF
+    progress = [np.hypot(5.0, 2 * h) - np.hypot(4.0, 2 * h), 2.0, 2 * (2.0 - ROOF), 2 * (2.0 - ROOF) - 3.0]
+    np.testing.assert_allclose(r, 0.1 * np.array(progress) - 0.01 + [0.0, 0.0, 20.0, 0.0])
+    assert task.succeeded(state, events).tolist() == [False, False, True, False]
+    task.events = events
+    assert task.failed(state).tolist() == [False, False, False, True]
+    # Losing sight of the car (its centre out of the 90° field of view) for 5 s fails.
+    state[:, STATE["position"]] = [[11.0, 0.0, 10.0], [9.0, 0.0, 10.0], [0.0, 0.0, 50.0], [0.0, 0.0, 30.0]]
+    assert task.in_view(state).tolist() == [False, True, False, True]
+    task.events = np.zeros(4, np.uint32)
+    for _ in range(125):
+        assert not task.failed(state).any()
+    assert task.failed(state).tolist() == [True, False, True, False]
+

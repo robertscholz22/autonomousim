@@ -158,11 +158,14 @@ pub struct Sim {
 impl Sim {
     pub fn new(world: WorldInstance) -> Self {
         let n = world.agents().len();
+        // Follow the first agent that is not scripted (scripted traffic may come first).
+        let groups = &world.scenario().groups;
+        let pilot = groups.iter().find(|g| !g.scripted()).map_or(0, |g| g.first_agent);
         // Aircraft fly by attitude from the start.
-        let aircraft = world.agent(0).vehicle.family() == Family::FixedWing;
+        let aircraft = world.agent(pilot).vehicle.family() == Family::FixedWing;
         let mut s = Self {
             world,
-            pilot: 0,
+            pilot,
             paused: false,
             time_scale: 1.0,
             pilot_mode: if aircraft { PilotMode::Attitude } else { PilotMode::Velocity },
@@ -949,6 +952,29 @@ mod tests {
             let shown = replay.camera_image(0, 0).expect("replayed image").1;
             assert!(shown == live, "frame of tick {tick} replays differently");
         }
+    }
+
+    /// Scripted traffic coming first: the viewer follows the first agent that is not scripted.
+    #[test]
+    fn follows_the_first_agent_not_scripted() {
+        let sc = Scenario::from_toml(
+            r#"
+            name = "traffic"
+            map = { type = "rural", seed = 3, count = 1, cache = false }
+            [[groups]]
+            name = "cars"
+            count = 2
+            vehicle = "sedan_like"
+            spawn = { on_road = true }
+            driver = { type = "road" }
+            [[groups]]
+            name = "drone"
+            vehicle = "iris_like"
+            "#,
+        )
+        .unwrap();
+        let s = Sim::new(WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(2)));
+        assert_eq!(s.pilot, 2);
     }
 
     /// A ground vehicle driven by the pedal, as the viewer's driver group.

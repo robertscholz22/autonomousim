@@ -132,6 +132,7 @@ class AutonomousimVectorEnv(VectorEnv):
         self._view = self._obs if images is None else {"state": self._obs, "image": images[:, 0]}
         self._state = self.sim.state(self.group)[:, 0, :]
         self._events = self.sim.events(self.group)[:, 0]
+        self.task.attach(self.sim)
         self.task.bind(num_envs, self.sim.policy_dt, self.act_dim)
         self._return = np.zeros(num_envs, dtype=np.float64)
         self._length = np.zeros(num_envs, dtype=np.int64)

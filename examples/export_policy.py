@@ -160,7 +160,8 @@ def export(path: pathlib.Path, out: pathlib.Path | None = None, env_kwargs: dict
         env_id = args["env_id"]
         kwargs = args.get("env_kwargs", {}) if env_kwargs is None else env_kwargs
         obs, actions, task, images = check_samples(policy, env_id, kwargs)
-        group = task.scenario()["groups"][0]["name"]
+        # The learning group (scripted groups, driven by a ``driver``, may come first).
+        group = next(g["name"] for g in task.scenario()["groups"] if "driver" not in g)
     rms = policy.obs_norm.rms
     data = {
         "format": FORMAT,

@@ -333,14 +333,15 @@ impl RoadDriver {
         let local = DVec2::from_angle(-heading).rotate(to);
         let dist2 = local.length_squared();
         let curvature = if dist2 > 1e-6 { 2.0 * local.y / dist2 } else { 0.0 };
-        // Following the agents ahead.
+        // Following the agents ahead: centres beyond the front (those over the vehicle itself,
+        // such as a drone landing on its roof, are not ahead of it).
         let g = self.geometry;
         let corridor = g.half_width + 1.2;
         let gap = if self.turn_at_end && left < TURN_QUEUE { TURN_GAP } else { FOLLOW_GAP };
         for o in others {
             let rel = o.center - pose.pos;
             let local = DVec2::from_angle(-heading).rotate(rel.truncate());
-            if local.x > 0.0 && local.x < FOLLOW_RANGE && local.y.abs() < corridor && rel.z.abs() < FOLLOW_HEIGHT {
+            if local.x > g.front && local.x < FOLLOW_RANGE && local.y.abs() < corridor && rel.z.abs() < FOLLOW_HEIGHT {
                 let free = local.x - g.front - o.radius.min(FOLLOW_RADIUS) - gap;
                 target = target.min((2.0 * s.decel * free.max(0.0)).sqrt());
             }
