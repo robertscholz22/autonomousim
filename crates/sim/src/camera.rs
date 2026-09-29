@@ -9,7 +9,8 @@
 //!
 //! A frame shows the world's map, water, roads and obstacles, and every active agent, the
 //! camera's own vehicle labelled [`SemanticClass::OwnVehicle`] and the others
-//! [`SemanticClass::Vehicle`]. Frames are bit-identical for the same state on the same GPU
+//! [`SemanticClass::Vehicle`], and the landing pads under the current goals of the groups
+//! with `goals.pad` ([`SemanticClass::Marker`]). Frames are bit-identical for the same state on the same GPU
 //! and driver.
 //!
 //! The process has one GPU context, created on first use with the adapter named by
@@ -19,13 +20,15 @@
 use crate::SimError;
 use crate::scenario::CompiledScenario;
 use crate::world::WorldInstance;
+use autonomousim_core::terrain::Terrain;
 use autonomousim_render::{
-    AdapterChoice, CameraPose, Draw, GpuContext, GpuRig, GpuWorld, Intrinsics, Job, Renderer, SemanticClass, Shading,
-    View, WorldOptions,
+    AdapterChoice, CameraPose, Draw, GpuContext, GpuMesh, GpuRig, GpuWorld, Intrinsics, Job, Renderer, SemanticClass,
+    Shading, View, WorldOptions,
 };
 use autonomousim_scene::rig::{Placement, Rig};
 use autonomousim_sensors::{CameraImage, Sensor, SensorConfig};
 use autonomousim_vehicles::Vehicle;
+use glam::{DQuat, DVec3};
 use std::sync::{Arc, OnceLock};
 
 static GPU: OnceLock<Result<Arc<GpuContext>, String>> = OnceLock::new();
@@ -68,6 +71,10 @@ pub struct Cameras {
     rigs: Vec<(Rig, GpuRig)>,
     /// Per agent, reused.
     placements: Vec<Vec<Placement>>,
+    /// Pad radius per group (0: none).
+    pads: Vec<f64>,
+    /// A pad of unit radius.
+    pad: GpuMesh,
 }
 
 impl Cameras {
@@ -88,6 +95,8 @@ impl Cameras {
             maps: (0..scenario.maps.len()).map(|_| None).collect(),
             rigs,
             placements: vec![Vec::new(); scenario.num_agents()],
+            pads: scenario.groups.iter().map(|g| g.spec.goals.pad).collect(),
+            pad: GpuMesh::new(&ctx, &autonomousim_scene::mesh::landing_pad(1.0), SemanticClass::Marker),
             ctx,
         }
     }
@@ -109,7 +118,7 @@ impl Cameras {
                 .iter()
                 .any(|a| !a.disabled && a.sensors.iter().any(|s| matches!(s, Sensor::Camera(c) if c.is_due(tick))))
         };
-        let Self { ctx, renderer, options, shading, maps, rigs, placements } = self;
+        let Self { ctx, renderer, options, shading, maps, rigs, placements, pads, pad } = self;
         for (w, _) in worlds.iter().filter(|(w, _)| due(w)) {
             let map = &mut maps[w.map_index()];
             if map.is_none() {
@@ -124,6 +133,18 @@ impl Cameras {
             let tick = w.clock().tick;
             let map = maps[w.map_index()].as_ref().expect("uploaded above");
             let agents = w.agents();
+            // Pads lie on the ground under the goals, tilted with it, 2 cm up.
+            let pad_draws: Vec<Draw> = agents
+                .iter()
+                .filter(|a| !a.disabled && pads[a.group] > 0.0 && !a.goals.is_empty())
+                .map(|a| {
+                    let g = a.goal().position;
+                    let (h, n) = w.map().terrain().height_normal(g.x, g.y);
+                    let r = pads[a.group];
+                    Draw::new(pad, DVec3::new(g.x, g.y, h) + 0.02 * n, DQuat::from_rotation_arc(DVec3::Z, n))
+                        .with_scale(DVec3::new(r, r, 1.0))
+                })
+                .collect();
             for (a, p) in agents.iter().zip(placements.iter_mut()) {
                 p.clear();
                 if !a.disabled {
@@ -149,6 +170,7 @@ impl Cameras {
                     };
                     let first = draws.len();
                     map.draws(&view, &mut draws);
+                    draws.extend(pad_draws.iter().copied());
                     for (j, b) in agents.iter().enumerate().filter(|(_, b)| !b.disabled) {
                         let class = if j == i { SemanticClass::OwnVehicle } else { SemanticClass::Vehicle };
                         rigs[b.group].1.draws(b.vehicle.pose(), &placements[j], class, &mut draws);

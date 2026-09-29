@@ -852,6 +852,11 @@ pub struct GoalSpec {
     /// metre from the centre. Draws that fail rank below all that pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub landing_slope: Option<f64>,
+    /// Radius of a landing pad drawn on the ground under the agent's current goal (m), seen
+    /// by cameras as [`SemanticClass::Marker`](autonomousim_render::SemanticClass::Marker);
+    /// 0: none. The pad is only visual: it has no collider.
+    #[serde(skip_serializing_if = "is_default")]
+    pub pad: f64,
 }
 
 impl Default for GoalSpec {
@@ -873,6 +878,7 @@ impl Default for GoalSpec {
             off_road: false,
             grade: None,
             landing_slope: None,
+            pad: 0.0,
         }
     }
 }
@@ -1237,7 +1243,9 @@ impl CompiledGroup {
             && gl.route.step > 0.0
             && gl.count >= 1
             && gl.grade.is_none_or(|g| g > 0.0)
-            && gl.landing_slope.is_none_or(|g| g > 0.0))
+            && gl.landing_slope.is_none_or(|g| g > 0.0)
+            && gl.pad >= 0.0
+            && gl.pad <= 100.0)
         {
             return Err(fail(format!("invalid goals {gl:?}")));
         }

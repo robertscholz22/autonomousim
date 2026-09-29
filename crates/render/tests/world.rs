@@ -80,7 +80,7 @@ struct Stats {
     /// Terrain and water nearer than 100 m, and their depth within 1e-3 relative.
     near_ground: usize,
     near_ground_ok: usize,
-    classes: [usize; 14],
+    classes: [usize; SemanticClass::ALL.len()],
     /// Depth outside the tolerance, by class.
     depth_bad: [usize; 14],
 }

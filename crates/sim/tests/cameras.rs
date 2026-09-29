@@ -205,6 +205,39 @@ fn a_down_camera_sees_the_ground_and_the_drone_below() {
 }
 
 #[test]
+fn a_pad_marks_the_goal() {
+    gpu();
+    let sc = compile(
+        r#"
+        name = "pad"
+        map = { type = "testworld", kind = "flat", size = 200.0 }
+        [[groups]]
+        name = "drones"
+        vehicle = "iris_like"
+        goals = { kind = "random", distance = [0.0, 5.0], pad = 1.5 }
+        sensors = [ { name = "down", type = "camera", width = 33, height = 33, fov_deg = 60.0, rate_hz = 50, mount = { position = [0.0, 0.0, -0.1], rotation = [0.0, 1.5707963267948966, 0.0] } } ]
+        obs = [ { term = "camera", sensor = "down", output = "semantic" } ]
+        "#,
+    );
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(1));
+    let mut cams = Cameras::new(camera::gpu().unwrap(), &sc);
+    let goal = w.agents()[0].goal().position;
+    w.place_agent(0, Pose::new(DVec3::new(goal.x, goal.y, 5.0), DQuat::IDENTITY), DVec3::ZERO, DVec3::ZERO);
+    cams.update(&mut w).unwrap();
+    let (_, img) = camera_image(&w, 0, 0).unwrap();
+    let (centre, marker) = (16 * 33 + 16, SemanticClass::Marker.id());
+    assert_eq!(img.class[centre], marker);
+    // 4.9 m to the ground, the pad 2 cm up, the bar 1 mm more.
+    assert!((f64::from(img.depth[centre]) - 4.879).abs() < 1e-3, "depth {}", img.depth[centre]);
+    // The pad covers π·1.5² of the (2·4.88·tan 30°)² footprint.
+    let side = 2.0 * 4.88 * (30f64).to_radians().tan();
+    let expected = std::f64::consts::PI * 1.5 * 1.5 / (side * side) * 33.0 * 33.0;
+    let seen = img.class.iter().filter(|&&c| c == marker).count() as f64;
+    assert!((seen / expected - 1.0).abs() < 0.1, "{seen} pad pixels, expected {expected:.0}");
+    assert!(img.class.iter().all(|&c| c == marker || c == SemanticClass::Grass.id()));
+}
+
+#[test]
 fn invalid_camera_setups_are_rejected() {
     let base = |sensor: &str, obs: &str| {
         format!(

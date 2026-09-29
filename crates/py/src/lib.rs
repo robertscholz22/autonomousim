@@ -3,12 +3,17 @@
 //! [`BatchSim`] wraps [`autonomousim_sim::BatchSim`]. Its outputs are numpy arrays created
 //! once and overwritten in place after every `step` and `reset`, one set per agent group:
 //! observations `float32 [num_envs, count, obs_dim]`, state rows `float64 [num_envs, count,
-//! STATE_DIM]` and event bits `uint32 [num_envs, count]`. Stepping, resetting and building
+//! STATE_DIM]` and event bits `uint32 [num_envs, count]`; for groups with camera terms also
+//! images `uint8 [num_envs, count, height, width, channels]`. Stepping, resetting and building
 //! the scenario release the GIL.
 
+use autonomousim_render::{AdapterChoice, SemanticClass};
+use autonomousim_sim::camera;
 use autonomousim_sim::record::{Recorder, RecorderConfig};
 use autonomousim_sim::{BatchSim as Batch, CompiledScenario, Events, STATE_DIM, STATE_FIELDS, Scenario, SimError};
-use numpy::{PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
+use numpy::{
+    PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods,
+};
 use pyo3::exceptions::{PyIOError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -17,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 fn sim_err(e: SimError) -> PyErr {
     match e {
         SimError::Io(e) => PyIOError::new_err(e.to_string()),
-        SimError::Record(m) => PyRuntimeError::new_err(m),
+        SimError::Record(m) | SimError::Render(m) => PyRuntimeError::new_err(m),
         e => PyValueError::new_err(e.to_string()),
     }
 }
@@ -55,6 +60,22 @@ fn trailer_presets() -> Vec<&'static str> {
     autonomousim_vehicles::presets::trailer_names().collect()
 }
 
+/// Choose the GPU adapter for cameras (`auto`, `software` for the CPU rasterizer, or part of
+/// an adapter's name) before the first scenario with cameras is built; the default comes from
+/// `AUTONOMOUSIM_RENDER_ADAPTER`. Returns false if the GPU context exists already (its adapter
+/// is kept).
+#[pyfunction]
+fn set_render_adapter(choice: &str) -> bool {
+    camera::use_adapter(&AdapterChoice::parse(choice))
+}
+
+/// The GPU adapter the cameras render with (name, type and driver); creates the GPU context
+/// if needed. Raises `RuntimeError` without a usable adapter.
+#[pyfunction]
+fn render_adapter(py: Python<'_>) -> PyResult<String> {
+    py.detach(camera::gpu).map(|c| c.describe()).map_err(sim_err)
+}
+
 /// A group given by index or name.
 #[derive(FromPyObject)]
 enum GroupRef {
@@ -67,6 +88,7 @@ struct GroupArrays {
     obs: Py<PyArray3<f32>>,
     state: Py<PyArray3<f64>>,
     events: Py<PyArray2<u32>>,
+    images: Option<Py<PyArrayDyn<u8>>>,
 }
 
 /// Copy the batch outputs into the numpy arrays.
@@ -75,6 +97,9 @@ fn publish(py: Python<'_>, arrays: &[GroupArrays], sim: &Batch) -> PyResult<()> 
         a.obs.bind(py).readwrite().as_slice_mut()?.copy_from_slice(sim.obs(g));
         a.state.bind(py).readwrite().as_slice_mut()?.copy_from_slice(sim.state(g));
         a.events.bind(py).readwrite().as_slice_mut()?.copy_from_slice(sim.events(g));
+        if let Some(images) = &a.images {
+            images.bind(py).readwrite().as_slice_mut()?.copy_from_slice(sim.images(g));
+        }
     }
     Ok(())
 }
@@ -183,6 +208,10 @@ impl BatchSim {
                     obs: PyArray3::zeros(py, [num_envs, c, g.obs_dim()], false).unbind(),
                     state: PyArray3::zeros(py, [num_envs, c, STATE_DIM], false).unbind(),
                     events: PyArray2::zeros(py, [num_envs, c], false).unbind(),
+                    images: g
+                        .obs
+                        .image_shape()
+                        .map(|[h, w, ch]| PyArrayDyn::zeros(py, vec![num_envs, c, h, w, ch], false).unbind()),
                 }
             })
             .collect::<Vec<_>>();
@@ -281,6 +310,14 @@ impl BatchSim {
         Ok(self.arrays[self.group(&group)?].events.bind(py).clone())
     }
 
+    /// Camera images of a group, `uint8 [num_envs, count, height, width, channels]` (channels
+    /// of the camera terms in order; see `group_info`'s `image_layout`), overwritten in place;
+    /// `None` if the group has no camera terms.
+    #[pyo3(signature = (group = GroupRef::Index(0)))]
+    fn images<'py>(&self, py: Python<'py>, group: GroupRef) -> PyResult<Option<Bound<'py, PyArrayDyn<u8>>>> {
+        Ok(self.arrays[self.group(&group)?].images.as_ref().map(|a| a.bind(py).clone()))
+    }
+
     #[getter]
     fn num_envs(&self) -> usize {
         self.num_envs
@@ -332,7 +369,9 @@ impl BatchSim {
     }
 
     /// Layout of a group: name, count, vehicle, family, action mode, `obs_dim`, `act_dim` and the
-    /// observation terms as `(name, offset, length)`; for ground vehicles in `vk`/`vw` also
+    /// observation terms as `(name, offset, length)`, `image_shape` (`(height, width,
+    /// channels)` or `None`) and `image_layout`, the camera terms as `(sensor/output, first
+    /// channel, channels)`; for ground vehicles in `vk`/`vw` also
     /// `full_scale`, the action map's full-scale speed, reverse speed (m/s), curvature (1/m)
     /// and yaw rate (rad/s).
     #[pyo3(signature = (group = GroupRef::Index(0)))]
@@ -349,6 +388,8 @@ impl BatchSim {
         d.set_item("num_rotors", g.def.as_multirotor().map_or(0, |d| d.rotors.len()))?;
         d.set_item("mass", g.def.mass())?;
         d.set_item("obs_layout", g.obs.layout())?;
+        d.set_item("image_shape", g.obs.image_shape().map(|[h, w, c]| (h, w, c)))?;
+        d.set_item("image_layout", g.obs.image_layout())?;
         if let Some(m) = g.action_map.as_ground() {
             let full = PyDict::new(py);
             full.set_item("speed", m.speed())?;
@@ -448,10 +489,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(default_scenario, m)?)?;
     m.add_function(wrap_pyfunction!(vehicle_presets, m)?)?;
     m.add_function(wrap_pyfunction!(trailer_presets, m)?)?;
+    m.add_function(wrap_pyfunction!(set_render_adapter, m)?)?;
+    m.add_function(wrap_pyfunction!(render_adapter, m)?)?;
     m.add_class::<BatchSim>()?;
     m.add("STATE_DIM", STATE_DIM)?;
     m.add("STATE_FIELDS", STATE_FIELDS.to_vec())?;
     m.add("EVENTS", Events::NAMES.iter().map(|(n, e)| (*n, e.0)).collect::<Vec<_>>())?;
     m.add("TERMINAL_EVENTS", Events::TERMINAL.0)?;
+    m.add("SEMANTIC_CLASSES", SemanticClass::ALL.iter().map(|c| c.name()).collect::<Vec<_>>())?;
     Ok(())
 }

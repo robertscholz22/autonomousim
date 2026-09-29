@@ -7,6 +7,7 @@ from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.fixed_wing_waypoints import FixedWingWaypoints
 from autonomousim.tasks.heli_landing_zone import HeliLandingZone
 from autonomousim.tasks.hover import QuadHover
+from autonomousim.tasks.hover_pad import QuadHoverPad
 from autonomousim.tasks.motorcycle_road import MotorcycleRoadRural
 from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.tasks.recover import QuadRecover
@@ -19,6 +20,7 @@ from autonomousim.tasks.waypoint_forest import QuadWaypointForest
 
 TASKS: dict[str, type[Task]] = {
     "hover": QuadHover,
+    "hover_pad": QuadHoverPad,
     "recover": QuadRecover,
     "waypoint_forest": QuadWaypointForest,
     "car_waypoint": CarWaypointOffroad,
@@ -33,7 +35,7 @@ TASKS: dict[str, type[Task]] = {
 
 
 def make_task(task: str | Task, **kwargs: Any) -> Task:
-    """A task instance from its name (``hover``, ``recover``, ``waypoint_forest``,
+    """A task instance from its name (``hover``, ``hover_pad``, ``recover``, ``waypoint_forest``,
     ``car_waypoint``, ``road_follow``, ``trailer_reverse``, ``tracked_cross_country``,
     ``motorcycle_road``, ``fixed_wing_waypoints``, ``heli_landing_zone``, ``tiltrotor_delivery``) and keyword
     arguments, or the instance itself."""
@@ -57,6 +59,7 @@ __all__ = [
     "MotorcycleRoadRural",
     "MultiAgentTask",
     "QuadHover",
+    "QuadHoverPad",
     "QuadRecover",
     "QuadWaypointForest",
     "RoadFollowRural",

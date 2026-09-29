@@ -8,7 +8,7 @@ use autonomousim_world::obstacles::tags;
 use autonomousim_world::{Obstacle, ObstacleClass};
 
 /// Version of the class table below.
-pub const SEMANTIC_VERSION: u32 = 1;
+pub const SEMANTIC_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -39,10 +39,12 @@ pub enum SemanticClass {
     OwnVehicle = 12,
     /// Any other agent's vehicle.
     Vehicle = 13,
+    /// Markers placed by the scenario, e.g. landing pads under goals (version 2).
+    Marker = 14,
 }
 
 impl SemanticClass {
-    pub const ALL: [SemanticClass; 14] = [
+    pub const ALL: [SemanticClass; 15] = [
         Self::Sky,
         Self::Grass,
         Self::ForestFloor,
@@ -57,6 +59,7 @@ impl SemanticClass {
         Self::Building,
         Self::OwnVehicle,
         Self::Vehicle,
+        Self::Marker,
     ];
 
     pub fn id(self) -> u8 {
@@ -83,6 +86,7 @@ impl SemanticClass {
             Self::Building => "building",
             Self::OwnVehicle => "own_vehicle",
             Self::Vehicle => "vehicle",
+            Self::Marker => "marker",
         }
     }
 }

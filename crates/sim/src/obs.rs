@@ -190,6 +190,14 @@ impl CameraOutput {
             CameraOutput::Depth | CameraOutput::Semantic => 1,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CameraOutput::Rgb => "rgb",
+            CameraOutput::Depth => "depth",
+            CameraOutput::Semantic => "semantic",
+        }
+    }
 }
 
 /// Default `range` of the depth image (m).
@@ -277,8 +285,10 @@ struct Compiled {
     count: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ImageTerm {
+    /// `<sensor>/<output>`.
+    name: String,
     sensor: usize,
     output: CameraOutput,
     range: f64,
@@ -365,7 +375,8 @@ impl CompiledObs {
                     return Err(format!("camera terms of a group must have one image size: {t:?} is {w}×{h}"));
                 }
                 shape[2] += output.channels();
-                images.push(ImageTerm { sensor, output, range });
+                let name = format!("{}/{}", sensors[sensor].name, output.name());
+                images.push(ImageTerm { name, sensor, output, range });
                 continue;
             }
             if t.term.needs_wheels() && num_wheels == 0 {
@@ -474,6 +485,19 @@ impl CompiledObs {
             }
             first += n;
         }
+    }
+
+    /// The camera terms as `(name, first channel, channels)`, named `<sensor>/<output>`.
+    pub fn image_layout(&self) -> Vec<(String, usize, usize)> {
+        let mut off = 0;
+        self.images
+            .iter()
+            .map(|t| {
+                let n = t.output.channels();
+                off += n;
+                (t.name.clone(), off - n, n)
+            })
+            .collect()
     }
 
     /// `(term name, offset, length)` of each term.

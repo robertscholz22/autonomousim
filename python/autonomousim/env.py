@@ -1,5 +1,6 @@
 """Single-environment Gymnasium adapter (``gym.make``), e.g. for ``check_env`` and tools that
-expect a ``gym.Env``. Training should use the native vector environment (``gym.make_vec``)."""
+expect a ``gym.Env``. Training should use the native vector environment (``gym.make_vec``).
+With camera terms the observation is a ``Dict`` (see ``autonomousim.vector_env``)."""
 
 import json
 from typing import Any
@@ -9,6 +10,7 @@ import numpy as np
 
 from autonomousim._native import BatchSim
 from autonomousim.tasks import Task, make_task
+from autonomousim.vector_env import copy_obs, obs_space
 
 
 class AutonomousimEnv(gym.Env):
@@ -30,9 +32,13 @@ class AutonomousimEnv(gym.Env):
         self.obs_dim = int(info["obs_dim"])
         self.act_dim = int(info["act_dim"])
         self.obs_layout = info["obs_layout"]
-        self.observation_space = gym.spaces.Box(-np.inf, np.inf, (self.obs_dim,), np.float32)
+        self.image_shape = info["image_shape"]
+        self.obs_image_layout = info["image_layout"]
+        self.observation_space = obs_space(self.obs_dim, self.image_shape)
         self.action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
         self._obs = self.sim.obs(0)[0, 0]
+        images = self.sim.images(0)
+        self._view = self._obs if images is None else {"state": self._obs, "image": images[0, 0]}
         self._state = self.sim.state(0)[:, 0, :]
         self._events = self.sim.events(0)[:, 0]
         self.task.bind(1, self.sim.policy_dt, self.act_dim)
@@ -41,14 +47,14 @@ class AutonomousimEnv(gym.Env):
         super().reset(seed=seed)
         self.sim.reset(None, None if seed is None else [seed])
         self.task.reset(None, self._state)
-        return self._obs.copy(), {}
+        return copy_obs(self._view), {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         a = np.asarray(action, dtype=np.float32).reshape(1, self.act_dim)
         self.sim.step(a)
         reward, terminated, truncated = self.task.compute(self._state, self._events, a)
         info = {"events": int(self._events[0]), "success": bool(self.task.success[0])}
-        return self._obs.copy(), float(reward[0]), bool(terminated[0]), bool(truncated[0]), info
+        return copy_obs(self._view), float(reward[0]), bool(terminated[0]), bool(truncated[0]), info
 
     def close(self) -> None:
         self.sim.close()

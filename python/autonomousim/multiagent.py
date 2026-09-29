@@ -14,7 +14,8 @@ obs, reward, terminated, truncated, info = envs.step(actions)
 ```
 
 Arrays are per group, keyed by group name: ``obs[g]`` ``float32 [num_envs, count, obs_dim]``,
-``reward[g]`` ``float64 [num_envs, count]``, ``terminated[g]`` ``bool [num_envs, count]``;
+or with camera terms ``{"state": that, "image": uint8 [num_envs, count, height, width,
+channels]}``, ``reward[g]`` ``float64 [num_envs, count]``, ``terminated[g]`` ``bool [num_envs, count]``;
 ``truncated`` is per world, ``bool [num_envs]``. ``step`` takes ``{group: [num_envs, count,
 act_dim]}``, or one array when there is a single group.
 
@@ -44,7 +45,7 @@ import numpy as np
 
 from autonomousim._native import BatchSim
 from autonomousim.tasks.multi import MultiAgentTask, make_multi_task
-from autonomousim.vector_env import _seeds
+from autonomousim.vector_env import _seeds, copy_obs, obs_space
 
 
 class MultiAgentVectorEnv:
@@ -77,18 +78,23 @@ class MultiAgentVectorEnv:
         self.obs_dim: dict[str, int] = {}
         self.act_dim: dict[str, int] = {}
         self.obs_layout: dict[str, Any] = {}
+        self.image_shape: dict[str, tuple[int, int, int] | None] = {}
+        self.obs_image_layout: dict[str, Any] = {}
         for g in self.groups:
             info = self.sim.group_info(g)
             self.count[g] = int(info["count"])
             self.obs_dim[g] = int(info["obs_dim"])
             self.act_dim[g] = int(info["act_dim"])
             self.obs_layout[g] = info["obs_layout"]
-        self.single_observation_spaces = {
-            g: gym.spaces.Box(-np.inf, np.inf, (self.obs_dim[g],), np.float32) for g in self.groups
-        }
+            self.image_shape[g] = info["image_shape"]
+            self.obs_image_layout[g] = info["image_layout"]
+        self.single_observation_spaces = {g: obs_space(self.obs_dim[g], self.image_shape[g]) for g in self.groups}
         self.single_action_spaces = {g: gym.spaces.Box(-1.0, 1.0, (self.act_dim[g],), np.float32) for g in self.groups}
         # Views of the native output arrays (overwritten in place by every step and reset).
-        self._obs = {g: self.sim.obs(g) for g in self.groups}
+        self._obs: dict[str, Any] = {}
+        for g in self.groups:
+            images = self.sim.images(g)
+            self._obs[g] = self.sim.obs(g) if images is None else {"state": self.sim.obs(g), "image": images}
         self._state = {g: self.sim.state(g) for g in self.groups}
         self._events = {g: self.sim.events(g) for g in self.groups}
         self.task.bind(num_envs, self.sim.policy_dt, self.act_dim)
@@ -101,9 +107,15 @@ class MultiAgentVectorEnv:
 
     # ------------------------------------------------------------------ spaces
 
-    def observation_space(self, group: str) -> gym.spaces.Box:
-        """Batched observation space of a group, ``[num_envs, count, obs_dim]``."""
-        return gym.spaces.Box(-np.inf, np.inf, (self.num_envs, self.count[group], self.obs_dim[group]), np.float32)
+    def observation_space(self, group: str) -> gym.spaces.Space:
+        """Batched observation space of a group, ``[num_envs, count, obs_dim]`` (a ``Dict`` with
+        ``image`` ``[num_envs, count, height, width, channels]`` for camera terms)."""
+        lead = (self.num_envs, self.count[group])
+        state = gym.spaces.Box(-np.inf, np.inf, (*lead, self.obs_dim[group]), np.float32)
+        if self.image_shape[group] is None:
+            return state
+        image = gym.spaces.Box(0, 255, (*lead, *self.image_shape[group]), np.uint8)
+        return gym.spaces.Dict({"state": state, "image": image})
 
     def action_space(self, group: str) -> gym.spaces.Box:
         """Batched action space of a group, ``[num_envs, count, act_dim]``."""
@@ -184,12 +196,12 @@ class MultiAgentVectorEnv:
             self._success[g][m] = False
         self._length[m] = 0
 
-    def _observation(self) -> dict[str, np.ndarray]:
+    def _observation(self) -> dict[str, Any]:
         return self._copy(self._obs) if self.copy else dict(self._obs)
 
     @staticmethod
-    def _copy(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        return {g: a.copy() for g, a in arrays.items()}
+    def _copy(arrays: dict[str, Any]) -> dict[str, Any]:
+        return {g: copy_obs(a) for g, a in arrays.items()}
 
     @property
     def state(self) -> dict[str, np.ndarray]:

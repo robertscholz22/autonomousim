@@ -22,6 +22,11 @@ Autoreset (``metadata["autoreset_mode"]``):
 
 ``NEXT_STEP`` is not supported: all worlds step together.
 
+Tasks with camera observation terms (``{"term": "camera", ...}``) observe a ``Dict``:
+``{"state": float32 [obs_dim], "image": uint8 [height, width, channels]}`` per world, the
+image channels being those of the camera terms in order (``obs_image_layout``). ``final_obs``
+is then a dict of such arrays too.
+
 ``info`` holds ``events`` (``uint32 [num_envs]``, see ``autonomousim.events``) on every step.
 When an episode ends it also holds ``episode = {"r": return, "l": length, "success": ...}``
 (float64, int64, bool; success as defined by the task, always false for tasks without one),
@@ -41,6 +46,20 @@ from autonomousim._native import BatchSim
 from autonomousim.tasks import Task, make_task
 
 
+def obs_space(obs_dim: int, image_shape: tuple[int, int, int] | None) -> gym.spaces.Space:
+    """Observation space of one agent: a ``Box`` of ``obs_dim`` values, or with camera terms a
+    ``Dict`` of that (``state``) and the ``uint8`` image of ``image_shape`` (``image``)."""
+    state = gym.spaces.Box(-np.inf, np.inf, (obs_dim,), np.float32)
+    if image_shape is None:
+        return state
+    return gym.spaces.Dict({"state": state, "image": gym.spaces.Box(0, 255, tuple(image_shape), np.uint8)})
+
+
+def copy_obs(obs: np.ndarray | dict[str, np.ndarray]) -> np.ndarray | dict[str, np.ndarray]:
+    """A copy of an observation array or dict of arrays."""
+    return {k: v.copy() for k, v in obs.items()} if isinstance(obs, dict) else obs.copy()
+
+
 def _seeds(seed: int | list[int] | None, num_envs: int) -> np.ndarray | None:
     """Per-world seeds, Gymnasium style: ``seed + i`` for an int, one per world for a list."""
     if seed is None:
@@ -57,8 +76,8 @@ class AutonomousimVectorEnv(VectorEnv):
     """``num_envs`` worlds of a task, one agent each, stepped in parallel on ``num_threads``
     threads (0: one per logical CPU). ``seed`` sets the worlds' base seeds before the first
     ``reset``. Other keyword arguments go to the task (see ``autonomousim.tasks``). With
-    ``copy=False``, ``reset`` and ``step`` return a view of the observation buffer. The next
-    call overwrites that view."""
+    ``copy=False``, ``reset`` and ``step`` return views of the observation buffers. The next
+    call overwrites those views."""
 
     metadata = {"autoreset_mode": AutoresetMode.SAME_STEP, "render_modes": []}
 
@@ -88,15 +107,19 @@ class AutonomousimVectorEnv(VectorEnv):
         self.obs_dim = int(info["obs_dim"])
         self.act_dim = int(info["act_dim"])
         self.obs_layout = info["obs_layout"]
+        self.image_shape = info["image_shape"]
+        self.obs_image_layout = info["image_layout"]
         self.metadata = {**type(self).metadata, "autoreset_mode": mode}
         self.render_mode = None
         self.copy = copy
-        self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (self.obs_dim,), np.float32)
+        self.single_observation_space = obs_space(self.obs_dim, self.image_shape)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
         self.observation_space = batch_space(self.single_observation_space, num_envs)
         self.action_space = batch_space(self.single_action_space, num_envs)
         # Views of the native output arrays (overwritten in place by every step and reset).
         self._obs = self.sim.obs(0)[:, 0, :]
+        images = self.sim.images(0)
+        self._view = self._obs if images is None else {"state": self._obs, "image": images[:, 0]}
         self._state = self.sim.state(0)[:, 0, :]
         self._events = self.sim.events(0)[:, 0]
         self.task.bind(num_envs, self.sim.policy_dt, self.act_dim)
@@ -145,7 +168,7 @@ class AutonomousimVectorEnv(VectorEnv):
             self._return[done] = 0.0
             self._length[done] = 0
             if self.metadata["autoreset_mode"] == AutoresetMode.SAME_STEP:
-                info["final_obs"] = self._obs.copy()
+                info["final_obs"] = copy_obs(self._view)
                 info["_final_obs"] = done
                 self.sim.reset(done)
                 self.task.reset(done, self._state)
@@ -156,8 +179,8 @@ class AutonomousimVectorEnv(VectorEnv):
 
     # ------------------------------------------------------------------ helpers
 
-    def _observation(self) -> np.ndarray:
-        return self._obs.copy() if self.copy else self._obs
+    def _observation(self) -> np.ndarray | dict[str, np.ndarray]:
+        return copy_obs(self._view) if self.copy else self._view
 
     @property
     def state(self) -> np.ndarray:

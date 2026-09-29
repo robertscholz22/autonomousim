@@ -16,7 +16,8 @@ Agents are named ``"<group>_<k>"``. An agent that stops (see ``autonomousim.task
 reports ``terminations[agent] = True`` once and then leaves ``env.agents``. At the time
 limit, every agent still going is truncated. The episode is over when ``env.agents`` is
 empty; call ``reset`` for the next one. ``infos[agent]["events"]`` holds the agent's event
-bits of the step (``autonomousim.events``). For training many worlds at once, use
+bits of the step (``autonomousim.events``). With camera terms an agent observes a dict
+``{"state", "image"}`` (see ``autonomousim.vector_env``). For training many worlds at once, use
 ``MultiAgentVectorEnv`` directly.
 """
 
@@ -67,7 +68,7 @@ class AutonomousimParallelEnv(_ParallelEnv):
         return self._venv.task
 
     @functools.cache  # noqa: B019 (one space object per agent, as PettingZoo requires)
-    def observation_space(self, agent: str) -> gym.spaces.Box:
+    def observation_space(self, agent: str) -> gym.spaces.Space:
         return self._obs_spaces[agent]
 
     @functools.cache  # noqa: B019
@@ -80,7 +81,7 @@ class AutonomousimParallelEnv(_ParallelEnv):
         obs, _ = self._venv.reset(seed=seed)
         self.agents = self.possible_agents[:]
         return (
-            {a: obs[g][0, k] for a, (g, k) in self._slots.items()},
+            {a: _agent_obs(obs[g], k) for a, (g, k) in self._slots.items()},
             {a: {} for a in self.agents},
         )
 
@@ -99,7 +100,7 @@ class AutonomousimParallelEnv(_ParallelEnv):
         out = ({}, {}, {}, {}, {})
         for a in live:
             g, k = self._slots[a]
-            out[0][a] = obs[g][0, k]
+            out[0][a] = _agent_obs(obs[g], k)
             out[1][a] = float(reward[g][0, k])
             out[2][a] = bool(terminated[g][0, k])
             out[3][a] = bool(truncated[0]) and not out[2][a]
@@ -117,6 +118,11 @@ class AutonomousimParallelEnv(_ParallelEnv):
 
     def close(self) -> None:
         self._venv.close()
+
+
+def _agent_obs(obs: np.ndarray | dict[str, np.ndarray], k: int) -> np.ndarray | dict[str, np.ndarray]:
+    """Agent ``k``'s observation in world 0 of a group's (possibly dict) observation."""
+    return {n: v[0, k] for n, v in obs.items()} if isinstance(obs, dict) else obs[0, k]
 
 
 def parallel_env(task: str | MultiAgentTask, **kwargs: Any) -> AutonomousimParallelEnv:

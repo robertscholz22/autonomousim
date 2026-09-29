@@ -138,6 +138,13 @@ Registered tasks: `QuadHover-v0`, `QuadRecover-v0`, `QuadWaypointForest-v0`,
 or `autonomousim.pettingzoo.parallel_env`). Task options such as `action_mode`, `map_seed` or reward weights are
 passed as keyword arguments.
 
+Camera sensors render RGB, depth and semantic images on the GPU (headless wgpu; all worlds of a
+batch in one submission). A task with camera observation terms observes a `Dict`
+`{"state": float32 [obs_dim], "image": uint8 [H, W, C]}`, e.g. `QuadHoverPad-v0` (hover over a
+landing pad seen by a downward camera), trained with `examples/ppo_pixels.py` (a small CNN
+encoder). `AUTONOMOUSIM_RENDER_ADAPTER` picks the GPU (`auto`, `software` for Mesa's lavapipe,
+or part of an adapter name).
+
 ### Train, record, replay
 
 ```bash
@@ -167,9 +174,10 @@ re-simulated from the file. The viewer relies on this for replay.
 | `crates/procgen` | Noise, erosion, hydrology, biomes, scatter; the wild map generator and cache |
 | `crates/vehicles` | Vehicle definitions (TOML), multirotor and wheeled-vehicle models, tyres |
 | `crates/control` | Multirotor cascade, allocation, ground-vehicle controllers, action modes |
-| `crates/sensors` | IMU, GPS, baro, mag, rangefinder, LiDAR |
+| `crates/sensors` | IMU, GPS, baro, mag, rangefinder, LiDAR, camera |
 | `crates/sim` | Worlds, agents, scenarios, observations, batched simulation, MCAP recording, policy playback |
 | `crates/scene` | Renderer-independent meshes (terrain chunks, vegetation, vehicles) |
+| `crates/render` | Headless wgpu renderer for camera sensors (RGB, depth, semantic classes) |
 | `crates/py` | Python bindings (`autonomousim._native`, PyO3) |
 | `crates/viewer` | The Bevy viewer (live, replay and trained policies) |
 | `crates/cli` | `autonomousim mapgen / map-hash / map-info / version` |

@@ -3,6 +3,8 @@
 Importing the package registers the Gymnasium environments:
 
 - ``autonomousim/QuadHover-v0``: fly to a goal up to 2 m away and hold it;
+- ``autonomousim/QuadHoverPad-v0``: find a landing pad with a downward camera and hover over
+  it (``Dict`` observations with an image);
 - ``autonomousim/QuadRecover-v0``: recover from any attitude and hold position;
 - ``autonomousim/QuadWaypointForest-v0``: fly through waypoints in generated forests with
   LiDAR;
@@ -33,10 +35,13 @@ wind, randomisation, observations and scenario overrides.
 import gymnasium as _gym
 
 from autonomousim._native import (
+    SEMANTIC_CLASSES,
     STATE_DIM,
     STATE_FIELDS,
     BatchSim,
     native_version,
+    render_adapter,
+    set_render_adapter,
     trailer_presets,
     vehicle_presets,
 )
@@ -48,6 +53,7 @@ __version__ = native_version()
 
 ENVS = {
     "QuadHover-v0": "hover",
+    "QuadHoverPad-v0": "hover_pad",
     "QuadRecover-v0": "recover",
     "QuadWaypointForest-v0": "waypoint_forest",
     "CarWaypointOffroad-v0": "car_waypoint",
@@ -71,6 +77,7 @@ for _name, _task in ENVS.items():
 
 __all__ = [
     "ENVS",
+    "SEMANTIC_CLASSES",
     "STATE",
     "STATE_DIM",
     "STATE_FIELDS",
@@ -81,6 +88,8 @@ __all__ = [
     "__version__",
     "default_scenario",
     "load_scenario",
+    "render_adapter",
+    "set_render_adapter",
     "trailer_presets",
     "vehicle_presets",
 ]

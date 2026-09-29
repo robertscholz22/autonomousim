@@ -17,6 +17,8 @@ from autonomousim.tasks.base import map_source
 from autonomousim.vector_env import AutonomousimVectorEnv
 
 IDS = [f"autonomousim/{name}" for name in autonomousim.ENVS]
+# Environments with camera (``Dict``) observations; their vector tests are in test_cameras.py.
+IMAGE_IDS = {"autonomousim/QuadHoverPad-v0"}
 # Small maps for the API tests (the waypoint task defaults to a pool of 16 generated maps).
 RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
 # A 4 km tiled map (the aircraft task defaults to the 16 km one).
@@ -68,7 +70,7 @@ def test_check_env(env_id):
     env.close()
 
 
-@pytest.mark.parametrize("env_id", IDS)
+@pytest.mark.parametrize("env_id", [i for i in IDS if i not in IMAGE_IDS])
 def test_vector_spaces_and_dtypes(env_id):
     envs = gym.make_vec(env_id, num_envs=4, num_threads=2, **KWARGS.get(env_id, {}))
     assert isinstance(envs.unwrapped, AutonomousimVectorEnv)

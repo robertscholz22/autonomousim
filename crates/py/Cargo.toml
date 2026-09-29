@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 autonomousim-core.workspace = true
+autonomousim-render.workspace = true
 autonomousim-sim.workspace = true
 autonomousim-vehicles.workspace = true
 pyo3.workspace = true

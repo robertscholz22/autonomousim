@@ -148,6 +148,28 @@ pub fn cylinder(radius: f32, half_height: f32, segments: usize, color: [f32; 4])
     m
 }
 
+/// A flat landing pad of `radius` at `z = 0`, facing up: an orange disc inside a white ring
+/// (the outer 30 %), with a white bar across the centre along x.
+pub fn landing_pad(radius: f32) -> MeshData {
+    const SEGMENTS: usize = 32;
+    let (white, orange) = (srgb([235, 235, 235]), srgb([240, 110, 20]));
+    let mut m = MeshData::new();
+    let outer = ring(radius, 0.0, SEGMENTS);
+    let inner = ring(0.7 * radius, 0.0, SEGMENTS);
+    for k in 0..SEGMENTS {
+        let j = (k + 1) % SEGMENTS;
+        m.push_flat_triangle(inner[k], outer[k], outer[j], white);
+        m.push_flat_triangle(inner[k], outer[j], inner[j], white);
+        m.push_flat_triangle(Vec3::ZERO, inner[k], inner[j], orange);
+    }
+    // The bar lies 1 mm above the disc.
+    let (a, b) = (0.5 * radius, 0.1 * radius);
+    let q = |x: f32, y: f32| Vec3::new(x, y, 0.001);
+    m.push_flat_triangle(q(-a, -b), q(a, -b), q(a, b), white);
+    m.push_flat_triangle(q(-a, -b), q(a, b), q(-a, b), white);
+    m
+}
+
 /// Open cylinder (no caps) from `z = −half_height` to `+half_height`, with smooth normals.
 pub fn tube(radius: f32, half_height: f32, segments: usize, color: [f32; 4]) -> MeshData {
     let mut m = MeshData::new();
