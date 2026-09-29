@@ -7,8 +7,13 @@
 //!
 //! World `i` has the base seed `seed/env/i`: its episodes do not depend on the number of
 //! worlds in the batch.
+//!
+//! With cameras, a step runs the physics of all worlds in parallel, renders the frames due in
+//! every world on the GPU (in world order), then adds the noise and writes the outputs in
+//! parallel. Images are `[num_envs, count, height, width, channels]` `u8` per group.
 
 use crate::SimError;
+use crate::camera::{self, Cameras, Capture};
 use crate::record::Recorder;
 use crate::scenario::{CompiledScenario, Scenario};
 use crate::world::{STATE_DIM, WorldInstance};
@@ -23,15 +28,20 @@ pub const TILES_PER_AGENT: usize = 8;
 struct Slot {
     world: WorldInstance,
     obs: Vec<Vec<f32>>,
+    images: Vec<Vec<u8>>,
     state: Vec<Vec<f64>>,
     events: Vec<Vec<u32>>,
     recorder: Option<Recorder>,
+    /// Frames rendered for the world, not yet delivered.
+    captures: Vec<Capture>,
 }
 
 impl Slot {
     fn write_outputs(&mut self) {
+        self.world.deliver(self.captures.drain(..));
         for g in 0..self.obs.len() {
             self.world.observe(g, &mut self.obs[g]);
+            self.world.observe_images(g, &mut self.images[g]);
             self.world.write_state(g, &mut self.state[g]);
             self.world.write_events(g, &mut self.events[g]);
         }
@@ -45,7 +55,6 @@ impl Slot {
             }
             None => self.world.step(),
         }
-        self.write_outputs();
     }
 
     fn reset(&mut self, seed: Option<u64>) {
@@ -53,7 +62,6 @@ impl Slot {
         if let Some(r) = &mut self.recorder {
             r.on_reset(&self.world);
         }
-        self.write_outputs();
     }
 }
 
@@ -61,7 +69,9 @@ pub struct BatchSim {
     scenario: Arc<CompiledScenario>,
     slots: Vec<Slot>,
     pool: rayon::ThreadPool,
+    cameras: Option<Cameras>,
     obs: Vec<Vec<f32>>,
+    images: Vec<Vec<u8>>,
     state: Vec<Vec<f64>>,
     events: Vec<Vec<u32>>,
 }
@@ -89,6 +99,8 @@ impl BatchSim {
             .map_err(|e| SimError::Scenario(format!("thread pool: {e}")))?;
         let groups = &scenario.groups;
         let obs_len: Vec<usize> = groups.iter().map(|g| g.spec.count * g.obs_dim()).collect();
+        let image_len: Vec<usize> = groups.iter().map(|g| g.spec.count * g.obs.image_len()).collect();
+        let cameras = if camera::has_cameras(&scenario) { Some(Cameras::new(camera::gpu()?, &scenario)) } else { None };
         let state_len: Vec<usize> = groups.iter().map(|g| g.spec.count * STATE_DIM).collect();
         let events_len: Vec<usize> = groups.iter().map(|g| g.spec.count).collect();
         let base = Seed::from_u64(seed).child("env");
@@ -103,29 +115,47 @@ impl BatchSim {
         let slots: Vec<Slot> = pool.install(|| {
             (0..num_envs)
                 .into_par_iter()
-                .map(|i| {
-                    let mut s = Slot {
-                        world: WorldInstance::new(scenario.clone(), base.child_index(i as u64)),
-                        obs: obs_len.iter().map(|&n| vec![0.0; n]).collect(),
-                        state: state_len.iter().map(|&n| vec![0.0; n]).collect(),
-                        events: events_len.iter().map(|&n| vec![0; n]).collect(),
-                        recorder: None,
-                    };
-                    s.write_outputs();
-                    s
+                .map(|i| Slot {
+                    world: WorldInstance::new(scenario.clone(), base.child_index(i as u64)),
+                    obs: obs_len.iter().map(|&n| vec![0.0; n]).collect(),
+                    images: image_len.iter().map(|&n| vec![0; n]).collect(),
+                    state: state_len.iter().map(|&n| vec![0.0; n]).collect(),
+                    events: events_len.iter().map(|&n| vec![0; n]).collect(),
+                    recorder: None,
+                    captures: Vec::new(),
                 })
                 .collect()
         });
         let mut b = Self {
             obs: obs_len.iter().map(|&n| vec![0.0; n * num_envs]).collect(),
+            images: image_len.iter().map(|&n| vec![0; n * num_envs]).collect(),
             state: state_len.iter().map(|&n| vec![0.0; n * num_envs]).collect(),
             events: events_len.iter().map(|&n| vec![0; n * num_envs]).collect(),
             scenario,
             slots,
             pool,
+            cameras,
         };
-        b.gather(None);
+        b.finish(None);
         Ok(b)
+    }
+
+    /// Render the frames due in the worlds in `mask` (all if `None`), write their outputs and
+    /// gather them.
+    fn finish(&mut self, mask: Option<&[bool]>) {
+        let selected = |i: usize| mask.is_none_or(|m| m[i]);
+        if let Some(cameras) = &mut self.cameras {
+            for (i, s) in self.slots.iter_mut().enumerate().filter(|(i, _)| selected(*i)) {
+                if let Err(e) = cameras.capture(&s.world, &mut s.captures) {
+                    panic!("rendering the cameras of world {i}: {e}");
+                }
+            }
+        }
+        let slots = &mut self.slots;
+        self.pool.install(|| {
+            slots.par_iter_mut().enumerate().filter(|(i, _)| selected(*i)).for_each(|(_, s)| s.write_outputs());
+        });
+        self.gather(mask);
     }
 
     /// Copy the outputs of the worlds in `mask` (all if `None`) into the batch arrays.
@@ -136,6 +166,7 @@ impl BatchSim {
             }
             for g in 0..s.obs.len() {
                 copy_row(&mut self.obs[g], &s.obs[g], i);
+                copy_row(&mut self.images[g], &s.images[g], i);
                 copy_row(&mut self.state[g], &s.state[g], i);
                 copy_row(&mut self.events[g], &s.events[g], i);
             }
@@ -152,15 +183,23 @@ impl BatchSim {
             assert_eq!(a.len(), n * d, "action array of group {:?}", self.scenario.groups[g].spec.name);
         }
         let slots = &mut self.slots;
+        let cameras = self.cameras.is_some();
         self.pool.install(|| {
             slots.par_iter_mut().enumerate().for_each(|(i, s)| {
                 for (g, (a, d)) in actions.iter().zip(&dims).enumerate() {
                     s.world.set_actions(g, &a[i * d..(i + 1) * d]);
                 }
                 s.step();
+                if !cameras {
+                    s.write_outputs();
+                }
             });
         });
-        self.gather(None);
+        if cameras {
+            self.finish(None);
+        } else {
+            self.gather(None);
+        }
     }
 
     /// Reset the worlds in `mask` (all if `None`). With `seeds`, world `i` starts the first
@@ -181,7 +220,7 @@ impl BatchSim {
                 }
             });
         });
-        self.gather(mask);
+        self.finish(mask);
     }
 
     /// Stop the agents of group `g` where `mask` (`[num_envs, count]`) is true, for the rest
@@ -202,6 +241,17 @@ impl BatchSim {
     /// Observations of group `g`, `[num_envs, count, obs_dim]`.
     pub fn obs(&self, g: usize) -> &[f32] {
         &self.obs[g]
+    }
+
+    /// Camera images of group `g`, `[num_envs, count, height, width, channels]` (empty
+    /// without camera terms; see [`image_shape`](Self::image_shape)).
+    pub fn images(&self, g: usize) -> &[u8] {
+        &self.images[g]
+    }
+
+    /// `[height, width, channels]` of the images of group `g`, if it has camera terms.
+    pub fn image_shape(&self, g: usize) -> Option<[usize; 3]> {
+        self.scenario.groups[g].obs.image_shape()
     }
 
     /// State rows ([`STATE_FIELDS`](crate::STATE_FIELDS)) of group `g`,
@@ -239,12 +289,14 @@ impl BatchSim {
         &mut self.slots[i].world
     }
 
-    /// Rewrite the outputs of world `i` from its current state.
+    /// Rewrite the outputs of world `i` from its current state (camera images stay those of
+    /// the last frames).
     pub fn refresh(&mut self, i: usize) {
         self.slots[i].write_outputs();
         let s = &self.slots[i];
         for g in 0..s.obs.len() {
             copy_row(&mut self.obs[g], &s.obs[g], i);
+            copy_row(&mut self.images[g], &s.images[g], i);
             copy_row(&mut self.state[g], &s.state[g], i);
             copy_row(&mut self.events[g], &s.events[g], i);
         }

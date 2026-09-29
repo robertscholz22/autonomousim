@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod batch;
 pub mod bay;
+pub mod camera;
 pub mod drive;
 pub mod events;
 pub mod interaction;
@@ -49,4 +50,6 @@ pub enum SimError {
     Io(#[from] std::io::Error),
     #[error("recording error: {0}")]
     Record(String),
+    #[error("rendering error: {0}")]
+    Render(String),
 }

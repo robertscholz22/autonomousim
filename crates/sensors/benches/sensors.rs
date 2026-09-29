@@ -37,6 +37,7 @@ fn bench(c: &mut Criterion) {
             SensorConfig::Pitot(c) => 500 / c.rate_hz,
             SensorConfig::Rangefinder(c) => 500 / c.rate_hz,
             SensorConfig::Lidar(c) => 500 / c.rate_hz,
+            SensorConfig::Camera(c) => 500 / c.rate_hz,
             SensorConfig::GroundTruth(c) => 500 / c.rate_hz,
         };
         c.bench_function(&format!("sensor/{name}"), |b| {

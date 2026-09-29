@@ -458,6 +458,7 @@ fn readings_are_deterministic() {
                         Sensor::Pitot(s) => format!("{:?}", s.latest()),
                         Sensor::Rangefinder(s) => format!("{:?}", s.latest()),
                         Sensor::Lidar(s) => format!("{:?}", s.latest()),
+                        Sensor::Camera(s) => format!("{:?}", s.latest()),
                         Sensor::GroundTruth(s) => format!("{:?}", s.latest()),
                     };
                 }

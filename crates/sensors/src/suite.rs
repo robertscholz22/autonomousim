@@ -15,8 +15,9 @@
 //! ```
 
 use crate::{
-    BaroConfig, Barometer, BodyKinematics, Gps, GpsConfig, GroundTruthConfig, GroundTruthSensor, Imu, ImuConfig, Lidar,
-    LidarConfig, MagConfig, Magnetometer, Pitot, PitotConfig, Rangefinder, RangefinderConfig, SensorEnv, SensorError,
+    BaroConfig, Barometer, BodyKinematics, Camera, CameraConfig, Gps, GpsConfig, GroundTruthConfig, GroundTruthSensor,
+    Imu, ImuConfig, Lidar, LidarConfig, MagConfig, Magnetometer, Pitot, PitotConfig, Rangefinder, RangefinderConfig,
+    SensorEnv, SensorError,
 };
 use autonomousim_core::rng::Seed;
 use autonomousim_core::time::Clock;
@@ -32,6 +33,7 @@ pub enum SensorConfig {
     Pitot(PitotConfig),
     Rangefinder(RangefinderConfig),
     Lidar(LidarConfig),
+    Camera(CameraConfig),
     GroundTruth(GroundTruthConfig),
 }
 
@@ -45,6 +47,7 @@ impl SensorConfig {
             SensorConfig::Pitot(_) => "pitot",
             SensorConfig::Rangefinder(_) => "rangefinder",
             SensorConfig::Lidar(_) => "lidar",
+            SensorConfig::Camera(_) => "camera",
             SensorConfig::GroundTruth(_) => "ground_truth",
         }
     }
@@ -78,6 +81,7 @@ pub enum Sensor {
     Pitot(Pitot),
     Rangefinder(Rangefinder),
     Lidar(Lidar),
+    Camera(Camera),
     GroundTruth(GroundTruthSensor),
 }
 
@@ -91,6 +95,7 @@ impl Sensor {
             SensorConfig::Pitot(c) => Sensor::Pitot(Pitot::new(c.clone(), clock, seed)?),
             SensorConfig::Rangefinder(c) => Sensor::Rangefinder(Rangefinder::new(c.clone(), clock, seed)?),
             SensorConfig::Lidar(c) => Sensor::Lidar(Lidar::new(c.clone(), clock, seed)?),
+            SensorConfig::Camera(c) => Sensor::Camera(Camera::new(c.clone(), clock, seed)?),
             SensorConfig::GroundTruth(c) => Sensor::GroundTruth(GroundTruthSensor::new(c.clone(), clock)?),
         })
     }
@@ -105,11 +110,13 @@ impl Sensor {
             Sensor::Pitot(s) => s.reset(seed),
             Sensor::Rangefinder(s) => s.reset(seed),
             Sensor::Lidar(s) => s.reset(seed),
+            Sensor::Camera(s) => s.reset(seed),
             Sensor::GroundTruth(s) => s.reset(),
         }
     }
 
-    /// Advance one physics tick; true if a new reading became visible.
+    /// Advance one physics tick; true if a new reading became visible. Cameras take their
+    /// frames through [`Camera::capture`] instead.
     pub fn update(&mut self, tick: u64, time: f64, kin: &BodyKinematics, env: &SensorEnv) -> bool {
         match self {
             Sensor::Imu(s) => s.update(tick, time, kin, env),
@@ -119,6 +126,7 @@ impl Sensor {
             Sensor::Pitot(s) => s.update(tick, time, kin, env),
             Sensor::Rangefinder(s) => s.update(tick, time, kin, env),
             Sensor::Lidar(s) => s.update(tick, time, kin, env),
+            Sensor::Camera(_) => false,
             Sensor::GroundTruth(s) => s.update(tick, time, kin, env),
         }
     }

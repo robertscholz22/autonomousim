@@ -1,5 +1,5 @@
 //! Sensor models: IMU, GPS, barometer, magnetometer, pitot-static airspeed, rangefinder, raycast
-//! LiDAR and ground truth.
+//! LiDAR, camera and ground truth.
 //!
 //! Every sensor is updated once per physics tick with the vehicle's [`BodyKinematics`] and the
 //! [`SensorEnv`]. It measures on the ticks its rate divides, and a reading becomes visible
@@ -12,6 +12,7 @@
 //! readings are in the sensor frame.
 
 pub mod baro;
+pub mod camera;
 pub mod gps;
 pub mod ground_truth;
 pub mod imu;
@@ -24,6 +25,7 @@ pub mod rangefinder;
 pub mod suite;
 
 pub use baro::{BaroConfig, BaroReading, Barometer};
+pub use camera::{Camera, CameraConfig, CameraImage, CameraNoise};
 pub use gps::{Gps, GpsConfig, GpsFix};
 pub use ground_truth::{GroundTruth, GroundTruthConfig, GroundTruthSensor};
 pub use imu::{Imu, ImuConfig, ImuReading, InertialNoise};

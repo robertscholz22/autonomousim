@@ -1035,7 +1035,7 @@ impl CompiledScenario {
             if spec.groups[..gi].iter().any(|o| o.name == g.name) {
                 return Err(SimError::Scenario(format!("duplicate group name {:?}", g.name)));
             }
-            groups.push(CompiledGroup::new(g.clone(), def, &clock, first_agent)?);
+            groups.push(CompiledGroup::new(g.clone(), def, &clock, decimation, first_agent)?);
             first_agent += g.count;
         }
         for g in &groups {
@@ -1106,7 +1106,13 @@ impl CompiledScenario {
 }
 
 impl CompiledGroup {
-    fn new(mut spec: GroupSpec, def: SharedDef, clock: &Clock, first_agent: usize) -> Result<Self, SimError> {
+    fn new(
+        mut spec: GroupSpec,
+        def: SharedDef,
+        clock: &Clock,
+        decimation: u32,
+        first_agent: usize,
+    ) -> Result<Self, SimError> {
         let family = def.family();
         let name = spec.name.clone();
         let fail = move |what: String| SimError::Scenario(format!("group {name:?}: {what}"));
@@ -1172,7 +1178,11 @@ impl CompiledGroup {
             if spec.sensors[..i].iter().any(|o| o.name == s.name) {
                 return Err(fail(format!("duplicate sensor name {:?}", s.name)));
             }
-            Sensor::new(&s.config, clock, Seed::from_u64(0))?;
+            if let Sensor::Camera(c) = Sensor::new(&s.config, clock, Seed::from_u64(0))?
+                && !c.divider().is_multiple_of(decimation)
+            {
+                return Err(fail(format!("camera {:?}: its period must be a whole number of policy steps", s.name)));
+            }
             let units = def.as_wheeled().map_or(1, |d| d.num_units());
             let carried = matches!(s.config, SensorConfig::Rangefinder(_) | SensorConfig::Lidar(_));
             if s.unit >= units || (s.unit > 0 && !carried) {

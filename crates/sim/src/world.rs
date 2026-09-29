@@ -19,6 +19,7 @@
 //! the count, so `reset(Some(s))` always reproduces the same episode.
 
 use crate::agent::{Agent, EnvState};
+use crate::camera::Capture;
 use crate::drive::ground_pose;
 use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
@@ -474,6 +475,31 @@ impl WorldInstance {
         }
     }
 
+    /// Camera images of `group` (`count × image_len` bytes; see [`obs`](crate::obs)).
+    pub fn observe_images(&self, group: usize, out: &mut [u8]) {
+        let g = &self.scenario.groups[group];
+        let len = g.obs.image_len();
+        assert_eq!(out.len(), g.spec.count * len, "image array of group {:?}", g.spec.name);
+        if len == 0 {
+            return;
+        }
+        for (k, o) in out.chunks_exact_mut(len).enumerate() {
+            g.obs.write_image(&self.agents[g.first_agent + k].sensors, o);
+        }
+    }
+
+    /// Hand rendered frames to their cameras (see [`camera`](crate::camera)); they are stamped
+    /// with the current tick.
+    pub fn deliver(&mut self, captures: impl IntoIterator<Item = Capture>) {
+        let (tick, time) = (self.clock.tick, self.clock.time());
+        for c in captures {
+            match &mut self.agents[c.agent].sensors[c.sensor] {
+                Sensor::Camera(cam) => cam.capture(tick, time, c.image),
+                _ => panic!("sensor {} of agent {} is not a camera", c.sensor, c.agent),
+            }
+        }
+    }
+
     /// State rows ([`STATE_FIELDS`]) of `group` (`count × STATE_DIM` values).
     pub fn write_state(&self, group: usize, out: &mut [f64]) {
         let g = &self.scenario.groups[group];
@@ -794,6 +820,14 @@ fn hash_sensor(s: &Sensor, f: &mut impl FnMut(f64)) {
         Sensor::Lidar(s) => {
             if let Some(scan) = s.latest() {
                 scan.ranges.iter().for_each(|r| f(f64::from(*r)))
+            }
+        }
+        Sensor::Camera(s) => {
+            if let Some(r) = s.latest() {
+                f(r.tick as f64);
+                for b in r.value.digest().as_chunks::<4>().0 {
+                    f(f64::from(u32::from_le_bytes(*b)));
+                }
             }
         }
         Sensor::GroundTruth(s) => {

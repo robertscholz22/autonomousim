@@ -47,6 +47,20 @@
 //!
 //! Sensor terms name their sensor (`sensor = "imu"`) and read zeros until its first reading
 //! arrives. Non-finite values are written as 0.
+//!
+//! **Images**: `camera` terms (`{ term = "camera", sensor = "down", output = "rgb" }`) are not
+//! part of the vector. They fill a separate `u8` image of `[height, width, channels]` per
+//! agent, their channels concatenated in the order of the terms; all the camera terms of a
+//! group must read images of the same size.
+//!
+//! | `output` | Channels | Value |
+//! |---|---|---|
+//! | `rgb` | 3 | sRGB colour |
+//! | `depth` | 1 | depth along the optical axis over `range` (default 100 m), 0–255; 255 where nothing was hit or beyond `range` |
+//! | `semantic` | 1 | semantic class id (`render::SemanticClass`) |
+//!
+//! Images read zeros until the camera's first frame, which is rendered at the reset (see
+//! [`Cameras`](crate::camera::Cameras)).
 
 use crate::interaction::{AgentGrid, AgentShape};
 use crate::lane::Follow;
@@ -117,6 +131,7 @@ pub enum TermKind {
     Articulation,
     TrailerGoal,
     Sinkage,
+    Camera,
     Lean,
     RiderLean,
     Feet,
@@ -140,6 +155,7 @@ impl TermKind {
             Mag => Some("mag"),
             Range => Some("rangefinder"),
             Lidar | LidarLog => Some("lidar"),
+            Camera => Some("camera"),
             _ => None,
         }
     }
@@ -158,6 +174,27 @@ fn one() -> f64 {
     1.0
 }
 
+/// Image a `camera` term reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraOutput {
+    Rgb,
+    Depth,
+    Semantic,
+}
+
+impl CameraOutput {
+    pub fn channels(self) -> usize {
+        match self {
+            CameraOutput::Rgb => 3,
+            CameraOutput::Depth | CameraOutput::Semantic => 1,
+        }
+    }
+}
+
+/// Default `range` of the depth image (m).
+pub const DEPTH_RANGE: f64 = 100.0;
+
 /// One observation term.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -175,14 +212,22 @@ pub struct ObsTerm {
     /// Agents in the `neighbors` term.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<usize>,
-    /// Range of the agent terms (m).
+    /// Range of the agent terms and of the depth image (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<f64>,
+    /// Image of a `camera` term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<CameraOutput>,
 }
 
 impl ObsTerm {
     pub fn new(term: TermKind, scale: f64) -> Self {
-        Self { term, scale, clip: None, sensor: None, count: None, range: None }
+        Self { term, scale, clip: None, sensor: None, count: None, range: None, output: None }
+    }
+
+    /// A `camera` term reading `output` of camera `sensor`.
+    pub fn camera(sensor: &str, output: CameraOutput) -> Self {
+        Self { output: Some(output), ..Self::new(TermKind::Camera, 1.0).sensor(sensor) }
     }
 
     pub fn clip(mut self, clip: f64) -> Self {
@@ -232,11 +277,21 @@ struct Compiled {
     count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ImageTerm {
+    sensor: usize,
+    output: CameraOutput,
+    range: f64,
+}
+
 /// An observation spec resolved against a group's sensors and action size.
 #[derive(Clone, Debug)]
 pub struct CompiledObs {
     terms: Vec<Compiled>,
     dim: usize,
+    images: Vec<ImageTerm>,
+    /// `[height, width, channels]` of the image, if there are camera terms.
+    image_shape: Option<[usize; 3]>,
 }
 
 /// Everything an agent's observation may read.
@@ -272,9 +327,14 @@ impl CompiledObs {
     ) -> Result<Self, String> {
         let mut out = Vec::with_capacity(terms.len());
         let mut dim = 0;
+        let mut images = Vec::new();
+        let mut image_shape: Option<[usize; 3]> = None;
         for t in terms {
             if !t.scale.is_finite() || t.clip.is_some_and(|c| c.is_nan() || c <= 0.0) {
                 return Err(format!("invalid scale or clip in {t:?}"));
+            }
+            if (t.term == TermKind::Camera) != t.output.is_some() {
+                return Err(format!("`output` goes with `camera` terms, and they need it: {t:?}"));
             }
             let (sensor, spec) = match (t.term.sensor_kind(), &t.sensor) {
                 (Some(kind), Some(name)) => {
@@ -291,6 +351,23 @@ impl CompiledObs {
                 (None, Some(_)) => return Err(format!("observation {:?} does not read a sensor", t.term)),
                 (None, None) => (usize::MAX, None),
             };
+            if let (Some(output), Some(SensorConfig::Camera(c))) = (t.output, spec) {
+                let range = t.range.unwrap_or(DEPTH_RANGE);
+                if t.scale != 1.0 || t.clip.is_some() || t.count.is_some() {
+                    return Err(format!("camera terms take no scale, clip or count: {t:?}"));
+                }
+                if (t.range.is_some() && output != CameraOutput::Depth) || !(range > 0.0 && range.is_finite()) {
+                    return Err(format!("only depth images take a (positive) range: {t:?}"));
+                }
+                let (h, w) = (c.height as usize, c.width as usize);
+                let shape = image_shape.get_or_insert([h, w, 0]);
+                if shape[..2] != [h, w] {
+                    return Err(format!("camera terms of a group must have one image size: {t:?} is {w}×{h}"));
+                }
+                shape[2] += output.channels();
+                images.push(ImageTerm { sensor, output, range });
+                continue;
+            }
             if t.term.needs_wheels() && num_wheels == 0 {
                 return Err(format!("observation {:?} needs a ground vehicle", t.term));
             }
@@ -353,11 +430,50 @@ impl CompiledObs {
             });
             dim += d;
         }
-        Ok(Self { terms: out, dim })
+        Ok(Self { terms: out, dim, images, image_shape })
     }
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// `[height, width, channels]` of the image, if there are camera terms.
+    pub fn image_shape(&self) -> Option<[usize; 3]> {
+        self.image_shape
+    }
+
+    /// Bytes of the image (0 without camera terms).
+    pub fn image_len(&self) -> usize {
+        self.image_shape.map_or(0, |[h, w, c]| h * w * c)
+    }
+
+    /// Write the image into `out` (length [`image_len`](Self::image_len)), interleaving the
+    /// channels of the terms per pixel.
+    pub fn write_image(&self, sensors: &[Sensor], out: &mut [u8]) {
+        assert_eq!(out.len(), self.image_len(), "image buffer length");
+        let Some([_, _, channels]) = self.image_shape else { return };
+        let mut first = 0;
+        for t in &self.images {
+            let n = t.output.channels();
+            let Sensor::Camera(cam) = &sensors[t.sensor] else {
+                unreachable!("sensor kinds are checked when the spec is compiled")
+            };
+            let pixels = out.chunks_exact_mut(channels).map(|p| &mut p[first..first + n]);
+            match cam.latest().map(|f| &f.value) {
+                None => pixels.for_each(|p| p.fill(0)),
+                Some(img) => match t.output {
+                    CameraOutput::Rgb => pixels.zip(img.rgb.as_chunks::<3>().0).for_each(|(p, c)| p.copy_from_slice(c)),
+                    CameraOutput::Semantic => pixels.zip(&img.class).for_each(|(p, c)| p[0] = *c),
+                    CameraOutput::Depth => {
+                        let k = 255.0 / t.range as f32;
+                        pixels
+                            .zip(&img.depth)
+                            .for_each(|(p, &d)| p[0] = if d > 0.0 { (d * k).round().min(255.0) as u8 } else { 255 })
+                    }
+                },
+            }
+            first += n;
+        }
     }
 
     /// `(term name, offset, length)` of each term.
