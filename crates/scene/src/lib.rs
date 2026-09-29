@@ -7,6 +7,7 @@
 
 pub mod mesh;
 pub mod props;
+pub mod rig;
 pub mod roads;
 pub mod single_track;
 pub mod terrain;

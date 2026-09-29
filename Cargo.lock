@@ -468,7 +468,12 @@ dependencies = [
 name = "autonomousim-render"
 version = "0.1.0"
 dependencies = [
+ "autonomousim-core",
+ "autonomousim-procgen",
  "autonomousim-scene",
+ "autonomousim-sim",
+ "autonomousim-vehicles",
+ "autonomousim-world",
  "blake3",
  "bytemuck",
  "glam 0.33.8",

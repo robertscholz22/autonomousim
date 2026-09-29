@@ -163,6 +163,35 @@ pub fn terrain_mesh(
     m
 }
 
+/// Material of every vertex of [`terrain_mesh`]`(grid, _, chunk, stride, _, _)`, in its vertex
+/// order: the material of the cell whose south-west corner the vertex is (the last row and
+/// column take the cell before). Every triangle of that mesh starts at the south-west corner
+/// of its quad, so a renderer that takes flat attributes from a triangle's first vertex labels
+/// each quad with its cell's material (at stride 1 exactly the cell under the pixel; coarser
+/// quads take their south-west cell's).
+pub fn terrain_vertex_materials(grid: &HeightGrid, chunk: &Chunk, stride: usize) -> Vec<MaterialId> {
+    let (cw, ch) = grid.cells();
+    let xs = samples(chunk.x0, chunk.nx, stride.max(1));
+    let ys = samples(chunk.y0, chunk.ny, stride.max(1));
+    let mut out = Vec::with_capacity(xs.len() * ys.len() + 2 * (xs.len() + ys.len()));
+    for &iy in &ys {
+        for &ix in &xs {
+            out.push(grid.cell_material(ix.min(cw - 1), iy.min(ch - 1)));
+        }
+    }
+    // Skirt vertices copy the border rings (see `terrain_mesh`).
+    let (w, h) = (xs.len(), ys.len());
+    let ring: Vec<usize> = (0..w)
+        .chain((0..h).map(|j| j * w + w - 1))
+        .chain((0..w).rev().map(|i| (h - 1) * w + i))
+        .chain((0..h).rev().map(|j| j * w))
+        .collect();
+    for v in ring {
+        out.push(out[v]);
+    }
+    out
+}
+
 /// Water surface of `chunk`: one quad per run of wet cells with the same level in a row.
 pub fn water_chunk(world: &StaticWorld, chunk: &Chunk, color: [f32; 4]) -> MeshData {
     water_mesh(world.grid(), chunk, color, DVec3::ZERO)
@@ -258,6 +287,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vertex_materials_label_each_quad_with_its_cell() {
+        // Hills with a pseudo-random material per cell.
+        let g = &HeightGrid::from_fn(
+            glam::DVec2::new(-20.0, -30.0),
+            1.5,
+            41,
+            37,
+            |x, y| (0.3 * x).sin() + 0.2 * y,
+            |x, y| MaterialId(((x * 7.3 + y * 3.1).abs() as u64 % 5) as u8),
+        );
+        let o = g.origin();
+        let colors = vec![[1.0; 4]; 5];
+        let mut kinds = std::collections::BTreeSet::new();
+        for stride in [1, 2, 8] {
+            for chunk in chunks(g, 16) {
+                let m = terrain_mesh(g, &colors, &chunk, stride, 2.0, DVec3::ZERO);
+                let ids = terrain_vertex_materials(g, &chunk, stride);
+                assert_eq!(ids.len(), m.vertex_count());
+                if stride > 1 {
+                    continue;
+                }
+                // At stride 1 a triangle's first vertex carries the material under its centroid.
+                let (sx, sy) = (chunk.nx + 1, chunk.ny + 1);
+                for t in m.indices[..6 * (sx - 1) * (sy - 1)].as_chunks::<3>().0 {
+                    let c = t.iter().map(|&i| Vec3::from_array(m.positions[i as usize])).sum::<Vec3>() / 3.0;
+                    let q = (c.as_dvec3().truncate() - o) / g.cell_size();
+                    let cell = g.cell_material(q.x as usize, q.y as usize);
+                    assert_eq!(ids[t[0] as usize], cell);
+                    kinds.insert(cell.0);
+                }
+            }
+        }
+        assert!(kinds.len() > 1, "{kinds:?}");
     }
 
     #[test]

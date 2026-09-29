@@ -30,7 +30,12 @@ struct Vertex {
 struct DrawUniform {
     mvp: [[f32; 4]; 4],
     sun: [f32; 4],
+    scale: [f32; 4],
+    /// x: class for every pixel of the draw, or [`NO_CLASS`] for the mesh's own.
+    class: [u32; 4],
 }
+
+const NO_CLASS: u32 = u32::MAX;
 
 /// A mesh uploaded to the GPU, in its own frame (placed by each [`Draw`]).
 pub struct GpuMesh {
@@ -74,17 +79,30 @@ impl GpuMesh {
     }
 }
 
-/// A mesh placed in the world: `rotation` and `position` take its frame into ENU.
+/// A mesh placed in the world: scaled by `scale` in its own frame, then `rotation` and
+/// `position` take it into ENU.
 #[derive(Clone, Copy)]
 pub struct Draw<'a> {
     pub mesh: &'a GpuMesh,
     pub position: DVec3,
     pub rotation: DQuat,
+    pub scale: DVec3,
+    /// Class of every pixel of this draw instead of the mesh's own (e.g. the camera's own
+    /// vehicle).
+    pub class: Option<SemanticClass>,
 }
 
 impl<'a> Draw<'a> {
     pub fn new(mesh: &'a GpuMesh, position: DVec3, rotation: DQuat) -> Self {
-        Self { mesh, position, rotation }
+        Self { mesh, position, rotation, scale: DVec3::ONE, class: None }
+    }
+
+    pub fn with_scale(self, scale: DVec3) -> Self {
+        Self { scale, ..self }
+    }
+
+    pub fn with_class(self, class: SemanticClass) -> Self {
+        Self { class: Some(class), ..self }
     }
 
     /// A mesh already in world coordinates.
@@ -116,6 +134,32 @@ pub struct View {
     pub pose: CameraPose,
     pub intrinsics: Intrinsics,
     pub shading: Shading,
+}
+
+impl View {
+    /// Whether anything inside the box `[min, max]` (ENU) may be in view: false only when all
+    /// its corners lie outside one plane of the view frustum.
+    pub fn may_see(&self, min: DVec3, max: DVec3) -> bool {
+        let k = &self.intrinsics;
+        let corners = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| {
+            let p = DVec3::new(
+                if i & 1 == 0 { min.x } else { max.x },
+                if i & 2 == 0 { min.y } else { max.y },
+                if i & 4 == 0 { min.z } else { max.z },
+            );
+            self.pose.to_camera(p)
+        });
+        let (tx, ty) = (0.5 * k.width as f64 / k.focal(), 0.5 * k.height as f64 / k.focal());
+        let planes: [&dyn Fn(DVec3) -> f64; 6] = [
+            &|c| c.x - k.near,
+            &|c| k.far - c.x,
+            &|c| c.x * tx - c.y,
+            &|c| c.x * tx + c.y,
+            &|c| c.x * ty - c.z,
+            &|c| c.x * ty + c.z,
+        ];
+        !planes.iter().any(|plane| corners.iter().all(|&c| plane(c) < 0.0))
+    }
 }
 
 /// A rendered frame, rows top to bottom.
@@ -323,12 +367,17 @@ impl Renderer {
         let sun = view.shading.sun.normalize_or_zero();
         let mut bytes = vec![0u8; draws.len() * DRAW_STRIDE as usize];
         for (i, d) in draws.iter().enumerate() {
-            let model_view =
-                DMat4::from_rotation_translation(to_camera * d.rotation, to_camera * (d.position - view.pose.position));
+            let model_view = DMat4::from_scale_rotation_translation(
+                d.scale,
+                to_camera * d.rotation,
+                to_camera * (d.position - view.pose.position),
+            );
             let local_sun = d.rotation.inverse() * sun;
             let u = DrawUniform {
                 mvp: (projection * model_view).as_mat4().to_cols_array_2d(),
                 sun: [local_sun.x as f32, local_sun.y as f32, local_sun.z as f32, view.shading.ambient as f32],
+                scale: [d.scale.x as f32, d.scale.y as f32, d.scale.z as f32, 1.0],
+                class: [d.class.map_or(NO_CLASS, |c| c.id() as u32), 0, 0, 0],
             };
             let at = i * DRAW_STRIDE as usize;
             bytes[at..at + size_of::<DrawUniform>()].copy_from_slice(bytemuck::bytes_of(&u));

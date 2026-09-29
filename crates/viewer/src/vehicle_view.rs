@@ -15,12 +15,10 @@ use crate::sim::Sim;
 use autonomousim_core::math::Pose;
 use autonomousim_scene::mesh::srgb;
 use autonomousim_scene::props;
+use autonomousim_scene::rig::{flapping, surface_angle, track_band, unit_local, wheel_local};
 use autonomousim_scene::single_track::{Limb, SingleTrackVisual};
 use autonomousim_vehicles::Vehicle;
-use autonomousim_vehicles::fixedwing::FixedWing;
 use autonomousim_vehicles::ground::Wheeled;
-use autonomousim_vehicles::ground::tire::TireModel;
-use autonomousim_vehicles::rotorcraft::Helicopter;
 use bevy::prelude::*;
 
 /// Root entity of agent `0`'s visual.
@@ -43,13 +41,6 @@ pub struct SurfacePart {
 /// A surface's transform at `angle` (rad, pilot sense; see [`props::SurfaceVisual`]).
 fn surface_transform(s: &props::SurfaceVisual, angle: f64) -> Transform {
     convert::transform(&Pose { pos: s.hinge, rot: glam::DQuat::from_axis_angle(s.axis, angle) })
-}
-
-/// Deflection of `s` in pilot sense (rad): positive commands roll right, pitch up and yaw
-/// right whatever the model's sign convention; flaps positive down.
-fn surface_angle(f: &FixedWing, s: &props::SurfaceVisual) -> f64 {
-    let d = f.surfaces()[s.control];
-    if s.control < 3 { d * f.control_signs()[s.control] } else { d }
 }
 
 /// A flapped surface of a tiltrotor agent, turned about its hinge by its mixed deflection.
@@ -123,29 +114,6 @@ pub struct TrackVisual {
     mesh: Handle<Mesh>,
 }
 
-/// Band of side `side` of a tracked vehicle around its sprocket, idler and road wheels as
-/// they stand, advanced by the road wheels' mean spin; `None` without tracks.
-fn track_band(w: &Wheeled, side: usize) -> Option<autonomousim_scene::MeshData> {
-    let def = w.def();
-    let track = def.track.as_ref()?;
-    let wheels: Vec<usize> = (0..w.num_wheels())
-        .filter(|&k| {
-            def.wheel_side(k) == side
-                && def.wheel_unit(k) == 0
-                && matches!(def.wheel_tire(k).model, TireModel::Track(_))
-        })
-        .collect();
-    let TireModel::Track(patch) = &def.tire(*wheels.first()? / 2).model else { return None };
-    let flat = |p: glam::DVec3| glam::DVec2::new(p.x, p.z);
-    let mut circles: Vec<(glam::DVec2, f64)> =
-        wheels.iter().map(|&k| (flat(wheel_local(w, k).pos), patch.radius)).collect();
-    circles.extend(track.sprocket.iter().chain(&track.idler).map(|r| (flat(r.position), r.radius)));
-    let y = def.wheel_position(wheels[0]).y;
-    let spin = wheels.iter().map(|&k| w.wheel(k).spin_angle).sum::<f64>() / wheels.len() as f64;
-    let thickness = props::track_thickness(patch.radius);
-    Some(props::track_band(&circles, y, patch.width, thickness, 0.25 * patch.length, spin * patch.radius))
-}
-
 /// Transform (in a unit's frame) of a unit link (a cylinder along z from −0.5 to 0.5)
 /// stretched from `a` to `b`.
 fn link_transform(a: glam::DVec3, b: glam::DVec3) -> Transform {
@@ -156,17 +124,6 @@ fn link_transform(a: glam::DVec3, b: glam::DVec3) -> Transform {
         d.length().max(1e-3) as f32,
         1.0,
     ))
-}
-
-/// Pose of unit `u` relative to the towing unit. Unit and wheel poses are those of the last
-/// step's start, so they are related to each other rather than to the current chassis pose.
-fn unit_local(w: &Wheeled, u: usize) -> Pose {
-    w.unit_pose(0).inverse() * w.unit_pose(u)
-}
-
-/// Pose of wheel `k` relative to its unit.
-fn wheel_local(w: &Wheeled, k: usize) -> Pose {
-    w.unit_pose(w.def().wheel_unit(k)).inverse() * w.wheel_pose(k)
 }
 
 /// Fastest apparent rotor turn (rad/s): faster rotors are drawn turning at this rate, since
@@ -195,15 +152,6 @@ pub struct Blade {
     blade: Option<u32>,
     count: u32,
     radius: f32,
-}
-
-/// Tip-path-plane tilt `[β₁c, β₁s]` and coning (rad) of rotor 0 (main) or 1 (tail).
-fn flapping(h: &Helicopter, rotor: usize) -> ([f64; 2], f64) {
-    if rotor == 0 {
-        (h.main_rotor_state().flap, h.loads().main.coning)
-    } else {
-        (h.tail_rotor_state().flap, h.loads().tail.coning)
-    }
 }
 
 /// Transform (body frame) of a rotor head: at the hub, the shaft frame tilted with the

@@ -5,6 +5,10 @@ struct DrawUniform {
     mvp: mat4x4<f32>,
     // Direction to the sun in the mesh's frame (xyz) and the ambient share (w).
     sun: vec4<f32>,
+    // Scale of the mesh in its own frame (xyz).
+    scale: vec4<f32>,
+    // x: class of every pixel of the draw, or 0xffffffff for the mesh's own.
+    class_id: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> draw: DrawUniform;
@@ -30,10 +34,11 @@ struct VertexOut {
 fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
     out.clip = draw.mvp * vec4<f32>(v.position, 1.0);
-    out.normal = v.normal;
+    // Normals of a scaled mesh scale inversely.
+    out.normal = v.normal / draw.scale.xyz;
     out.color = v.color;
     out.depth = out.clip.w;
-    out.class_id = v.class_id;
+    out.class_id = select(draw.class_id.x, v.class_id, draw.class_id.x == 0xffffffffu);
     return out;
 }
 

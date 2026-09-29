@@ -186,17 +186,25 @@ pub fn props_grouped<'a>(
 ) -> Vec<MeshData> {
     let mut out = vec![MeshData::new(); n];
     for (key, o, k) in items {
-        // Hedges hide their woody cores.
-        let hidden = o.tag == tags::HEDGE && o.class == ObstacleClass::Solid;
-        if hidden || (detail.min_size > 0.0 && extent(&o.shape) < detail.min_size) {
-            continue;
+        if let Some(m) = shown_obstacle(materials, key, o, detail) {
+            out[k].append_transformed(&m, o.pose.rot, o.pose.pos - anchor);
         }
-        let color = srgb(base_color(materials, o));
-        let mut m = obstacle_visual(o, color, detail);
-        m.tint(variation(key));
-        out[k].append_transformed(&m, o.pose.rot, o.pose.pos - anchor);
     }
     out
+}
+
+/// Mesh of obstacle `o` in its local frame as it is shown, coloured and with its brightness
+/// varied by `key`; `None` where it is not shown (hedge cores, and obstacles smaller than
+/// `detail.min_size`).
+pub fn shown_obstacle(materials: &MaterialTable, key: u64, o: &Obstacle, detail: PropDetail) -> Option<MeshData> {
+    // Hedges hide their woody cores.
+    let hidden = o.tag == tags::HEDGE && o.class == ObstacleClass::Solid;
+    if hidden || (detail.min_size > 0.0 && extent(&o.shape) < detail.min_size) {
+        return None;
+    }
+    let mut m = obstacle_visual(o, srgb(base_color(materials, o)), detail);
+    m.tint(variation(key));
+    Some(m)
 }
 
 /// Visual of a multirotor in its body frame (FLU): hub, arms, motors and rotor discs.

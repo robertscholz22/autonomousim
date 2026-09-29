@@ -18,8 +18,10 @@ pub mod camera;
 pub mod context;
 pub mod renderer;
 pub mod semantic;
+pub mod world;
 
 pub use camera::{CameraPose, Intrinsics};
 pub use context::{AdapterChoice, GpuContext, RenderError};
 pub use renderer::{Draw, Frame, GpuMesh, Renderer, Shading, View};
-pub use semantic::SemanticClass;
+pub use semantic::{SemanticClass, obstacle_class, terrain_class};
+pub use world::{GpuRig, GpuWorld, WorldOptions};

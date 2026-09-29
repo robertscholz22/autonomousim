@@ -3,6 +3,10 @@
 //! The table is part of the observation format: classes are only appended, and
 //! [`SEMANTIC_VERSION`] changes with it.
 
+use autonomousim_core::material::MaterialId;
+use autonomousim_world::obstacles::tags;
+use autonomousim_world::{Obstacle, ObstacleClass};
+
 /// Version of the class table below.
 pub const SEMANTIC_VERSION: u32 = 1;
 
@@ -80,6 +84,39 @@ impl SemanticClass {
             Self::OwnVehicle => "own_vehicle",
             Self::Vehicle => "vehicle",
         }
+    }
+}
+
+/// Class of terrain of material `m`.
+pub fn terrain_class(m: MaterialId) -> SemanticClass {
+    match m {
+        MaterialId::ROCK | MaterialId::SCREE => SemanticClass::Rock,
+        MaterialId::SNOW => SemanticClass::Snow,
+        MaterialId::SAND | MaterialId::MUD | MaterialId::DIRT | MaterialId::PLOWED => SemanticClass::Soil,
+        MaterialId::FOREST_FLOOR => SemanticClass::ForestFloor,
+        MaterialId::WATER => SemanticClass::Water,
+        MaterialId::ASPHALT | MaterialId::CONCRETE | MaterialId::GRAVEL => SemanticClass::Road,
+        MaterialId::WOOD | MaterialId::METAL => SemanticClass::Building,
+        MaterialId::FOLIAGE => SemanticClass::Canopy,
+        _ => SemanticClass::Grass,
+    }
+}
+
+/// Class of an obstacle: by its tag, else by its class and material.
+pub fn obstacle_class(o: &Obstacle) -> SemanticClass {
+    match o.tag {
+        tags::TRUNK => SemanticClass::Trunk,
+        tags::CANOPY | tags::CANOPY_BROADLEAF => SemanticClass::Canopy,
+        tags::HEDGE if o.class == ObstacleClass::Foliage => SemanticClass::Canopy,
+        tags::HEDGE => SemanticClass::Trunk,
+        tags::ROCK => SemanticClass::Boulder,
+        tags::PILLAR | tags::WALL | tags::FENCE | tags::BUILDING | tags::SILO => SemanticClass::Building,
+        _ if o.class == ObstacleClass::Foliage => SemanticClass::Canopy,
+        _ => match o.material {
+            MaterialId::ROCK | MaterialId::SCREE => SemanticClass::Boulder,
+            MaterialId::WOOD => SemanticClass::Trunk,
+            _ => SemanticClass::Building,
+        },
     }
 }
 

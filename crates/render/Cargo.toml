@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+autonomousim-core.workspace = true
+autonomousim-world.workspace = true
 autonomousim-scene.workspace = true
 glam.workspace = true
 wgpu.workspace = true
@@ -14,6 +16,9 @@ bytemuck.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+autonomousim-procgen.workspace = true
+autonomousim-sim.workspace = true
+autonomousim-vehicles.workspace = true
 blake3.workspace = true
 toml.workspace = true
 

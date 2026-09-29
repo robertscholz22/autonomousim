@@ -19,6 +19,8 @@ pub enum RenderError {
     Poll(#[from] wgpu::PollError),
     #[error("reading back an image: {0}")]
     Map(#[from] wgpu::BufferAsyncError),
+    #[error("not supported yet: {0}")]
+    Unsupported(String),
 }
 
 /// Which adapter renders.
