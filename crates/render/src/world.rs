@@ -33,7 +33,7 @@ pub struct WorldOptions {
 impl Default for WorldOptions {
     fn default() -> Self {
         Self {
-            chunk_cells: 64,
+            chunk_cells: 32,
             lod: vec![(160.0, 1), (380.0, 2), (800.0, 4)],
             coarsest: 8,
             detailed_props: 250.0,

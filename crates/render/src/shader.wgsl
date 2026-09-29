@@ -1,4 +1,5 @@
-// One pass, three targets: shaded colour, linear depth along the optical axis, class id.
+// One pass, two targets: shaded colour with the class id in alpha (alpha is stored linearly,
+// so id / 255 comes back as the id), and linear depth along the optical axis.
 
 struct DrawUniform {
     // Mesh-local position → clip space (camera-relative, composed in f64 on the CPU).
@@ -45,7 +46,6 @@ fn vs_main(v: VertexIn) -> VertexOut {
 struct FragmentOut {
     @location(0) color: vec4<f32>,
     @location(1) depth: f32,
-    @location(2) class_id: u32,
 };
 
 @fragment
@@ -58,8 +58,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> FragmentOut {
     let ambient = draw.sun.w;
     let light = ambient + (1.0 - ambient) * max(dot(n, draw.sun.xyz), 0.0);
     var out: FragmentOut;
-    out.color = vec4<f32>(in.color.rgb * light, 1.0);
+    out.color = vec4<f32>(in.color.rgb * light, f32(in.class_id) / 255.0);
     out.depth = in.depth;
-    out.class_id = in.class_id;
     return out;
 }

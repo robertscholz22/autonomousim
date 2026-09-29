@@ -1,0 +1,78 @@
+{
+  "camera": [
+    {
+      "adapter": "Intel(R) Iris(R) Xe Graphics (RPL-U) (IntegratedGpu, Intel open-source Mesa driver Mesa 26.0.8-1ubuntu0.3)",
+      "camera_ms": 13.44591996,
+      "frames_per_s": 4686.436436362587,
+      "map": "rural",
+      "maps": 4,
+      "num_envs": 64,
+      "physics_ms": 0.21051193,
+      "size": 64,
+      "step_ms": 13.65643189,
+      "threads": 10
+    },
+    {
+      "adapter": "Intel(R) Iris(R) Xe Graphics (RPL-U) (IntegratedGpu, Intel open-source Mesa driver Mesa 26.0.8-1ubuntu0.3)",
+      "camera_ms": 17.802892420000003,
+      "frames_per_s": 3561.0765318864164,
+      "map": "wild",
+      "maps": 4,
+      "num_envs": 64,
+      "physics_ms": 0.16920097,
+      "size": 64,
+      "step_ms": 17.97209339,
+      "threads": 10
+    },
+    {
+      "adapter": "Intel(R) Iris(R) Xe Graphics (RPL-U) (IntegratedGpu, Intel open-source Mesa driver Mesa 26.0.8-1ubuntu0.3)",
+      "camera_ms": 10.881494570000001,
+      "frames_per_s": 5805.48057195337,
+      "map": "forest",
+      "maps": 1,
+      "num_envs": 64,
+      "physics_ms": 0.14257126,
+      "size": 64,
+      "step_ms": 11.024065830000001,
+      "threads": 10
+    },
+    {
+      "adapter": "Intel(R) Iris(R) Xe Graphics (RPL-U) (IntegratedGpu, Intel open-source Mesa driver Mesa 26.0.8-1ubuntu0.3)",
+      "camera_ms": 16.769240640000003,
+      "frames_per_s": 3784.3813529414992,
+      "map": "rural",
+      "maps": 4,
+      "num_envs": 64,
+      "physics_ms": 0.14237424,
+      "size": 128,
+      "step_ms": 16.911614880000002,
+      "threads": 10
+    },
+    {
+      "adapter": "Intel(R) Iris(R) Xe Graphics (RPL-U) (IntegratedGpu, Intel open-source Mesa driver Mesa 26.0.8-1ubuntu0.3)",
+      "camera_ms": 37.294701980000006,
+      "frames_per_s": 6758.292625490292,
+      "map": "rural",
+      "maps": 4,
+      "num_envs": 256,
+      "physics_ms": 0.5846877100000001,
+      "size": 64,
+      "step_ms": 37.879389690000004,
+      "threads": 10
+    },
+    {
+      "adapter": "llvmpipe (LLVM 21.1.8, 256 bits) (Cpu, llvmpipe Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8))",
+      "camera_ms": 129.31205601,
+      "frames_per_s": 494.2655505824629,
+      "map": "rural",
+      "maps": 4,
+      "num_envs": 64,
+      "physics_ms": 0.17299493999999999,
+      "size": 64,
+      "step_ms": 129.48505095,
+      "threads": 10
+    }
+  ],
+  "date": "2026-09-29",
+  "host": "robert-Latitude-7440"
+}

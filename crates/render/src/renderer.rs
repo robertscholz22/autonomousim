@@ -11,10 +11,11 @@ use crate::semantic::SemanticClass;
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
-const CLASS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Uint;
 const Z_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Per-draw uniforms sit at this stride (the largest minimum uniform offset alignment).
 const DRAW_STRIDE: u64 = 256;
+/// Most images of one size in one set of targets.
+const MAX_LAYERS: u32 = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -194,25 +195,28 @@ impl Frame {
     }
 }
 
-/// Render targets of one image size, with their read-back buffers.
+/// Render targets for up to `layers` images of one size (one array layer each), with their
+/// read-back buffers.
 struct Targets {
     width: u32,
     height: u32,
+    layers: u32,
     color: wgpu::Texture,
     depth: wgpu::Texture,
-    class: wgpu::Texture,
-    z: wgpu::Texture,
+    /// Colour (class in alpha) and depth views of each layer.
+    views: Vec<[wgpu::TextureView; 2]>,
+    /// Depth buffer, shared by the layers (each pass clears it; one per layer is no faster).
+    z: wgpu::TextureView,
     /// (buffer, bytes per pixel, padded bytes per row) per colour target.
-    readback: [(wgpu::Buffer, u32, u32); 3],
+    readback: [(wgpu::Buffer, u32, u32); 2],
 }
 
 impl Targets {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-        let texture = |label, format, usage| {
+    fn new(device: &wgpu::Device, width: u32, height: u32, layers: u32) -> Self {
+        let texture = |label, format, usage, layers| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
-                size,
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: layers },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -226,32 +230,44 @@ impl Targets {
             let row = (width * bytes).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("readback"),
-                size: (row * height) as u64,
+                size: u64::from(row) * u64::from(height) * u64::from(layers),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
             (buffer, bytes, row)
         };
-        Self {
-            width,
-            height,
-            color: texture("color", COLOR_FORMAT, out),
-            depth: texture("depth", DEPTH_FORMAT, out),
-            class: texture("class", CLASS_FORMAT, out),
-            z: texture("z", Z_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT),
-            readback: [readback(4), readback(4), readback(1)],
-        }
+        let color = texture("color", COLOR_FORMAT, out, layers);
+        let depth = texture("depth", DEPTH_FORMAT, out, layers);
+        let layer = |t: &wgpu::Texture, i| {
+            t.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        };
+        let views = (0..layers).map(|i| [layer(&color, i), layer(&depth, i)]).collect();
+        let z = texture("z", Z_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT, 1).create_view(&Default::default());
+        Self { width, height, layers, color, depth, views, z, readback: [readback(4), readback(4)] }
     }
 }
 
-/// The camera pass: one pipeline, per-draw uniforms and targets sized to the last image.
+/// One image of a batch: what `view` sees of a range of the batch's draws.
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub view: View,
+    pub draws: std::ops::Range<usize>,
+}
+
+/// The camera pass: one pipeline, per-draw uniforms and layered targets per image size.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     capacity: u64,
-    targets: Option<Targets>,
+    /// By image size; several of one size when a batch has more images than layers.
+    targets: Vec<Targets>,
 }
 
 impl Renderer {
@@ -315,13 +331,13 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
-                targets: &[target(COLOR_FORMAT), target(DEPTH_FORMAT), target(CLASS_FORMAT)],
+                targets: &[target(COLOR_FORMAT), target(DEPTH_FORMAT)],
             }),
             multiview_mask: None,
             cache: None,
         });
         let (uniforms, bind_group) = Self::uniform_buffer(device, &layout, 64);
-        Self { pipeline, layout, uniforms, bind_group, capacity: 64, targets: None }
+        Self { pipeline, layout, uniforms, bind_group, capacity: 64, targets: Vec::new() }
     }
 
     fn uniform_buffer(
@@ -352,111 +368,179 @@ impl Renderer {
 
     /// Render `draws` as `view` sees them and read the images back.
     pub fn render(&mut self, ctx: &GpuContext, view: &View, draws: &[Draw<'_>]) -> Result<Frame, RenderError> {
+        let job = Job { view: *view, draws: 0..draws.len() };
+        Ok(self.render_batch(ctx, &[job], draws)?.pop().expect("one frame per job"))
+    }
+
+    /// Render the images of `jobs` in one submission and read them back, one frame per job in
+    /// order. Every image is rendered as [`render`](Self::render) would render it alone: into
+    /// its own array layer, so it does not depend on the others or on its place in the batch.
+    pub fn render_batch(
+        &mut self,
+        ctx: &GpuContext,
+        jobs: &[Job],
+        draws: &[Draw<'_>],
+    ) -> Result<Vec<Frame>, RenderError> {
         let device = &ctx.device;
-        let k = &view.intrinsics;
-        if self.targets.as_ref().is_none_or(|t| (t.width, t.height) != (k.width, k.height)) {
-            self.targets = Some(Targets::new(device, k.width, k.height));
+        if jobs.is_empty() {
+            return Ok(Vec::new());
         }
         if draws.len() as u64 > self.capacity {
             self.capacity = (draws.len() as u64).next_power_of_two();
             (self.uniforms, self.bind_group) = Self::uniform_buffer(device, &self.layout, self.capacity);
         }
-        // Per-draw uniforms, composed in f64 relative to the camera.
-        let projection = projection(k);
-        let to_camera = view.pose.orientation.inverse();
-        let sun = view.shading.sun.normalize_or_zero();
+        // Per-draw uniforms, composed in f64 relative to each job's camera.
         let mut bytes = vec![0u8; draws.len() * DRAW_STRIDE as usize];
-        for (i, d) in draws.iter().enumerate() {
-            let model_view = DMat4::from_scale_rotation_translation(
-                d.scale,
-                to_camera * d.rotation,
-                to_camera * (d.position - view.pose.position),
-            );
-            let local_sun = d.rotation.inverse() * sun;
-            let u = DrawUniform {
-                mvp: (projection * model_view).as_mat4().to_cols_array_2d(),
-                sun: [local_sun.x as f32, local_sun.y as f32, local_sun.z as f32, view.shading.ambient as f32],
-                scale: [d.scale.x as f32, d.scale.y as f32, d.scale.z as f32, 1.0],
-                class: [d.class.map_or(NO_CLASS, |c| c.id() as u32), 0, 0, 0],
-            };
-            let at = i * DRAW_STRIDE as usize;
-            bytes[at..at + size_of::<DrawUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
+        for job in jobs {
+            let view = &job.view;
+            let projection = projection(&view.intrinsics);
+            let to_camera = view.pose.orientation.inverse();
+            let sun = view.shading.sun.normalize_or_zero();
+            for i in job.draws.clone() {
+                let d = &draws[i];
+                let model_view = DMat4::from_scale_rotation_translation(
+                    d.scale,
+                    to_camera * d.rotation,
+                    to_camera * (d.position - view.pose.position),
+                );
+                let local_sun = d.rotation.inverse() * sun;
+                let u = DrawUniform {
+                    mvp: (projection * model_view).as_mat4().to_cols_array_2d(),
+                    sun: [local_sun.x as f32, local_sun.y as f32, local_sun.z as f32, view.shading.ambient as f32],
+                    scale: [d.scale.x as f32, d.scale.y as f32, d.scale.z as f32, 1.0],
+                    class: [d.class.map_or(NO_CLASS, |c| c.id() as u32), 0, 0, 0],
+                };
+                let at = i * DRAW_STRIDE as usize;
+                bytes[at..at + size_of::<DrawUniform>()].copy_from_slice(bytemuck::bytes_of(&u));
+            }
         }
         if !bytes.is_empty() {
             ctx.queue.write_buffer(&self.uniforms, 0, &bytes);
         }
-        let t = self.targets.as_ref().expect("targets were just made");
-        let views = [&t.color, &t.depth, &t.class].map(|x| x.create_view(&Default::default()));
-        let z_view = t.z.create_view(&Default::default());
-        let [r, g, b] = view.shading.sky;
+
+        // Jobs by image size, in groups of at most `max_layers`; the n-th group of a size
+        // renders into the n-th targets of that size.
+        let max_layers = device.limits().max_texture_array_layers.min(MAX_LAYERS);
+        let mut groups: Vec<((u32, u32), Vec<usize>)> = Vec::new();
+        for (i, job) in jobs.iter().enumerate() {
+            let size = (job.view.intrinsics.width, job.view.intrinsics.height);
+            match groups.iter_mut().rev().find(|(s, m)| *s == size && m.len() < max_layers as usize) {
+                Some((_, m)) => m.push(i),
+                None => groups.push((size, vec![i])),
+            }
+        }
+        let mut used = Vec::with_capacity(groups.len());
+        for (g, (size, members)) in groups.iter().enumerate() {
+            let nth = groups[..g].iter().filter(|(s, _)| s == size).count();
+            let found = self.targets.iter().enumerate().filter(|(_, t)| (t.width, t.height) == *size).nth(nth);
+            let need = members.len() as u32;
+            let layers = need.next_power_of_two().min(max_layers);
+            let index = match found.map(|(i, t)| (i, t.layers)) {
+                Some((i, have)) if have >= need => i,
+                Some((i, _)) => {
+                    self.targets[i] = Targets::new(device, size.0, size.1, layers);
+                    i
+                }
+                None => {
+                    self.targets.push(Targets::new(device, size.0, size.1, layers));
+                    self.targets.len() - 1
+                }
+            };
+            used.push(index);
+        }
+
         let clear = |c: wgpu::Color| wgpu::Operations { load: wgpu::LoadOp::Clear(c), store: wgpu::StoreOp::Store };
         let attachment = |view, c| {
             Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: clear(c) })
         };
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("camera") });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("camera"),
-                color_attachments: &[
-                    attachment(&views[0], wgpu::Color { r, g, b, a: 1.0 }),
-                    attachment(&views[1], wgpu::Color::TRANSPARENT),
-                    attachment(&views[2], wgpu::Color::TRANSPARENT),
-                ],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &z_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            for (i, d) in draws.iter().enumerate() {
-                pass.set_bind_group(0, &self.bind_group, &[(i as u64 * DRAW_STRIDE) as u32]);
-                pass.set_vertex_buffer(0, d.mesh.vertices.slice(..));
-                pass.set_index_buffer(d.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..d.mesh.index_count, 0, 0..1);
+        for ((_, members), &ti) in groups.iter().zip(&used) {
+            let t = &self.targets[ti];
+            for (layer, &j) in members.iter().enumerate() {
+                let job = &jobs[j];
+                let [r, g, b] = job.view.shading.sky;
+                let [color, depth] = &t.views[layer];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("camera"),
+                    color_attachments: &[
+                        attachment(color, wgpu::Color { r, g, b, a: 0.0 }),
+                        attachment(depth, wgpu::Color::TRANSPARENT),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &t.z,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                for i in job.draws.clone() {
+                    let d = &draws[i];
+                    pass.set_bind_group(0, &self.bind_group, &[(i as u64 * DRAW_STRIDE) as u32]);
+                    pass.set_vertex_buffer(0, d.mesh.vertices.slice(..));
+                    pass.set_index_buffer(d.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..d.mesh.index_count, 0, 0..1);
+                }
             }
-        }
-        let size = wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 };
-        for (texture, (buffer, _, row)) in [&t.color, &t.depth, &t.class].into_iter().zip(&t.readback) {
-            encoder.copy_texture_to_buffer(
-                texture.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer,
-                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(*row), rows_per_image: None },
-                },
-                size,
-            );
+            let size = wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: members.len() as u32 };
+            for (texture, (buffer, _, row)) in [&t.color, &t.depth].into_iter().zip(&t.readback) {
+                encoder.copy_texture_to_buffer(
+                    texture.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(*row),
+                            rows_per_image: Some(t.height),
+                        },
+                    },
+                    size,
+                );
+            }
         }
         ctx.queue.submit([encoder.finish()]);
-        for (buffer, _, _) in &t.readback {
-            buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("mapping a readback buffer"));
+        for &ti in &used {
+            for (buffer, _, _) in &self.targets[ti].readback {
+                buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("mapping a readback buffer"));
+            }
         }
         ctx.wait()?;
-        let unpad = |(buffer, bytes, row): &(wgpu::Buffer, u32, u32)| {
-            let data = buffer.get_mapped_range(..);
-            let line = (t.width * bytes) as usize;
-            let mut out = Vec::with_capacity(line * t.height as usize);
-            for y in 0..t.height as usize {
-                let at = y * *row as usize;
-                out.extend_from_slice(&data[at..at + line]);
+
+        let mut frames: Vec<Option<Frame>> = (0..jobs.len()).map(|_| None).collect();
+        for ((_, members), &ti) in groups.iter().zip(&used) {
+            let t = &self.targets[ti];
+            let data = t.readback.each_ref().map(|(buffer, _, _)| buffer.get_mapped_range(..));
+            let (w, h) = (t.width as usize, t.height as usize);
+            for (layer, &j) in members.iter().enumerate() {
+                // The rows of target `k` in this layer, without their padding.
+                let rows = |k: usize| {
+                    let (_, bytes, row) = t.readback[k];
+                    let (line, row) = (w * bytes as usize, row as usize);
+                    let mut out = Vec::with_capacity(line * h);
+                    for y in 0..h {
+                        let at = (layer * h + y) * row;
+                        out.extend_from_slice(&data[k][at..at + line]);
+                    }
+                    out
+                };
+                let (rgba, depth) = (rows(0), rows(1));
+                frames[j] = Some(Frame {
+                    width: t.width,
+                    height: t.height,
+                    rgb: rgba.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect(),
+                    depth: depth.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
+                    class: rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
+                });
             }
             drop(data);
-            buffer.unmap();
-            out
-        };
-        let rgba = unpad(&t.readback[0]);
-        let depth = unpad(&t.readback[1]);
-        let class = unpad(&t.readback[2]);
-        Ok(Frame {
-            width: t.width,
-            height: t.height,
-            rgb: rgba.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect(),
-            depth: depth.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
-            class,
-        })
+            t.readback.iter().for_each(|(buffer, _, _)| buffer.unmap());
+        }
+        Ok(frames.into_iter().map(|f| f.expect("every job is rendered")).collect())
     }
 }
 

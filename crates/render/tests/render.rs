@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use autonomousim_render::{
-    AdapterChoice, CameraPose, Draw, Frame, GpuContext, GpuMesh, Intrinsics, Renderer, SemanticClass, Shading, View,
+    AdapterChoice, CameraPose, Draw, Frame, GpuContext, GpuMesh, Intrinsics, Job, Renderer, SemanticClass, Shading,
+    View,
 };
 use autonomousim_scene::MeshData;
 use autonomousim_scene::mesh::{cuboid, icosphere};
@@ -315,4 +316,45 @@ fn the_image_does_not_depend_on_the_thread_count() {
         let hash = stdout.lines().find_map(|l| l.strip_prefix("HASH ")).unwrap_or_else(|| panic!("{stdout}"));
         assert_eq!(hash, here, "LP_NUM_THREADS={threads}");
     }
+}
+
+/// A batch renders each image exactly as it renders alone, whatever its size, its place in
+/// the batch or the number of images (more than one set of layered targets holds).
+#[test]
+fn a_batch_renders_each_image_as_alone() {
+    let ctx = ctx();
+    let floor = GpuMesh::new(ctx, &ground(300.0, [0.25, 0.4, 0.15, 1.0]), SemanticClass::Grass);
+    let block = GpuMesh::new(ctx, &cuboid(Vec3::new(2.0, 1.0, 1.5), [0.6, 0.5, 0.4, 1.0]), SemanticClass::Building);
+    let ball = GpuMesh::new(ctx, &icosphere(1.0, 2, true, [0.8, 0.1, 0.1, 1.0]), SemanticClass::Vehicle);
+    let mut draws = Vec::new();
+    let mut jobs = Vec::new();
+    for i in 0..300 {
+        let a = i as f64 * 0.37;
+        // Most images are 8×8 (more than the 256 layers of one set of targets), some 24×18.
+        let (w, h) = if i % 10 == 3 { (24, 18) } else { (8, 8) };
+        let view = View {
+            pose: pose(DVec3::new(a.sin() * 3.0, a.cos() * 3.0, 2.5), a, 0.2),
+            intrinsics: Intrinsics::new(w, h, 80f64.to_radians()),
+            shading: Shading::default(),
+        };
+        let first = draws.len();
+        draws.push(Draw::world(&floor));
+        draws.push(Draw::new(&block, DVec3::new(8.0, -2.0, 1.5), DQuat::from_rotation_z(a)));
+        if i % 2 == 0 {
+            draws.push(Draw::new(&ball, DVec3::new(4.0 * a.cos(), 4.0 * a.sin(), 1.0), DQuat::IDENTITY));
+        }
+        jobs.push(Job { view, draws: first..draws.len() });
+    }
+    let mut r = Renderer::new(ctx);
+    // A small batch first, so that the targets grow.
+    let few = r.render_batch(ctx, &jobs[..5], &draws).unwrap();
+    let all = r.render_batch(ctx, &jobs, &draws).unwrap();
+    assert_eq!(&all[..5], &few[..]);
+    assert_eq!(all, r.render_batch(ctx, &jobs, &draws).unwrap());
+    let mut alone = Renderer::new(ctx);
+    for (i, (job, frame)) in jobs.iter().zip(&all).enumerate() {
+        assert_eq!(*frame, alone.render(ctx, &job.view, &draws[job.draws.clone()]).unwrap(), "image {i}");
+    }
+    assert!(all.iter().any(|f| f.class.contains(&SemanticClass::Vehicle.id())));
+    assert!(r.render_batch(ctx, &[], &draws).unwrap().is_empty());
 }

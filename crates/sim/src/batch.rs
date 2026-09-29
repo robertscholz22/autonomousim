@@ -9,8 +9,8 @@
 //! worlds in the batch.
 //!
 //! With cameras, a step runs the physics of all worlds in parallel, renders the frames due in
-//! every world on the GPU (in world order), then adds the noise and writes the outputs in
-//! parallel. Images are `[num_envs, count, height, width, channels]` `u8` per group.
+//! every world on the GPU (one submission for the batch), then adds the noise and writes the
+//! outputs in parallel. Images are `[num_envs, count, height, width, channels]` `u8` per group.
 
 use crate::SimError;
 use crate::camera::{self, Cameras, Capture};
@@ -145,10 +145,15 @@ impl BatchSim {
     fn finish(&mut self, mask: Option<&[bool]>) {
         let selected = |i: usize| mask.is_none_or(|m| m[i]);
         if let Some(cameras) = &mut self.cameras {
-            for (i, s) in self.slots.iter_mut().enumerate().filter(|(i, _)| selected(*i)) {
-                if let Err(e) = cameras.capture(&s.world, &mut s.captures) {
-                    panic!("rendering the cameras of world {i}: {e}");
-                }
+            let mut worlds: Vec<_> = self
+                .slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| selected(*i))
+                .map(|(_, s)| (&s.world, &mut s.captures))
+                .collect();
+            if let Err(e) = cameras.capture_batch(&mut worlds) {
+                panic!("rendering the cameras: {e}");
             }
         }
         let slots = &mut self.slots;

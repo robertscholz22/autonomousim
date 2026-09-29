@@ -4,7 +4,8 @@
 //! Rendering is not part of the physics tick: after a policy step (or a reset),
 //! [`Cameras::capture`] renders every camera due at the world's current tick, from the poses
 //! at that tick, and [`WorldInstance::deliver`] passes the frames on. [`BatchSim`](crate::BatchSim)
-//! does this for all its worlds; a single world uses [`Cameras::update`].
+//! renders the cameras of all its worlds in one GPU submission ([`Cameras::capture_batch`]);
+//! a single world uses [`Cameras::update`].
 //!
 //! A frame shows the world's map, water, roads and obstacles, and every active agent, the
 //! camera's own vehicle labelled [`SemanticClass::OwnVehicle`] and the others
@@ -19,8 +20,8 @@ use crate::SimError;
 use crate::scenario::CompiledScenario;
 use crate::world::WorldInstance;
 use autonomousim_render::{
-    AdapterChoice, CameraPose, Draw, GpuContext, GpuRig, GpuWorld, Intrinsics, Renderer, SemanticClass, Shading, View,
-    WorldOptions,
+    AdapterChoice, CameraPose, Draw, GpuContext, GpuRig, GpuWorld, Intrinsics, Job, Renderer, SemanticClass, Shading,
+    View, WorldOptions,
 };
 use autonomousim_scene::rig::{Placement, Rig};
 use autonomousim_sensors::{CameraImage, Sensor, SensorConfig};
@@ -97,58 +98,76 @@ impl Cameras {
 
     /// Render the cameras of active agents that are due at `world`'s tick into `out`.
     pub fn capture(&mut self, world: &WorldInstance, out: &mut Vec<Capture>) -> Result<(), SimError> {
-        let tick = world.clock().tick;
-        let due = |s: &Sensor| matches!(s, Sensor::Camera(c) if c.is_due(tick));
-        let agents = world.agents();
-        if !agents.iter().any(|a| !a.disabled && a.sensors.iter().any(due)) {
-            return Ok(());
-        }
+        self.capture_batch(&mut [(world, out)])
+    }
+
+    /// Render the cameras due in each world into its list, all in one GPU submission.
+    pub fn capture_batch(&mut self, worlds: &mut [(&WorldInstance, &mut Vec<Capture>)]) -> Result<(), SimError> {
+        let due = |w: &WorldInstance| {
+            let tick = w.clock().tick;
+            w.agents()
+                .iter()
+                .any(|a| !a.disabled && a.sensors.iter().any(|s| matches!(s, Sensor::Camera(c) if c.is_due(tick))))
+        };
         let Self { ctx, renderer, options, shading, maps, rigs, placements } = self;
-        let map = &mut maps[world.map_index()];
-        if map.is_none() {
-            *map = Some(GpuWorld::new(ctx, world.map(), options.clone()).map_err(|e| SimError::Render(e.to_string()))?);
-        }
-        let map = map.as_ref().expect("uploaded above");
-        for (a, p) in agents.iter().zip(placements.iter_mut()) {
-            p.clear();
-            if !a.disabled {
-                rigs[a.group].0.place(&a.vehicle, p);
+        for (w, _) in worlds.iter().filter(|(w, _)| due(w)) {
+            let map = &mut maps[w.map_index()];
+            if map.is_none() {
+                *map = Some(GpuWorld::new(ctx, w.map(), options.clone()).map_err(|e| SimError::Render(e.to_string()))?);
             }
         }
         let mut draws: Vec<Draw> = Vec::new();
-        for (i, a) in agents.iter().enumerate().filter(|(_, a)| !a.disabled) {
-            for (k, s) in a.sensors.iter().enumerate() {
-                let Sensor::Camera(cam) = s else { continue };
-                if !cam.is_due(tick) {
-                    continue;
+        let mut jobs = Vec::new();
+        // World, agent and sensor of each job.
+        let mut owners = Vec::new();
+        for (wi, (w, _)) in worlds.iter().enumerate().filter(|(_, (w, _))| due(w)) {
+            let tick = w.clock().tick;
+            let map = maps[w.map_index()].as_ref().expect("uploaded above");
+            let agents = w.agents();
+            for (a, p) in agents.iter().zip(placements.iter_mut()) {
+                p.clear();
+                if !a.disabled {
+                    rigs[a.group].0.place(&a.vehicle, p);
                 }
-                let c = cam.config();
-                let pose = c.mount.world_pose(&a.kinematics());
-                let view = View {
-                    pose: CameraPose::new(pose.pos, pose.rot),
-                    intrinsics: Intrinsics {
-                        near: c.near,
-                        far: c.far,
-                        ..Intrinsics::new(c.width, c.height, c.fov_deg.to_radians())
-                    },
-                    shading: *shading,
-                };
-                draws.clear();
-                map.draws(&view, &mut draws);
-                for (j, b) in agents.iter().enumerate().filter(|(_, b)| !b.disabled) {
-                    let class = if j == i { SemanticClass::OwnVehicle } else { SemanticClass::Vehicle };
-                    rigs[b.group].1.draws(b.vehicle.pose(), &placements[j], class, &mut draws);
-                }
-                let frame = renderer.render(ctx, &view, &draws).map_err(|e| SimError::Render(e.to_string()))?;
-                let image = CameraImage {
-                    width: frame.width,
-                    height: frame.height,
-                    rgb: frame.rgb,
-                    depth: frame.depth,
-                    class: frame.class,
-                };
-                out.push(Capture { agent: i, sensor: k, image });
             }
+            for (i, a) in agents.iter().enumerate().filter(|(_, a)| !a.disabled) {
+                for (k, s) in a.sensors.iter().enumerate() {
+                    let Sensor::Camera(cam) = s else { continue };
+                    if !cam.is_due(tick) {
+                        continue;
+                    }
+                    let c = cam.config();
+                    let pose = c.mount.world_pose(&a.kinematics());
+                    let view = View {
+                        pose: CameraPose::new(pose.pos, pose.rot),
+                        intrinsics: Intrinsics {
+                            near: c.near,
+                            far: c.far,
+                            ..Intrinsics::new(c.width, c.height, c.fov_deg.to_radians())
+                        },
+                        shading: *shading,
+                    };
+                    let first = draws.len();
+                    map.draws(&view, &mut draws);
+                    for (j, b) in agents.iter().enumerate().filter(|(_, b)| !b.disabled) {
+                        let class = if j == i { SemanticClass::OwnVehicle } else { SemanticClass::Vehicle };
+                        rigs[b.group].1.draws(b.vehicle.pose(), &placements[j], class, &mut draws);
+                    }
+                    jobs.push(Job { view, draws: first..draws.len() });
+                    owners.push((wi, i, k));
+                }
+            }
+        }
+        let frames = renderer.render_batch(ctx, &jobs, &draws).map_err(|e| SimError::Render(e.to_string()))?;
+        for ((wi, agent, sensor), frame) in owners.into_iter().zip(frames) {
+            let image = CameraImage {
+                width: frame.width,
+                height: frame.height,
+                rgb: frame.rgb,
+                depth: frame.depth,
+                class: frame.class,
+            };
+            worlds[wi].1.push(Capture { agent, sensor, image });
         }
         Ok(())
     }
