@@ -54,7 +54,7 @@ def examples(monkeypatch):
     pytest.importorskip("torch")
     monkeypatch.syspath_prepend(str(ROOT / "examples"))
     yield
-    for name in ("ppo_continuous", "sac_continuous", "eval_record", "export_policy"):
+    for name in ("ppo_continuous", "sac_continuous", "ppo_pixels", "eval_record", "export_policy"):
         sys.modules.pop(name, None)
 
 
@@ -115,3 +115,46 @@ def test_sac_and_eval_record(examples, tmp_path, capsys):
     eval_record.main([str(_run_dir(tmp_path) / "policy.pt"), "--episodes", "2", "--out", str(tmp_path / "s.mcap")])
     assert "replay: 2 episodes" in capsys.readouterr().out
     _check_export(_run_dir(tmp_path) / "policy.pt", "tanh")
+
+
+def test_ppo_pixels_export_runs_in_rust(examples, tmp_path):
+    """A pixel policy exported after a short run: the Rust network (``_native.Policy``, which
+    also checks the file's samples) matches PyTorch within 1e-5 on random states and images."""
+    import ppo_pixels
+
+    from autonomousim import _native
+
+    ppo_pixels.main(
+        ["--num-envs", "8", "--num-steps", "16", "--total-timesteps", "256", "--sim-threads", "2",
+         "--torch-threads", "1", "--eval-episodes", "2", "--no-tensorboard", "--runs-dir", str(tmp_path / "runs"),
+         "--env-kwargs", '{"image_size": 24, "depth": true}']
+    )  # fmt: skip
+    import export_policy
+    import torch
+
+    trained = _run_dir(tmp_path) / "policy.pt"
+    assert trained.with_suffix(".json").exists()  # exported after training
+    # The last actor layer starts at 0.01 of the usual scale: scaled up, actions are of order 1.
+    ckpt = torch.load(trained, weights_only=False)
+    for k in ("actor_mean.4.weight", "actor_mean.4.bias"):
+        ckpt["agent"][k] *= 20.0
+    path = tmp_path / "scaled.pt"
+    torch.save(ckpt, path)
+    export_policy.main([str(path)])
+    data = json.loads(path.with_suffix(".json").read_text())
+    assert data["algo"] == "ppo_pixels" and data["encoder"]["image_shape"] == [24, 24, 4]
+    assert len(data["check"]["image"]) == len(data["check"]["obs"]) >= 16
+    rust = _native.Policy(path.with_suffix(".json").read_text())
+    torch_policy, _ = ppo_pixels.load_policy(path)
+    assert rust.image_shape == (24, 24, 4) and (rust.obs_dim, rust.act_dim) == (17, 4)
+    rng = np.random.default_rng(0)
+    state = rng.normal(0.0, 3.0, (64, 17)).astype(np.float32)
+    image = rng.integers(0, 256, (64, 24, 24, 4), dtype=np.uint8)
+    expected = torch_policy({"state": state, "image": image})
+    inside = np.abs(expected) < 1.0
+    assert inside.mean() > 0.5 and np.abs(expected[inside]).mean() > 0.1, expected
+    actions = rust.act(state, image)
+    np.testing.assert_allclose(actions, expected, rtol=0, atol=1e-5)
+    print(f"largest difference to PyTorch {np.abs(actions - expected).max():.1e}")
+    with pytest.raises(ValueError, match="images"):
+        rust.act(state)

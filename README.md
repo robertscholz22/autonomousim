@@ -174,6 +174,15 @@ cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json --ag
 `eval_record.py` checks that the recording reproduces every recorded state bit for bit when
 re-simulated from the file. The viewer relies on this for replay.
 
+Pixel policies work the same way: `ppo_pixels.py` exports its CNN encoder with the MLP, the
+viewer runs it in Rust on the camera images (matching PyTorch within 1e-5), and
+`autonomousim._native.Policy` runs an exported file from Python:
+
+```bash
+uv run python examples/ppo_pixels.py --total-timesteps 1500000     # QuadHoverPad-v0, ~11 min
+cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json --camera-view
+```
+
 ## Layout
 
 | Path | Contents |

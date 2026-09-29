@@ -20,6 +20,8 @@ pub struct Autopilot {
     /// The policy flies the followed agent too; otherwise the keyboard does.
     pub flies_pilot: bool,
     obs: Vec<f32>,
+    /// Camera images of the group's agents (pixel policies).
+    images: Vec<u8>,
     action: Vec<f32>,
     /// Simulated time at which the current episode ended.
     pub ended: Option<f64>,
@@ -49,9 +51,18 @@ impl Autopilot {
                 policy.act_dim()
             );
         }
+        if g.obs.image_shape() != policy.image_shape() {
+            anyhow::bail!(
+                "group {:?} observes images of {:?} (height, width, channels), the policy {:?}",
+                file.group,
+                g.obs.image_shape(),
+                policy.image_shape()
+            );
+        }
         Ok(Self {
             name: file.name.clone(),
             obs: vec![0.0; g.spec.count * g.obs_dim()],
+            images: vec![0; g.spec.count * policy.image_len()],
             action: vec![0.0; g.act_dim()],
             policy,
             group,
@@ -71,12 +82,15 @@ impl Autopilot {
             return;
         }
         world.observe(self.group, &mut self.obs);
+        world.observe_images(self.group, &mut self.images);
         let first = world.scenario().groups[self.group].first_agent;
-        for (k, obs) in self.obs.chunks_exact(self.policy.obs_dim()).enumerate() {
+        let (dim, len) = (self.policy.obs_dim(), self.policy.image_len());
+        for k in 0..world.scenario().groups[self.group].spec.count {
             if Some(first + k) == manual {
                 continue;
             }
-            self.policy.act(obs, &mut self.action);
+            let obs = &self.obs[k * dim..(k + 1) * dim];
+            self.policy.act_with_image(obs, &self.images[k * len..(k + 1) * len], &mut self.action);
             world.set_action(first + k, &self.action);
         }
     }
@@ -217,6 +231,70 @@ mod tests {
         }
         let a = s.autopilot.as_ref().unwrap();
         assert_eq!((s.episodes, a.flown, a.finished), (2, 2, 2));
+    }
+
+    /// A pixel policy flying forward at the mean green of its 8×8 down camera (over grass).
+    #[test]
+    fn pixel_policies_see_the_camera_images() {
+        autonomousim_sim::camera::use_adapter(&autonomousim_render::AdapterChoice::Software);
+        let camera = json!({ "name": "down", "type": "camera", "width": 8, "height": 8, "rate_hz": 25,
+                             "mount": { "rotation": [0.0, std::f64::consts::FRAC_PI_2, 0.0] } });
+        let scenario = json!({
+            "name": "t",
+            "map": { "type": "testworld", "kind": "flat", "size": 400.0 },
+            "groups": [{ "name": "agent", "count": 2, "vehicle": "iris_like", "action_mode": "velocity",
+                         "sensors": [camera], "spawn": { "agl": [3.0, 3.0] },
+                         "obs": [{ "term": "camera", "sensor": "down", "output": "rgb" }, { "term": "agl" }] }],
+        });
+        let compiled = serde_json::from_value::<Scenario>(scenario.clone()).unwrap().compile().unwrap();
+        let act = compiled.groups[0].act_dim();
+        let mut kernel = vec![0.0; 3 * 64];
+        kernel[64..128].fill(1.0 / 64.0);
+        let mut weight = vec![0.0; act * 2];
+        weight[0] = 1.0;
+        let file = json!({
+            "format": "autonomousim-policy", "version": 1, "name": "green", "env_id": "test",
+            "algo": "ppo_pixels", "group": "agent", "episode_time": 60.0, "scenario": scenario,
+            "obs_norm": { "mean": [0.0], "var": [1.0], "clip": 10.0, "eps": 1e-8 },
+            "encoder": {
+                "image_shape": [8, 8, 3],
+                "convs": [{ "shape": [1, 3, 8, 8], "stride": 8, "padding": 0, "weight": kernel, "bias": [0.0], "activation": "relu" }],
+                "fc": { "shape": [1, 1], "weight": [1.0], "bias": [0.0], "activation": "relu" },
+            },
+            "layers": [{ "shape": [act, 2], "weight": weight, "bias": vec![0.0; act], "activation": "identity" }],
+            "output": "clip",
+        });
+        let file = PolicyFile::from_json(&file.to_string()).unwrap();
+        let world = WorldInstance::new(Arc::new(compiled), Seed::from_u64(3));
+        let start = world.agent(1).vehicle.position();
+        let mut s = Sim::new(world);
+        s.autopilot = Some(super::Autopilot::new(&file, &s.world).unwrap());
+        // At 0.97 s the last frame (25 Hz) is that of 0.96 s, which the last policy step
+        // (50 Hz, at 0.96 s) saw.
+        for _ in 0..9 {
+            s.advance(0.1);
+        }
+        s.advance(0.07);
+        assert!(s.world.time() > 0.96 && s.world.time() < 0.98, "{}", s.world.time());
+        let mut images = vec![0u8; 2 * 8 * 8 * 3];
+        s.world.observe_images(0, &mut images);
+        for (i, image) in images.as_chunks::<{ 8 * 8 * 3 }>().0.iter().enumerate() {
+            let green = image.iter().skip(1).step_by(3).map(|&g| f64::from(g) / 255.0).sum::<f64>() / 64.0;
+            let a = s.world.agent(i).action[0];
+            assert!(green > 0.2 && (a - green).abs() < 1e-6, "agent {i}: action {a}, mean green {green}");
+        }
+        for _ in 0..20 {
+            s.advance(0.1);
+        }
+        let moved = (s.world.agent(1).vehicle.position() - start).truncate().length();
+        assert!(moved > 1.0, "the drone flies forward: {moved} m");
+        // A policy for other images (16×16, stride 16) is refused.
+        let mut other = file.clone();
+        let encoder = other.encoder.as_mut().unwrap();
+        encoder.image_shape = [16, 16, 3];
+        (encoder.convs[0].shape, encoder.convs[0].stride) = ([1, 3, 16, 16], 16);
+        encoder.convs[0].weight = vec![0.0; 3 * 256];
+        assert!(super::Autopilot::new(&other, &s.world).unwrap_err().to_string().contains("images"));
     }
 
     #[test]

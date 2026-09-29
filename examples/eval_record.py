@@ -40,7 +40,7 @@ from autonomousim.multiagent import MultiAgentVectorEnv
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-SCRIPTS = {"ppo": "ppo_continuous", "sac": "sac_continuous"}
+SCRIPTS = {"ppo": "ppo_continuous", "sac": "sac_continuous", "ppo_pixels": "ppo_pixels"}
 
 
 def load_policy(path: pathlib.Path):

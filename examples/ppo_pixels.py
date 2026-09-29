@@ -16,6 +16,8 @@ Everything else follows ``ppo_continuous.py`` (bootstrapping truncated episodes 
 ``AUTONOMOUSIM_RENDER_ADAPTER`` (default: the best available). The checkpoint
 (``runs/<run>/policy.pt``) holds the network, the state statistics and the arguments;
 ``load_policy`` rebuilds a numpy-in, numpy-out policy that takes the ``Dict`` observations.
+``policy.json`` for the viewer (encoder included) is exported next to it (``--no-export``
+skips this).
 """
 
 import argparse
@@ -72,6 +74,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a("--runs-dir", default="runs")
     a("--env-kwargs", type=json.loads, default={}, help='task options as JSON, e.g. \'{"depth": true}\'')
     a("--eval-env-kwargs", type=json.loads, default={}, help="task options for the final evaluation on top of --env-kwargs")
+    a("--export", action=argparse.BooleanOptionalAction, default=True,
+      help="write policy.json next to policy.pt after training (export_policy.py; the viewer's `policy` command)")
     args = p.parse_args(argv)
     args.batch_size = args.num_envs * args.num_steps
     args.minibatch_size = args.batch_size // args.num_minibatches
@@ -397,6 +401,10 @@ def main(argv: list[str] | None = None) -> dict[str, float]:
     result["minutes"] = (time.time() - start) / 60
     (run_dir / "eval.json").write_text(json.dumps(result, indent=2))
     print(f"saved {policy_path}; evaluation: {json.dumps(result)}")
+    if args.export:
+        from export_policy import export
+
+        print(f"exported {export(policy_path)}", flush=True)
     if writer is not None:
         for k, v in result.items():
             writer.add_scalar(f"eval/{k}", v, global_step)

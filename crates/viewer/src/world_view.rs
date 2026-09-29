@@ -858,3 +858,67 @@ pub fn update_lod(
         vis.set_if_neq(if shown { Visibility::Inherited } else { Visibility::Hidden });
     }
 }
+
+/// The landing pad under the current goal of agent `.0` (groups with `goals.pad`), as the
+/// cameras see it.
+#[derive(Component)]
+pub struct PadVisual(usize);
+
+pub fn spawn_pads(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let groups = &sim.world.scenario().groups;
+    if groups.iter().all(|g| g.spec.goals.pad <= 0.0) {
+        return;
+    }
+    let mesh = meshes.add(convert::mesh(&autonomousim_scene::mesh::landing_pad(1.0)));
+    // Two-sided, as the cameras draw it.
+    let material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 0.9,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    for (i, a) in sim.world.agents().iter().enumerate() {
+        if groups[a.group].spec.goals.pad > 0.0 {
+            // Meshes live in the render world only, so the bounds are given (the unit pad).
+            let bounds = aabb(Vec3::new(-1.0, -0.01, -1.0), Vec3::new(1.0, 0.01, 1.0));
+            commands.spawn((
+                PadVisual(i),
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                bounds,
+                Visibility::Hidden,
+            ));
+        }
+    }
+}
+
+/// Pads lie on the ground under the goals, tilted with it, 2 cm up (as in
+/// `sim::camera`); hidden while their agent is disabled or has no goal.
+pub fn sync_pads(
+    sim: Res<Sim>,
+    origin: Res<RenderOrigin>,
+    mut pads: Query<(&PadVisual, &mut Transform, &mut Visibility)>,
+) {
+    for (pad, mut t, mut visible) in &mut pads {
+        let Some(a) = sim.world.agents().get(pad.0) else { continue };
+        if a.disabled || a.goals.is_empty() {
+            *visible = Visibility::Hidden;
+            continue;
+        }
+        let g = a.goal().position;
+        let (h, n) = sim.world.map().terrain().height_normal(g.x, g.y);
+        let r = sim.world.scenario().groups[a.group].spec.goals.pad;
+        let pose = autonomousim_core::math::Pose::new(
+            DVec3::new(g.x, g.y, h) + 0.02 * n,
+            glam::DQuat::from_rotation_arc(DVec3::Z, n),
+        );
+        *t = origin.transform(&pose).with_scale(Vec3::new(r as f32, 1.0, r as f32));
+        *visible = Visibility::Inherited;
+    }
+}

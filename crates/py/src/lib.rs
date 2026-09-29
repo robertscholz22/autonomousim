@@ -12,7 +12,8 @@ use autonomousim_sim::camera;
 use autonomousim_sim::record::{Recorder, RecorderConfig};
 use autonomousim_sim::{BatchSim as Batch, CompiledScenario, Events, STATE_DIM, STATE_FIELDS, Scenario, SimError};
 use numpy::{
-    PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods,
+    PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyIOError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -501,6 +502,75 @@ impl Drop for BatchSim {
     }
 }
 
+/// An exported policy (`examples/export_policy.py`) run as the Rust programs run it, e.g. to
+/// check an export against PyTorch. The file's check samples are verified on loading.
+#[pyclass(module = "autonomousim._native")]
+struct Policy {
+    policy: autonomousim_sim::policy::Policy,
+}
+
+#[pymethods]
+impl Policy {
+    #[new]
+    fn new(json: &str) -> PyResult<Self> {
+        let file = autonomousim_sim::policy::PolicyFile::from_json(json).map_err(sim_err)?;
+        Ok(Self { policy: file.policy().map_err(sim_err)? })
+    }
+
+    #[getter]
+    fn obs_dim(&self) -> usize {
+        self.policy.obs_dim()
+    }
+
+    #[getter]
+    fn act_dim(&self) -> usize {
+        self.policy.act_dim()
+    }
+
+    /// `(height, width, channels)` of a pixel policy's image, else `None`.
+    #[getter]
+    fn image_shape(&self) -> Option<(usize, usize, usize)> {
+        self.policy.image_shape().map(|[h, w, c]| (h, w, c))
+    }
+
+    /// Deterministic actions `float32 [N, act_dim]` for observations `float32 [N, obs_dim]`
+    /// and, for pixel policies, images `uint8 [N, H, W, C]`.
+    #[pyo3(signature = (obs, image=None))]
+    fn act<'py>(
+        &mut self,
+        py: Python<'py>,
+        obs: PyReadonlyArray2<'_, f32>,
+        image: Option<PyReadonlyArrayDyn<'_, u8>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let (n, dim) = (obs.shape()[0], self.policy.obs_dim());
+        if obs.shape()[1] != dim {
+            return Err(PyValueError::new_err(format!("observations: expected [N, {dim}], got {:?}", obs.shape())));
+        }
+        let len = self.policy.image_len();
+        let images: Vec<u8> = match (&image, self.policy.image_shape()) {
+            (Some(img), Some([h, w, c])) if img.shape() == [n, h, w, c] => img.as_array().iter().copied().collect(),
+            (None, None) => Vec::new(),
+            (img, shape) => {
+                return Err(PyValueError::new_err(format!(
+                    "images: expected {}, got {:?}",
+                    shape.map_or("none".into(), |[h, w, c]| format!("[{n}, {h}, {w}, {c}] uint8")),
+                    img.as_ref().map(|i| i.shape().to_vec())
+                )));
+            }
+        };
+        let obs = obs.as_array();
+        let act_dim = self.policy.act_dim();
+        let mut out = vec![0.0f32; n * act_dim];
+        for (k, a) in out.chunks_exact_mut(act_dim).enumerate() {
+            let o: Vec<f32> = obs.row(k).iter().copied().collect();
+            self.policy.act_with_image(&o, &images[k * len..(k + 1) * len], a);
+        }
+        numpy::ndarray::Array2::from_shape_vec((n, act_dim), out)
+            .map(|a| PyArray2::from_owned_array(py, a))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_version, m)?)?;
@@ -511,6 +581,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_render_adapter, m)?)?;
     m.add_function(wrap_pyfunction!(render_adapter, m)?)?;
     m.add_class::<BatchSim>()?;
+    m.add_class::<Policy>()?;
     m.add("STATE_DIM", STATE_DIM)?;
     m.add("STATE_FIELDS", STATE_FIELDS.to_vec())?;
     m.add("EVENTS", Events::NAMES.iter().map(|(n, e)| (*n, e.0)).collect::<Vec<_>>())?;

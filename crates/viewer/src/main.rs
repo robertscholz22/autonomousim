@@ -550,7 +550,13 @@ fn main() -> anyhow::Result<()> {
         .add_plugins(EguiPlugin::default())
         .add_systems(
             Startup,
-            (world_view::spawn_lights, world_view::spawn_map, vehicle_view::spawn_vehicles, spawn_camera),
+            (
+                world_view::spawn_lights,
+                world_view::spawn_map,
+                world_view::spawn_pads,
+                vehicle_view::spawn_vehicles,
+                spawn_camera,
+            ),
         )
         .add_systems(
             Update,
@@ -562,11 +568,15 @@ fn main() -> anyhow::Result<()> {
                 history::record,
                 world_view::recenter,
                 world_view::sync_map,
-                vehicle_view::sync_vehicles,
-                vehicle_view::sync_tracks,
-                vehicle_view::sync_riders,
-                vehicle_view::sync_rotors,
-                vehicle_view::sync_tiltrotors,
+                (
+                    vehicle_view::sync_vehicles,
+                    vehicle_view::sync_tracks,
+                    vehicle_view::sync_riders,
+                    vehicle_view::sync_rotors,
+                    vehicle_view::sync_tiltrotors,
+                    world_view::sync_pads,
+                )
+                    .chain(),
                 camera::update_camera,
                 world_view::stream_tiles,
                 world_view::update_view_distance,
