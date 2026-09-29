@@ -9,6 +9,7 @@ members = [
     "crates/control",
     "crates/sim",
     "crates/scene",
+    "crates/render",
     "crates/py",
     "crates/viewer",
     "crates/cli",
@@ -23,6 +24,7 @@ default-members = [
     "crates/control",
     "crates/sim",
     "crates/scene",
+    "crates/render",
     "crates/cli",
 ]
 
@@ -42,6 +44,7 @@ autonomousim-sensors = { path = "crates/sensors" }
 autonomousim-control = { path = "crates/control" }
 autonomousim-sim = { path = "crates/sim" }
 autonomousim-scene = { path = "crates/scene" }
+autonomousim-render = { path = "crates/render" }
 
 # math / geometry (glam must unify with parry3d-f64's glam via glamx)
 glam = { version = "0.33", features = ["serde"] }
@@ -63,6 +66,10 @@ rayon = "1.12"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
+
+# headless rendering (cameras); the same wgpu as Bevy's, Vulkan only
+wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
+bytemuck = { version = "1.25", features = ["derive"] }
 
 # python
 pyo3 = "0.29"

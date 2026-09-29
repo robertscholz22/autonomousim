@@ -465,6 +465,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "autonomousim-render"
+version = "0.1.0"
+dependencies = [
+ "autonomousim-scene",
+ "blake3",
+ "bytemuck",
+ "glam 0.33.8",
+ "thiserror 2.0.20",
+ "toml",
+ "wgpu",
+]
+
+[[package]]
 name = "autonomousim-scene"
 version = "0.1.0"
 dependencies = [
@@ -5250,13 +5263,18 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.16.1",
+ "js-sys",
  "log",
  "naga",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu-core",
  "wgpu-hal",
  "wgpu-types",

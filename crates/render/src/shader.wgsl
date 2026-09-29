@@ -1,0 +1,60 @@
+// One pass, three targets: shaded colour, linear depth along the optical axis, class id.
+
+struct DrawUniform {
+    // Mesh-local position → clip space (camera-relative, composed in f64 on the CPU).
+    mvp: mat4x4<f32>,
+    // Direction to the sun in the mesh's frame (xyz) and the ambient share (w).
+    sun: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> draw: DrawUniform;
+
+struct VertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) class_id: u32,
+};
+
+struct VertexOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) color: vec4<f32>,
+    // Clip w is the camera-frame x: the depth along the optical axis (linear in space, so
+    // perspective-correct interpolation is exact).
+    @location(2) depth: f32,
+    @location(3) @interpolate(flat) class_id: u32,
+};
+
+@vertex
+fn vs_main(v: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    out.clip = draw.mvp * vec4<f32>(v.position, 1.0);
+    out.normal = v.normal;
+    out.color = v.color;
+    out.depth = out.clip.w;
+    out.class_id = v.class_id;
+    return out;
+}
+
+struct FragmentOut {
+    @location(0) color: vec4<f32>,
+    @location(1) depth: f32,
+    @location(2) class_id: u32,
+};
+
+@fragment
+fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> FragmentOut {
+    // Two-sided: a back face is lit as seen from its own side.
+    var n = normalize(in.normal);
+    if (!front) {
+        n = -n;
+    }
+    let ambient = draw.sun.w;
+    let light = ambient + (1.0 - ambient) * max(dot(n, draw.sun.xyz), 0.0);
+    var out: FragmentOut;
+    out.color = vec4<f32>(in.color.rgb * light, 1.0);
+    out.depth = in.depth;
+    out.class_id = in.class_id;
+    return out;
+}

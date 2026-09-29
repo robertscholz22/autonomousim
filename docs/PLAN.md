@@ -2445,7 +2445,7 @@ The rest of this section is proposed and open to change.
 #### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 0 | `render` crate: headless device and adapter choice (incl. lavapipe), offscreen RGB/depth/semantic of a single mesh, readback, pinhole intrinsics | Depth of an analytic plane and box matches within 1e-4 relative; the image hash on lavapipe is stable across runs and thread counts; golden hash committed |
+| 0 ✅ | `render` crate: headless device and adapter choice (incl. lavapipe), offscreen RGB/depth/semantic of a single mesh, readback, pinhole intrinsics | Depth of an analytic plane and box matches within 1e-4 relative; the image hash on lavapipe is stable across runs and thread counts; golden hash committed |
 | 1 | World and vehicle residency: map upload from `scene` (LOD, culling), semantic classes, instanced vehicles with articulated parts | Depth and class match LiDAR ray casts from the same poses (terrain, trees, rocks, roads, water, a car, a drone) within tolerance on test and procedural maps |
 | 2 | Camera sensor and sim integration: `SensorConfig::Camera`, batched render in `BatchSim`, image buffers, noise, rates and latency, reset | Determinism suite: the same seed gives the same images on one adapter; world 0 is identical at N = 1 and N = 64; latency is exact in frames; state goldens unchanged |
 | 3 | Performance: atlas batching, multiple maps per batch, double-buffered readback, benchmarks | ≥ 3,000 frames/s at 64×64 RGB + depth for 64 worlds on the Iris Xe; 7900 XT measured; results in `benchmarks/results` |
@@ -2455,9 +2455,19 @@ The rest of this section is proposed and open to change.
 | 7 | Rust CNN inference and export for pixel policies | Rust outputs match PyTorch within 1e-5 on random inputs; an exported pixel policy flies in `viewer policy` |
 | 8 | `DroneLandOnCar-v0`: task, scripted pilot from the semantic image, short training, export, viewer, replay | As for the other demos |
 
+#### As built
+- **Step 0 (`render` crate)**, `autonomousim-render` (`crates/render`; wgpu 29 with only the Vulkan backend and WGSL; the lockfile has one wgpu, shared with Bevy's): `GpuContext`, `AdapterChoice`, `Intrinsics`, `CameraPose`, `GpuMesh`, `Draw`, `View`, `Shading`, `Renderer`, `Frame`, `SemanticClass`, `RenderError`:
+  - **Device** (`GpuContext::new(&AdapterChoice)`): headless, no surface; `Auto` ranks discrete → integrated → virtual → CPU, `Software` takes the CPU rasterizer (lavapipe), `Named` matches the adapter name; `AUTONOMOUSIM_RENDER_ADAPTER` (`auto`, `software`/`lavapipe`/`cpu`, or a name) via `from_env`; `describe()` gives name, type and driver for benchmark and golden records. Futures are driven by a small `block_on` (no async runtime).
+  - **Camera model**: ideal pinhole, square pixels, principal point at the centre; `Intrinsics { width, height, fov_x, near = 0.05, far = 1000 }`, `ray(u, v)` (unit axis depth), `project`. Camera frame FLU with the optical axis +x: `u = cx − f·y/x`, `v = cy − f·z/x`; `CameraPose.orientation` rotates camera → ENU.
+  - **Pass**: one pipeline, three colour targets (Rgba8UnormSrgb shaded colour, R32Float depth along the optical axis, R8Uint class) plus a reversed-Z Depth32Float buffer (compare Greater, clear 0). Model-view-projection composed per draw in f64 relative to the camera, then rounded to f32 (no precision loss far from the origin); the linear depth is clip w, interpolated perspective-correctly. Lighting: two-sided Lambert with ambient share, `ambient + (1 − ambient)·max(n·sun, 0)`, the sun turned into each mesh's frame; no culling (back faces lit from their own side). Per-draw uniforms in 256-byte slots with dynamic offsets; targets and read-back buffers are recreated only when the image size changes; rows unpadded on readback. Sky: clear colour, depth 0, class 0.
+  - **Meshes**: `GpuMesh::new(ctx, &MeshData, class)` or `with_classes` (per vertex, flat-interpolated); vertex = position, normal, linear colour, class (48 bytes).
+  - **Semantic classes** (`SEMANTIC_VERSION` 1, append only): sky, grass, forest floor, rock, soil, snow, water, road, trunk, canopy, boulder, building, own vehicle, vehicle.
+  - **Tests** (`crates/render/tests/render.rs`, all on lavapipe): a tilted, rolled, yawed camera over a plane matches the analytic depth within 1e-4 relative on every pixel whose ±0.6 px neighbourhood is all ground (plus class and sky checks); a rotated box on the ground matches slab intersection in depth and class away from edges; shading against the sun (overhead, 60°, below the horizon, a back face from both sides, a flipped mesh, the sky colour) within 1 LSB of the sRGB encoding; the same frame from the same and a new renderer; the golden hash (`fixtures/golden_images.toml`, with the lavapipe/Mesa version in its header); the test binary rerun with `LP_NUM_THREADS` = 1 and 4 gives the same hash.
+  - **First numbers** (`cargo run -p autonomousim-render --release --example adapters`): one 64² frame with synchronous readback takes ~240 µs on the Iris Xe and ~170 µs on lavapipe, which is latency-bound; batching many views per submission comes in step 3.
+
 **To confirm while building**:
-- whether wgpu 29 can be shared as one workspace dependency with Bevy's (no second copy);
-- lavapipe's determinism across thread counts (`LP_NUM_THREADS`);
+- ~~whether wgpu 29 can be shared as one workspace dependency with Bevy's~~ (yes, one copy in the lockfile);
+- ~~lavapipe's determinism across thread counts (`LP_NUM_THREADS`)~~ (identical at 1 and 4 threads);
 - readback latency and atlas limits on the Iris Xe (max texture size, buffer mapping cost);
 - uint16 versus float32 for depth in Python;
 - the frame rate of large tiled maps (M6a) in the camera path, or restricting cameras to monolithic maps at first.
