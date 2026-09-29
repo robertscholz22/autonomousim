@@ -2385,6 +2385,83 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 - whether the aerial physics rate stays 500 Hz for fixed-wing aircraft (the short period of a small UAV is several Hz) and moves to 1 kHz for helicopters;
 - the tile size and cache bound against memory on the laptop.
 
+## Milestone 7: Camera sensors
+
+Planned 2026-09-29. Decided with the user at the start:
+- **Renderer**: a new **`render` crate on plain wgpu**, fed by the `scene` meshes. There is one GPU context per process; the cameras of all worlds are batched into texture atlases with one readback per step. Bevy stays out of the training path.
+- **Outputs**: **RGB, depth and semantic** from one pass (multiple render targets). Cameras are ideal pinhole cameras with noise, exposure and latency. Lens distortion, motion blur and rolling shutter are deferred.
+- **Determinism**: images are **bit-identical on the same GPU and driver**. Tests and golden image hashes run on **lavapipe** (Mesa's Vulkan software rasterizer, installed on the laptop), so they do not depend on the machine. Images from different GPUs are compared within a tolerance.
+- **Python**: a Gymnasium **`Dict` observation `{state, image}`**. `state` is the flat float vector as today; `image` is uint8 `[H, W, C]` per camera, written in place into preallocated numpy buffers. Tasks without cameras keep their plain `Box`. A new `ppo_pixels.py` trains a small CNN encoder.
+- **Target**: on the laptop (Iris Xe), **≥ 3,000 camera frames/s at 64×64 RGB + depth** for a batch of 64 worlds, i.e. PPO at ≥ 1.5k SPS. The 7900 XT is measured, with 5–10× expected.
+- **Demo**: **a drone lands on a moving car**. The car is driven by a **scripted driver** along rural roads; only the drone learns. The drone sees a **64×64 downward camera** (RGB + depth; semantic for debugging and auxiliary losses) and its own state (velocity, attitude, AGL). It is not given the car's position, and it acts in `velocity` mode.
+- **Training**: as before, only enough to test what was built; the user trains the agents.
+
+The rest of this section is proposed and open to change.
+
+**Already in place**:
+- **`scene` meshes**, independent of any renderer: terrain chunks with LOD strides, water, road ribbons, obstacles merged per chunk, and visuals for every vehicle family (multirotor, fixed-wing, tiltrotor, helicopter, `wheeled` cars/trucks/trailers, tracks, single-track).
+- **wgpu 29** is already in the lockfile, through Bevy 0.19.
+- **Sensor timing** (`Timing { divider, latency }`, `DelayLine`) and the LiDAR as a template. The LiDAR sees terrain, obstacles and other agents (`SceneRays`), which gives a reference for depth and semantic images.
+- **Agent contacts**: a drone rests on a car's roof (`AgentContacts.supported`, `sim/tests/sim.rs::drone_rides_on_a_car_roof`).
+- **Road geometry**: `lane::Follow` (`heading`, `curvature` and `point` ahead). Pure-pursuit drivers exist, but only in tests.
+- **Batching**: `BatchSim::step` runs physics per world on rayon, then `gather`s serially. A batched render fits between the two.
+
+**Not in place**:
+- No GPU code outside the viewer.
+- **No Rust-side scripted agents**: every group takes actions from Python (`BatchSim::step` asserts one action array per group), and `set_action` overwrites `set_command` each step.
+- **`LANDED` uses absolute speed**, so it cannot trigger on a moving car. Nothing records which agent an agent rests on.
+- **Observations** are one flat `f32` vector per agent; there is no image buffer.
+- **The Rust policy runner** (`sim::policy`, used by the viewer) runs MLPs only.
+- **The recorder** writes state, pose, action, events and optional LiDAR; there are no image channels.
+
+#### Design
+- **`render` crate** (`autonomousim-render`: wgpu, `scene`, `world`; no Bevy):
+  - **Device**: headless, with the adapter chosen by preference (discrete → integrated → lavapipe). `AUTONOMOUSIM_RENDER_ADAPTER` names one explicitly; tests force lavapipe. Without a GPU, lavapipe still works, only slowly.
+  - **World residency**: each map in the pool is uploaded once (terrain chunks at 2–4 LOD strides, water, roads, merged obstacles) as vertex buffers per chunk. Vertices carry colour and a semantic class. Maps are shared across worlds by `Arc` identity, like `StaticWorld`.
+  - **Vehicles**: one mesh set per vehicle definition, drawn instanced with per-agent part transforms (body, wheels, rotors, surfaces, mounts). The poses come from the same functions the viewer uses to pose its visuals.
+  - **One pass, three targets**:
+    - RGB (`Rgba8Unorm`) with sun and ambient shading, fog and sky colour;
+    - linear depth (`R32Float`, metres along the optical axis, 0 for sky);
+    - semantic class (`R8Uint`).
+    - No MSAA; sensors alias like real ones at 64².
+  - **Semantic classes**: sky, terrain (by material group: grass/field, forest floor, rock/scree, sand/mud, snow), water, road, tree trunk, canopy, rock, building/farm, vehicle (own), vehicle (other agents). The table is fixed and versioned.
+  - **Batching**: all cameras due in a step render into atlas textures (a 64×64 tile per camera), with one draw list per tile and chunk-level frustum culling. There is one `copy_texture_to_buffer` and one map-read per step, and double-buffered readback lets the next step's physics overlap the copy.
+- **Camera sensor** (`sensors::camera`, `SensorConfig::Camera`):
+  - **Configuration**: `width`, `height`, `fov_deg` (horizontal), mount pose (FLU position + roll/pitch/yaw), `rate_hz`, `latency`, `outputs` (any of `rgb`, `depth`, `semantic`), `near`/`far`, and noise (Gaussian pixel noise, depth noise ∝ d², exposure jitter). Noise is applied on the CPU from the sensor's seeded stream, so it is deterministic everywhere.
+  - **Timing**: a camera's period must be a multiple of the policy period (one frame at most per policy step, rendered from the poses at the end of the step). Latency is a whole number of camera frames, held in a `DelayLine` of images.
+  - **The render runs in `BatchSim`, not in `WorldInstance::tick`**: after the parallel physics, the batch collects the due cameras of all worlds, renders once and scatters the images. Single worlds (viewer, `WorldInstance`) use the same path with a batch of one.
+- **Image outputs**: per group `[num_envs, count, cameras, H, W, C]` uint8 (depth as float32 metres in its own array, or quantised to uint16 mm), next to the flat obs. `GroupSpec.obs` gains `{ term = "camera", sensor = "down", output = "rgb" }` entries, which go to the image dict instead of the flat vector.
+- **Scripted groups** (`GroupSpec.driver`): a group with a Rust driver takes no actions from Python and is left out of the Python action and observation arrays (it stays in the state array for rewards). The first driver is `road`: pure pursuit on `lane::Follow` with a curvature-limited speed profile, a random target speed (`speed = [3, 12]` m/s), optional random stops and a random turn at junctions. It is deterministic from the world's seed stream.
+- **Landing on agents**: `LANDED` compares speeds relative to the supporting agent's velocity at the contact. A new state column `support` holds the index of the agent an agent rests on (−1 for none), so tasks can tell "landed on the car" from "landed on the road".
+- **Recording and viewer**: recordings do not store images, because replay re-renders them from the recorded state (deterministic on the same machine). An optional `/agent/<id>/camera` channel (PNG, low rate) serves Foxglove. The viewer shows a camera panel (RGB/depth/semantic toggle) from the `render` crate, uploaded as an egui texture, so it shows exactly what the policy sees, plus a frustum gizmo.
+- **Rust CNN inference**: `sim::policy` gains conv layers (conv 3×3/stride, ReLU, flatten) matching `ppo_pixels.py`'s encoder, so exported pixel policies fly in `viewer policy`.
+- **Demo `DroneLandOnCar-v0`**:
+  - **Setup**: an `iris_like` drone in `velocity` mode and a scripted car on `rural` training maps. The drone spawns 15–30 m above the car with the car inside the camera footprint (±10 m offset), and the car drives at 3–12 m/s. There is mild wind.
+  - **Observation**: `image` is the 64×64 downward camera (RGB + depth); `state` is body velocity, rates, attitude, AGL and the last action.
+  - **Reward**: shaping on the privileged relative position (reward only, not observed); success is `LANDED` with `support` = the car. A crash or losing the car for more than 5 s ends the episode.
+  - **Curriculum options**: car speed range, stops on or off, spawn offset.
+  - **Scripted pilot**: flies from the semantic image only (centroid and size of the "other vehicle" pixels → a velocity command; depth for height), to prove the camera loop without learning.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 0 | `render` crate: headless device and adapter choice (incl. lavapipe), offscreen RGB/depth/semantic of a single mesh, readback, pinhole intrinsics | Depth of an analytic plane and box matches within 1e-4 relative; the image hash on lavapipe is stable across runs and thread counts; golden hash committed |
+| 1 | World and vehicle residency: map upload from `scene` (LOD, culling), semantic classes, instanced vehicles with articulated parts | Depth and class match LiDAR ray casts from the same poses (terrain, trees, rocks, roads, water, a car, a drone) within tolerance on test and procedural maps |
+| 2 | Camera sensor and sim integration: `SensorConfig::Camera`, batched render in `BatchSim`, image buffers, noise, rates and latency, reset | Determinism suite: the same seed gives the same images on one adapter; world 0 is identical at N = 1 and N = 64; latency is exact in frames; state goldens unchanged |
+| 3 | Performance: atlas batching, multiple maps per batch, double-buffered readback, benchmarks | ≥ 3,000 frames/s at 64×64 RGB + depth for 64 worlds on the Iris Xe; 7900 XT measured; results in `benchmarks/results` |
+| 4 | Python: `Dict` observations in the vector, multi-agent and PettingZoo envs; in-place uint8 buffers; `ppo_pixels.py` (CNN encoder) | `check_env` and vector tests pass with images; a small pixel task (hover over a pad from the down camera) trains in minutes |
+| 5 | Scripted groups (`GroupSpec.driver = road`), relative `LANDED` and the `support` column | The car drives 10 min of random routes on rural maps without leaving the road, deterministically; the group is absent from the Python arrays; a drone landed on a car at 8 m/s reports `LANDED` with `support` = the car |
+| 6 | Viewer: camera panel (RGB/depth/semantic), frustum gizmo, scripted cars in live and replay; optional camera recording channel | Live and replay show the feed at ≥ 60 fps with one camera on the Iris Xe; replayed images equal the live ones on the same machine |
+| 7 | Rust CNN inference and export for pixel policies | Rust outputs match PyTorch within 1e-5 on random inputs; an exported pixel policy flies in `viewer policy` |
+| 8 | `DroneLandOnCar-v0`: task, scripted pilot from the semantic image, short training, export, viewer, replay | As for the other demos |
+
+**To confirm while building**:
+- whether wgpu 29 can be shared as one workspace dependency with Bevy's (no second copy);
+- lavapipe's determinism across thread counts (`LP_NUM_THREADS`);
+- readback latency and atlas limits on the Iris Xe (max texture size, buffer mapping cost);
+- uint16 versus float32 for depth in Python;
+- the frame rate of large tiled maps (M6a) in the camera path, or restricting cameras to monolithic maps at first.
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
@@ -2393,7 +2470,7 @@ Like M4, M6 is split into sub-milestones. Each ends with tests, its demo, a comm
 | M4 | (Detailed above; split into M4a/b/c.) Rural maps (spline road graph, terrain blending, fields, farms, dirt tracks) + trucks and trailers (fifth wheel, drawbar, 6×6/8×8, multi-axle steering, lifting the 4-axle limit) + **tracked vehicles** and soft soil (design below) | Offtracking vs analytic results; trailer reversing task; tracked checks below |
 | M5 ✅ | (Detailed above; done 2026-09-28.) Bicycles and motorcycles (camber thrust, turn slip) | Whipple benchmark (Meijaard 2007): weave ≈ 4.292 m/s, capsize ≈ 6.024 m/s |
 | M6 ✅ | (Detailed above; split into M6a/b/c; done 2026-09-29.) Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
-| M7 | Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
+| M7 | (Detailed above.) Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 | Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
 | M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export; live viewer attach to a running simulation (moved from M3, 2026-09-25) | Round trip with `ros2 topic echo` |
 
