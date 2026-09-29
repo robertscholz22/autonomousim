@@ -17,7 +17,8 @@ Arrays are per group, keyed by group name: ``obs[g]`` ``float32 [num_envs, count
 or with camera terms ``{"state": that, "image": uint8 [num_envs, count, height, width,
 channels]}``, ``reward[g]`` ``float64 [num_envs, count]``, ``terminated[g]`` ``bool [num_envs, count]``;
 ``truncated`` is per world, ``bool [num_envs]``. ``step`` takes ``{group: [num_envs, count,
-act_dim]}``, or one array when there is a single group.
+act_dim]}``, or one array when there is a single group. Scripted groups (``driver``, e.g.
+traffic added with ``overrides``) have no arrays here and take no actions (``envs.scripted``).
 
 Agents stop individually (see ``autonomousim.tasks.multi``): ``terminated[g]`` is true on
 the step an agent stops, and from then on it is frozen, its reward is 0 and its
@@ -71,7 +72,11 @@ class MultiAgentVectorEnv:
         self.task = make_multi_task(task, **task_kwargs)
         self.sim = BatchSim(json.dumps(self.task.scenario()), num_envs, seed, num_threads)
         self.num_envs = num_envs
-        self.groups: list[str] = list(self.sim.group_names)
+        names = list(self.sim.group_names)
+        #: Learning groups (those with arrays here) and scripted ones (``driver``: no actions,
+        #: observations or rewards; their rows are ``sim.state(g)``).
+        self.groups: list[str] = [g for g in names if not self.sim.group_info(g)["scripted"]]
+        self.scripted: list[str] = [g for g in names if self.sim.group_info(g)["scripted"]]
         self.autoreset = autoreset
         self.copy = copy
         self.count: dict[str, int] = {}

@@ -563,6 +563,11 @@ impl GroundController {
                 }
                 if v_ref == 0.0 {
                     input.throttle = 0.0;
+                    // Stopping: the brakes act against the motion whichever gear is engaged
+                    // (a vehicle rolling back in forward gear gets no throttle).
+                    if force * v < 0.0 {
+                        input.brake = input.brake.max((force.abs() * r / self.brake_torque).clamp(0.0, 1.0));
+                    }
                 }
                 // Launching through a converter: held on the brakes until the engine runs up.
                 if let Some(tc) = &c.torque_converter

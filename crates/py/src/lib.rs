@@ -215,34 +215,41 @@ impl BatchSim {
                 }
             })
             .collect::<Vec<_>>();
-        let actions = scenario.groups.iter().map(|g| vec![0.0; num_envs * g.spec.count * g.act_dim()]).collect();
+        // Scripted groups take no actions.
+        let actions = scenario
+            .groups
+            .iter()
+            .map(|g| if g.scripted() { Vec::new() } else { vec![0.0; num_envs * g.spec.count * g.act_dim()] })
+            .collect();
         publish(py, &arrays, &sim)?;
         Ok(Self { sim: Mutex::new(sim), scenario, num_envs, arrays, actions })
     }
 
     /// One policy step of every world. `actions` is one array `[num_envs, count, act_dim]`
-    /// (any shape with `num_envs` rows and that many values; float32 or float64) per group,
-    /// as a list or tuple, or a single array when there is one group. Actions are clipped to
+    /// (any shape with `num_envs` rows and that many values; float32 or float64) per learning
+    /// group (scripted groups, driven by a `driver`, take none), in group order, as a list or
+    /// tuple, or a single array when there is one learning group. Actions are clipped to
     /// [−1, 1]; non-finite values read as 0.
     fn step(&mut self, py: Python<'_>, actions: &Bound<'_, PyAny>) -> PyResult<()> {
         let groups = &self.scenario.groups;
         let num_envs = self.num_envs;
+        let learning: Vec<usize> = (0..groups.len()).filter(|&g| !groups[g].scripted()).collect();
         if actions.is_instance_of::<PyList>() || actions.is_instance_of::<PyTuple>() {
             let items: Vec<Bound<'_, PyAny>> = actions.try_iter()?.collect::<PyResult<_>>()?;
-            if items.len() != groups.len() {
+            if items.len() != learning.len() {
                 return Err(PyValueError::new_err(format!(
-                    "expected {} action arrays (one per group), got {}",
-                    groups.len(),
+                    "expected {} action arrays (one per learning group), got {}",
+                    learning.len(),
                     items.len()
                 )));
             }
-            for ((a, out), g) in items.iter().zip(&mut self.actions).zip(groups) {
-                stage_actions(a, num_envs, out, &g.spec.name)?;
+            for (a, &g) in items.iter().zip(&learning) {
+                stage_actions(a, num_envs, &mut self.actions[g], &groups[g].spec.name)?;
             }
-        } else if groups.len() == 1 {
-            stage_actions(actions, num_envs, &mut self.actions[0], &groups[0].spec.name)?;
+        } else if let [g] = learning[..] {
+            stage_actions(actions, num_envs, &mut self.actions[g], &groups[g].spec.name)?;
         } else {
-            return Err(PyTypeError::new_err("pass a list with one action array per group"));
+            return Err(PyTypeError::new_err("pass a list with one action array per learning group"));
         }
         let sim = self.sim.get_mut().unwrap_or_else(PoisonError::into_inner);
         let staged: Vec<&[f32]> = self.actions.iter().map(Vec::as_slice).collect();
@@ -368,7 +375,9 @@ impl BatchSim {
         self.scenario.map_hashes.iter().map(|h| h.hex()).collect()
     }
 
-    /// Layout of a group: name, count, vehicle, family, action mode, `obs_dim`, `act_dim` and the
+    /// Layout of a group: name, count, vehicle, family, action mode, `obs_dim`, `act_dim`,
+    /// `first_agent` (index in the world of its first agent), `scripted` and `driver` (its
+    /// driver's name or `None`), and the
     /// observation terms as `(name, offset, length)`, `image_shape` (`(height, width,
     /// channels)` or `None`) and `image_layout`, the camera terms as `(sensor/output, first
     /// channel, channels)`; for ground vehicles in `vk`/`vw` also
@@ -385,6 +394,9 @@ impl BatchSim {
         d.set_item("action_mode", g.action_mode().name())?;
         d.set_item("obs_dim", g.obs_dim())?;
         d.set_item("act_dim", g.act_dim())?;
+        d.set_item("first_agent", g.first_agent)?;
+        d.set_item("scripted", g.scripted())?;
+        d.set_item("driver", g.spec.driver.as_ref().map(|d| d.name()))?;
         d.set_item("num_rotors", g.def.as_multirotor().map_or(0, |d| d.rotors.len()))?;
         d.set_item("mass", g.def.mass())?;
         d.set_item("obs_layout", g.obs.layout())?;

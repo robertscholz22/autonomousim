@@ -729,6 +729,62 @@ fn drone_rides_on_a_car_roof() {
     assert!(moved.length() < 0.05, "the drone slid {moved:?} on the roof");
 }
 
+/// A drone set down on the roof of a car driving at 8 m/s has landed (at rest relative to the
+/// car), and its state row names the car as its support.
+#[test]
+fn drone_lands_on_a_moving_car() {
+    let mut w = car_and_drone();
+    // Start 60 m before the map's centre, heading through it.
+    let car = w.agent(0).vehicle.pose();
+    let (lo, hi) = w.map().extent();
+    let heading = (car.rot * DVec3::X).truncate().normalize();
+    let start = (0.5 * (lo + hi) - 60.0 * heading).extend(car.pos.z);
+    w.place_agent(0, Pose::new(start, car.rot), DVec3::ZERO, DVec3::ZERO);
+    w.set_command(0, GroundSetpoint::SpeedCurvature { speed: 8.0, curvature: 0.0 });
+    let mut steps = 0;
+    while w.agent(0).vehicle.lin_vel_body().x < 7.95 {
+        w.step();
+        steps += 1;
+        assert!(steps < 500, "the car does not reach 8 m/s");
+    }
+    let velocity = w.agent(0).vehicle.lin_vel_world();
+    let roof = w.agent(0).vehicle.pose().transform_point(DVec3::new(-0.3, 0.5, 0.79 + 0.45 + 0.12 + 0.3));
+    w.place_agent(1, Pose::new(roof, w.agent(0).vehicle.pose().rot), velocity, DVec3::ZERO);
+    let mut touched = false;
+    for _ in 0..100 {
+        let v = w.agent(0).vehicle.lin_vel_world();
+        let down = Setpoint::Velocity { velocity: v - 0.3 * DVec3::Z, frame: Frame::World, yaw: YawCommand::Rate(0.0) };
+        w.set_command(1, down);
+        w.step();
+        assert!(!w.agent(1).events.contains(Events::CRASH_AGENT), "{:?}", w.agent(1).events);
+        if w.agent(1).events.contains(Events::GROUND_CONTACT) {
+            touched = true;
+            break;
+        }
+    }
+    assert!(touched, "the drone never touched the roof");
+    // Pressing down on the roof (with its rotors off the air stream would blow it off): it
+    // rocks a little but has mostly landed, relative to the car.
+    let mut landed = 0;
+    for _ in 0..50 {
+        let v = w.agent(0).vehicle.lin_vel_world();
+        let down = Setpoint::Velocity { velocity: v - 0.3 * DVec3::Z, frame: Frame::World, yaw: YawCommand::Rate(0.0) };
+        w.set_command(1, down);
+        w.step();
+        let e = w.agent(1).events;
+        assert!(e.contains(Events::GROUND_CONTACT) && !e.is_terminal(), "{e:?}");
+        assert_eq!(w.agent(1).support, Some(0));
+        landed += usize::from(e.contains(Events::LANDED));
+    }
+    assert!(landed >= 25, "landed in {landed} of 50 steps");
+    assert!((w.agent(1).vehicle.lin_vel_world().length() - 8.0).abs() < 0.2);
+    let mut rows = vec![0.0; STATE_DIM];
+    w.write_state(1, &mut rows);
+    assert_eq!(rows[STATE_DIM - 1], 0.0);
+    w.write_state(0, &mut rows);
+    assert_eq!(rows[STATE_DIM - 1], -1.0);
+}
+
 #[test]
 fn falling_drone_crashes_into_the_car() {
     let mut w = car_and_drone();

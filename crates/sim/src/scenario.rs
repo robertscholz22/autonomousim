@@ -40,6 +40,7 @@
 use crate::SimError;
 use crate::bay::BayGoals;
 use crate::drive::{self, DrivableSpec, DriveGrid};
+use crate::driver::DriverSpec;
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
@@ -619,6 +620,10 @@ pub struct GroupSpec {
     /// Freeze an agent after a terminal event until the next reset (it then no longer moves,
     /// collides or appears in other agents' sensors).
     pub disable_on_terminal: bool,
+    /// A scripted driver ([`DriverSpec`]): the group's agents are driven by it and take no
+    /// actions (a scripted group; its action arrays are ignored and may be left out).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<DriverSpec>,
 }
 
 impl Default for GroupSpec {
@@ -646,6 +651,7 @@ impl Default for GroupSpec {
             goals: GoalSpec::default(),
             randomize: VehicleRandomization::default(),
             disable_on_terminal: true,
+            driver: None,
         }
     }
 }
@@ -981,6 +987,11 @@ impl CompiledGroup {
         self.action_map.dim()
     }
 
+    /// Driven by a scripted driver (takes no actions).
+    pub fn scripted(&self) -> bool {
+        self.spec.driver.is_some()
+    }
+
     pub fn obs_dim(&self) -> usize {
         self.obs.dim()
     }
@@ -1223,6 +1234,16 @@ impl CompiledGroup {
         }
         if sp.on_road && !sp.on_ground {
             return Err(fail("`spawn.on_road` needs `spawn.on_ground`".into()));
+        }
+        if let Some(d) = &spec.driver {
+            d.validate().map_err(&fail)?;
+            let single = def.as_wheeled().is_some_and(|d| d.num_units() == 1 && !d.is_single_track());
+            if !single || !sp.on_road || spec.goals.kind == GoalKind::Route {
+                return Err(fail(format!(
+                    "the `{}` driver drives ground vehicles without trailers (not two-wheelers) spawned `on_road`, without `route` goals",
+                    d.name()
+                )));
+            }
         }
         match (sp.airspeed, family) {
             (None, _) | (Some(_), Family::Rotorcraft | Family::Tiltrotor) => {}

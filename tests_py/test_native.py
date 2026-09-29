@@ -80,9 +80,9 @@ def test_actions_are_validated():
     a = zeros(sim)
     sim.step([a[0].astype(np.float64), a[1].reshape(3, 4)])  # float64 and any shape with num_envs rows
     sim.step(tuple(a))
-    with pytest.raises(ValueError, match="one per group"):
+    with pytest.raises(ValueError, match="one per learning group"):
         sim.step([a[0]])
-    with pytest.raises(TypeError, match="per group"):
+    with pytest.raises(TypeError, match="per learning group"):
         sim.step(a[0])
     with pytest.raises(ValueError, match="expected 24 values"):
         sim.step([a[0][:, :1], a[1]])

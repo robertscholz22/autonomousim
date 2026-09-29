@@ -7,6 +7,7 @@
 //! shape) run back to back per agent; [`sense`](Agent::sense) needs every agent's new shape
 //! and runs after all of them.
 
+use crate::driver::{DriverGeometry, DriverSpec, RoadDriver};
 use crate::events::Events;
 use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
 use crate::obs::ObsInput;
@@ -89,6 +90,11 @@ pub struct Agent {
     goal_radius: f64,
     /// Events since the start of the current policy step.
     pub events: Events,
+    /// The agent it rested on at the end of the last physics step (see
+    /// [`AgentContacts::support`]).
+    pub support: Option<u32>,
+    /// The scripted driver of an agent of a `driver` group.
+    pub driver: Option<RoadDriver>,
     pub disabled: bool,
     pub spawn: Pose,
     air: AirData,
@@ -143,6 +149,8 @@ impl Agent {
             legs: Vec::new(),
             goal_radius: group.spec.goals.radius,
             events: Events::NONE,
+            support: None,
+            driver: group.spec.driver.as_ref().map(|DriverSpec::Road(r)| RoadDriver::new(r, DriverGeometry::of(group))),
             disabled: false,
             spawn: Pose::IDENTITY,
             air: AirData::default(),
@@ -251,6 +259,7 @@ impl Agent {
         self.goals = goals;
         self.goal_index = 0;
         self.events = Events::NONE;
+        self.support = None;
         self.disabled = false;
         self.spawn = pose;
         self.anchor = pose.pos;
@@ -464,7 +473,8 @@ impl Agent {
             return;
         }
         self.update_shape(shape);
-        self.events |= self.detect_events(world, events, shape, agents.supported);
+        self.support = agents.support.map(|s| s.agent);
+        self.events |= self.detect_events(world, events, shape, agents);
         if self.vehicle.family() == Family::Wheeled {
             let e = self.ground_events(dt, &events.ground);
             self.events |= e;
@@ -542,9 +552,15 @@ impl Agent {
         shape.radius = radius;
     }
 
-    fn detect_events(&self, world: &StaticWorld, cfg: &EventConfig, shape: &AgentShape, on_agent: bool) -> Events {
+    fn detect_events(
+        &self,
+        world: &StaticWorld,
+        cfg: &EventConfig,
+        shape: &AgentShape,
+        agents: &AgentContacts,
+    ) -> Events {
         let v = &self.vehicle;
-        let mut e = if on_agent { Events::GROUND_CONTACT } else { Events::NONE };
+        let mut e = if agents.supported { Events::GROUND_CONTACT } else { Events::NONE };
         let colliders = v.colliders();
         let mut crashed = false;
         for c in v.contacts() {
@@ -561,11 +577,15 @@ impl Agent {
                 HitKind::Agent(_) => {}
             }
         }
-        if e.contains(Events::GROUND_CONTACT)
-            && !crashed
-            && v.lin_vel_body().length() < cfg.landed_speed
-            && v.ang_vel_body().length() < cfg.landed_rate
-        {
+        // Landed: at rest, relative to the agent carrying it if any.
+        let (lin, ang) = match agents.support {
+            Some(s) => {
+                let rot = v.orientation();
+                ((rot * v.lin_vel_body() - s.velocity).length(), (rot * v.ang_vel_body() - s.ang_vel).length())
+            }
+            None => (v.lin_vel_body().length(), v.ang_vel_body().length()),
+        };
+        if e.contains(Events::GROUND_CONTACT) && !crashed && lin < cfg.landed_speed && ang < cfg.landed_rate {
             e |= Events::LANDED;
         }
         let p = shape.center;

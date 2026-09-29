@@ -21,6 +21,7 @@
 use crate::agent::{Agent, EnvState};
 use crate::camera::Capture;
 use crate::drive::ground_pose;
+use crate::driver::Traffic;
 use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
 use crate::lane;
@@ -70,8 +71,10 @@ const PREFETCH_RADIUS: f64 = 150.0;
 /// position and heading for other vehicles); `sinkage` the mean sinkage of a tracked
 /// vehicle's loaded patches into soft soil (m; 0 otherwise); `air_data` the true airspeed
 /// (m/s), angle of attack and sideslip (rad) relative to the air at the vehicle
-/// ([`AirFlow`](autonomousim_vehicles::aero::AirFlow)).
-pub const STATE_FIELDS: [(&str, usize); 15] = [
+/// ([`AirFlow`](autonomousim_vehicles::aero::AirFlow)); `support` the index in the world of
+/// the agent it rests on (agents are numbered group by group; −1: none, see
+/// [`AgentContacts::support`](crate::interaction::AgentContacts::support)).
+pub const STATE_FIELDS: [(&str, usize); 16] = [
     ("position", 3),
     ("orientation", 4),
     ("velocity", 3),
@@ -87,10 +90,11 @@ pub const STATE_FIELDS: [(&str, usize); 15] = [
     ("tail", 3),
     ("sinkage", 1),
     ("air_data", 3),
+    ("support", 1),
 ];
 
 /// Length of a state row.
-pub const STATE_DIM: usize = 33;
+pub const STATE_DIM: usize = 34;
 
 #[derive(Clone, Debug)]
 pub struct WorldInstance {
@@ -218,12 +222,14 @@ impl WorldInstance {
                 let n = p.len();
                 (p, (0..n).map(|_| None).collect::<Vec<_>>())
             } else if spawn.on_road {
+                let only = self.agents[g.first_agent].driver.as_ref().map(|d| d.roads(world));
                 let rs = lane::road_spawns(
                     world,
                     spawn,
                     route_goals.then_some(&g.spec.goals),
                     g.spec.count,
                     lift,
+                    only.as_deref(),
                     &mut placed,
                     &mut spawn_rng,
                     &mut goal_rng,
@@ -295,6 +301,7 @@ impl WorldInstance {
                     placement.lin_vel += placement.pose.rot * v_body + self.env.config.wind.steady_at(agl, 0.0);
                     placement.tiltrotor = Some(start);
                 }
+                let walk = road_spawn.as_ref().and_then(|rs| rs.walk);
                 let mut route = road_spawn.and_then(|rs| rs.route);
                 if route_goals && route.is_none() {
                     route = lane::plan_route(world, p.truncate(), &g.spec.goals, &mut goal_rng);
@@ -344,6 +351,9 @@ impl WorldInstance {
                 agent.route = route.map(Arc::new);
                 agent.legs = legs;
                 agent.follow_leg();
+                if let Some(d) = &mut agent.driver {
+                    agent.route = d.reset(seed.child("driver"), world, walk);
+                }
                 let contact = g.def.contact_model(agent.vehicle.mass(), sc.dt());
                 self.shapes[id].set_contact(&contact.solid);
                 agent.update_shape(&mut self.shapes[id]);
@@ -388,12 +398,36 @@ impl WorldInstance {
         for a in &mut self.agents {
             a.events = if a.disabled { Events::DISABLED } else { Events::NONE };
         }
+        self.drive();
         for _ in 0..self.scenario.decimation {
             self.tick();
             after_tick(self);
         }
         self.steps += 1;
         self.grid.build(&self.shapes);
+    }
+
+    /// Command the agents of scripted groups for the coming policy step.
+    fn drive(&mut self) {
+        if !self.agents.iter().any(|a| a.driver.is_some()) {
+            return;
+        }
+        let dt = f64::from(self.scenario.decimation) * self.scenario.dt();
+        let world = &*self.map;
+        let traffic: Vec<(usize, Traffic)> = (self.shapes.iter().enumerate())
+            .filter(|(_, s)| s.active)
+            .map(|(i, s)| (i, Traffic { center: s.center, radius: s.radius, spheres: &s.spheres }))
+            .collect();
+        let mut others = Vec::with_capacity(traffic.len());
+        for (i, a) in self.agents.iter_mut().enumerate().filter(|(_, a)| !a.disabled) {
+            if let Some(d) = &mut a.driver {
+                others.clear();
+                others.extend(traffic.iter().filter(|(j, _)| *j != i).map(|(_, t)| *t));
+                let v = &a.vehicle;
+                let command = d.drive(world, &mut a.route, &v.pose(), v.lin_vel_body().x, dt, &others);
+                a.set_command(command);
+            }
+        }
     }
 
     /// On tiled maps: have the tiles ahead of each moving agent generated in the background.
@@ -539,6 +573,7 @@ impl WorldInstance {
             row[29] = v.as_wheeled().map_or(0.0, |w| w.sinkage());
             let flow = a.air().flow(q, q * v.lin_vel_body(), v.ang_vel_body());
             row[30..33].copy_from_slice(&[flow.airspeed, flow.alpha, flow.beta]);
+            row[33] = a.support.map_or(-1.0, f64::from);
         };
         let rows = out.as_chunks_mut::<STATE_DIM>().0;
         if g.spec.count >= PARALLEL_AGENTS {
@@ -711,6 +746,11 @@ impl WorldInstance {
             }
             f(f64::from(a.events.0));
             f(a.goal_index as f64);
+            if let Some(d) = &a.driver {
+                for x in [d.cruise, d.stop_left, d.station, d.turn.map_or(-1.0, |t| t.target)] {
+                    f(x);
+                }
+            }
             for s in &a.sensors {
                 hash_sensor(s, &mut f);
             }

@@ -27,6 +27,9 @@ Tasks with camera observation terms (``{"term": "camera", ...}``) observe a ``Di
 image channels being those of the camera terms in order (``obs_image_layout``). ``final_obs``
 is then a dict of such arrays too.
 
+Scripted groups (``driver``, e.g. traffic) may join the learning agent's group: they take no
+actions and are not observed here (their rows: ``sim.state(g)``).
+
 ``info`` holds ``events`` (``uint32 [num_envs]``, see ``autonomousim.events``) on every step.
 When an episode ends it also holds ``episode = {"r": return, "l": length, "success": ...}``
 (float64, int64, bool; success as defined by the task, always false for tasks without one),
@@ -53,6 +56,15 @@ def obs_space(obs_dim: int, image_shape: tuple[int, int, int] | None) -> gym.spa
     if image_shape is None:
         return state
     return gym.spaces.Dict({"state": state, "image": gym.spaces.Box(0, 255, tuple(image_shape), np.uint8)})
+
+
+def learning_group(sim: BatchSim) -> tuple[int, dict[str, Any]]:
+    """Index and ``group_info`` of the one learning group of a single-agent task scenario (with
+    one agent; scripted groups, driven by a ``driver``, may be added)."""
+    learning = [g for g in range(sim.num_groups) if not sim.group_info(g)["scripted"]]
+    if len(learning) != 1 or sim.group_info(learning[0])["count"] != 1:
+        raise ValueError("a task scenario must have one learning group with one agent")
+    return learning[0], sim.group_info(learning[0])
 
 
 def copy_obs(obs: np.ndarray | dict[str, np.ndarray]) -> np.ndarray | dict[str, np.ndarray]:
@@ -100,9 +112,7 @@ class AutonomousimVectorEnv(VectorEnv):
             raise ValueError("NEXT_STEP autoreset is not supported; use SAME_STEP or DISABLED")
         self.task = make_task(task, **task_kwargs)
         self.sim = BatchSim(json.dumps(self.task.scenario()), num_envs, seed, num_threads)
-        info = self.sim.group_info(0)
-        if self.sim.num_groups != 1 or info["count"] != 1:
-            raise ValueError("a task scenario must have one group with one agent")
+        self.group, info = learning_group(self.sim)
         self.num_envs = num_envs
         self.obs_dim = int(info["obs_dim"])
         self.act_dim = int(info["act_dim"])
@@ -117,11 +127,11 @@ class AutonomousimVectorEnv(VectorEnv):
         self.observation_space = batch_space(self.single_observation_space, num_envs)
         self.action_space = batch_space(self.single_action_space, num_envs)
         # Views of the native output arrays (overwritten in place by every step and reset).
-        self._obs = self.sim.obs(0)[:, 0, :]
-        images = self.sim.images(0)
+        self._obs = self.sim.obs(self.group)[:, 0, :]
+        images = self.sim.images(self.group)
         self._view = self._obs if images is None else {"state": self._obs, "image": images[:, 0]}
-        self._state = self.sim.state(0)[:, 0, :]
-        self._events = self.sim.events(0)[:, 0]
+        self._state = self.sim.state(self.group)[:, 0, :]
+        self._events = self.sim.events(self.group)[:, 0]
         self.task.bind(num_envs, self.sim.policy_dt, self.act_dim)
         self._return = np.zeros(num_envs, dtype=np.float64)
         self._length = np.zeros(num_envs, dtype=np.int64)

@@ -87,7 +87,7 @@ LQR) that balances them behind `vk`/`vw` actions, or `raw` actions for agents th
 themselves; riders in the viewer. **MotorcycleRoadRural-v0** rides a route over the rural
 roads to a farm yard; a scripted rider finishes about 85 % of the routes.
 
-Next up (Milestone 6, in progress): large tiled maps, fixed-wing aircraft, helicopters and a tiltrotor. The full plan, the design decisions and as-built notes for
+Next up (Milestone 7, in progress): camera sensors, scripted traffic and a drone that lands on a moving car. The full plan, the design decisions and as-built notes for
 every step are in [docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
@@ -144,6 +144,12 @@ batch in one submission). A task with camera observation terms observes a `Dict`
 landing pad seen by a downward camera), trained with `examples/ppo_pixels.py` (a small CNN
 encoder). `AUTONOMOUSIM_RENDER_ADAPTER` picks the GPU (`auto`, `software` for Mesa's lavapipe,
 or part of an adapter name).
+
+Scripted groups drive themselves: a ground-vehicle group spawned `on_road` with
+`driver = { type = "road" }` drives random routes over the road network (pure pursuit in its
+lane, slowing for bends and the traffic ahead, K-turns at dead ends and map edges). Such
+groups take no actions and have no arrays in the Python environments; a drone that lands on
+a moving car reports `LANDED` with the car's index in the state column `support`.
 
 ### Train, record, replay
 

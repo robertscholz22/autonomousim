@@ -29,6 +29,7 @@ class BatchSim:
     threads (0: one per logical CPU). Output arrays are overwritten in place."""
 
     def __init__(self, scenario: str, num_envs: int, seed: int = 0, num_threads: int = 0) -> None: ...
+    # One action array per learning group, in group order (scripted groups take none).
     def step(self, actions: npt.ArrayLike | Sequence[npt.ArrayLike]) -> None: ...
     def reset(
         self, mask: npt.NDArray[np.bool_] | Sequence[bool] | None = None, seeds: npt.ArrayLike | None = None

@@ -183,16 +183,22 @@ impl BatchSim {
     pub fn step(&mut self, actions: &[&[f32]]) {
         let n = self.slots.len();
         assert_eq!(actions.len(), self.scenario.groups.len(), "one action array per group");
-        let dims: Vec<usize> = self.scenario.groups.iter().map(|g| g.spec.count * g.act_dim()).collect();
+        // Scripted groups take no actions: 0 for them.
+        let dims: Vec<usize> =
+            self.scenario.groups.iter().map(|g| if g.scripted() { 0 } else { g.spec.count * g.act_dim() }).collect();
         for (g, (a, d)) in actions.iter().zip(&dims).enumerate() {
-            assert_eq!(a.len(), n * d, "action array of group {:?}", self.scenario.groups[g].spec.name);
+            let group = &self.scenario.groups[g];
+            let ok = a.len() == n * d || (group.scripted() && a.len() == n * group.spec.count * group.act_dim());
+            assert!(ok, "action array of group {:?}", group.spec.name);
         }
         let slots = &mut self.slots;
         let cameras = self.cameras.is_some();
         self.pool.install(|| {
             slots.par_iter_mut().enumerate().for_each(|(i, s)| {
                 for (g, (a, d)) in actions.iter().zip(&dims).enumerate() {
-                    s.world.set_actions(g, &a[i * d..(i + 1) * d]);
+                    if *d > 0 {
+                        s.world.set_actions(g, &a[i * d..(i + 1) * d]);
+                    }
                 }
                 s.step();
                 if !cameras {

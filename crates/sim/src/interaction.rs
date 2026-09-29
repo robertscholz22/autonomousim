@@ -93,6 +93,15 @@ impl AgentShape {
         }
     }
 
+    /// Angular velocity of the body carrying sphere `s` (world frame).
+    #[inline]
+    fn body_ang_vel(&self, s: &Sphere) -> DVec3 {
+        match s.body {
+            0 => self.ang_vel,
+            k => self.bodies[k as usize - 1].ang_vel,
+        }
+    }
+
     /// Link receiving the forces on sphere `s`.
     #[inline]
     fn link(&self, s: &Sphere) -> u16 {
@@ -118,10 +127,26 @@ pub struct AgentContacts {
     /// Resting on or pushing against another agent with gear or wheels
     /// ([`Events::GROUND_CONTACT`](crate::Events::GROUND_CONTACT)).
     pub supported: bool,
+    /// The agent it rests on (a supported contact whose normal points up within 60°), with
+    /// the velocity of that agent's surface at the contact and its angular velocity (world
+    /// frame); the first such contact in pair order.
+    pub support: Option<Support>,
     /// `(force, point, link)`: force and point in world coordinates, and the link of the
     /// vehicle's tree it acts on (0: the main body), in application order.
     pub forces: SmallVec<[(DVec3, DVec3, u16); 2]>,
 }
+
+/// Another agent carrying this one (see [`AgentContacts::support`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Support {
+    pub agent: u32,
+    pub velocity: DVec3,
+    pub ang_vel: DVec3,
+}
+
+/// Contacts whose normal is within this of the vertical count as resting on the other agent
+/// (cos 60°).
+const SUPPORT_NZ: f64 = 0.5;
 
 /// Friction state of one touching sphere pair; `a < b` are agent indices.
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +200,7 @@ pub(crate) fn agent_contacts(
     for c in out.iter_mut() {
         c.crashed = false;
         c.supported = false;
+        c.support = None;
         c.forces.clear();
     }
     for p in &mut state.bristles {
@@ -202,6 +228,8 @@ pub(crate) fn agent_contacts(
             let kt = series(sa.tangential_stiffness, sb.tangential_stiffness);
             let ct = series(sa.tangential_damping, sb.tangential_damping);
             let (mut crashed, mut supported) = (false, false);
+            // b carrying a, a carrying b.
+            let (mut on_b, mut on_a) = (None, None);
             for (ia, ca) in sa.spheres.iter().enumerate() {
                 for (ib, cb) in sb.spheres.iter().enumerate() {
                     let d = ca.center - cb.center;
@@ -217,6 +245,19 @@ pub(crate) fn agent_contacts(
                     let vn = v.dot(n);
                     if (ca.gear || cb.gear) && vn >= -crash_speed {
                         supported = true;
+                        if n.z > SUPPORT_NZ && on_b.is_none() {
+                            on_b = Some(Support {
+                                agent: b,
+                                velocity: sb.point_velocity(cb, point),
+                                ang_vel: sb.body_ang_vel(cb),
+                            });
+                        } else if n.z < -SUPPORT_NZ && on_a.is_none() {
+                            on_a = Some(Support {
+                                agent: a,
+                                velocity: sa.point_velocity(ca, point),
+                                ang_vel: sa.body_ang_vel(ca),
+                            });
+                        }
                     } else {
                         crashed = true;
                     }
@@ -246,6 +287,10 @@ pub(crate) fn agent_contacts(
             for x in [a, b] {
                 out[x as usize].crashed |= crashed;
                 out[x as usize].supported |= supported;
+            }
+            for (x, s) in [(a, on_b), (b, on_a)] {
+                let c = &mut out[x as usize];
+                c.support = c.support.or(s);
             }
         }
     }
