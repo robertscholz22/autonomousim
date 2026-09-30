@@ -41,11 +41,12 @@ use crate::SimError;
 use crate::bay::BayGoals;
 use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::driver::DriverSpec;
+use crate::hybrid::CruiseTrim;
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use crate::rooftop::RooftopGoals;
 use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
-use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
+use autonomousim_control::ground::{GroundActionLimits, GroundActionMode, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
 use autonomousim_control::rotorcraft::{HelicopterActionLimits, HelicopterConfig};
 use autonomousim_control::tiltrotor::{TiltrotorActionLimits, TiltrotorConfig};
@@ -689,6 +690,69 @@ pub struct GroupSpec {
     /// actions (a scripted group; its action arrays are ignored and may be left out).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub driver: Option<DriverSpec>,
+    /// How the group's ground vehicles are simulated (see [`PhysicsMode`]).
+    #[serde(skip_serializing_if = "is_default")]
+    pub physics: PhysicsMode,
+    /// Switching of `hybrid` groups.
+    #[serde(skip_serializing_if = "is_default")]
+    pub hybrid: HybridSpec,
+}
+
+/// How a group's ground vehicles are simulated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicsMode {
+    /// The multibody model throughout.
+    #[default]
+    Full,
+    /// The kinematic model throughout (see
+    /// [`Wheeled::step_kinematic`](autonomousim_vehicles::ground::Wheeled::step_kinematic)):
+    /// no forces act on the vehicles, their contacts with full-physics agents are one-sided.
+    Kinematic,
+    /// Kinematic, promoted to the multibody model near the learning agents (see
+    /// [`HybridSpec`]).
+    Hybrid,
+}
+
+/// When the agents of a `hybrid` group switch between the kinematic and the multibody model.
+/// Switching happens at the start of a policy step, agent by agent in order, from the state
+/// at the step's start (so it is deterministic and independent of the threads).
+///
+/// An agent is promoted when it is within `promote` (centre to centre) of a learning agent
+/// (an active agent of a full-physics group without a driver), or within `margin` (between the
+/// colliders' surfaces) of any agent simulated in full. It is demoted when it is beyond
+/// `demote` from every learning agent, beyond `margin` from every agent in full, and has had
+/// no contact with another agent for `calm` seconds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HybridSpec {
+    pub promote: f64,
+    pub demote: f64,
+    pub margin: f64,
+    pub calm: f64,
+}
+
+impl Default for HybridSpec {
+    fn default() -> Self {
+        Self { promote: 40.0, demote: 60.0, margin: 1.0, calm: 2.0 }
+    }
+}
+
+impl HybridSpec {
+    fn validate(&self) -> Result<(), String> {
+        let ok = self.promote > 0.0
+            && self.demote > self.promote
+            && self.demote.is_finite()
+            && self.margin >= 0.0
+            && self.margin.is_finite()
+            && self.calm >= 0.0
+            && self.calm.is_finite();
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("hybrid settings need 0 < promote < demote, margin ≥ 0, calm ≥ 0: {self:?}"))
+        }
+    }
 }
 
 impl Default for GroupSpec {
@@ -717,6 +781,8 @@ impl Default for GroupSpec {
             randomize: VehicleRandomization::default(),
             disable_on_terminal: true,
             driver: None,
+            physics: PhysicsMode::Full,
+            hybrid: HybridSpec::default(),
         }
     }
 }
@@ -1071,6 +1137,8 @@ pub struct CompiledGroup {
     pub rest: Pose,
     pub half_width: f64,
     pub drive: Vec<Arc<DriveGrid>>,
+    /// Hybrid groups: the ground controller's steady speed integrator (see [`crate::hybrid`]).
+    pub cruise: CruiseTrim,
 }
 
 impl CompiledGroup {
@@ -1081,6 +1149,12 @@ impl CompiledGroup {
     /// Driven by a scripted driver (takes no actions).
     pub fn scripted(&self) -> bool {
         self.spec.driver.is_some()
+    }
+
+    /// Whether its agents are learning agents (the ones hybrid agents are promoted near): a
+    /// full-physics group without a driver.
+    pub fn learning(&self) -> bool {
+        self.spec.driver.is_none() && self.spec.physics == PhysicsMode::Full
     }
 
     pub fn obs_dim(&self) -> usize {
@@ -1360,6 +1434,20 @@ impl CompiledGroup {
                 )));
             }
         }
+        if spec.physics != PhysicsMode::Full {
+            spec.hybrid.validate().map_err(&fail)?;
+            let wheeled = def.as_wheeled().is_some_and(|d| !d.is_single_track());
+            let commanded = spec.driver.is_some()
+                || matches!(
+                    spec.action_mode,
+                    Some(AgentActionMode::Ground(GroundActionMode::Vk | GroundActionMode::Vw))
+                );
+            if !wheeled || !commanded {
+                return Err(fail(
+                    "`kinematic` and `hybrid` physics need ground vehicles (not two-wheelers) with a driver or the `vk` or `vw` action mode".into(),
+                ));
+            }
+        }
         match (sp.airspeed, family) {
             (None, _) | (Some(_), Family::Rotorcraft | Family::Tiltrotor) => {}
             (Some(a), Family::FixedWing) if a[0] > 0.0 => {}
@@ -1431,6 +1519,12 @@ impl CompiledGroup {
             Some(d) => (Wheeled::new(d.clone(), clock.dt()).rest(DVec3::ZERO, 0.0, 0.0).pose, drive::half_width(d)),
             None => (fixed_wing_rest.unwrap_or(Pose::IDENTITY), 0.0),
         };
+        let cruise = match (def.as_wheeled(), &controller) {
+            (Some(d), Controller::Ground(c)) if spec.physics == PhysicsMode::Hybrid => {
+                CruiseTrim::calibrate(d, c, clock.dt(), autonomousim_vehicles::ground::STANDARD_GRAVITY)
+            }
+            _ => CruiseTrim::default(),
+        };
         Ok(Self {
             spec,
             def,
@@ -1443,6 +1537,7 @@ impl CompiledGroup {
             rest,
             half_width,
             drive: Vec::new(),
+            cruise,
         })
     }
 

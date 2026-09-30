@@ -405,6 +405,20 @@ impl GroundController {
         self.track_steer.is_some()
     }
 
+    /// The speed loop's integrator (m/s²): the acceleration demand it adds, which trims the
+    /// resistances and grades at steady speed.
+    pub fn speed_integral(&self) -> f64 {
+        self.speed_i
+    }
+
+    /// Preset the speed loop's integrator (within the acceleration limits), e.g. to its steady
+    /// value when taking over a vehicle moving at speed.
+    pub fn set_speed_integral(&mut self, accel: f64) {
+        if accel.is_finite() {
+            self.speed_i = accel.clamp(-self.config.max_decel, self.config.max_accel);
+        }
+    }
+
     /// Clear the loop state.
     pub fn reset(&mut self) {
         self.speed_i = 0.0;

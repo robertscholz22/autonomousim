@@ -16,6 +16,7 @@ pub mod camera;
 pub mod drive;
 pub mod driver;
 pub mod events;
+pub mod hybrid;
 pub mod interaction;
 pub mod lane;
 pub mod obs;
@@ -31,7 +32,9 @@ pub use batch::BatchSim;
 pub use driver::{DriverSpec, RoadDriverSpec};
 pub use events::Events;
 pub use obs::{ObsTerm, TermKind};
-pub use scenario::{CompiledGroup, CompiledScenario, Goal, GroupSpec, MapSource, Scenario, Testworld};
+pub use scenario::{
+    CompiledGroup, CompiledScenario, Goal, GroupSpec, HybridSpec, MapSource, PhysicsMode, Scenario, Testworld,
+};
 pub use world::{STATE_DIM, STATE_FIELDS, WorldInstance};
 
 use thiserror::Error;

@@ -9,15 +9,17 @@
 
 use crate::driver::{DriverGeometry, DriverSpec, RoadDriver};
 use crate::events::Events;
+use crate::hybrid::CruiseTrim;
 use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
 use crate::obs::ObsInput;
-use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, Placement};
+use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, PhysicsMode, Placement};
 use crate::traffic::{RoadTrack, Signals};
-use autonomousim_control::ground::GroundEstimate;
+use autonomousim_control::ground::{GroundEstimate, GroundSetpoint};
 use autonomousim_control::multirotor::StateEstimate;
 use autonomousim_control::{Command, Controller};
 use autonomousim_core::contact::StaticScene;
 use autonomousim_core::geometry::HitKind;
+use autonomousim_core::material::MaterialId;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::{Seed, SimRng};
@@ -25,7 +27,7 @@ use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorEnv};
 use autonomousim_vehicles::fixedwing::FixedWingInit;
-use autonomousim_vehicles::ground::{Wheeled, WheeledInit};
+use autonomousim_vehicles::ground::{KinematicLimits, KinematicState, KinematicTarget, Wheeled, WheeledInit};
 use autonomousim_vehicles::multirotor::{AirData, GroundPlane, InitialState, MAX_ROTORS, MultirotorScales};
 use autonomousim_vehicles::rotorcraft::HelicopterInit;
 use autonomousim_vehicles::tiltrotor::TiltrotorInit;
@@ -99,6 +101,13 @@ pub struct Agent {
     pub track: RoadTrack,
     /// The scripted driver of an agent of a `driver` group.
     pub driver: Option<RoadDriver>,
+    /// The kinematic state while the vehicle is driven kinematically (`kinematic` and
+    /// `hybrid` groups; `None` while simulated in full).
+    pub kinematic: Option<KinematicState>,
+    kinematic_limits: KinematicLimits,
+    cruise: CruiseTrim,
+    /// Time since the last contact with another agent (s).
+    pub calm: f64,
     pub disabled: bool,
     pub spawn: Pose,
     air: AirData,
@@ -156,6 +165,19 @@ impl Agent {
             support: None,
             track: RoadTrack::default(),
             driver: group.spec.driver.as_ref().map(|DriverSpec::Road(r)| RoadDriver::new(r, DriverGeometry::of(group))),
+            kinematic: None,
+            kinematic_limits: {
+                let c = &group.spec.ground_controller;
+                KinematicLimits {
+                    time_constant: c.speed_time_constant,
+                    max_accel: c.max_accel,
+                    max_decel: c.max_decel,
+                    trim_gain: c.curvature_integral,
+                    trim_limit: c.curvature_correction,
+                }
+            },
+            cruise: group.cruise,
+            calm: 0.0,
             disabled: false,
             spawn: Pose::IDENTITY,
             air: AirData::default(),
@@ -274,8 +296,76 @@ impl Agent {
         if self.vehicle.gust_span().is_some() {
             self.turbulence = self.turbulence.with_rotational(&mut self.turbulence_rng);
         }
+        self.kinematic = None;
+        self.calm = 0.0;
+        if group.spec.physics != PhysicsMode::Full {
+            self.demote(world);
+        }
         self.update_air(world, env, 0.0, Some(0.0));
         self.reset_track(world);
+    }
+
+    /// Whether the vehicle is driven kinematically now.
+    pub fn is_kinematic(&self) -> bool {
+        self.kinematic.is_some()
+    }
+
+    /// Switch to the kinematic model from the current state (ground vehicles; no-op when
+    /// already kinematic).
+    pub fn demote(&mut self, world: &StaticWorld) {
+        if self.kinematic.is_some() {
+            return;
+        }
+        let Vehicle::Wheeled(w) = &mut self.vehicle else { return };
+        let mut k = w.kinematic_state();
+        w.place_kinematic(&mut k, world.terrain());
+        self.kinematic = Some(k);
+    }
+
+    /// Switch to the multibody model from the kinematic state (no-op when simulated in full),
+    /// with the controller's speed loop trimmed for the speed and grade (see
+    /// [`hybrid`](crate::hybrid)); `g` is the gravity.
+    pub fn promote(&mut self, world: &StaticWorld, g: f64) {
+        if self.kinematic.take().is_none() {
+            return;
+        }
+        self.controller.reset(&self.vehicle);
+        if let (Vehicle::Wheeled(w), Controller::Ground(c)) = (&mut self.vehicle, &mut self.controller) {
+            w.resume_dynamics();
+            // The ground's rise along the heading (sine of the grade).
+            let p = w.position();
+            let e = w.orientation() * DVec3::X;
+            let (_, n) = world.terrain().height_normal(p.x, p.y);
+            let slope = -(n.x * e.x + n.y * e.y) / (n.z * e.truncate().length().max(1e-9));
+            let rise = slope / (1.0 + slope * slope).sqrt();
+            // Rolling resistance beyond the calibration's (asphalt).
+            let def = w.def();
+            let here = world.material(world.terrain().material(p.x, p.y));
+            let asphalt = world.material(MaterialId::ASPHALT);
+            let rolling = g * (def.motion_resistance(here, g) - def.motion_resistance(asphalt, g));
+            c.set_speed_integral(self.cruise.at(GroundEstimate::of(w).speed(), rise, g) + rolling);
+        }
+    }
+
+    /// Re-derive the kinematic state after the vehicle was placed by hand.
+    pub(crate) fn replace_kinematic(&mut self, world: &StaticWorld) {
+        if self.kinematic.take().is_some() {
+            self.demote(world);
+        }
+    }
+
+    /// The kinematic model's target for the held command.
+    fn kinematic_target(&self) -> KinematicTarget {
+        match self.command {
+            Command::Ground(GroundSetpoint::SpeedCurvature { speed, curvature }) => {
+                KinematicTarget::SpeedCurvature { speed, curvature }
+            }
+            Command::Ground(GroundSetpoint::SpeedYawRate { speed, yaw_rate }) => {
+                KinematicTarget::SpeedYawRate { speed, yaw_rate }
+            }
+            // Other commands (validated away for kinematic groups): stop.
+            _ => KinematicTarget::SpeedCurvature { speed: 0.0, curvature: 0.0 },
+        }
     }
 
     /// Start lane tracking from the current pose (ground vehicles on maps with road sections).
@@ -414,6 +504,13 @@ impl Agent {
             return;
         }
         self.update_air(world, env, time, env_step);
+        if self.kinematic.is_some() {
+            // No forces act on a kinematic vehicle.
+            if agents.crashed {
+                self.events |= Events::CRASH_AGENT;
+            }
+            return;
+        }
         let scene =
             StaticScene { terrain: world.terrain(), obstacles: world.obstacles(), materials: world.materials() };
         match (&mut self.vehicle, &mut self.controller, &self.command) {
@@ -489,7 +586,15 @@ impl Agent {
             shape.active = false;
             return;
         }
-        let ok = self.vehicle.finish_step(env.gravity).is_ok();
+        self.calm = if agents.forces.is_empty() { self.calm + dt } else { 0.0 };
+        let target = self.kinematic_target();
+        let ok = match (&mut self.kinematic, &mut self.vehicle) {
+            (Some(k), Vehicle::Wheeled(w)) => {
+                w.step_kinematic(k, target, &self.kinematic_limits, world.terrain());
+                true
+            }
+            _ => self.vehicle.finish_step(env.gravity).is_ok(),
+        };
         let state = self.vehicle.state();
         let finite = ok && state.q.iter().chain(state.v.iter()).all(|x| x.is_finite());
         if !finite {

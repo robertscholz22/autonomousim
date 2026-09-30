@@ -35,7 +35,12 @@ use autonomousim_core::dynamics::{
 };
 use autonomousim_core::math::{Pose, SpatialForce};
 use glam::{DQuat, DVec3};
+use kinematic::KinematicGeometry;
 use std::sync::Arc;
+
+mod kinematic;
+
+pub use kinematic::{KinematicLimits, KinematicState, KinematicTarget};
 
 /// Everything outside the vehicle that one physics step needs.
 #[derive(Clone, Copy)]
@@ -180,6 +185,8 @@ pub struct Wheeled {
     feet: Option<usize>,
     feet_down: bool,
     contact: ContactModel,
+    /// Geometry of the kinematic model ([`step_kinematic`](Self::step_kinematic)).
+    kinematic: Arc<KinematicGeometry>,
     // State.
     pub state: MbState,
     /// Steering angle of the equivalent bicycle (rad).
@@ -294,6 +301,7 @@ impl Wheeled {
             },
             band_radius: (0..def.axles.len()).find(|&a| def.tire(a).is_track()).map_or(0.0, |a| def.tire(a).radius()),
             contact: def.contact.model(mass, dt),
+            kinematic: Arc::new(KinematicGeometry::empty()),
             model,
             mass,
             corners,
@@ -310,6 +318,7 @@ impl Wheeled {
         };
         let init = s.rest(DVec3::ZERO, 0.0, 0.0);
         s.reset(&init);
+        s.kinematic = Arc::new(KinematicGeometry::new(&s));
         s
     }
 

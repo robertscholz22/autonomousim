@@ -684,6 +684,24 @@ impl Powertrain {
         self.status = PowertrainStatus { gear: self.gear, ..Default::default() };
     }
 
+    /// [`reset`](Self::reset), in the gear the automatic reaches when accelerating to the
+    /// wheel speeds (above each gear's upshift point, the next one), so that holding the speed
+    /// does not shift at once.
+    pub fn reset_cruising(&mut self, spin: &[f64]) {
+        self.reset(spin);
+        if let PowertrainDef::Combustion(c) = &self.def {
+            let shaft = self.driveshaft_speed(spin, c);
+            let g = &c.gearbox;
+            let mut gear = 1;
+            while gear < g.forward.len() && shaft / g.forward[gear - 1] / RPM > g.shift[gear - 1][1] {
+                gear += 1;
+            }
+            self.gear = gear as i32;
+            self.engine_speed = (shaft / g.forward[gear - 1]).max(0.0);
+            self.status = PowertrainStatus { gear: self.gear, ..Default::default() };
+        }
+    }
+
     fn driveshaft_speed(&self, spin: &[f64], c: &CombustionDef) -> f64 {
         self.shares.iter().map(|&(w, s)| s * spin[w]).sum::<f64>() / c.final_drive
     }

@@ -23,10 +23,12 @@ use crate::camera::Capture;
 use crate::drive::ground_pose;
 use crate::driver::Traffic;
 use crate::events::Events;
-use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts};
+use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts, surface_distance};
 use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
-use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, SpawnSpec, TiltrotorStart};
+use crate::scenario::{
+    CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, PhysicsMode, SpawnSpec, TiltrotorStart,
+};
 use crate::traffic::Signals;
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
@@ -433,6 +435,7 @@ impl WorldInstance {
         for a in &mut self.agents {
             a.events = if a.disabled { Events::DISABLED } else { Events::NONE };
         }
+        self.switch_physics();
         self.drive();
         let n = self.scenario.decimation;
         for k in 0..n {
@@ -445,6 +448,56 @@ impl WorldInstance {
         }
         self.steps += 1;
         self.grid.build(&self.shapes);
+    }
+
+    /// Promote and demote the agents of `hybrid` groups (see
+    /// [`HybridSpec`](crate::scenario::HybridSpec)), from the state at the start of the policy
+    /// step. [`step`](Self::step) does this; when ticking by hand, call it before
+    /// [`drive`](Self::drive).
+    pub fn switch_physics(&mut self) {
+        let sc = &*self.scenario;
+        if !sc.groups.iter().any(|g| g.spec.physics == PhysicsMode::Hybrid) {
+            return;
+        }
+        let world = &*self.map;
+        let active = |i: usize| self.shapes[i].active && !self.agents[i].disabled;
+        let learners: Vec<usize> =
+            (0..self.agents.len()).filter(|&i| active(i) && sc.groups[self.agents[i].group].learning()).collect();
+        let full: Vec<usize> =
+            (0..self.agents.len()).filter(|&i| active(i) && !self.agents[i].is_kinematic()).collect();
+        // Decide from the state at the step's start, then switch.
+        let mut switch = Vec::new();
+        for i in 0..self.agents.len() {
+            let spec = &sc.groups[self.agents[i].group].spec;
+            if spec.physics != PhysicsMode::Hybrid || !active(i) {
+                continue;
+            }
+            let h = &spec.hybrid;
+            let me = &self.shapes[i];
+            let learner_distance =
+                learners.iter().map(|&j| me.center.distance(self.shapes[j].center)).fold(f64::INFINITY, f64::min);
+            let near = full.iter().any(|&j| j != i && surface_distance(me, &self.shapes[j], h.margin) < h.margin);
+            let a = &self.agents[i];
+            if a.is_kinematic() {
+                if learner_distance <= h.promote || near {
+                    switch.push(i);
+                }
+            } else if learner_distance > h.demote && !near && a.calm >= h.calm {
+                switch.push(i);
+            }
+        }
+        for &i in &switch {
+            let a = &mut self.agents[i];
+            if a.is_kinematic() {
+                a.promote(world, self.env.config.gravity);
+            } else {
+                a.demote(world);
+                a.update_shape(&mut self.shapes[i]);
+            }
+        }
+        if !switch.is_empty() {
+            self.grid.build(&self.shapes);
+        }
     }
 
     /// Command the agents of scripted groups for the coming policy step. [`step`](Self::step)
@@ -741,6 +794,7 @@ impl WorldInstance {
     /// its transient vehicle state; its shape follows at once.
     pub fn place_agent(&mut self, i: usize, pose: Pose, lin_vel_world: DVec3, ang_vel_body: DVec3) {
         self.agents[i].vehicle.place(pose, lin_vel_world, ang_vel_body);
+        self.agents[i].replace_kinematic(&self.map);
         self.agents[i].reset_track(&self.map);
         self.agents[i].update_shape(&mut self.shapes[i]);
         self.grid.build(&self.shapes);
@@ -813,6 +867,13 @@ impl WorldInstance {
                 }
                 Vehicle::Tiltrotor(v) => {
                     v.rotor_speeds().iter().chain(v.tilts()).chain(&v.channels()).for_each(|x| f(*x));
+                }
+            }
+            if let Some(k) = &a.kinematic {
+                for x in
+                    [k.xy.x, k.xy.y, k.yaw, k.speed, k.lateral, k.yaw_rate, k.steer, k.trim].iter().chain(&k.unit_yaw)
+                {
+                    f(*x);
                 }
             }
             f(f64::from(a.events.0));
