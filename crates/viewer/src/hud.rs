@@ -29,7 +29,7 @@ const HELP: &str = "W/S  forward/back     A/D  left/right\n\
                     R  reset episode      Tab  next agent\n\
                     P  pause   [/]  time scale   C  camera\n\
                     mouse drag  look      wheel  zoom\n\
-                    O  goals/trails       G  plots   I/K  camera image/output\n\
+                    O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                     L  LiDAR hits         V  LiDAR view\n\
                     H  hide HUD   F1  help   Esc  quit";
 
@@ -37,7 +37,7 @@ const GROUND_HELP: &str = "W/S  throttle / brake, reverse   A/D  steer\n\
                            Space  handbrake      R  reset episode\n\
                            Tab  next agent       P  pause   [/]  time scale\n\
                            C  camera             mouse drag  look   wheel  zoom\n\
-                           O  goals/trails       G  plots   I/K  camera image/output\n\
+                           O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                            L  LiDAR hits         V  LiDAR view\n\
                            H  hide HUD   F1  help   Esc  quit\n\
                            gamepad: RT/LT pedals, left stick steers, A handbrake";
@@ -46,7 +46,7 @@ const RIDE_HELP: &str = "W/S  speed setpoint up/down (vk)   A/D  turn\n\
                          Space  stop           R  reset episode\n\
                          Tab  next agent       P  pause   [/]  time scale\n\
                          C  camera             mouse drag  look   wheel  zoom\n\
-                         O  goals/trails       G  plots   I/K  camera image/output\n\
+                         O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                          L  LiDAR hits         V  LiDAR view\n\
                          H  hide HUD   F1  help   Esc  quit";
 
@@ -56,7 +56,7 @@ const FLIGHT_HELP: &str = "attitude  A/D bank   W/S pitch   Space/Shift airspeed
                            M  pilot mode         R  reset episode\n\
                            Tab  next agent       P  pause   [/]  time scale\n\
                            C  camera             mouse drag  look   wheel  zoom\n\
-                           O  goals/trails       G  plots   I/K  camera image/output\n\
+                           O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                            H  hide HUD   F1  help   Esc  quit";
 
 const HELI_HELP: &str = "velocity  W/S forward/back   A/D left/right   Space/Shift climb   Q/E yaw\n\
@@ -65,7 +65,7 @@ const HELI_HELP: &str = "velocity  W/S forward/back   A/D left/right   Space/Shi
                          M  pilot mode         R  reset episode\n\
                          Tab  next agent       P  pause   [/]  time scale\n\
                          C  camera             mouse drag  look   wheel  zoom\n\
-                         O  goals/trails       G  plots   I/K  camera image/output\n\
+                         O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                          H  hide HUD   F1  help   Esc  quit";
 
 const TILT_HELP: &str = "velocity  W/S speed setpoint   A/D sideways (hover) / turn (wing)   Space/Shift climb   Q/E yaw\n\
@@ -73,7 +73,7 @@ const TILT_HELP: &str = "velocity  W/S speed setpoint   A/D sideways (hover) / t
                          M  pilot mode         R  reset episode\n\
                          Tab  next agent       P  pause   [/]  time scale\n\
                          C  camera             mouse drag  look   wheel  zoom\n\
-                         O  goals/trails       G  plots   I/K  camera image/output\n\
+                         O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                          H  hide HUD   F1  help   Esc  quit";
 
 /// Shown above [`HELP`] while a policy flies.
@@ -85,7 +85,7 @@ const REPLAY_HELP: &str = "P  play/pause         [/]  speed\n\
                            Home/R  start of episode\n\
                            Tab  next agent       C  camera\n\
                            mouse drag  look      wheel  zoom\n\
-                           O  goals/trails       G  plots   I/K  camera image/output\n\
+                           O  goals/trails/lanes G  plots   I/K  camera image/output\n\
                            L  LiDAR hits         V  LiDAR view\n\
                            H  hide HUD   F1  help   Esc  quit";
 

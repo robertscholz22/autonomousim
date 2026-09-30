@@ -8,6 +8,7 @@ use autonomousim_core::geometry::{HitKind, HitMask, Ray};
 use autonomousim_core::math::Pose;
 use autonomousim_core::rng::Seed;
 use autonomousim_procgen::rural::{self, RuralConfig};
+use autonomousim_procgen::urban::{self, UrbanConfig};
 use autonomousim_procgen::wild::{self, WildConfig};
 use autonomousim_render::{
     AdapterChoice, CameraPose, Frame, GpuContext, GpuRig, GpuWorld, Intrinsics, Renderer, SemanticClass, Shading, View,
@@ -17,7 +18,7 @@ use autonomousim_scene::rig::{Placement, Rig};
 use autonomousim_sim::scenario::{GroupSpec, MapSource, SpawnSpec, Testworld, VehicleRef};
 use autonomousim_sim::{Scenario, WorldInstance};
 use autonomousim_world::obstacles::tags;
-use autonomousim_world::{StaticWorld, testworlds};
+use autonomousim_world::{Area, Light, StaticWorld, testworlds};
 use glam::{DQuat, DVec3};
 
 fn ctx() -> &'static GpuContext {
@@ -59,7 +60,12 @@ fn cast(world: &StaticWorld, v: &View, u: f64, w: f64) -> (Thing, SemanticClass,
     let cos = hit.normal.dot(d / len).abs();
     let (thing, class, depth) = match hit.kind {
         HitKind::Terrain => {
-            let c = terrain_class(hit.material);
+            // Sidewalks and islands are sidewalk (drawn as ribbons over the concrete).
+            let area = world.roads().has_sections().then(|| world.roads().area(hit.point.truncate()));
+            let c = match area {
+                Some(Area::Sidewalk | Area::Median) => SemanticClass::Sidewalk,
+                _ => terrain_class(hit.material),
+            };
             (Thing::Terrain(c), c, depth)
         }
         HitKind::Water => (Thing::Water, SemanticClass::Water, depth),
@@ -82,7 +88,12 @@ struct Stats {
     near_ground_ok: usize,
     classes: [usize; SemanticClass::ALL.len()],
     /// Depth outside the tolerance, by class.
-    depth_bad: [usize; 14],
+    depth_bad: [usize; SemanticClass::ALL.len()],
+    /// Clean pixels on sidewalks (by the area classes), and those the camera shows as such.
+    sidewalk: usize,
+    sidewalk_ok: usize,
+    /// Pixels of every class the camera drew (clean or not).
+    drawn: [usize; SemanticClass::ALL.len()],
 }
 
 /// Compare `frame` with the ray casts of `v`'s pixel centres.
@@ -99,9 +110,18 @@ fn compare(world: &StaticWorld, v: &View, frame: &Frame, stats: &mut Stats) {
             }
             stats.clean += 1;
             let (got_class, got) = (frame.class_at(i, j), frame.depth_at(i, j) as f64);
-            // Road ribbons lie a few centimetres above the terrain the rays hit.
-            let ribbon = got_class == SemanticClass::Road.id() && matches!(thing, Thing::Terrain(_));
-            if got_class != class.id() && !(ribbon && (got - t).abs() < 0.15) {
+            // Ribbons lie up to 9 cm above the terrain: along the ray, that much over the
+            // incidence cosine.
+            let lift = 0.1 / cos.max(0.02);
+            if class == SemanticClass::Sidewalk {
+                stats.sidewalk += 1;
+                stats.sidewalk_ok += usize::from(got_class == class.id() && (got - t).abs() < lift);
+            }
+            // Road ribbons (surfaces, sidewalks, markings) lie a few centimetres above the
+            // terrain the rays hit.
+            let painted = [SemanticClass::Road, SemanticClass::Sidewalk, SemanticClass::LaneMarking];
+            let ribbon = painted.iter().any(|c| c.id() == got_class) && matches!(thing, Thing::Terrain(_));
+            if got_class != class.id() && !(ribbon && (got - t).abs() < lift) {
                 continue;
             }
             stats.class_ok += 1;
@@ -113,7 +133,7 @@ fn compare(world: &StaticWorld, v: &View, frame: &Frame, stats: &mut Stats) {
                 Thing::Obstacle(_) => 0.01 * t + 0.1 / cos.max(0.1),
             };
             let err = (got - t).abs();
-            let good = err <= tol + if ribbon { 0.15 } else { 0.0 };
+            let good = err <= tol + if ribbon { lift } else { 0.0 };
             stats.depth_ok += usize::from(good);
             stats.depth_bad[class.id() as usize] += usize::from(!good);
             if matches!(thing, Thing::Terrain(_) | Thing::Water) && t < 100.0 && !ribbon {
@@ -125,7 +145,7 @@ fn compare(world: &StaticWorld, v: &View, frame: &Frame, stats: &mut Stats) {
 }
 
 /// Render `views` of `world` and hold the images to the ray casts.
-fn check_map(name: &str, world: &StaticWorld, views: &[View], expect: &[SemanticClass]) {
+fn check_map(name: &str, world: &StaticWorld, views: &[View], expect: &[SemanticClass]) -> Stats {
     let ctx = ctx();
     let start = std::time::Instant::now();
     let gpu = GpuWorld::new(ctx, world, WorldOptions::default()).unwrap();
@@ -138,6 +158,11 @@ fn check_map(name: &str, world: &StaticWorld, views: &[View], expect: &[Semantic
         gpu.draws(v, &mut draws);
         let frame = r.render(ctx, v, &draws).unwrap();
         compare(world, v, &frame, &mut stats);
+        for j in 0..frame.height {
+            for i in 0..frame.width {
+                stats.drawn[frame.class_at(i, j) as usize] += 1;
+            }
+        }
     }
     let frac = |a: usize, b: usize| a as f64 / b.max(1) as f64;
     let seen: Vec<String> = SemanticClass::ALL
@@ -155,12 +180,19 @@ fn check_map(name: &str, world: &StaticWorld, views: &[View], expect: &[Semantic
         stats.near_ground,
         seen.join(", ")
     );
+    let drawn: Vec<String> = SemanticClass::ALL
+        .iter()
+        .filter(|c| stats.drawn[c.id() as usize] > 0)
+        .map(|c| format!("{} {}", c.name(), stats.drawn[c.id() as usize]))
+        .collect();
+    println!("{name}: drawn {}", drawn.join(", "));
     assert!(frac(stats.class_ok, stats.clean) > 0.97, "{name}: classes {stats:?}");
     assert!(frac(stats.depth_ok, stats.class_ok) > 0.98, "{name}: depths {stats:?}");
     assert!(frac(stats.near_ground_ok, stats.near_ground) > 0.995, "{name}: near ground {stats:?}");
     for c in expect {
         assert!(stats.classes[c.id() as usize] >= 20, "{name}: too few {} pixels: {stats:?}", c.name());
     }
+    stats
 }
 
 /// Views over a map: from a few points at low and high altitude, turning around.
@@ -239,6 +271,62 @@ fn procedural_maps_match_ray_casts() {
         views.push(view(look_at(a.extend(ground + 12.0) - d.extend(0.0) * 10.0, (a + d * 15.0).extend(ground))));
     }
     check_map("rural training map", &farm, &views, &[C::Grass, C::Road, C::Building, C::Sky]);
+}
+
+#[test]
+fn urban_maps_match_ray_casts() {
+    use SemanticClass as C;
+    let (city, _) = urban::generate(&UrbanConfig::training(), 2).unwrap();
+    let mut views = survey(&city, 4);
+    views.extend(close_ups(&city, tags::BLOCK, 4, 45.0, 12.0));
+    views.extend(close_ups(&city, tags::SIGNAL, 6, 7.0, 2.5));
+    // Along streets from a car's eye height, over the right sidewalk.
+    let net = city.roads();
+    for road in net.roads().iter().filter(|r| r.class.is_urban()).step_by(9).take(8) {
+        let s = 0.5 * road.line.length();
+        let (p, h) = (road.line.point_at(s).truncate(), road.line.heading_at(s));
+        let side = glam::DVec2::new(h.sin(), -h.cos()) * (0.5 * road.width - 1.5);
+        let a = p + side;
+        let ahead = glam::DVec2::from_angle(h) * 25.0 + side * 1.3;
+        let ground = city.surface_height(a.x, a.y);
+        views.push(view(look_at(a.extend(ground + 1.6), (p + ahead).extend(ground))));
+    }
+    let stats =
+        check_map("urban training map", &city, &views, &[C::Road, C::Sidewalk, C::Building, C::TrafficLight, C::Sky]);
+    // Markings have no counterpart in the ray casts (they are paint on the road).
+    assert!(stats.drawn[C::LaneMarking.id() as usize] >= 500, "{stats:?}");
+    // Signal heads show the light they are given: lamps in its colour, class traffic light.
+    let ctx = ctx();
+    let gpu = GpuWorld::new(ctx, &city, WorldOptions::default()).unwrap();
+    assert!(gpu.signal_heads() >= 8, "{} heads", gpu.signal_heads());
+    let mut r = Renderer::new(ctx);
+    for light in [Light::Red, Light::Amber, Light::Green] {
+        let mut lit = 0;
+        for h in autonomousim_scene::streets::signal_heads(&city).iter().step_by(5).take(6) {
+            // From 8 m in front of the lamps, a little below them.
+            let front = h.rotation * DVec3::X;
+            let v = view(look_at(h.position + front * 8.0 - DVec3::Z * 1.0, h.position));
+            let mut draws = Vec::new();
+            gpu.draws(&v, &mut draws);
+            gpu.signal_draws(&v, |_| light, &mut draws);
+            let frame = r.render(ctx, &v, &draws).unwrap();
+            for (i, j) in (0..frame.height).flat_map(|j| (0..frame.width).map(move |i| (i, j))) {
+                let c = frame.rgb_at(i, j);
+                let [r, g, b] = c.map(u32::from);
+                let bright = match light {
+                    Light::Red => r > 120 && 2 * g < r && 2 * b < r,
+                    Light::Amber => r > 120 && 2 * g > r && g < r && 3 * b < r,
+                    Light::Green => g > 120 && 2 * r < g && b < g,
+                };
+                lit += usize::from(bright && frame.class_at(i, j) == C::TrafficLight.id());
+            }
+        }
+        println!("{light:?}: {lit} lit lamp pixels");
+        assert!(lit >= 3, "{light:?}: {lit} lit pixels");
+    }
+    let frac = stats.sidewalk_ok as f64 / stats.sidewalk.max(1) as f64;
+    println!("sidewalk pixels shown as sidewalk: {frac:.4} of {}", stats.sidewalk);
+    assert!(stats.sidewalk >= 200 && frac > 0.9, "{stats:?}");
 }
 
 /// Nearest hit of a ray on the triangles of `meshes` placed at `poses`: depth along the ray.

@@ -8,7 +8,7 @@ use autonomousim_world::obstacles::tags;
 use autonomousim_world::{Obstacle, ObstacleClass};
 
 /// Version of the class table below.
-pub const SEMANTIC_VERSION: u32 = 2;
+pub const SEMANTIC_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -41,10 +41,20 @@ pub enum SemanticClass {
     Vehicle = 13,
     /// Markers placed by the scenario, e.g. landing pads under goals (version 2).
     Marker = 14,
+    /// Sidewalks, curbs and median islands (version 3).
+    Sidewalk = 15,
+    /// Lane lines, stop lines, crosswalks, turn arrows and bay outlines.
+    LaneMarking = 16,
+    /// Signal poles and heads.
+    TrafficLight = 17,
+    /// Reserved for pedestrians (M8c).
+    Pedestrian = 18,
+    /// Reserved for cyclists (M8c).
+    Cyclist = 19,
 }
 
 impl SemanticClass {
-    pub const ALL: [SemanticClass; 15] = [
+    pub const ALL: [SemanticClass; 20] = [
         Self::Sky,
         Self::Grass,
         Self::ForestFloor,
@@ -60,6 +70,11 @@ impl SemanticClass {
         Self::OwnVehicle,
         Self::Vehicle,
         Self::Marker,
+        Self::Sidewalk,
+        Self::LaneMarking,
+        Self::TrafficLight,
+        Self::Pedestrian,
+        Self::Cyclist,
     ];
 
     pub fn id(self) -> u8 {
@@ -87,6 +102,11 @@ impl SemanticClass {
             Self::OwnVehicle => "own_vehicle",
             Self::Vehicle => "vehicle",
             Self::Marker => "marker",
+            Self::Sidewalk => "sidewalk",
+            Self::LaneMarking => "lane_marking",
+            Self::TrafficLight => "traffic_light",
+            Self::Pedestrian => "pedestrian",
+            Self::Cyclist => "cyclist",
         }
     }
 }
@@ -106,6 +126,16 @@ pub fn terrain_class(m: MaterialId) -> SemanticClass {
     }
 }
 
+/// Class of a road ribbon vertex.
+pub fn paint_class(p: autonomousim_scene::roads::Paint) -> SemanticClass {
+    use autonomousim_scene::roads::Paint;
+    match p {
+        Paint::Road => SemanticClass::Road,
+        Paint::Sidewalk => SemanticClass::Sidewalk,
+        Paint::Marking => SemanticClass::LaneMarking,
+    }
+}
+
 /// Class of an obstacle: by its tag, else by its class and material.
 pub fn obstacle_class(o: &Obstacle) -> SemanticClass {
     match o.tag {
@@ -115,9 +145,8 @@ pub fn obstacle_class(o: &Obstacle) -> SemanticClass {
         tags::HEDGE => SemanticClass::Trunk,
         tags::ROCK => SemanticClass::Boulder,
         tags::PILLAR | tags::WALL | tags::FENCE | tags::BUILDING | tags::SILO => SemanticClass::Building,
-        tags::BLOCK | tags::ROOF | tags::PARAPET | tags::ROOF_UNIT | tags::PAD | tags::LAMP | tags::SIGNAL => {
-            SemanticClass::Building
-        }
+        tags::SIGNAL => SemanticClass::TrafficLight,
+        tags::BLOCK | tags::ROOF | tags::PARAPET | tags::ROOF_UNIT | tags::PAD | tags::LAMP => SemanticClass::Building,
         _ if o.class == ObstacleClass::Foliage => SemanticClass::Canopy,
         _ => match o.material {
             MaterialId::ROCK | MaterialId::SCREE => SemanticClass::Boulder,

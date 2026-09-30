@@ -14,6 +14,35 @@ use autonomousim_core::terrain::Terrain;
 use autonomousim_world::{Polyline, Road, RoadClass, StaticWorld};
 use glam::DVec2;
 
+/// What a ribbon vertex shows: the semantic class of cameras.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Paint {
+    /// Carriageways, bike lanes, road shoulders.
+    Road,
+    /// Sidewalks, curbs and median islands.
+    Sidewalk,
+    /// Lane lines, stop lines, crosswalks, arrows and bay outlines.
+    Marking,
+}
+
+/// The ribbons of one chunk: a mesh and what each of its vertices shows.
+#[derive(Clone, Debug, Default)]
+pub struct Ribbons {
+    pub mesh: MeshData,
+    pub paint: Vec<Paint>,
+}
+
+impl Ribbons {
+    pub fn is_empty(&self) -> bool {
+        self.mesh.is_empty()
+    }
+
+    pub fn push_vertex(&mut self, p: glam::Vec3, n: glam::Vec3, c: [f32; 4], paint: Paint) -> u32 {
+        self.paint.push(paint);
+        self.mesh.push_vertex(p, n, c)
+    }
+}
+
 /// Height of a road surface above the terrain (m), by class.
 fn lift(class: RoadClass) -> f64 {
     match class {
@@ -37,6 +66,7 @@ struct Layer {
     offsets: Vec<f64>,
     lift: f64,
     color: [f32; 4],
+    paint: Paint,
 }
 
 /// Unit vector to the left of heading `h`.
@@ -61,21 +91,29 @@ fn layers(world: &StaticWorld, road: &Road) -> Vec<Layer> {
     let base = lift(road.class);
     let span = |a: f64, b: f64, n: usize| (0..=n).map(|k| a + (b - a) * k as f64 / n as f64).collect::<Vec<_>>();
     match road.class {
-        // Urban roads are drawn as paved ones until their lanes are (M8a step 5).
+        // Urban roads without sections (not generated so) are drawn as paved ones.
         RoadClass::Paved | RoadClass::Arterial | RoadClass::Collector | RoadClass::Local => {
             let edge = |side: f64| Layer {
                 offsets: band(side * (w - 0.35), side * (w - 0.2)),
                 lift: base + MARKING_LIFT,
                 color: srgb(MARKING),
+                paint: Paint::Marking,
             };
-            vec![Layer { offsets: span(-w, w, 4), lift: base, color: srgb([64, 66, 70]) }, edge(-1.0), edge(1.0)]
+            let surface = Layer { offsets: span(-w, w, 4), lift: base, color: srgb([64, 66, 70]), paint: Paint::Road };
+            vec![surface, edge(-1.0), edge(1.0)]
         }
-        RoadClass::Gravel => vec![Layer { offsets: span(-w, w, 2), lift: base, color: color(MaterialId::GRAVEL, 1.0) }],
+        RoadClass::Gravel => vec![Layer {
+            offsets: span(-w, w, 2),
+            lift: base,
+            color: color(MaterialId::GRAVEL, 1.0),
+            paint: Paint::Road,
+        }],
         RoadClass::Track => {
             let rut = |side: f64| Layer {
                 offsets: band(side * 0.55, side * 1.05),
                 lift: base,
                 color: color(MaterialId::DIRT, 0.7),
+                paint: Paint::Road,
             };
             vec![rut(-1.0), rut(1.0)]
         }
@@ -84,11 +122,11 @@ fn layers(world: &StaticWorld, road: &Road) -> Vec<Layer> {
 
 /// Append a strip along `line` between the stations of `points` (indices into the line's
 /// points) to `m`.
-fn strip(m: &mut MeshData, world: &StaticWorld, line: &Polyline, points: &[usize], layer: &Layer) {
+fn strip(m: &mut Ribbons, world: &StaticWorld, line: &Polyline, points: &[usize], layer: &Layer) {
     let pts = line.points();
     let n = pts.len();
     let cols = layer.offsets.len();
-    let base = m.vertex_count() as u32;
+    let base = m.mesh.vertex_count() as u32;
     for &i in points {
         let (a, b) = (pts[i.saturating_sub(1)], pts[(i + 1).min(n - 1)]);
         let d = (b - a).truncate();
@@ -96,7 +134,7 @@ fn strip(m: &mut MeshData, world: &StaticWorld, line: &Polyline, points: &[usize
         for &off in &layer.offsets {
             let xy = pts[i].truncate() + off * l;
             let (h, normal) = world.grid().height_normal(xy.x, xy.y);
-            m.push_vertex(xy.extend(h + layer.lift).as_vec3(), normal.as_vec3(), layer.color);
+            m.push_vertex(xy.extend(h + layer.lift).as_vec3(), normal.as_vec3(), layer.color, layer.paint);
         }
     }
     for r in 0..points.len().saturating_sub(1) as u32 {
@@ -104,18 +142,23 @@ fn strip(m: &mut MeshData, world: &StaticWorld, line: &Polyline, points: &[usize
             // Rows run along the road, columns from right to left: counter-clockwise from above.
             let (i00, i01) = (base + r * cols as u32 + c, base + r * cols as u32 + c + 1);
             let (i10, i11) = (i00 + cols as u32, i01 + cols as u32);
-            m.push_triangle(i00, i10, i11);
-            m.push_triangle(i00, i11, i01);
+            m.mesh.push_triangle(i00, i10, i11);
+            m.mesh.push_triangle(i00, i11, i01);
         }
     }
 }
 
 /// Road ribbons grouped by chunk: one merged mesh per entry of `chunks` (empty where no road
-/// passes). A road is cut where it crosses into another chunk.
-pub fn roads_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize) -> Vec<MeshData> {
+/// passes). A road is cut where it crosses into another chunk. Urban streets (maps with road
+/// sections) are drawn by [`streets`](crate::streets): lanes, sidewalks and markings.
+pub fn roads_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize) -> Vec<Ribbons> {
     let grid = world.grid();
-    let mut out = vec![MeshData::new(); chunks.len()];
+    let mut out = vec![Ribbons::default(); chunks.len()];
+    let sections = world.roads().has_sections();
     for road in world.roads().roads() {
+        if sections && road.class.is_urban() {
+            continue;
+        }
         let line = &road.line;
         let pts = line.points();
         if pts.len() < 2 {
@@ -139,8 +182,12 @@ pub fn roads_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize) -> Vec
         }
         // Centre-line dashes on paved roads.
         if road.class == RoadClass::Paved {
-            let dash =
-                Layer { offsets: vec![-0.06, 0.06], lift: lift(road.class) + MARKING_LIFT, color: srgb(MARKING) };
+            let dash = Layer {
+                offsets: vec![-0.06, 0.06],
+                lift: lift(road.class) + MARKING_LIFT,
+                color: srgb(MARKING),
+                paint: Paint::Marking,
+            };
             let stations = station_indices(line);
             let mut s = 0.5 * DASH_PERIOD;
             while s + DASH < line.length() {
@@ -154,6 +201,7 @@ pub fn roads_by_chunk(world: &StaticWorld, chunks: &[Chunk], size: usize) -> Vec
             }
         }
     }
+    crate::streets::streets(world, &mut out, size);
     out
 }
 
@@ -223,8 +271,11 @@ mod tests {
         let cs = chunks(w.grid(), 32);
         let meshes = roads_by_chunk(&w, &cs, 32);
         assert_eq!(meshes.len(), cs.len());
+        for m in &meshes {
+            assert_eq!(m.paint.len(), m.mesh.vertex_count());
+        }
         let all = meshes.iter().fold(MeshData::new(), |mut m, c| {
-            m.append(c);
+            m.append(&c.mesh);
             m
         });
         assert!(min_clearance(&w, &all) > 0.035);

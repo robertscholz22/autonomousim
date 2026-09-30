@@ -242,6 +242,50 @@ pub fn cuboid(h: Vec3, color: [f32; 4]) -> MeshData {
     m
 }
 
+/// A cuboid of half extents `h` whose side faces are cut at the heights (relative to the
+/// centre, ascending) of `bands`: the side between `bands[k].0` and `bands[k].1` takes
+/// `band_color`, the rest `color`. The same box as [`cuboid`], with more triangles.
+pub fn banded_cuboid(h: Vec3, color: [f32; 4], bands: &[(f32, f32)], band_color: [f32; 4]) -> MeshData {
+    let mut m = MeshData::new();
+    let c = |x: f32, y: f32, z: f32| Vec3::new(x * h.x, y * h.y, z * h.z);
+    // Slices of the sides, bottom to top.
+    let mut slices = Vec::new();
+    let mut z = -h.z;
+    for &(a, b) in bands {
+        let (a, b) = (a.clamp(z, h.z), b.clamp(z, h.z));
+        if a > z {
+            slices.push((z, a, color));
+        }
+        if b > a {
+            slices.push((a, b, band_color));
+        }
+        z = z.max(b);
+    }
+    if h.z > z {
+        slices.push((z, h.z, color));
+    }
+    // Sides as (bottom corner at z = 0, horizontal edge) with edge × z pointing outwards.
+    let sides = [
+        (c(1., -1., 0.), Vec3::Y * 2.0 * h.y),
+        (c(-1., 1., 0.), -Vec3::Y * 2.0 * h.y),
+        (c(1., 1., 0.), -Vec3::X * 2.0 * h.x),
+        (c(-1., -1., 0.), Vec3::X * 2.0 * h.x),
+    ];
+    for (o, du) in sides {
+        for &(z0, z1, col) in &slices {
+            let (a, b) = (o + Vec3::Z * z0, o + Vec3::Z * z1);
+            m.push_flat_triangle(a, a + du, b + du, col);
+            m.push_flat_triangle(a, b + du, b, col);
+        }
+    }
+    for (o, u, v) in [(c(-1., -1., 1.), Vec3::X, Vec3::Y), (c(-1., 1., -1.), Vec3::X, -Vec3::Y)] {
+        let (du, dv) = (u * 2.0 * h, v * 2.0 * h);
+        m.push_flat_triangle(o, o + du, o + du + dv, color);
+        m.push_flat_triangle(o, o + du + dv, o + dv, color);
+    }
+    m
+}
+
 /// Gable roof over the rectangle `±h.x × ±h.y` at `z = 0`, its ridge along x at `z = h.z`:
 /// two slopes and two gable ends, without a bottom.
 pub fn gable_roof(h: Vec3, color: [f32; 4]) -> MeshData {

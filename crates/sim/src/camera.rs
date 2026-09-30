@@ -191,6 +191,10 @@ impl Cameras {
                     };
                     let first = draws.len();
                     map.draws(&view, &mut draws);
+                    if map.signal_heads() > 0 {
+                        let (lanes, t) = (w.map().roads().lanes(), w.time());
+                        map.signal_draws(&view, |c| w.signals().light(lanes, c, t), &mut draws);
+                    }
                     draws.extend(pad_draws.iter().copied());
                     for (j, b) in agents.iter().enumerate().filter(|(_, b)| !b.disabled) {
                         let class = if j == i { SemanticClass::OwnVehicle } else { SemanticClass::Vehicle };

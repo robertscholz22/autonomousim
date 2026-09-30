@@ -30,6 +30,7 @@ mod hud;
 mod lidar_view;
 mod overlay;
 mod replay;
+mod signals_view;
 mod sim;
 mod vehicle_view;
 mod world_view;
@@ -529,6 +530,7 @@ fn main() -> anyhow::Result<()> {
         .insert_resource(world_view::MapView::new(map, quality))
         .insert_resource(history::History::default())
         .insert_resource(overlay::Overlay::default())
+        .init_resource::<signals_view::SignalLamps>()
         .insert_resource(sim)
         .insert_resource(DemoRoute::default())
         .insert_resource(hud::Hud { visible: true, help: display.screenshot.is_none(), plots: display.plots })
@@ -586,6 +588,7 @@ fn main() -> anyhow::Result<()> {
                     vehicle_view::sync_rotors,
                     vehicle_view::sync_tiltrotors,
                     world_view::sync_pads,
+                    signals_view::sync_signals,
                 )
                     .chain(),
                 camera::update_camera,
@@ -965,6 +968,55 @@ mod tests {
         assert!(Arc::ptr_eq(&view.world, app.resource::<sim::Sim>().world.map()));
         let after: Vec<Entity> = app.query_filtered::<Entity, With<MapEntity>>().iter(&app).collect();
         assert!(!after.is_empty() && before.iter().all(|e| app.get_entity(*e).is_err()));
+    }
+
+    /// On an urban map every signal head gets lamps, lit as the simulation's signals are, and
+    /// they change with the signal state.
+    #[test]
+    fn signal_heads_show_the_signal_state() {
+        use autonomousim_scene::streets::Lamp;
+        use autonomousim_sim::traffic::Signals;
+        use signals_view::HeadLamps;
+        let args = ["viewer", "--map", "urban", "--preset", "training", "--seed", "2", "--vehicle", "sedan_like"];
+        let cli = Cli::parse_from(args);
+        let sc = scenario(&cli.live).unwrap();
+        let world = WorldInstance::new(Arc::new(sc.compile().unwrap()), Seed::from_u64(0));
+        let mut app = World::new();
+        app.init_resource::<convert::RenderOrigin>();
+        app.init_resource::<signals_view::SignalLamps>();
+        app.insert_resource(sim::Sim::new(world));
+        app.insert_resource(Assets::<Mesh>::default());
+        app.insert_resource(Assets::<StandardMaterial>::default());
+        // The first run spawns the lamps (dark), the next lights them.
+        app.run_system_once(signals_view::sync_signals).unwrap();
+        app.run_system_once(signals_view::sync_signals).unwrap();
+        // (shown, expected) lamp per head.
+        let lit = |app: &mut World| {
+            let heads: Vec<(Lamp, u32)> =
+                app.query::<&HeadLamps>().iter(app).map(|h| (h.lit(), h.connector())).collect();
+            let sim = app.resource::<sim::Sim>();
+            let (lanes, t) = (sim.world.map().roads().lanes(), sim.time());
+            heads
+                .into_iter()
+                .map(|(got, c)| (got, signals_view::lamp(sim.world.signals().light(lanes, c, t))))
+                .collect::<Vec<_>>()
+        };
+        let first = lit(&mut app);
+        assert!(first.len() >= 20, "{} heads", first.len());
+        assert!(first.iter().all(|(got, want)| got == want));
+        // Shift every controller by a third of its cycle: some heads change, and follow.
+        let shifted = {
+            let sim = app.resource::<sim::Sim>();
+            let lanes = sim.world.map().roads().lanes();
+            let offsets = sim.world.signals().offsets();
+            let o = lanes.controllers().iter().zip(offsets).map(|(c, o)| o + c.cycle() / 3.0).collect();
+            Signals::with_offsets(o)
+        };
+        app.resource_mut::<sim::Sim>().world.set_signals(shifted);
+        app.run_system_once(signals_view::sync_signals).unwrap();
+        let second = lit(&mut app);
+        assert!(second.iter().all(|(got, want)| got == want));
+        assert!(first.iter().zip(&second).filter(|(a, b)| a.0 != b.0).count() >= 5);
     }
 
     /// On a tiled map the coarse layer is drawn at once and the detail tiles around the camera

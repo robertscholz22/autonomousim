@@ -438,7 +438,7 @@ fn build_map(commands: &mut Commands, view: &MapView, origin: RenderOrigin, mesh
     let enu_bounds = |m: &MeshData| m.bounds().map(|(lo, hi)| (lo.as_dvec3(), hi.as_dvec3()));
     let mut road_triangles = 0;
     // Roads are drawn where obstacles are drawn in detail.
-    for r in road_meshes.into_iter().filter(|r| !r.is_empty()) {
+    for r in road_meshes.into_iter().filter(|r| !r.is_empty()).map(|r| r.mesh) {
         road_triangles += r.triangle_count();
         let (rmin, rmax) = bevy_bounds(&r).unwrap();
         let (min, max) = enu_bounds(&r).unwrap();

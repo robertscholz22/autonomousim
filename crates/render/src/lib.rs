@@ -23,5 +23,5 @@ pub mod world;
 pub use camera::{CameraPose, Intrinsics};
 pub use context::{AdapterChoice, GpuContext, RenderError};
 pub use renderer::{Draw, Frame, GpuMesh, Job, Renderer, Shading, View};
-pub use semantic::{SemanticClass, obstacle_class, terrain_class};
+pub use semantic::{SemanticClass, obstacle_class, paint_class, terrain_class};
 pub use world::{GpuRig, GpuWorld, WorldOptions};

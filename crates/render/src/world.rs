@@ -5,14 +5,15 @@ use autonomousim_core::math::Pose;
 use autonomousim_scene::MeshData;
 use autonomousim_scene::props::{self, PropDetail};
 use autonomousim_scene::rig::{Placement, Rig};
+use autonomousim_scene::streets::{self, Lamp, SignalHead};
 use autonomousim_scene::terrain::{self, Chunk};
 use autonomousim_scene::{mesh::srgb, roads};
-use autonomousim_world::StaticWorld;
+use autonomousim_world::{Light, StaticWorld};
 use glam::{DQuat, DVec3};
 
 use crate::context::{GpuContext, RenderError};
 use crate::renderer::{Draw, GpuMesh, View};
-use crate::semantic::{SemanticClass, obstacle_class, terrain_class};
+use crate::semantic::{SemanticClass, obstacle_class, paint_class, terrain_class};
 
 /// How a map is cut up and simplified with distance.
 #[derive(Clone, Debug, PartialEq)]
@@ -38,7 +39,13 @@ impl Default for WorldOptions {
             coarsest: 8,
             detailed_props: 250.0,
             // Finer than the viewer's: depth images show the facets.
-            props: PropDetail { segments: 12, capsule_segments: 8, sphere_subdivisions: 2, min_size: 0.0 },
+            props: PropDetail {
+                segments: 12,
+                capsule_segments: 8,
+                sphere_subdivisions: 2,
+                min_size: 0.0,
+                facades: true,
+            },
             far_props: PropDetail::default(),
         }
     }
@@ -79,6 +86,9 @@ pub struct GpuWorld {
     chunks: Vec<GpuChunk>,
     /// Road ribbons in world coordinates, one per chunk that has roads, with their bounds.
     roads: Vec<(GpuMesh, DVec3, DVec3)>,
+    /// Signal heads, and the lamp meshes (red, amber, green lit) of each head size.
+    heads: Vec<(SignalHead, usize)>,
+    lamps: Vec<[GpuMesh; 3]>,
     triangles: usize,
 }
 
@@ -160,14 +170,30 @@ impl GpuWorld {
         }
         let roads = roads::roads_by_chunk(world, &chunks, size)
             .into_iter()
-            .filter(|m| !m.is_empty())
-            .map(|m| {
-                triangles += m.triangle_count();
-                let (lo, hi) = m.bounds().expect("a road mesh has vertices");
-                (GpuMesh::new(ctx, &m, SemanticClass::Road), lo.as_dvec3(), hi.as_dvec3())
+            .filter(|r| !r.is_empty())
+            .map(|r| {
+                triangles += r.mesh.triangle_count();
+                let (lo, hi) = r.mesh.bounds().expect("a road mesh has vertices");
+                let ids: Vec<u8> = r.paint.iter().map(|&p| paint_class(p).id()).collect();
+                (GpuMesh::with_classes(ctx, &r.mesh, &ids), lo.as_dvec3(), hi.as_dvec3())
             })
             .collect();
-        Ok(Self { options, strides, chunks: gpu_chunks, roads, triangles })
+        let mut sizes: Vec<DVec3> = Vec::new();
+        let mut lamps = Vec::new();
+        let heads = streets::signal_heads(world)
+            .into_iter()
+            .map(|h| {
+                let k = sizes.iter().position(|s| *s == h.half_extents).unwrap_or_else(|| {
+                    sizes.push(h.half_extents);
+                    lamps.push([Lamp::Red, Lamp::Amber, Lamp::Green].map(|l| {
+                        GpuMesh::new(ctx, &streets::signal_lamps(h.half_extents, l), SemanticClass::TrafficLight)
+                    }));
+                    sizes.len() - 1
+                });
+                (h, k)
+            })
+            .collect();
+        Ok(Self { options, strides, chunks: gpu_chunks, roads, heads, lamps, triangles })
     }
 
     /// Triangles at full detail (terrain at the finest stride, water, obstacles, roads).
@@ -205,6 +231,32 @@ impl GpuWorld {
                 out.push(Draw::world(m));
             }
         }
+    }
+}
+
+impl GpuWorld {
+    /// Append the lamps of the signal heads that `view` may see (within the detailed
+    /// obstacle distance), lit by `light` of each head's connector.
+    pub fn signal_draws<'a>(&'a self, view: &View, light: impl Fn(u32) -> Light, out: &mut Vec<Draw<'a>>) {
+        let eye = view.pose.position;
+        for (h, k) in &self.heads {
+            let r = h.half_extents.max_element();
+            let (lo, hi) = (h.position - DVec3::splat(r), h.position + DVec3::splat(r));
+            if box_distance(eye, lo, hi) > self.options.detailed_props || !view.may_see(lo, hi) {
+                continue;
+            }
+            let lit = match light(h.connector) {
+                Light::Red => 0,
+                Light::Amber => 1,
+                Light::Green => 2,
+            };
+            out.push(Draw::new(&self.lamps[*k][lit], h.position, h.rotation));
+        }
+    }
+
+    /// Number of signal heads.
+    pub fn signal_heads(&self) -> usize {
+        self.heads.len()
     }
 }
 

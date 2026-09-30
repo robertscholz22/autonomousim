@@ -81,6 +81,10 @@ impl GpuContext {
     pub fn new(choice: &AdapterChoice) -> Result<Self, RenderError> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN;
+        // No debug labels or validation by default, even in debug builds: naming objects through
+        // the debug-utils extension crashed the Vulkan loader now and then when two contexts
+        // were created in parallel (tests). `WGPU_DEBUG=1` / `WGPU_VALIDATION=1` turn them on.
+        desc.flags = wgpu::InstanceFlags::empty().with_env();
         let instance = wgpu::Instance::new(desc);
         let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
         // The best rank wins; ties keep the enumeration order.

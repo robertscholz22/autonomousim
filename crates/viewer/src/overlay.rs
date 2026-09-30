@@ -1,14 +1,18 @@
 //! Markers drawn over the scene with gizmos: the goals of every agent and the line to the
 //! current one, the route of agents with `route` goals, the path flown over the last seconds,
-//! and the hits of the latest LiDAR scan.
-//! O toggles the goals and trails, L the LiDAR points.
+//! the hits of the latest LiDAR scan, and on urban maps the lane graph near the camera (lanes,
+//! connectors in their signals' colours, yield points and stop lines).
+//! O cycles through goals and trails, those with the lane graph, and nothing; L toggles the
+//! LiDAR points.
 
+use crate::CameraRig;
 use crate::convert::RenderOrigin;
 use crate::sim::Sim;
 use autonomousim_core::math::Pose;
 use autonomousim_sensors::{LidarConfig, Sensor};
 use autonomousim_sim::scenario::GoalKind;
-use autonomousim_world::StaticWorld;
+use autonomousim_world::lanes::Control;
+use autonomousim_world::{Light, Polyline, StaticWorld, Turn};
 use bevy::prelude::*;
 use glam::DVec3;
 use std::collections::VecDeque;
@@ -22,6 +26,8 @@ const MAX_POINTS: usize = 4096;
 #[derive(Resource)]
 pub struct Overlay {
     pub markers: bool,
+    /// The lane graph (with the markers).
+    pub lanes: bool,
     pub lidar: bool,
     /// Live trails: (time, position) of every agent.
     trails: Vec<VecDeque<(f64, DVec3)>>,
@@ -30,7 +36,7 @@ pub struct Overlay {
 
 impl Default for Overlay {
     fn default() -> Self {
-        Self { markers: true, lidar: true, trails: Vec::new(), map: None }
+        Self { markers: true, lanes: false, lidar: true, trails: Vec::new(), map: None }
     }
 }
 
@@ -82,11 +88,21 @@ pub fn draw(
     keys: Res<ButtonInput<KeyCode>>,
     sim: Res<Sim>,
     origin: Res<RenderOrigin>,
+    camera: Query<&CameraRig>,
     mut overlay: ResMut<Overlay>,
     mut gizmos: Gizmos,
 ) {
     if keys.just_pressed(KeyCode::KeyO) {
-        overlay.markers = !overlay.markers;
+        (overlay.markers, overlay.lanes) = match (overlay.markers, overlay.lanes) {
+            (true, false) => (true, true),
+            (true, true) => (false, false),
+            _ => (true, false),
+        };
+    }
+    if overlay.lanes
+        && let Ok(rig) = camera.single()
+    {
+        draw_lanes(&sim, &origin, rig.eye, &mut gizmos);
     }
     if keys.just_pressed(KeyCode::KeyL) {
         overlay.lidar = !overlay.lidar;
@@ -171,6 +187,84 @@ pub fn draw(
             let size = (0.012 * r).clamp(0.05, 0.6) as f32;
             let p = origin.pos(scan.pose.transform_point(p));
             gizmos.cross(Isometry3d::from_translation(p), size, range_color(r, max));
+        }
+    }
+}
+
+/// Lanes and connectors are drawn within this distance of the camera (m).
+const LANE_RANGE: f64 = 150.0;
+const LANE: Color = Color::srgba(0.35, 0.7, 1.0, 0.8);
+const CONNECTOR: Color = Color::srgba(0.85, 0.85, 0.85, 0.6);
+const CONFLICT: Color = Color::srgb(1.0, 0.45, 0.1);
+
+fn light_color(l: Light) -> Color {
+    match l {
+        Light::Green => Color::srgb(0.1, 1.0, 0.3),
+        Light::Amber => Color::srgb(1.0, 0.7, 0.05),
+        Light::Red => Color::srgb(1.0, 0.1, 0.1),
+    }
+}
+
+/// The lane graph near `eye`: lanes (blue, with their direction), connectors (grey, or in
+/// their signal's colour), the points where a connector yields (orange crosses), and stop lines
+/// in the light of the movement straight on.
+fn draw_lanes(sim: &Sim, origin: &RenderOrigin, eye: DVec3, gizmos: &mut Gizmos) {
+    let net = sim.world.map().roads();
+    if !net.has_sections() {
+        return;
+    }
+    let g = net.lanes();
+    let t = sim.time();
+    let signals = sim.world.signals();
+    let lift = DVec3::Z * 0.3;
+    let near = |line: &Polyline| {
+        let p = line.points();
+        [p[0], p[p.len() / 2], p[p.len() - 1]].iter().any(|q| q.truncate().distance(eye.truncate()) < LANE_RANGE)
+    };
+    let strip = |line: &Polyline| {
+        let p = line.points();
+        let last = p.len() - 1;
+        (0..p.len()).step_by(2).chain([last]).map(|k| origin.pos(p[k] + lift)).collect::<Vec<_>>()
+    };
+    for l in g.lanes() {
+        if !near(&l.line) {
+            continue;
+        }
+        gizmos.linestrip(strip(&l.line), LANE);
+        let len = l.line.length();
+        let tip = l.line.point_at(len);
+        gizmos.arrow(origin.pos(l.line.point_at((len - 3.0).max(0.0)) + lift), origin.pos(tip + lift), LANE);
+    }
+    for (i, c) in g.connectors().iter().enumerate() {
+        if !near(&c.line) {
+            continue;
+        }
+        let color = match g.connector_signal(i as u32) {
+            Some(_) => light_color(signals.light(g, i as u32, t)),
+            None => CONNECTOR,
+        };
+        gizmos.linestrip(strip(&c.line), color);
+        for k in c.conflicts.iter().filter(|k| k.yields) {
+            let p = origin.pos(c.line.point_at(k.station) + lift);
+            gizmos.cross(Isometry3d::from_translation(p), 0.4, CONFLICT);
+        }
+    }
+    for j in g.junctions() {
+        for a in &j.approaches {
+            let mid = 0.5 * (a.stop_line[0] + a.stop_line[1]);
+            if mid.truncate().distance(eye.truncate()) > LANE_RANGE || a.control != Control::Signal {
+                continue;
+            }
+            let straight = a
+                .lanes
+                .iter()
+                .flat_map(|&l| &g.lanes()[l as usize].successors)
+                .copied()
+                .find(|&c| g.connectors()[c as usize].turn == Turn::Straight)
+                .or_else(|| a.lanes.first().and_then(|&l| g.lanes()[l as usize].successors.first().copied()));
+            let Some(c) = straight else { continue };
+            let color = light_color(signals.light(g, c, t));
+            gizmos.line(origin.pos(a.stop_line[0] + lift), origin.pos(a.stop_line[1] + lift), color);
         }
     }
 }

@@ -10,6 +10,7 @@ pub mod props;
 pub mod rig;
 pub mod roads;
 pub mod single_track;
+pub mod streets;
 pub mod terrain;
 
 pub use mesh::MeshData;

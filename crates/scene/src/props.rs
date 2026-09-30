@@ -20,18 +20,22 @@ pub struct PropDetail {
     pub sphere_subdivisions: u32,
     /// Obstacles smaller than this (largest extent, m) are left out.
     pub min_size: f64,
+    /// Building blocks with window bands, parapets, roof units, lamps and signals; else plain
+    /// boxes without the fittings (the far field).
+    pub facades: bool,
 }
 
 impl Default for PropDetail {
     fn default() -> Self {
-        Self { segments: 7, capsule_segments: 5, sphere_subdivisions: 1, min_size: 0.0 }
+        Self { segments: 7, capsule_segments: 5, sphere_subdivisions: 1, min_size: 0.0, facades: true }
     }
 }
 
 impl PropDetail {
-    /// For obstacles seen from a few hundred metres: coarse, without small rocks.
+    /// For obstacles seen from a few hundred metres: coarse, without small rocks, buildings as
+    /// boxes.
     pub fn far() -> Self {
-        Self { segments: 4, capsule_segments: 3, sphere_subdivisions: 0, min_size: 1.5 }
+        Self { segments: 4, capsule_segments: 3, sphere_subdivisions: 0, min_size: 1.5, facades: false }
     }
 }
 
@@ -101,11 +105,37 @@ fn roof_color(material: MaterialId) -> [u8; 3] {
     }
 }
 
+/// Storey height (m) of urban buildings, and the window band within each storey (m above
+/// its floor).
+const STOREY: f64 = 3.2;
+const WINDOWS: (f64, f64) = (0.9, 2.3);
+
+/// Window bands of a building block of half height `hz` (relative to its centre, ascending):
+/// one per storey counted down from the top, above the lowest 0.5 m (below the ground);
+/// industrial halls (metal) get one clerestory band.
+fn window_bands(hz: f64, material: MaterialId) -> Vec<(f32, f32)> {
+    let mut bands = Vec::new();
+    let mut top = hz;
+    while top - STOREY >= -hz + 0.5 - 1e-9 {
+        bands.push(((top - STOREY + WINDOWS.0) as f32, (top - STOREY + WINDOWS.1) as f32));
+        top -= STOREY;
+        if material == MaterialId::METAL {
+            break;
+        }
+    }
+    bands.reverse();
+    bands
+}
+
 /// Mesh of one obstacle in its local frame as the viewer shows it: its shape, except that
-/// buildings get a gable roof (above their collision box), silos a conical cap, and fences
-/// are drawn as posts and wires.
+/// buildings get a gable roof (above their collision box), silos a conical cap, fences are
+/// drawn as posts and wires, and urban building blocks get window bands (with `facades`).
 pub fn obstacle_visual(o: &Obstacle, color: [f32; 4], detail: PropDetail) -> MeshData {
     match (o.tag, &o.shape) {
+        (tags::BLOCK, ObstacleShape::Cuboid { half_extents: h }) if detail.facades => {
+            let glass = if o.material == MaterialId::METAL { [96, 110, 122] } else { [68, 84, 100] };
+            mesh::banded_cuboid(h.as_vec3(), color, &window_bands(h.z, o.material), srgb(glass))
+        }
         (tags::BUILDING, ObstacleShape::Cuboid { half_extents: h }) => {
             let mut m = mesh::cuboid(h.as_vec3(), color);
             // The ridge runs along the longer side; the roof overhangs by 0.3 m.
@@ -208,6 +238,9 @@ pub fn props_grouped<'a>(
 pub fn shown_obstacle(materials: &MaterialTable, key: u64, o: &Obstacle, detail: PropDetail) -> Option<MeshData> {
     // Hedges hide their woody cores.
     let hidden = o.tag == tags::HEDGE && o.class == ObstacleClass::Solid;
+    // The far field leaves out the fittings of buildings and streets.
+    let fitting = matches!(o.tag, tags::PARAPET | tags::ROOF_UNIT | tags::LAMP | tags::SIGNAL);
+    let hidden = hidden || (fitting && !detail.facades);
     if hidden || (detail.min_size > 0.0 && extent(&o.shape) < detail.min_size) {
         return None;
     }
@@ -1107,6 +1140,41 @@ mod tests {
             assert!(lo.x as f64 > clo.x - 8.0 && (hi.x as f64) < chi.x + 8.0);
             assert!(lo.y as f64 > clo.y - 8.0 && (hi.y as f64) < chi.y + 8.0);
             assert!((hi.z as f64) > clo.z);
+        }
+    }
+
+    #[test]
+    fn city_blocks_get_window_bands_near_and_boxes_far() {
+        use autonomousim_core::math::Pose;
+        let table = MaterialTable::default();
+        // A 10-storey block from 0.5 m below the ground: 32.5 m high.
+        let h = DVec3::new(10.0, 6.0, 16.25);
+        let block = Obstacle::solid(ObstacleShape::Cuboid { half_extents: h }, Pose::IDENTITY, MaterialId::CONCRETE)
+            .with_tag(tags::BLOCK);
+        let near = shown_obstacle(&table, 1, &block, PropDetail::default()).unwrap();
+        let far = shown_obstacle(&table, 1, &block, PropDetail::far()).unwrap();
+        // The same box: bands only cut its sides.
+        assert_eq!(near.bounds(), far.bounds());
+        assert_eq!(far.triangle_count(), 12);
+        // Ten window bands on each of the four sides, each between two wall slices.
+        assert_eq!(near.triangle_count(), 4 * (2 * 10 + 1) * 2 + 4);
+        assert_eq!(window_bands(h.z, MaterialId::CONCRETE).len(), 10);
+        assert_eq!(window_bands(h.z, MaterialId::METAL).len(), 1);
+        // Faces point outwards (from the centre).
+        for t in near.indices.as_chunks::<3>().0 {
+            let [a, b, c] = t.map(|i| Vec3::from_array(near.positions[i as usize]));
+            assert!((b - a).cross(c - a).dot((a + b + c) / 3.0) > 0.0);
+        }
+        // Fittings are left out far away.
+        for tag in [tags::PARAPET, tags::ROOF_UNIT, tags::LAMP, tags::SIGNAL] {
+            let o = Obstacle::solid(
+                ObstacleShape::Cuboid { half_extents: DVec3::new(3.0, 3.0, 3.0) },
+                Pose::IDENTITY,
+                MaterialId::METAL,
+            )
+            .with_tag(tag);
+            assert!(shown_obstacle(&table, 1, &o, PropDetail::default()).is_some());
+            assert!(shown_obstacle(&table, 1, &o, PropDetail::far()).is_none());
         }
     }
 
