@@ -46,6 +46,13 @@ impl Events {
     pub const JACKKNIFE: Self = Self(1 << 14);
     /// A fixed-wing aircraft flies beyond its stall angle of attack (not terminal).
     pub const STALL: Self = Self(1 << 15);
+    /// A ground vehicle crossed a stop line on red (urban maps; not terminal, see
+    /// [`traffic`](crate::traffic)).
+    pub const RED_LIGHT: Self = Self(1 << 16);
+    /// A ground vehicle drives against its lane's direction (not terminal).
+    pub const WRONG_WAY: Self = Self(1 << 17);
+    /// A ground vehicle drives on a sidewalk, a median or off the roads (not terminal).
+    pub const OFF_ROAD: Self = Self(1 << 18);
 
     /// Events after which the vehicle cannot continue.
     pub const TERMINAL: Self = Self(
@@ -59,7 +66,7 @@ impl Events {
             | Self::JACKKNIFE.0,
     );
 
-    pub const NAMES: [(&'static str, Events); 16] = [
+    pub const NAMES: [(&'static str, Events); 19] = [
         ("crash_terrain", Self::CRASH_TERRAIN),
         ("crash_obstacle", Self::CRASH_OBSTACLE),
         ("crash_agent", Self::CRASH_AGENT),
@@ -76,6 +83,9 @@ impl Events {
         ("stuck", Self::STUCK),
         ("jackknife", Self::JACKKNIFE),
         ("stall", Self::STALL),
+        ("red_light", Self::RED_LIGHT),
+        ("wrong_way", Self::WRONG_WAY),
+        ("off_road", Self::OFF_ROAD),
     ];
 
     #[inline]

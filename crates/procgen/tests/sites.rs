@@ -5,7 +5,7 @@ use autonomousim_core::geometry::{HitMask, Ray};
 use autonomousim_procgen::urban::{self, UrbanPreset};
 use autonomousim_world::lanes::Area;
 use autonomousim_world::obstacles::tags;
-use autonomousim_world::{BayKind, Roof, StaticWorld, Zone};
+use autonomousim_world::{BayKind, JunctionKind, Light, Roof, StaticWorld, Zone};
 use glam::{DVec2, DVec3};
 
 /// An oriented rectangle: centre, heading of its x axis, half sizes.
@@ -61,6 +61,7 @@ fn check(w: &StaticWorld, label: &str) {
         assert!(sites.bays.iter().filter(|b| b.kind == kind).count() > 20, "{label}: few {kind:?} bays");
     }
     let obstacles = w.obstacles().set().expect("obstacles").obstacles();
+    signals(w, label);
 
     // Every lot fronts its street: the middle of its frontage lies within the raster's margin
     // (1.5 m and a cell's diagonal) of the road's sidewalk.
@@ -143,6 +144,31 @@ fn check(w: &StaticWorld, label: &str) {
                 let shrunk = Rect { half: r.half - DVec2::splat(0.05), ..r };
                 for p in shrunk.samples(0.5) {
                     assert_eq!(net.area(p), Area::Parking, "{label}: street bay {k} at {p}");
+                }
+            }
+        }
+    }
+}
+
+/// Every signalized junction has a controller over all its connectors, with a 60–120 s cycle,
+/// and no two conflicting connectors are ever green (or amber) together.
+fn signals(w: &StaticWorld, label: &str) {
+    let g = w.roads().lanes();
+    let signalled = g.junctions().iter().filter(|j| j.kind == JunctionKind::Signal).count();
+    assert!(signalled > 0, "{label}: no signals");
+    assert_eq!(g.controllers().len(), signalled, "{label}");
+    for ctl in g.controllers() {
+        let j = &g.junctions()[ctl.junction as usize];
+        assert!((2..=6).contains(&ctl.phases.len()), "{label}: junction {} {} phases", j.node, ctl.phases.len());
+        let cycle = ctl.cycle();
+        assert!((60.0 - 1e-9..=120.0).contains(&cycle), "{label}: cycle {cycle}");
+        let phase = |c: u32| g.connector_signal(c).expect("signalled").1 as usize;
+        for s in 0..(cycle / 0.25) as usize {
+            let t = s as f64 * 0.25;
+            let go: Vec<u32> = j.connectors.iter().copied().filter(|&c| ctl.light(phase(c), t) != Light::Red).collect();
+            for &a in &go {
+                for e in &g.connectors()[a as usize].conflicts {
+                    assert!(!go.contains(&e.other), "{label}: junction {}: {a} and {} at {t}", j.node, e.other);
                 }
             }
         }

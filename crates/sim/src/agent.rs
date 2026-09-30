@@ -12,12 +12,14 @@ use crate::events::Events;
 use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
 use crate::obs::ObsInput;
 use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, Placement};
+use crate::traffic::{RoadTrack, Signals};
 use autonomousim_control::ground::GroundEstimate;
 use autonomousim_control::multirotor::StateEstimate;
 use autonomousim_control::{Command, Controller};
 use autonomousim_core::contact::StaticScene;
 use autonomousim_core::geometry::HitKind;
 use autonomousim_core::math::Pose;
+use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
@@ -93,6 +95,8 @@ pub struct Agent {
     /// The agent it rested on at the end of the last physics step (see
     /// [`AgentContacts::support`]).
     pub support: Option<u32>,
+    /// Where a ground vehicle is on the roads (urban maps; see [`traffic`](crate::traffic)).
+    pub track: RoadTrack,
     /// The scripted driver of an agent of a `driver` group.
     pub driver: Option<RoadDriver>,
     pub disabled: bool,
@@ -150,6 +154,7 @@ impl Agent {
             goal_radius: group.spec.goals.radius,
             events: Events::NONE,
             support: None,
+            track: RoadTrack::default(),
             driver: group.spec.driver.as_ref().map(|DriverSpec::Road(r)| RoadDriver::new(r, DriverGeometry::of(group))),
             disabled: false,
             spawn: Pose::IDENTITY,
@@ -270,6 +275,27 @@ impl Agent {
             self.turbulence = self.turbulence.with_rotational(&mut self.turbulence_rng);
         }
         self.update_air(world, env, 0.0, Some(0.0));
+        self.reset_track(world);
+    }
+
+    /// Start lane tracking from the current pose (ground vehicles on maps with road sections).
+    pub(crate) fn reset_track(&mut self, world: &StaticWorld) {
+        self.track = RoadTrack::default();
+        if self.vehicle.as_wheeled().is_some() {
+            let pose = self.vehicle.pose();
+            self.track.reset(world.roads(), pose.pos.truncate(), yaw(pose.rot));
+        }
+    }
+
+    /// Update lane tracking after a policy step (see [`traffic`](crate::traffic)).
+    pub(crate) fn update_track(&mut self, world: &StaticWorld, signals: &Signals, t: f64, cfg: &EventConfig) {
+        if self.disabled || self.vehicle.as_wheeled().is_none() || !world.roads().has_sections() {
+            return;
+        }
+        let pose = self.vehicle.pose();
+        let v = (pose.rot * self.vehicle.lin_vel_body()).truncate();
+        let speed = cfg.ground.off_road_speed;
+        self.events |= self.track.update(world.roads(), signals, pose.pos.truncate(), yaw(pose.rot), v, t, speed);
     }
 
     /// Hold `action` (normalised; clipped to [−1, 1], non-finite read as 0) until the next one.
@@ -690,6 +716,8 @@ impl Agent {
         agents: &[AgentShape],
         grid: &AgentGrid,
         me: usize,
+        signals: &Signals,
+        time: f64,
         out: &mut [f32],
     ) {
         let kin = self.kinematics();
@@ -712,6 +740,9 @@ impl Agent {
                 me,
                 grid,
                 route: self.route.as_deref(),
+                track: &self.track,
+                signals,
+                time,
             },
             out,
         );

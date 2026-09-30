@@ -10,6 +10,7 @@
 //! lane index 0 is the leftmost (innermost) lane of its direction. Traffic keeps right.
 
 use crate::roads::{NodeKind, Polyline, Road, RoadClass, RoadNode, Section, SegmentGrid, wrap_angle};
+use crate::signals::{self, Controller};
 use glam::{DVec2, DVec3};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -209,6 +210,10 @@ pub struct LaneGraph {
     /// Setback (m) of the lanes from each end of each road: `[start, end]`.
     setbacks: Vec<[f64; 2]>,
     grid: SegmentGrid,
+    /// Signal controllers, and each connector's (controller, phase) and junction's controller.
+    controllers: Vec<Controller>,
+    connector_signals: Vec<Option<(u32, u8)>>,
+    junction_controllers: Vec<Option<u32>>,
 }
 
 /// One end of a road at a node.
@@ -582,7 +587,7 @@ impl LaneGraph {
                 }
             }
             if !grown {
-                return g;
+                return g.with_signals();
             }
         }
     }
@@ -803,7 +808,19 @@ impl LaneGraph {
             lanes[conn.to as usize].predecessors.push(c as u32);
         }
         let grid = SegmentGrid::of_lines(&lanes.iter().map(|l| &l.line).collect::<Vec<_>>());
-        Self { lanes, connectors, junctions, setbacks, grid }
+        Self { lanes, connectors, junctions, setbacks, grid, ..Self::default() }
+    }
+
+    /// With the signal controllers of its signalized junctions.
+    fn with_signals(mut self) -> Self {
+        let (controllers, of) = signals::build(&self.lanes, &self.connectors, &self.junctions);
+        self.junction_controllers = vec![None; self.junctions.len()];
+        for (k, c) in controllers.iter().enumerate() {
+            self.junction_controllers[c.junction as usize] = Some(k as u32);
+        }
+        self.controllers = controllers;
+        self.connector_signals = of;
+        self
     }
 
     pub fn lanes(&self) -> &[Lane] {
@@ -826,6 +843,21 @@ impl LaneGraph {
 
     pub fn is_empty(&self) -> bool {
         self.lanes.is_empty()
+    }
+
+    /// The signal controllers, one per signalized junction.
+    pub fn controllers(&self) -> &[Controller] {
+        &self.controllers
+    }
+
+    /// The (controller, phase) that lets connector `c` go, if it is signalled.
+    pub fn connector_signal(&self, c: u32) -> Option<(u32, u8)> {
+        self.connector_signals.get(c as usize).copied().flatten()
+    }
+
+    /// The controller of junction `j`, if it is signalized.
+    pub fn junction_controller(&self, j: u32) -> Option<u32> {
+        self.junction_controllers.get(j as usize).copied().flatten()
     }
 
     /// The lanes outside the largest strongly connected component (over connectors and lane
@@ -998,7 +1030,17 @@ impl LaneGraph {
     }
 
     /// The area class of `p`, given the network's roads and sections.
-    pub(crate) fn area(&self, roads: &[Road], section: &Section, road: u32, station: f64, offset: f64) -> Area {
+    /// Points outside the carriageways that a connector's lane width covers are part of its
+    /// junction.
+    pub(crate) fn area(
+        &self,
+        roads: &[Road],
+        section: &Section,
+        road: u32,
+        station: f64,
+        offset: f64,
+        p: DVec2,
+    ) -> Area {
         let r = &roads[road as usize];
         let len = r.line.length();
         let half = 0.5 * r.width;
@@ -1041,6 +1083,19 @@ impl LaneGraph {
             } else {
                 Area::Parking
             };
+        }
+        // Corners that turning traffic sweeps (outside both carriageways).
+        let near = |node: u32| {
+            let j = &self.junctions[node as usize];
+            j.approaches.len() >= 3
+                && j.connectors.iter().any(|&c| {
+                    let c = &self.connectors[c as usize];
+                    let w = self.lanes[c.from as usize].width;
+                    c.line.project(p).distance <= 0.5 * w
+                })
+        };
+        if (station < sa + 2.0 && near(r.start)) || (station > len - sb - 2.0 && near(r.end)) {
+            return Area::Junction;
         }
         let side = usize::from(x < 0.0);
         if urban && x.abs() <= half + section.sidewalk[side] {
@@ -1164,6 +1219,7 @@ impl PartialOrd for Entry {
 mod tests {
     use super::*;
     use crate::roads::RoadNetwork;
+    use crate::signals::Light;
 
     fn arterial() -> Section {
         Section { lanes: [2, 2], lane_width: 3.5, median: 2.0, bike: [0.0; 2], parking: [0.0; 2], sidewalk: [3.0; 2] }
@@ -1275,6 +1331,77 @@ mod tests {
         let j = &g.lanes().junctions()[0];
         assert_eq!(j.kind, JunctionKind::Signal);
         assert!(j.approaches.iter().all(|a| a.control == Control::Signal));
+    }
+
+    /// Every connector of every signalized junction is in one phase, and no two connectors that
+    /// conflict are green together at any time of the cycle.
+    pub(crate) fn check_signals(g: &LaneGraph) {
+        for (k, ctl) in g.controllers().iter().enumerate() {
+            let j = &g.junctions()[ctl.junction as usize];
+            assert_eq!(g.junction_controller(ctl.junction), Some(k as u32));
+            for &c in &j.connectors {
+                let (id, p) = g.connector_signal(c).expect("signalled");
+                assert_eq!(id, k as u32);
+                assert!(ctl.phases[p as usize].connectors.contains(&c));
+            }
+            let cycle = ctl.cycle();
+            assert!((60.0 - 1e-9..=120.0).contains(&cycle), "cycle {cycle}");
+            let steps = (cycle / 0.1) as usize;
+            for s in 0..steps {
+                let t = s as f64 * 0.1;
+                let go: Vec<u32> = j
+                    .connectors
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        let (_, p) = g.connector_signal(c).unwrap();
+                        ctl.light(p as usize, t) != Light::Red
+                    })
+                    .collect();
+                for &a in &go {
+                    for e in &g.connectors()[a as usize].conflicts {
+                        assert!(!go.contains(&e.other), "junction {}: {a} and {} at {t}", j.node, e.other);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signal_phases_of_a_cross() {
+        let net = cross(RoadClass::Collector);
+        let g = net.lanes();
+        assert_eq!(g.controllers().len(), 1);
+        check_signals(g);
+        let ctl = &g.controllers()[0];
+        // The arterial's protected lefts, its main phase, then the street's (single lanes: the
+        // lefts cross the oncoming straight movements and get their own phase too).
+        let turns = |k: usize| {
+            let mut t: Vec<(u32, Turn)> = ctl.phases[k]
+                .connectors
+                .iter()
+                .map(|&c| (g.lanes()[g.connectors()[c as usize].from as usize].road, g.connectors()[c as usize].turn))
+                .collect();
+            t.sort_by_key(|x| (x.0, x.1 as u8));
+            t.dedup();
+            t
+        };
+        assert_eq!(ctl.phases.len(), 4, "{:?}", ctl.phases);
+        assert!(ctl.phases[0].protected && !ctl.phases[1].protected);
+        assert_eq!(turns(0), vec![(0, Turn::Left), (1, Turn::Left)]);
+        assert_eq!(turns(1), vec![(0, Turn::Straight), (0, Turn::Right), (1, Turn::Straight), (1, Turn::Right)]);
+        assert!(turns(2).iter().all(|x| x.1 == Turn::Left && x.0 >= 2));
+        assert!((ctl.cycle() - 90.0).abs() < 1e-9);
+        // Green, amber, then red, with the cycle wrapping round.
+        let s1 = ctl.start(1);
+        let green = ctl.phases[1].green;
+        assert_eq!(ctl.light(1, s1 + 0.1), Light::Green);
+        assert_eq!(ctl.light(1, s1 + green + 1.0), Light::Amber);
+        assert_eq!(ctl.light(1, s1 + green + ctl.amber + 1.0), Light::Red);
+        assert_eq!(ctl.light(1, s1 + 0.1 + 3.0 * ctl.cycle()), Light::Green);
+        assert_eq!(ctl.light(0, s1 + 0.1 - ctl.cycle()), Light::Red);
+        // No lights at stop junctions.
+        assert!(cross(RoadClass::Local).lanes().controllers().is_empty());
     }
 
     #[test]

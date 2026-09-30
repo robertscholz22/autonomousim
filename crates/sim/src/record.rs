@@ -11,6 +11,11 @@
 //! | `/agent/<id>/camera/<sensor>` | frames captured at multiples of `1/camera_hz`, if enabled | the visible RGB image as `foxglove.RawImage` (`rgb8`, base64) |
 //! | `/route` | when a scripted agent's route changes (scenarios with scripted groups) | time, agent id and the route's lane points |
 //! | `/events` | when an agent gets new event bits | agent id and event names |
+//! | `/signals` | at resets and whenever a controller's phase or light changes (map pools with traffic signals) | time, controller, junction node, phase and light (`green`, `amber`, `red`) |
+//!
+//! `/episode` carries the signal offsets of the episode (`signals`, s per controller) on maps
+//! with traffic signals; the state follows from them and the time
+//! ([`traffic`](crate::traffic)).
 //!
 //! Vehicle definitions in `/meta` are a multirotor's fields alone (as in the first recordings),
 //! or other families' definitions with their `type` tag.
@@ -26,7 +31,7 @@ use crate::scenario::{CompiledScenario, Goal, Scenario};
 use crate::world::{STATE_FIELDS, WorldInstance};
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::{SharedDef, Vehicle, VehicleDef};
-use autonomousim_world::Polyline;
+use autonomousim_world::{Light, Polyline};
 use glam::{DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -209,6 +214,10 @@ pub struct Recorder {
     /// agent.
     route: Option<u16>,
     routes: Vec<Option<Arc<Polyline>>>,
+    /// The `/signals` channel (map pools with signals) and the (phase, light) last written
+    /// per controller.
+    signals: Option<u16>,
+    lights: Vec<Option<(usize, Light)>>,
     seen: Vec<u32>,
     error: Option<SimError>,
 }
@@ -228,6 +237,8 @@ impl Recorder {
             camera_divider: 1,
             route: None,
             routes: Vec::new(),
+            signals: None,
+            lights: Vec::new(),
             seen: Vec::new(),
             error: None,
         }
@@ -269,6 +280,9 @@ impl Recorder {
         let events = self.sink.add_channel("/events", "autonomousim.Events", OBJECT_SCHEMA)?;
         if sc.groups.iter().any(|g| g.scripted()) {
             self.route = Some(self.sink.add_channel("/route", "autonomousim.Route", OBJECT_SCHEMA)?);
+        }
+        if sc.maps.iter().any(|m| m.roads().has_sections() && !m.roads().lanes().controllers().is_empty()) {
+            self.signals = Some(self.sink.add_channel("/signals", "autonomousim.Signals", OBJECT_SCHEMA)?);
         }
         if self.config.camera_hz > 0 {
             self.camera_divider = u64::from(sc.clock.divider("recorder camera", self.config.camera_hz)?);
@@ -383,19 +397,48 @@ impl Recorder {
                 m
             })
             .collect();
-        let msg = json!({
+        let mut msg = json!({
             "episode": self.episodes,
             "seed": seed,
             "map": w.map_index(),
             "environment": w.env().config,
             "agents": agents,
         });
+        if !w.signals().is_empty() {
+            msg["signals"] = json!(w.signals().offsets());
+        }
         self.episodes += 1;
         self.send(episode, &msg);
         self.routes = w.agents().iter().map(|a| a.route.clone()).collect();
         self.cameras.iter_mut().flatten().for_each(|c| c.last = None);
         self.seen.fill(0);
+        self.lights.clear();
+        self.write_signals(w);
         self.write_states(w);
+    }
+
+    /// `/signals` messages for the controllers whose phase or light changed.
+    fn write_signals(&mut self, w: &WorldInstance) {
+        let Some(ch) = self.signals else { return };
+        if w.signals().is_empty() {
+            return;
+        }
+        let lanes = w.map().roads().lanes();
+        let time = w.time();
+        self.lights.resize(lanes.controllers().len(), None);
+        for (k, c) in lanes.controllers().iter().enumerate() {
+            let s = w.signals().state(lanes, k, time);
+            if self.lights[k] != Some(s) {
+                self.lights[k] = Some(s);
+                let light = match s.1 {
+                    Light::Green => "green",
+                    Light::Amber => "amber",
+                    Light::Red => "red",
+                };
+                let msg = json!({"time": time, "controller": k, "junction": c.junction, "phase": s.0, "light": light});
+                self.send(ch, &msg);
+            }
+        }
     }
 
     /// After new actions were set.
@@ -446,6 +489,7 @@ impl Recorder {
                 self.send(ch, &json!({"time": time, "agent": a.id, "route": route.points()}));
             }
         }
+        self.write_signals(w);
         self.on_frames(w);
         if w.clock().tick.is_multiple_of(self.divider) {
             self.write_states(w);
@@ -793,6 +837,8 @@ pub struct RecordedEpisode {
     pub actions: Vec<Vec<RecordedAction>>,
     pub scans: Vec<Vec<RecordedScan>>,
     pub events: Vec<RecordedEvents>,
+    /// Offsets (s) of the map's signal controllers (empty without signals).
+    pub signal_offsets: Vec<f64>,
 }
 
 impl RecordedEpisode {
@@ -860,6 +906,8 @@ impl Recording {
             seed: String,
             map: usize,
             agents: Vec<EpisodeAgent>,
+            #[serde(default)]
+            signals: Vec<f64>,
         }
         #[derive(Deserialize)]
         struct EpisodeAgent {
@@ -916,6 +964,7 @@ impl Recording {
                     actions: vec![Vec::new(); n],
                     scans: vec![Vec::new(); n],
                     events: Vec::new(),
+                    signal_offsets: e.signals,
                 });
                 continue;
             }

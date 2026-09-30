@@ -27,6 +27,7 @@ use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape
 use crate::lane;
 use crate::obs::CLEARANCE_RANGE;
 use crate::scenario::{CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, SpawnSpec, TiltrotorStart};
+use crate::traffic::Signals;
 use autonomousim_control::Command;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
@@ -116,6 +117,8 @@ pub struct WorldInstance {
     /// Neighbour index over `shapes`, rebuilt after every policy step, reset and change of
     /// an agent's placement or status.
     grid: AgentGrid,
+    /// The traffic signals of the current map with the episode's offsets.
+    signals: Signals,
 }
 
 impl WorldInstance {
@@ -140,6 +143,7 @@ impl WorldInstance {
             steps: 0,
             agent_contact_state: AgentContactState::default(),
             grid: AgentGrid::default(),
+            signals: Signals::default(),
             map,
             map_index: 0,
             scenario,
@@ -168,6 +172,7 @@ impl WorldInstance {
             r.apply(&mut env, &mut es.child("environment").rng());
         }
         self.env = EnvState::new(env, world);
+        self.signals = Signals::new(world, es.child("signals"));
         self.clock = sc.clock;
         self.steps = 0;
         self.agent_contact_state.clear();
@@ -412,8 +417,13 @@ impl WorldInstance {
             a.events = if a.disabled { Events::DISABLED } else { Events::NONE };
         }
         self.drive();
-        for _ in 0..self.scenario.decimation {
+        let n = self.scenario.decimation;
+        for k in 0..n {
             self.tick();
+            if k + 1 == n {
+                // Lane tracking once per policy step, before the last tick is reported.
+                self.track_roads();
+            }
             after_tick(self);
         }
         self.steps += 1;
@@ -441,6 +451,20 @@ impl WorldInstance {
                 let command = d.drive(world, &mut a.route, &v.pose(), v.lin_vel_body().x, dt, &others);
                 a.set_command(command);
             }
+        }
+    }
+
+    /// Lane tracking and its events for every ground vehicle (see [`traffic`](crate::traffic)).
+    /// [`step`](Self::step) does this after the last tick of every policy step.
+    pub fn track_roads(&mut self) {
+        let world = &*self.map;
+        if !world.roads().has_sections() {
+            return;
+        }
+        let t = self.clock.time();
+        let cfg = &self.scenario.spec.events;
+        for a in &mut self.agents {
+            a.update_track(world, &self.signals, t, cfg);
         }
     }
 
@@ -518,7 +542,7 @@ impl WorldInstance {
         }
         let write = |(k, o): (usize, &mut [f32])| {
             let me = g.first_agent + k;
-            self.agents[me].observe(g, &self.map, &self.shapes, &self.grid, me, o);
+            self.agents[me].observe(g, &self.map, &self.shapes, &self.grid, me, &self.signals, self.clock.time(), o);
         };
         if g.spec.count >= PARALLEL_AGENTS {
             out.par_chunks_exact_mut(dim).enumerate().for_each(write);
@@ -659,6 +683,16 @@ impl WorldInstance {
         self.clock.time()
     }
 
+    /// The traffic signals of the current map and episode.
+    pub fn signals(&self) -> &Signals {
+        &self.signals
+    }
+
+    /// Replace the signal offsets (replays set the recorded ones).
+    pub fn set_signals(&mut self, signals: Signals) {
+        self.signals = signals;
+    }
+
     /// Policy steps since the reset.
     pub fn steps(&self) -> u64 {
         self.steps
@@ -670,11 +704,12 @@ impl WorldInstance {
     }
 
     /// Use map `index` of the pool until the next reset draws one (replays show the recorded
-    /// map this way).
+    /// map this way). Its signals run without offsets until they are set ([`set_signals`](Self::set_signals)).
     pub fn set_map(&mut self, index: usize) {
         self.map = self.scenario.maps[index].clone();
         self.map_index = index;
         self.env = EnvState::new(self.env.config.clone(), &self.map);
+        self.signals = Signals::default();
     }
 
     /// Stop agent `i` for the rest of the episode, as a terminal event would: it freezes and
@@ -689,6 +724,7 @@ impl WorldInstance {
     /// its transient vehicle state; its shape follows at once.
     pub fn place_agent(&mut self, i: usize, pose: Pose, lin_vel_world: DVec3, ang_vel_body: DVec3) {
         self.agents[i].vehicle.place(pose, lin_vel_world, ang_vel_body);
+        self.agents[i].reset_track(&self.map);
         self.agents[i].update_shape(&mut self.shapes[i]);
         self.grid.build(&self.shapes);
     }

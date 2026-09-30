@@ -588,11 +588,20 @@ pub struct GroundEventConfig {
     /// Stuck after moving less than `stuck_distance` (m) for `stuck_time` seconds (0: never).
     pub stuck_time: f64,
     pub stuck_distance: f64,
+    /// `OFF_ROAD` and `WRONG_WAY` only above this speed (m/s; urban maps, see
+    /// [`traffic`](crate::traffic)).
+    #[serde(skip_serializing_if = "is_default_off_road_speed")]
+    pub off_road_speed: f64,
+}
+
+/// Recordings of scenarios with other ground thresholds stay as they were.
+fn is_default_off_road_speed(x: &f64) -> bool {
+    *x == GroundEventConfig::default().off_road_speed
 }
 
 impl Default for GroundEventConfig {
     fn default() -> Self {
-        Self { rollover_deg: 60.0, jackknife_deg: 70.0, stuck_time: 5.0, stuck_distance: 0.5 }
+        Self { rollover_deg: 60.0, jackknife_deg: 70.0, stuck_time: 5.0, stuck_distance: 0.5, off_road_speed: 2.0 }
     }
 }
 

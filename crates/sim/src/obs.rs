@@ -41,6 +41,9 @@
 //! | `trailer_goal` | 4 | goal − tail of the last unit, in that unit's heading frame (x, y; m), then sin, cos of goal heading − the unit's heading (see `Wheeled::tail_pose`) |
 //! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
 //!
+//! | `signal` | 4 | ground vehicles on urban maps: the light (one-hot green, amber, red) for the movement ahead (the one nearest the route, else straight on) at the end of the lane followed, if that is a signalized junction, then the distance to its stop line (m); all 0 without |
+//! | `lanes` | 12 | ground vehicles on urban maps: the lane followed 5, 10, 20 and 40 m ahead in the heading frame (x, y; m; through the connectors `signal` picks), its speed limit (m/s), 1 if a lane to its left / right of the same direction exists (else 0), the offset from its centre (m, + left); all 0 without a lane |
+//!
 //! `road` and `route` follow the lane of the agent's route (`route` goals), or else the lane
 //! of the nearest road within 30 m in the direction closer to the heading (keep right; see
 //! [`lane`](crate::lane)); with neither they read 0.
@@ -65,6 +68,7 @@
 use crate::interaction::{AgentGrid, AgentShape};
 use crate::lane::Follow;
 use crate::scenario::Goal;
+use crate::traffic::{RoadTrack, Signals, next_connector, walk};
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
 use autonomousim_vehicles::aero::AirData;
@@ -138,6 +142,8 @@ pub enum TermKind {
     AirData,
     WindBody,
     Pitot,
+    Signal,
+    Lanes,
 }
 
 /// Distances ahead at which the `road` and `route` terms look (m).
@@ -165,7 +171,17 @@ impl TermKind {
         use TermKind::*;
         matches!(
             self,
-            WheelSpeeds | WheelSlip | Steering | GearRpm | Articulation | TrailerGoal | Sinkage | RiderLean | Feet
+            WheelSpeeds
+                | WheelSlip
+                | Steering
+                | GearRpm
+                | Articulation
+                | TrailerGoal
+                | Sinkage
+                | RiderLean
+                | Feet
+                | Signal
+                | Lanes
         )
     }
 }
@@ -324,6 +340,10 @@ pub struct ObsInput<'a> {
     pub grid: &'a AgentGrid,
     /// The lane line of the agent's route, if it has one.
     pub route: Option<&'a Polyline>,
+    /// Where the agent is on the roads, the signals and the time (s).
+    pub track: &'a RoadTrack,
+    pub signals: &'a Signals,
+    pub time: f64,
 }
 
 impl CompiledObs {
@@ -410,6 +430,8 @@ impl CompiledObs {
                     _,
                 ) => (1, 0.0),
                 (TermKind::Road, _) => (2 + LOOKAHEAD.len(), 0.0),
+                (TermKind::Signal, _) => (4, 0.0),
+                (TermKind::Lanes, _) => (2 * LOOKAHEAD.len() + 4, 0.0),
                 (TermKind::RoadClass, _) => (3, 0.0),
                 (TermKind::Articulation | TermKind::TrailerGoal, _) => (4, 0.0),
                 (TermKind::Route, _) => (2 * LOOKAHEAD.len(), 0.0),
@@ -686,6 +708,40 @@ impl CompiledObs {
                         put(dst, &v, t)
                     }
                 }
+                TermKind::Signal => {
+                    let mut v = [0.0; 4];
+                    let lanes = inp.world.roads().lanes();
+                    if let Some(l) = inp.track.lane
+                        && inp.track.past_end < 0.0
+                        && lanes.junction_controller(lanes.lanes()[l as usize].to_node).is_some()
+                        && let Some(c) = next_connector(lanes, l, inp.route)
+                    {
+                        v[inp.signals.light(lanes, c, inp.time) as usize] = 1.0;
+                        v[3] = -inp.track.past_end;
+                    }
+                    put(dst, &v, t)
+                }
+                TermKind::Lanes => {
+                    let Some(l) = inp.track.lane else {
+                        dst.fill(0.0);
+                        continue;
+                    };
+                    let lanes = inp.world.roads().lanes();
+                    let lane = &lanes.lanes()[l as usize];
+                    let mut v = [0.0; 2 * LOOKAHEAD.len() + 4];
+                    let to_heading = heading.inverse();
+                    let (pts, rest) = v.split_at_mut(2 * LOOKAHEAD.len());
+                    for (d, &a) in pts.as_chunks_mut::<2>().0.iter_mut().zip(&LOOKAHEAD) {
+                        let p = walk(lanes, l, inp.track.station, a, inp.route);
+                        let r = to_heading * (p - k.position.truncate()).extend(0.0);
+                        *d = [r.x, r.y];
+                    }
+                    rest[0] = lane.speed;
+                    rest[1] = f64::from(u8::from(lane.left.is_some()));
+                    rest[2] = f64::from(u8::from(lane.right.is_some()));
+                    rest[3] = inp.track.offset;
+                    put(dst, &v, t)
+                }
                 TermKind::OnRoad => {
                     let on = inp.world.roads().on_road(k.position.truncate()).is_some();
                     put(dst, &[f64::from(u8::from(on))], t)
@@ -836,6 +892,9 @@ mod tests {
             me: 0,
             grid: &AgentGrid::default(),
             route: None,
+            track: &RoadTrack::default(),
+            signals: &Signals::default(),
+            time: 0.0,
         };
         let mut out = vec![f32::NAN; obs.dim()];
         obs.write(&inp, &mut out);
@@ -892,6 +951,9 @@ mod tests {
             me: 0,
             grid: &AgentGrid::default(),
             route: None,
+            track: &RoadTrack::default(),
+            signals: &Signals::default(),
+            time: 0.0,
         };
         let mut out = vec![f32::NAN; 6];
         obs.write(&inp, &mut out);

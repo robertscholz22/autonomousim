@@ -5,10 +5,12 @@ use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::wrap_angle;
 use autonomousim_core::rng::Seed;
+use autonomousim_sim::drive::ground_pose;
+use autonomousim_sim::record::{MemorySink, Recorder, RecorderConfig, Recording};
 use autonomousim_sim::{CompiledScenario, Events, STATE_DIM, STATE_FIELDS, Scenario, WorldInstance};
 use autonomousim_world::BayKind;
 use glam::{DQuat, DVec2, DVec3};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn compile(toml: &str) -> Arc<CompiledScenario> {
     Arc::new(Scenario::from_toml(toml).unwrap().compile().unwrap())
@@ -103,4 +105,102 @@ fn bay_goals_in_lots_and_on_streets() {
             assert!((turn - expect).abs() < 0.25, "{name} {episode}: heading {turn}");
         }
     }
+}
+
+/// Traffic signals: per-episode offsets drawn deterministically within each cycle; the
+/// `signal` and `lanes` terms read the lane a car stands in before a stop line; recordings
+/// carry the offsets and the light changes.
+#[test]
+fn signals_offsets_terms_and_recording() {
+    let sc = compile(
+        r#"
+        map = { type = "urban", seed = 2, count = 1 }
+        [[groups]]
+        vehicle = "sedan_like"
+        action_mode = "vk"
+        obs = [{ term = "signal" }, { term = "lanes" }]
+        "#,
+    );
+    let mut a = WorldInstance::new(sc.clone(), Seed::from_u64(7));
+    let b = WorldInstance::new(sc.clone(), Seed::from_u64(7));
+    let lanes = a.map().roads().lanes();
+    let n = lanes.controllers().len();
+    assert!(n > 0);
+    assert_eq!(a.signals(), b.signals());
+    assert_eq!(a.signals().offsets().len(), n);
+    for (o, c) in a.signals().offsets().iter().zip(lanes.controllers()) {
+        assert!((0.0..c.cycle()).contains(o));
+    }
+    let first = a.signals().clone();
+    a.reset(None);
+    assert_ne!(a.signals(), &first);
+    a.reset(Some(7));
+    assert_eq!(a.signals(), &first);
+
+    // A lane into a signalized junction, long enough to stand 15 m before its stop line.
+    let map = a.map().clone();
+    let lanes = map.roads().lanes();
+    let (l, lane) = lanes
+        .lanes()
+        .iter()
+        .enumerate()
+        .find(|(_, l)| lanes.junction_controller(l.to_node).is_some() && l.line.length() > 30.0)
+        .unwrap();
+    let s = lane.line.length() - 15.0;
+    let p = lane.line.point_at(s);
+    let pose = ground_pose(
+        &map,
+        sc.groups[0].def.as_wheeled().unwrap(),
+        &sc.groups[0].rest,
+        p.truncate(),
+        lane.line.heading_at(s),
+    );
+    let sink = Arc::new(Mutex::new(MemorySink::default()));
+    let mut rec = Recorder::new(Box::new(sink.clone()), RecorderConfig::default());
+    rec.on_reset(&a);
+    a.place_agent(0, pose, DVec3::ZERO, DVec3::ZERO);
+    a.set_command(0, GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 });
+    for _ in 0..(90.0 / a.scenario().policy_dt()) as usize {
+        a.step_with(&mut |w| rec.on_tick(w));
+        let e = a.agent(0).events;
+        assert!(!e.intersects(Events::RED_LIGHT | Events::WRONG_WAY | Events::OFF_ROAD), "{e:?}");
+    }
+    assert_eq!(a.agent(0).track.lane, Some(l as u32));
+    let mut o = vec![0.0f32; 16];
+    a.observe(0, &mut o);
+    assert_eq!(o[0] + o[1] + o[2], 1.0, "{o:?}");
+    assert!((o[3] - 15.0).abs() < 1.5, "{o:?}");
+    assert!((o[4] - 5.0).abs() < 0.5 && o[5].abs() < 0.5, "{o:?}");
+    assert!((o[8] - 20.0).abs() < 1.0 && o[9].abs() < 1.0, "{o:?}");
+    assert!((f64::from(o[12]) - lane.speed).abs() < 1e-5);
+    assert_eq!(o[13], f32::from(u8::from(lane.left.is_some())));
+    assert!(o[15].abs() < 0.5);
+    rec.finish().unwrap();
+
+    let sink = sink.lock().unwrap();
+    let ep = &sink.topic("/episode")[0].1;
+    let offsets: Vec<f64> = serde_json::from_value(ep["signals"].clone()).unwrap();
+    assert_eq!(offsets, first.offsets());
+    let changes = sink.topic("/signals");
+    // All controllers at the reset, then over 90 s every one changes at least twice.
+    assert!(changes.len() >= 3 * n, "{} messages", changes.len());
+    let k = changes[0].1["controller"].as_u64().unwrap() as usize;
+    let t = changes.iter().filter(|m| m.1["controller"] == k).nth(1).unwrap().1["time"].as_f64().unwrap();
+    let (phase, light) = a.signals().state(lanes, k, t);
+    let m = changes.iter().filter(|m| m.1["controller"] == k).nth(1).unwrap();
+    assert_eq!(m.1["phase"].as_u64().unwrap() as usize, phase);
+    assert_eq!(m.1["light"], format!("{light:?}").to_lowercase());
+    drop(sink);
+
+    // Read back from a file.
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("signals.mcap");
+    let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+    a.reset(Some(7));
+    rec.on_reset(&a);
+    for _ in 0..5 {
+        a.step_with(&mut |w| rec.on_tick(w));
+    }
+    rec.finish().unwrap();
+    let r = Recording::read(&path).unwrap();
+    assert_eq!(r.episodes[0].signal_offsets, first.offsets());
 }

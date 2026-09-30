@@ -336,7 +336,7 @@ impl RoadNetwork {
     pub fn area(&self, p: DVec2) -> Area {
         let Some(rp) = self.nearest(p, 30.0) else { return Area::Off };
         let section = self.section(rp.road as usize);
-        self.lanes().area(&self.roads, &section, rp.road, rp.projection.station, rp.projection.offset)
+        self.lanes().area(&self.roads, &section, rp.road, rp.projection.station, rp.projection.offset, p)
     }
 
     /// Cross-section of road `i`.

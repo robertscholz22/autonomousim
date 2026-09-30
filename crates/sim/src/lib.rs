@@ -22,6 +22,7 @@ pub mod obs;
 pub mod policy;
 pub mod record;
 pub mod scenario;
+pub mod traffic;
 pub mod world;
 
 pub use agent::{Agent, EnvState};

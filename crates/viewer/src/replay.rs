@@ -4,6 +4,7 @@
 
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::{RecordedEpisode, RecordedState, RecordedWheel, Recording};
+use autonomousim_sim::traffic::Signals;
 use autonomousim_sim::{Events, WorldInstance};
 use autonomousim_vehicles::ground::tire::TireForces;
 use autonomousim_vehicles::ground::{PowertrainStatus, WheelState, WheeledInit};
@@ -140,6 +141,9 @@ impl Replay {
         let ep = self.current();
         if world.map_index() != ep.map {
             world.set_map(ep.map);
+        }
+        if world.signals().offsets() != ep.signal_offsets.as_slice() {
+            world.set_signals(Signals::with_offsets(ep.signal_offsets.clone()));
         }
         for i in 0..world.agents().len() {
             let Some(s) = self.sample(i) else { continue };

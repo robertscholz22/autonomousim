@@ -241,6 +241,8 @@ def test_trailers():
 def test_fixed_wing():
     assert {"aerosonde_like", "c172_like"} <= set(autonomousim.vehicle_presets())
     assert Event.STALL == 1 << 15 and not (TERMINAL & Event.STALL)
+    urban = Event.RED_LIGHT | Event.WRONG_WAY | Event.OFF_ROAD
+    assert urban == 0b111 << 16 and not (TERMINAL & urban)
     flight = {
         "name": "flight",
         "map": {"type": "testworld", "kind": "flat", "size": 3000.0},
