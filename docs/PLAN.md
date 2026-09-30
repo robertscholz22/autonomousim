@@ -2539,6 +2539,210 @@ The rest of this section is proposed and open to change.
 - ~~uint16 versus float32 for depth in Python~~ (uint8 over a range in the observation image; float metres from the sensor in Rust);
 - the frame rate of large tiled maps (M6a) in the camera path, or restricting cameras to monolithic maps at first.
 
+## Milestone 8: Urban maps, traffic and pedestrians
+
+Planned 2026-09-30. Decided with the user at the start:
+- **Street layout**: **mixed**. A perturbed grid downtown, organic streets and cul-de-sacs in the suburbs, and a fringe that blends into rural roads and fields.
+- **Road features**: multi-lane roads with lane changes, traffic lights, roundabouts, parking lots and on-street parking.
+- **NPCs**: IDM + MOBIL cars, buses and trucks, cyclists, social-force pedestrians.
+- **NPC physics**: **hybrid**. NPCs are kinematic far from learning agents and are promoted to full vehicle dynamics near them.
+- **Buildings**: massing and roofs. L, U and courtyard footprints, flat and pitched roofs, heights by district, landable flat roofs.
+- **Driving observations**: both privileged terms (lanes, traffic, signals) and sensor-only configurations, selectable per task.
+- **NPC reaction to learning agents**: reactive, with a configurable attention that goes down to oblivious NPCs for robustness tests.
+- **Scale**:
+  - Training maps of about 1 km² with about 50 cars and 100 pedestrians per world, batched.
+  - A 2×2 km showcase with about 300 cars and 1,000 pedestrians in the viewer at ≥ 60 fps (1080p medium, Iris Xe).
+- **Demos**: four, spread over the sub-milestones: drone rooftop delivery (M8a), parking and a multi-agent intersection (M8b), urban driving in full traffic (M8c).
+- **Training**: as before, only enough to test what was built; the user trains the agents.
+
+The rest of this section is proposed and open to change.
+
+M8 is split into three sub-milestones. Each ends with tests, its demo(s), a commit and a push.
+- **M8a**: the urban map, the lane graph, traffic signals, rendering and the viewer.
+- **M8b**: vehicle NPCs (hybrid physics, IDM/MOBIL, junction rules, buses and trucks, parked cars).
+- **M8c**: pedestrians and cyclists.
+
+**Already in place**:
+- **Rural road network** (`world::roads`): `RoadNetwork` of undirected `Road`s (`Polyline` centre lines, `RoadClass` Paved/Gravel/Track) between `RoadNode`s, with `route` (Dijkstra), `project`, and terrain blending by editing the heightfield. There is no junction geometry.
+- **Lanes** (`sim::lane`): one lane offset per paved road (keep right), random walks, `Follow`, route goals, road spawns.
+- **Scripted `road` driver**: pure pursuit with a curvature speed profile, following agents ahead, K-turns. It drives full wheeled dynamics at 1 kHz and scans all other agents (O(N²) per step).
+- **Obstacles**: `ObstacleShape` (cuboid, convex hull, …) with a BVH; `tags::BUILDING` cuboids with drawn roofs; materials include ASPHALT and CONCRETE.
+- **Semantic classes** (15, including Road, Building, Vehicle), cameras and LiDAR.
+- **Goals**: Bay and Yard goals (farm yards only) and pad goals.
+- **Observation terms**: Road, Route, OnRoad, Neighbors, NearestAgent, Lidar, Camera.
+- **Multi-agent API**, recording and replay, `viewer policy`, `spawn.near`.
+
+**Not in place**:
+- A lane-level graph with junction connectors, conflicts and right-of-way; multi-lane roads.
+- Building footprints beyond yard cuboids; blocks, lots and zoning.
+- Traffic signals, or any dynamic world state other than agents.
+- A cheap vehicle model: every agent is a full multibody.
+- A spatial traffic index for drivers.
+- Pedestrians.
+
+### M8a: Urban maps, lanes and signals
+
+#### Design
+- **Generator** `procgen::urban` (`MapSource::Urban`, `UrbanConfig`, `URBAN_VERSION = 1`):
+  - **Presets**: `training` (1024 m) and `showcase` (2048 m), with JSON overrides as for rural maps. Maps are cached and hashed as rural maps are. Maps are monolithic; tiled urban maps are out of scope.
+  - **Pipeline**: gentle landform (low relief, graded city plateau) → city mask and districts → street network → terrain grading → blocks and lots → zoning and buildings → furniture and vegetation → the rural fringe beyond the mask (the existing farmland fields and roads, connected to the arterials).
+- **Street network**:
+  - **Arterials**: a skeleton of radial and ring arterials from the centre, routed over the terrain with grade limits (the rural A* and spline tools).
+  - **Downtown**: a perturbed grid per district. Each district gets its own rotation, blocks of 80–150 m and jittered spacing.
+  - **Suburbs**: organic growth in the manner of Parish & Müller (2001). Streets grow from the arterials with curvature noise under local constraints (snap to nearby nodes, minimum junction angle, minimum segment length), with cul-de-sacs.
+  - **Planarization**: segments intersected and merged into a planar graph; junction degree ≤ 5.
+  - **Road classes**: new `Arterial` (2–3 lanes per direction, optional median), `Collector` (1–2 lanes) and `Local` (1 lane per direction), each with a lane width, speed limit, sidewalk width and optional parking and bike lanes. Existing classes are unchanged.
+  - **Roundabouts**: at a share of arterial and collector junctions of degree 3–5, with a ring of 12–20 m radius and splitter islands.
+- **Lane graph** (`world::lanes`, stored in the map file, version 3):
+  - **`Lane`**: a directed polyline with a width, speed limit, left and right neighbours (for lane changes, with "may change" flags from the markings), a successor list and its road.
+  - **`Junction`**: its kind (`Signal`, `Stop`, `Yield`, `Roundabout` or `Uncontrolled`, with priority by road class), stop lines, and **connectors**. A connector is a lane-to-lane curve (clothoid/Bézier, curvature within a car's turning radius) through the junction. Each has a **conflict list**: the other connectors it crosses or merges with, with the stations of the conflict points, and which of the two has priority.
+  - **Turn lanes**: lane assignment near junctions (left, straight, right) determines which connectors leave from which lane.
+  - **Rural roads**: they get a derived lane graph (one lane per direction on paved roads, shared on gravel and tracks). The existing `road` driver, the Road/Route terms and all goldens stay as they are.
+  - **Queries**: nearest lane with its station and offset; lane-level routes (Dijkstra over lanes and connectors); the area class of a point (lane, shoulder, sidewalk, crosswalk, median, lot).
+- **Blocks and lots**: blocks are the faces of the planar street graph, inset by the road and sidewalk widths.
+  - Blocks are split into lots by recursive oriented-bounding-box subdivision. Every lot keeps street frontage; lots that are too thin merge with a neighbour.
+  - **Zoning** by district: downtown (towers of 30–150 m, high lot coverage), commercial (4–8 storeys), residential (houses with pitched roofs and gardens), industrial (large low halls, yards), parks (trees, paths, grass) and parking lots.
+- **Buildings**:
+  - **Footprints**: rectangle, L, U or courtyard, fitted to the lot with setbacks.
+  - **Roofs**: flat (landable, with a parapet and roof units) or pitched (gable or hip).
+  - **Collision**: each building is a few convex pieces (cuboids; `ConvexHull` prisms for pitched roofs), tagged `BUILDING`.
+  - **Rooftop landing pads**: some flat roofs carry a pad.
+  - **Drawing**: per-storey window bands as vertex colours, no textures.
+- **Furniture**: street trees along sidewalks, lamp posts, signal poles and heads (thin cylinders and boxes), bus stops, low walls and fences in residential lots.
+- **Parking**: parking lots with marked bays in rows, and on-street parking lanes on collectors and locals.
+  - Bays become a map-level list, `ParkingBay { pose, size, kind }`, which generalizes the Bay goal beyond farm yards.
+  - Parked cars come in M8b.
+- **Traffic signals** (`sim::signals`): the first dynamic world state other than agents.
+  - **Controller** per signalized junction: fixed-time phases (2–4, optionally a protected left), green/amber/all-red timings and a 60–90 s cycle.
+  - **Episode randomization**: per-junction offsets are drawn from the episode's seed stream.
+  - **State**: a pure function of time and the episode draw, so snapshots, replays and batches stay deterministic.
+  - **Check**: no two conflicting connectors are ever green at once (checked when the map is built).
+  - **Pedestrian phases** are reserved for M8c.
+- **Events and observations**:
+  - **New event bits** (non-terminal; tasks decide): `RED_LIGHT` (crossing a stop line on red), `WRONG_WAY` (driving against a lane's direction), `OFF_ROAD` (sidewalk, median or lot at speed).
+  - **New observation terms**:
+    - `signal`: the state of the next signal on the route or lane, and the distance to its stop line.
+    - `lanes`: the current lane ahead as points, its speed limit, left/right lane availability and the offset from the lane centre.
+- **Rendering** (`scene`, `render`, viewer):
+  - **Road surfaces**: lane markings (solid, dashed, stop lines, crosswalks, turn arrows as flat meshes), sidewalks with drawn curbs, medians and lots.
+  - **Buildings**: meshes merged per chunk, with a box LOD for the far field.
+  - **Signal heads**: they show their state, as vertex colour updates or small per-head instances.
+  - **Semantic classes**: `Sidewalk`, `LaneMarking`, `TrafficLight`, `Pedestrian` and `Cyclist` are *appended*, so existing class ids and image goldens are unchanged.
+  - **Viewer**: an overlay (O) for lanes, connectors, conflicts and signal states. Recordings gain a `/signals` channel for Foxglove; replays recompute the state.
+- **Curbs**: curbs are drawn and classified but are not physical in M8a, because the 1 m terrain grid cannot hold a 15 cm step. Leaving the road is detected through the area class (`OFF_ROAD`). Physical curbs (thin obstacle strips) are a possible later addition.
+- **Demo `DroneRooftopDelivery-v0`**: `iris_like` in `velocity` mode on urban training maps.
+  - **Start and goal**: the drone starts at street level or on a roof, and flies 200–600 m to a pad on a target roof between the buildings, in mild wind.
+  - **Observation**: `goal_rel_body`, rot6d, velocities, AGL, `rl64` LiDAR; optionally the down camera.
+  - **Reward**: progress, proximity to obstacles, smoothness, and a landing bonus. Success is `LANDED` on the target pad.
+  - **Scripted pilot**: climb above the local building heights, cruise, descend over the pad.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | `procgen::urban` street network: landform, city mask, districts, arterials, downtown grids, organic suburbs, roundabouts, planarization, grading, the rural fringe; `MapSource::Urban`, presets, cache, hash | Golden hashes are identical at 1 and 12 threads; the street graph is planar with junction angles ≥ 30° and no segment under the minimum length; every street is reachable from the arterials; the grade limits hold; the training preset generates in ≤ 2 s and the showcase in ≤ 15 s cold |
+| 2 | Lane graph: lanes, turn lanes, connectors, conflict lists and priorities, roundabouts, area classes, lane routes; derived graphs for rural maps | The lane graph is strongly connected (dead ends turn round); connector curvature stays within a car's turning radius; every pair of crossing connectors has a conflict entry; lane routes between random pairs exist and follow legal turns; rural goldens are unchanged |
+| 3 | Blocks, lots, zoning, buildings (footprints, roofs, pads), furniture, parks, parking lots and on-street bays (`ParkingBay`, generalized Bay goals) | No building overlaps a road, sidewalk, bay or another building; every lot has frontage; flat roofs are landable (a drone rests on a pad); obstacle and LiDAR queries agree with the building shapes; bay goals sample in lots and on streets |
+| 4 | Signals: controllers, phases, per-episode offsets, the signal state in `WorldInstance`, recording, the `signal` and `lanes` terms, the `RED_LIGHT`, `WRONG_WAY` and `OFF_ROAD` events | Conflicting connectors are never green together (checked over a full cycle for every junction); the state is identical in replays and across thread counts; events fire on scripted test drives (through a red, against a lane, onto a sidewalk) and not on legal drives |
+| 5 | Rendering and viewer: markings, sidewalks, building meshes and LOD, signal heads, appended semantic classes, lane and signal overlay, urban live and replay | The showcase map renders at ≥ 60 fps at 1080p medium on the Iris Xe; camera depth and class agree with LiDAR on buildings, sidewalks and signal poles; existing image goldens are unchanged |
+| 6 | `DroneRooftopDelivery-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
+
+### M8b: Vehicle NPCs
+
+#### Design
+- **Kinematic vehicles** (`vehicles::kinematic`, a new `Vehicle` variant):
+  - **Model**: a kinematic bicycle model (x, y, yaw, speed, steering) with longitudinal and lateral acceleration limits. It is integrated at the controller rate (100 Hz), not at 1 kHz.
+  - **Ground following**: z, pitch and roll follow the terrain under the wheel contact points.
+  - **Shapes**: the same colliders (`AgentShape`) and visuals as the full preset it stands for, so LiDAR, cameras and contact queries see the same car.
+  - **Articulated trucks**: kinematic trailers follow the hitch kinematics.
+- **Hybrid physics**:
+  - **Groups**: `GroupSpec.physics = "full" | "kinematic" | "hybrid"` (default `full`, as today).
+  - **Promotion**: a hybrid NPC is promoted to its full multibody within `promote` m (default 40) of any learning agent, or when a contact or near-contact is predicted. It is demoted beyond `demote` m (60) once free of contacts for a while.
+  - **Switching**: promotions and demotions happen at policy-step boundaries in agent order, so they are deterministic and thread-independent.
+  - **State mapping**: the full model is placed at the kinematic pose with matching wheel speeds, steering and suspension at its static deflection (precomputed per preset); demotion keeps the pose, speed and yaw rate.
+  - **Contacts**: a kinematic NPC against a full body is one-sided (it pushes, with infinite mass). Hybrid promotion keeps all contacts near learning agents physical.
+- **Traffic driver** (`sim::traffic`, `driver = { type = "traffic" }`), running on the lane graph:
+  - **Longitudinal**: IDM (Treiber, Hennecke & Helbing 2000). Parameters are drawn per driver: v₀ as a factor of the speed limit, T 1–2 s, s₀ 2 m, a 1–2 m/s², b 2–3 m/s².
+  - **Lane changes**: MOBIL (Kesting, Treiber & Helbing 2007), with politeness 0–0.5, a threshold and a keep-right bias. Mandatory changes toward the lane of the next turn get an urgency that grows with proximity. The change itself is a smooth lateral path over 3–5 s.
+  - **Routes**: random turns at junctions (weighted by road class), or routes to destinations.
+  - **Junction rules**:
+    - Signals: stop on red, and on amber if able to stop.
+    - Stop and yield: gap acceptance on conflicting connectors, with a critical gap of 4–6 s drawn per driver.
+    - Roundabouts: yield to the ring.
+    - Uncontrolled junctions: the lower road class yields.
+  - **Conflict-point reservations**: time slots on the conflict points prevent two NPCs from occupying a conflict together. A deadlock breaker releases the lowest-priority waiting driver after a timeout.
+  - **Traffic index**: leaders and followers come from per-lane occupancy lists sorted by station and rebuilt each policy step. This is O(N log N) instead of today's O(N²) scan.
+  - **Learning agents**: they are projected onto lanes and treated as leaders or crossing traffic, subject to `attention` (0–1: the probability that a driver notices an agent per encounter; 0 is oblivious).
+- **Density and lifecycle**:
+  - `density` (vehicles per km of lane) at spawn, spread over lanes with IDM spacing.
+  - NPCs that leave the map, reach a dead-end destination or are stuck for 60 s respawn at a free lane position out of every learning agent's sensor range. This is deterministic from the seed stream.
+- **Buses and trucks**:
+  - Buses run fixed loop routes with stops (bus bays at stops, dwell times).
+  - Trucks use the M4 presets (rigid, or tractor + trailer) with IDM parameters for heavy vehicles.
+- **Parked cars**: kinematic, frozen NPCs in a share of the bays and on-street spots (`occupancy`). A parked car is promoted if touched.
+- **Observations and events**:
+  - **`traffic` term**: the nearest K vehicles in the body frame (position, velocity, heading, size), sorted by distance, with each one's lane relation (same, left, right, crossing).
+  - **Lane-level `route` term**: the route along lanes and connectors, including the lane to be in for the next turn.
+  - **Events**: collisions with NPCs are `CRASH_AGENT` as today.
+- **Recording**: NPC states go into a compact packed `/npcs` channel (pose, speed, physics mode) at the state rate, instead of per-agent channels. Replay re-simulates bit for bit from seeds and actions as before.
+- **Viewer**: instanced NPC drawing, a promoted/kinematic tint in the overlay, NPC counts and the step cost in the HUD.
+- **Demo `CarParking-v0`**: `sedan_like` in `raw` or (v, κ) mode parks in a free bay (lot or on-street between parked cars).
+  - **Observation**: the bay pose (privileged), LiDAR, speed and steering.
+  - **Success**: in the bay within position and yaw tolerances, stopped.
+  - **Scripted pilot**: a Reeds–Shepp path and a tracker.
+- **Demo `IntersectionMulti-v0`**: 2–4 learning cars (M3 multi-agent API) cross an unsignalized junction or a roundabout to their exits, optionally with NPC traffic.
+  - **Reward**: progress, a time penalty, collisions and success.
+  - **Scripted baseline**: the traffic driver flying the learning group.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Kinematic vehicles (bicycle model, ground following, kinematic trailers) and `GroupSpec.physics`; hybrid promotion and demotion | A kinematic sedan follows a lane change within 0.2 m of the full model; promotion and demotion keep position exactly and speed within 0.05 m/s, without contact force spikes; the switching is deterministic across thread counts; existing goldens are unchanged |
+| 2 | Traffic driver: lane index, IDM, MOBIL, lane change paths, routes | A ring road of 22 cars on 230 m shows stop-and-go waves as in Sugiyama et al. (2008); steady-state gaps match the IDM equilibrium; MOBIL changes lanes only with an incentive above the threshold; no NPC collisions in 30 min on a multi-lane arterial |
+| 3 | Junction rules (signals, stop and yield, roundabouts, priority), conflict reservations, deadlock breaker; density, respawn, parked cars | 30 min of 50 NPCs on each training map: no NPC–NPC collisions, no red-light crossings, no gridlock (every NPC keeps moving within 2 min), stable density; roundabouts and unsignalized junctions keep flowing |
+| 4 | Buses (routes, stops) and trucks | Buses keep their loop and dwell at stops; trucks turn at junctions without leaving their lanes by more than their offtracking |
+| 5 | Agents' side: `attention`, the `traffic` and lane-level `route` terms, `/npcs` recording and replay, viewer instancing and overlay; performance | NPCs yield to a scripted agent car with attention 1 and ignore it at 0; replays are bit-exact; 50 hybrid NPCs add ≤ 30 % to a learning car's step time; the showcase runs 300 NPC cars at ≥ 60 fps in the viewer |
+| 6 | `CarParking-v0`: task, scripted pilot, short training, export, viewer, replay | As for the other demos |
+| 7 | `IntersectionMulti-v0`: task, scripted baseline, short training, export, viewer, replay | As for the other demos |
+
+### M8c: Pedestrians and cyclists
+
+#### Design
+- **Pedestrian network**: a graph of sidewalks (both sides of each street), crosswalks at junctions (signalized ones get pedestrian phases in the signal controllers), some mid-block crossings, park paths, and building entrances and bus stops as origins and destinations.
+- **Pedestrians** (`sim::pedestrians`; a lightweight agent kind: a capsule, kinematic, no multibody):
+  - **Model**: social force (Helbing & Molnár 1995; the parameters of Moussaïd et al. 2009), with anisotropic interaction. Desired speed is drawn from 1.34 ± 0.26 m/s.
+  - **Integration**: at 25–50 Hz, with neighbour queries on the agent grid.
+  - **Paths**: A* over the pedestrian network to random destinations, with waiting and dwelling.
+  - **Crossing**: wait at crosswalks on red; jaywalk with a configurable probability.
+  - **Vehicle avoidance**: time-to-collision based avoidance of vehicles, including learning agents, subject to `attention`.
+  - **Collisions**: a vehicle hitting a pedestrian raises a new `PEDESTRIAN_HIT` event bit; the pedestrian stops and is removed at the next respawn.
+  - **Density**: counts are held by respawning out of the agents' sensor range.
+  - **Sensing**: pedestrians are seen by LiDAR and cameras (capsule shapes, the `Pedestrian` class).
+- **Cyclists**: kinematic riders in bike lanes or at the right edge of the road, using the traffic driver with cyclist parameters (low v₀, gap acceptance, obeying signals). Near learning agents they are promoted to the M5 bicycle model with its `vk` controller, like hybrid cars.
+- **Traffic interaction**: NPC drivers yield to pedestrians on crosswalks and at turns; cyclists are leaders and overtaking targets for IDM/MOBIL.
+- **Observations**: the `traffic` term gains pedestrians and cyclists (a type flag), plus a `pedestrians` term (the nearest K pedestrians in the body frame).
+- **Viewer**: instanced low-poly figures with a walk cycle (leg and arm swing driven by speed), riders on drawn bicycles, and a showcase with about 1,000 pedestrians.
+- **Demo `CarUrbanDrive-v0`**: `sedan_like` drives a lane-level route of 0.5–1.5 km through the city in full traffic (NPC cars, buses, cyclists, pedestrians, lights, roundabouts).
+  - **Observation**: privileged terms (`lanes`, `route`, `signal`, `traffic`, `pedestrians`) or a sensor-only configuration (LiDAR/camera plus a route hint).
+  - **Reward**: progress along the route. There are penalties for `RED_LIGHT`, `WRONG_WAY`, `OFF_ROAD` and jerk. Collisions and `PEDESTRIAN_HIT` are terminal.
+  - **Success**: reaching the destination.
+  - **Scripted baseline**: the traffic driver itself (also usable as an imitation-learning expert).
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 | Pedestrian network: sidewalks, crosswalks, pedestrian signal phases, mid-block crossings, entrances | Connected across each map; crosswalks meet sidewalks at both ends; pedestrian phases never conflict with green connectors |
+| 2 | Social-force pedestrians: the model, paths, crossing behaviour, vehicle avoidance, `PEDESTRIAN_HIT`, respawn, LiDAR and camera visibility | Bidirectional corridor flow forms lanes; the free speed distribution matches the draw; 30 min with NPC traffic: no pedestrian hit by an NPC vehicle, and no crossing on red unless jaywalking is enabled |
+| 3 | Cyclists: kinematic and hybrid (M5 bicycle), bike lanes, junction behaviour | Cyclists follow their routes without falls after promotion; cars overtake them safely; no collisions in 30 min |
+| 4 | Observations (`traffic` with types, `pedestrians`), viewer figures and animation, showcase performance | The showcase with 300 cars and 1,000 pedestrians runs at ≥ 60 fps at 1080p medium on the Iris Xe; 100 pedestrians add ≤ 20 % to a training world's step time |
+| 5 | `CarUrbanDrive-v0`: task, scripted baseline, short training, export, viewer, replay | As for the other demos |
+
+**To confirm while building**:
+- **Traffic side**: right-hand traffic only, or a `left_hand` map option.
+- **Curbs**: whether they need to be physical for the driving tasks.
+- **Tractor-trailers**: whether kinematic tractor-trailers are worth it in M8b, or rigid trucks and buses suffice.
+- **Contacts**: whether one-sided kinematic contacts ever matter for learning agents outside the promotion radius (LiDAR range versus `promote`).
+- **Performance**: the kinematic NPC update in structure-of-arrays form if 50 NPCs per world cost more than planned.
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
