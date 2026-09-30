@@ -7,7 +7,7 @@
 //! shape) run back to back per agent; [`sense`](Agent::sense) needs every agent's new shape
 //! and runs after all of them.
 
-use crate::driver::{DriverGeometry, DriverSpec, RoadDriver};
+use crate::driver::Driver;
 use crate::events::Events;
 use crate::hybrid::CruiseTrim;
 use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
@@ -100,7 +100,7 @@ pub struct Agent {
     /// Where a ground vehicle is on the roads (urban maps; see [`traffic`](crate::traffic)).
     pub track: RoadTrack,
     /// The scripted driver of an agent of a `driver` group.
-    pub driver: Option<RoadDriver>,
+    pub driver: Option<Driver>,
     /// The kinematic state while the vehicle is driven kinematically (`kinematic` and
     /// `hybrid` groups; `None` while simulated in full).
     pub kinematic: Option<KinematicState>,
@@ -164,7 +164,7 @@ impl Agent {
             events: Events::NONE,
             support: None,
             track: RoadTrack::default(),
-            driver: group.spec.driver.as_ref().map(|DriverSpec::Road(r)| RoadDriver::new(r, DriverGeometry::of(group))),
+            driver: group.spec.driver.as_ref().map(|d| d.driver(group)),
             kinematic: None,
             kinematic_limits: {
                 let c = &group.spec.ground_controller;

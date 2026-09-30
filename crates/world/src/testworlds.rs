@@ -3,6 +3,7 @@
 
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::{Obstacle, ObstacleSet, ObstacleShape};
+use crate::roads::{NodeKind, Polyline, Road, RoadClass, RoadNetwork, RoadNode, Section};
 use crate::static_world::{MapMeta, StaticWorld};
 use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::math::Pose;
@@ -48,6 +49,34 @@ pub fn tree(base: DVec3, height: f64) -> [Obstacle; 2] {
 /// Flat grass plane at `z = 0`.
 pub fn flat(size: f64) -> StaticWorld {
     world("flat", grid(size, 2.0, |_, _| 0.0, MaterialId::GRASS), Vec::new())
+}
+
+/// Flat asphalt with a circular road of centre-line `radius` (m) round the origin, in two
+/// halves (counter-clockwise from (r, 0) over the top, then back under the bottom) meeting at
+/// two through nodes: `lanes[0]` lanes counter-clockwise and `lanes[1]` clockwise, each
+/// `lane_width` wide, of road class `class` (its speed limit). For traffic tests.
+pub fn ring(radius: f64, lanes: [u8; 2], lane_width: f64, class: RoadClass) -> StaticWorld {
+    let size = 2.0 * (radius + 60.0);
+    let terrain = grid(size, 2.0, |_, _| 0.0, MaterialId::ASPHALT);
+    let n = ((std::f64::consts::PI * radius / 2.0).ceil() as usize).max(8);
+    let arc = |from: f64| {
+        Polyline::new(
+            (0..=n)
+                .map(|k| {
+                    let a = from + std::f64::consts::PI * k as f64 / n as f64;
+                    DVec3::new(radius * a.cos(), radius * a.sin(), 0.0)
+                })
+                .collect(),
+        )
+    };
+    let section = Section { lanes, lane_width, median: 0.0, bike: [0.0; 2], parking: [0.0; 2], sidewalk: [0.0; 2] };
+    let node = |x: f64| RoadNode { position: DVec3::new(x, 0.0, 0.0), kind: NodeKind::Junction };
+    let road = |start, end, from| Road { class, width: section.width(), start, end, line: arc(from) };
+    let net =
+        RoadNetwork::new(vec![node(radius), node(-radius)], vec![road(0, 1, 0.0), road(1, 0, std::f64::consts::PI)])
+            .and_then(|n| n.with_sections(vec![section; 2]))
+            .expect("a valid ring");
+    world("ring", terrain, Vec::new()).with_roads(net)
 }
 
 /// Plane rising along +x with slope `angle` (radians), height 0 at the origin.
@@ -210,5 +239,33 @@ mod tests {
             (w.obstacles().nearest_distance(DVec3::new(9.0, 0.0, 1.0), 5.0, HitMask::SOLID).unwrap() - 1.0).abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn ring_lanes_close_the_loop() {
+        let w = ring(40.0, [2, 1], 3.5, RoadClass::Local);
+        let g = w.roads().lanes();
+        assert_eq!(g.lanes().len(), 6);
+        for (k, l) in g.lanes().iter().enumerate() {
+            // Through nodes: each lane continues straight into the next half's.
+            let straight =
+                l.successors.iter().filter(|&&c| g.connectors()[c as usize].turn == crate::lanes::Turn::Straight);
+            eprintln!(
+                "lane {k} dir {} index {} length {:.2} successors {:?}",
+                l.dir,
+                l.index,
+                l.line.length(),
+                l.successors
+            );
+            assert_eq!(straight.count(), 1, "lane {k}");
+        }
+        // Counter-clockwise inner lane plus its connectors: a full circle at its offset.
+        let inner = &g.lanes()[0];
+        let r = inner.line.points()[0].truncate().length();
+        let c = &g.connectors()[inner.successors[0] as usize];
+        let next = &g.lanes()[c.to as usize];
+        let c2 = &g.connectors()[next.successors[0] as usize];
+        let total = inner.line.length() + c.line.length() + next.line.length() + c2.line.length();
+        assert!((total - std::f64::consts::TAU * r).abs() < 0.5, "{total} vs {}", std::f64::consts::TAU * r);
     }
 }

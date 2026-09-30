@@ -25,6 +25,7 @@ pub mod record;
 pub mod rooftop;
 pub mod scenario;
 pub mod traffic;
+pub mod traffic_driver;
 pub mod world;
 
 pub use agent::{Agent, EnvState};

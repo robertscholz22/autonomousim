@@ -59,7 +59,7 @@ fn cars_drive_random_routes_on_the_roads() {
                 still[k] = if d < 0.01 { still[k] + 1 } else { 0 };
                 assert!(still[k] < 60 * steps_per_s, "car {k} stands still at {p} after {step} steps");
                 last[k] = p;
-                let turning = a.driver.as_ref().unwrap().turn.is_some();
+                let turning = a.driver.as_ref().unwrap().as_road().unwrap().turn.is_some();
                 if turning && !was_turning[k] {
                     turns[k] += 1;
                 }

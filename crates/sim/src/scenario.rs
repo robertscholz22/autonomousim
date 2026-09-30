@@ -72,7 +72,7 @@ use autonomousim_vehicles::tiltrotor::TiltrotorInput;
 use autonomousim_vehicles::{Family, SharedDef, VehicleDef};
 use autonomousim_world::environment::{EnvironmentConfig, Gust};
 use autonomousim_world::testworlds;
-use autonomousim_world::{MapHash, StaticWorld};
+use autonomousim_world::{MapHash, RoadClass, StaticWorld};
 use glam::{DQuat, DVec2, DVec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -408,12 +408,35 @@ pub enum Testworld {
         half_size: f64,
         height: f64,
     },
+    /// Circular road (see [`testworlds::ring`]); `lanes` per direction (counter-clockwise,
+    /// clockwise), `class` sets the speed limit.
+    Ring {
+        radius: f64,
+        #[serde(default = "ring_lanes")]
+        lanes: [u8; 2],
+        #[serde(default = "ring_lane_width")]
+        lane_width: f64,
+        #[serde(default = "ring_class")]
+        class: RoadClass,
+    },
     /// Hilly forest with `density` trees per hectare.
     ForestPatch {
         size: f64,
         density: f64,
         seed: u64,
     },
+}
+
+fn ring_lanes() -> [u8; 2] {
+    [1, 0]
+}
+
+fn ring_lane_width() -> f64 {
+    3.5
+}
+
+fn ring_class() -> RoadClass {
+    RoadClass::Local
 }
 
 impl Testworld {
@@ -438,6 +461,12 @@ impl Testworld {
             }
             Testworld::WalledArena { half_size, height } => {
                 testworlds::walled_arena(positive(half_size, "size")?, height)
+            }
+            Testworld::Ring { radius, lanes, lane_width, class } => {
+                if lanes[0] == 0 {
+                    return Err(SimError::Scenario("a ring needs a lane counter-clockwise".into()));
+                }
+                testworlds::ring(positive(radius, "radius")?, lanes, positive(lane_width, "lane width")?, class)
             }
             Testworld::ForestPatch { size, density, seed } => {
                 testworlds::forest_patch(positive(size, "size")?, density.max(0.0), seed)

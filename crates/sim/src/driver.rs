@@ -1,6 +1,6 @@
 //! Scripted drivers: groups whose agents are driven by Rust code instead of taking actions.
 //!
-//! A group with `driver = { type = "road", ... }` takes no actions from the caller (its action
+//! A group with `driver = { type = "road" | "traffic", ... }` takes no actions from the caller (its action
 //! array may be empty and is ignored); at the start of every policy step the driver commands
 //! each active agent's controller with a speed and a path curvature
 //! ([`GroundSetpoint::SpeedCurvature`]), whatever the group's action mode.
@@ -18,10 +18,14 @@
 //! near the ground (vehicles, landed drones; it does not overtake), and K-turns keep clear of
 //! other agents and solid obstacles. Everything is drawn from the agent's seed stream, so the
 //! driving is deterministic.
+//!
+//! The `traffic` driver drives the lane graph with IDM and MOBIL (see
+//! [`traffic_driver`](crate::traffic_driver)).
 
 use crate::interaction::Sphere;
 use crate::lane::{self, WalkPos};
 use crate::scenario::CompiledGroup;
+use crate::traffic_driver::{TrafficDriver, TrafficDriverSpec};
 use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::wrap_angle;
@@ -39,18 +43,53 @@ use std::sync::Arc;
 pub enum DriverSpec {
     /// Random routes along the roads (see the module documentation).
     Road(RoadDriverSpec),
+    /// Traffic on the lane graph (IDM, MOBIL; see [`traffic_driver`](crate::traffic_driver)).
+    Traffic(TrafficDriverSpec),
 }
 
 impl DriverSpec {
     pub fn name(&self) -> &'static str {
         match self {
             DriverSpec::Road(_) => "road",
+            DriverSpec::Traffic(_) => "traffic",
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
         match self {
             DriverSpec::Road(r) => r.validate(),
+            DriverSpec::Traffic(t) => t.validate(),
+        }
+    }
+
+    /// A driver of this kind for an agent of `group`.
+    pub fn driver(&self, group: &CompiledGroup) -> Driver {
+        match self {
+            DriverSpec::Road(r) => Driver::Road(Box::new(RoadDriver::new(r, DriverGeometry::of(group)))),
+            DriverSpec::Traffic(t) => Driver::Traffic(Box::new(TrafficDriver::new(t, DriverGeometry::of(group)))),
+        }
+    }
+}
+
+/// The scripted driver of an agent.
+#[derive(Clone, Debug)]
+pub enum Driver {
+    Road(Box<RoadDriver>),
+    Traffic(Box<TrafficDriver>),
+}
+
+impl Driver {
+    pub fn as_road(&self) -> Option<&RoadDriver> {
+        match self {
+            Driver::Road(d) => Some(d),
+            Driver::Traffic(_) => None,
+        }
+    }
+
+    pub fn as_traffic(&self) -> Option<&TrafficDriver> {
+        match self {
+            Driver::Traffic(d) => Some(d),
+            Driver::Road(_) => None,
         }
     }
 }
