@@ -258,3 +258,24 @@ fn drones_spawn_near_the_cars() {
     let e = err(toml.replace("offset = 10.0", "offset = -1.0"));
     assert!(e.contains("spawn.near"), "{e}");
 }
+
+/// Urban maps in scenarios: cars spawn on the streets and drive along them.
+#[test]
+fn cars_drive_on_urban_maps() {
+    let sc =
+        compile(&TRAFFIC.replace(r#"type = "rural", seed = 3, count = 2"#, r#"type = "urban", seed = 3, count = 1"#));
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(1));
+    w.reset(None);
+    let map = w.map().clone();
+    assert!(map.roads().has_sections());
+    let start: Vec<_> = w.agents().iter().map(|a| a.vehicle.position()).collect();
+    for p in &start {
+        assert!(map.roads().on_road(p.truncate()).is_some(), "car at {p} off the streets");
+    }
+    for _ in 0..500 {
+        w.step();
+    }
+    for (a, p) in w.agents().iter().zip(&start) {
+        assert!(a.vehicle.position().distance(*p) > 10.0 && !a.events.is_terminal(), "{:?}", a.events);
+    }
+}

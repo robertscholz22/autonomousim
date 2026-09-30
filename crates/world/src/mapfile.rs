@@ -4,17 +4,18 @@
 //! ‖ postcard(roads))`. The map part holds the metadata, the height grid (heights, cell
 //! materials, water), the obstacles in their stored order and the material table; the road part
 //! (format 2 on, written only for maps with roads) the road nodes and polylines. The height
-//! pyramid, the obstacle BVH and the road grid are rebuilt on load. Format 1 files (no roads)
-//! still load.
+//! pyramid, the obstacle BVH and the road grid are rebuilt on load. Format 3 adds, after the
+//! roads and only for networks with them, `postcard(sections)`: the roads' cross-sections
+//! (urban maps). Format 1 and 2 files still load.
 //!
 //! The **content hash** is blake3 over a domain tag and the same postcard encoding (the roads
-//! only when there are any, so maps without roads keep their format-1 hashes), so two maps
+//! and sections only when there are any, so older maps keep their hashes), so two maps
 //! have equal hashes exactly when every stored value is bit-identical. Generators use it for
 //! golden tests; recordings store it to check that a replay rebuilt the same map.
 
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::{Obstacle, ObstacleClass, ObstacleSet, ObstacleShape};
-use crate::roads::{RoadNetwork, RoadsData};
+use crate::roads::{RoadNetwork, RoadsData, Section};
 use crate::static_world::{MapMeta, StaticWorld};
 use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::math::Pose;
@@ -26,7 +27,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 const MAGIC: &[u8; 8] = b"AUTOSIMM";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const HASH_DOMAIN: &[u8] = b"autonomousim map v1";
 
 /// blake3 content hash of a map (see the module docs).
@@ -228,6 +229,9 @@ pub fn content_hash(world: &StaticWorld) -> MapHash {
     if !world.roads().is_empty() {
         postcard::to_io(&world.roads().stored(), &mut h).expect("hashing cannot fail");
     }
+    if world.roads().has_sections() {
+        postcard::to_io(world.roads().stored_sections(), &mut h).expect("hashing cannot fail");
+    }
     MapHash(*h.finalize().as_bytes())
 }
 
@@ -245,6 +249,10 @@ pub fn write(world: &StaticWorld, w: impl Write, level: i32) -> Result<MapHash, 
     let mut enc = postcard::to_io(&view(world), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
     if !world.roads().is_empty() {
         enc = postcard::to_io(&world.roads().stored(), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    }
+    if world.roads().has_sections() {
+        enc =
+            postcard::to_io(world.roads().stored_sections(), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
     }
     enc.finish()?.flush()?;
     Ok(hash)
@@ -269,8 +277,15 @@ pub fn read(r: impl Read) -> Result<(StaticWorld, MapHash), MapFileError> {
     let roads = if rest.is_empty() {
         RoadNetwork::default()
     } else {
-        let r: RoadsData = postcard::from_bytes(rest).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
-        RoadNetwork::try_from(r).map_err(MapFileError::Corrupt)?
+        let corrupt = |e: postcard::Error| MapFileError::Corrupt(e.to_string());
+        let (r, rest): (RoadsData, _) = postcard::take_from_bytes(rest).map_err(corrupt)?;
+        let net = RoadNetwork::try_from(r).map_err(MapFileError::Corrupt)?;
+        if rest.is_empty() {
+            net
+        } else {
+            let sections: Vec<Section> = postcard::from_bytes(rest).map_err(corrupt)?;
+            net.with_sections(sections).map_err(|e| MapFileError::Corrupt(e.to_string()))?
+        }
     };
     let (nx, ny) = (d.nx as usize, d.ny as usize);
     let cells = nx.saturating_sub(1) * ny.saturating_sub(1);
@@ -389,6 +404,25 @@ mod tests {
         assert_eq!(h, with.content_hash());
         assert_eq!(back.roads(), with.roads());
         assert!(back.roads().on_road(DVec2::new(0.0, -45.0)).is_some());
+        assert!(!back.roads().has_sections() && back.roads().section(0) == Section::plain(4.0));
+        // Sections (format 3) round-trip and change the hash.
+        let section = Section {
+            lanes: [1, 0],
+            lane_width: 3.0,
+            median: 0.0,
+            bike: [1.0, 0.0],
+            parking: [0.0; 2],
+            sidewalk: [2.0, 1.5],
+        };
+        let net = with.roads().clone().with_sections(vec![section]).unwrap();
+        assert!(with.roads().clone().with_sections(vec![Section { lane_width: 3.5, ..section }]).is_err());
+        let urban = plain.clone().with_roads(net);
+        assert_ne!(urban.content_hash(), with.content_hash());
+        let mut buf = Vec::new();
+        write(&urban, &mut buf, 3).unwrap();
+        let (back, _) = read(&buf[..]).unwrap();
+        assert_eq!(back.roads(), urban.roads());
+        assert_eq!(back.roads().section(0), section);
         // A format-1 file: the same bytes as a map without roads, under version 1.
         let mut old = Vec::new();
         write(&plain, &mut old, 3).unwrap();
@@ -396,7 +430,7 @@ mod tests {
         let (back, h) = read(&old[..]).unwrap();
         assert_eq!(h, before);
         assert!(back.roads().is_empty());
-        old[8..12].copy_from_slice(&3u32.to_le_bytes());
-        assert!(matches!(read(&old[..]), Err(MapFileError::Version(3))));
+        old[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(read(&old[..]), Err(MapFileError::Version(4))));
     }
 }

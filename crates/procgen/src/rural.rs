@@ -101,9 +101,10 @@ impl Default for RoadsConfig {
 }
 
 impl RoadsConfig {
+    /// Limits of `class` (the urban classes, which rural maps do not have, take the paved ones).
     pub fn class(&self, class: RoadClass) -> &ClassConfig {
         match class {
-            RoadClass::Paved => &self.paved,
+            RoadClass::Paved | RoadClass::Arterial | RoadClass::Collector | RoadClass::Local => &self.paved,
             RoadClass::Gravel => &self.gravel,
             RoadClass::Track => &self.track,
         }
@@ -385,15 +386,15 @@ impl RuralStats {
 }
 
 /// Vertex heights of the final grid with bilinear sampling.
-struct Heights<'a> {
-    h: &'a [f32],
-    n: usize,
-    origin: DVec2,
-    cell: f64,
+pub(crate) struct Heights<'a> {
+    pub h: &'a [f32],
+    pub n: usize,
+    pub origin: DVec2,
+    pub cell: f64,
 }
 
 impl Heights<'_> {
-    fn at(&self, p: DVec2) -> f64 {
+    pub(crate) fn at(&self, p: DVec2) -> f64 {
         let q = ((p - self.origin) / self.cell).clamp(DVec2::ZERO, DVec2::splat((self.n - 1) as f64));
         let (ix, iy) = ((q.x as usize).min(self.n - 2), (q.y as usize).min(self.n - 2));
         let (fx, fy) = (q.x - ix as f64, q.y - iy as f64);
@@ -439,7 +440,7 @@ pub fn generate(config: &RuralConfig, seed: u64) -> Result<(StaticWorld, RuralSt
 
     // 1. Landform.
     let land = landform(
-        &Land { size: c.size, cell: c.cell, terrain: &c.terrain, erosion: &c.erosion, water: &c.water },
+        &Land { size: c.size, cell: c.cell, terrain: &c.terrain, erosion: &c.erosion, water: &c.water, shape: None },
         &root,
         &mut |name| stats.stage(name, &mut t),
     );
@@ -1159,7 +1160,7 @@ fn route_roads(
 /// Centripetal Catmull–Rom through control points taken every 12 m along `path` (ends kept),
 /// resampled every metre; the controls are smoothed until the curvature away from the ends
 /// stays within `1 / min_radius`.
-fn smooth_path(path: &[DVec2], min_radius: f64) -> Vec<DVec2> {
+pub(crate) fn smooth_path(path: &[DVec2], min_radius: f64) -> Vec<DVec2> {
     let len: f64 = path.windows(2).map(|w| w[0].distance(w[1])).sum();
     let spacing = 12.0;
     let mut controls = vec![path[0]];
@@ -1242,7 +1243,7 @@ fn catmull_rom(controls: &[DVec2]) -> Vec<DVec2> {
 }
 
 /// Points every `step` m along a polyline (at least the two ends).
-fn resample(points: &[DVec2], step: f64) -> Vec<DVec2> {
+pub(crate) fn resample(points: &[DVec2], step: f64) -> Vec<DVec2> {
     let len: f64 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
     let count = ((len / step).round() as usize).max(1);
     let ds = len / count as f64;
@@ -1302,7 +1303,7 @@ fn reach_nodes(c: &RoadsConfig, pieces: &[Piece], lengths: &[f64], node_z: &mut 
 /// the end heights and limited to `max_grade`. Where the ends are too far apart for the grade
 /// (only between two yards, see `reach_nodes`), a straight ramp instead: the road meets its
 /// ends and exceeds the grade.
-fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, window: f64) -> Vec<f64> {
+pub(crate) fn profile(points: &[DVec2], hs: &Heights, z0: f64, z1: f64, max_grade: f64, window: f64) -> Vec<f64> {
     let n = points.len();
     let raw: Vec<f64> = points.iter().map(|&p| hs.at(p)).collect();
     let ds: Vec<f64> = points.windows(2).map(|w| w[0].distance(w[1])).collect();
@@ -1558,7 +1559,9 @@ fn materials(
                 MaterialId::CONCRETE
             } else if let Some((class, _)) = road.filter(|r| r.1 <= 0.0) {
                 match class {
-                    RoadClass::Paved => MaterialId::ASPHALT,
+                    RoadClass::Paved | RoadClass::Arterial | RoadClass::Collector | RoadClass::Local => {
+                        MaterialId::ASPHALT
+                    }
                     RoadClass::Gravel => MaterialId::GRAVEL,
                     RoadClass::Track => MaterialId::DIRT,
                 }

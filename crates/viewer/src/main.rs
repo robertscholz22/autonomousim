@@ -6,6 +6,7 @@
 //! cargo run -p autonomousim-viewer --release -- --preset offroad --vehicle offroad_4x4 --record drive.mcap
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle truck_6x4 --trailer semitrailer_3axle
 //! cargo run -p autonomousim-viewer --release -- --map rural --vehicle motorcycle_sport
+//! cargo run -p autonomousim-viewer --release -- --map urban --preset training --vehicle sedan_like
 //! cargo run -p autonomousim-viewer --release -- --preset large --vehicle aerosonde_like
 //! cargo run -p autonomousim-viewer --release -- --preset large --demo --demo-speed 30 --demo-agl 200 --demo-turn 0
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
@@ -38,10 +39,12 @@ use autonomousim_control::ground::{GroundActionMode, GroundSetpoint};
 use autonomousim_control::multirotor::ActionMode;
 use autonomousim_core::math::quat::yaw;
 use autonomousim_core::rng::Seed;
-use autonomousim_procgen::{RuralPreset, WildPreset};
+use autonomousim_procgen::{RuralPreset, UrbanPreset, WildPreset};
 use autonomousim_sim::policy::PolicyFile;
 use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
-use autonomousim_sim::scenario::{GoalKind, GoalSpec, MapSource, RuralMaps, SpawnSpec, VehicleRef, WildMaps};
+use autonomousim_sim::scenario::{
+    GoalKind, GoalSpec, MapSource, RuralMaps, SpawnSpec, UrbanMaps, VehicleRef, WildMaps,
+};
 use autonomousim_sim::{CompiledScenario, Events, GroupSpec, Scenario, WorldInstance};
 use autonomousim_vehicles::{Vehicle, VehicleDef};
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
@@ -171,6 +174,7 @@ struct LiveArgs {
 enum MapKind {
     Wild,
     Rural,
+    Urban,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -287,7 +291,7 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
     if !ground && !args.trailer.is_empty() {
         bail!("only ground vehicles tow trailers");
     }
-    let rural = args.map == MapKind::Rural;
+    let roads = matches!(args.map, MapKind::Rural | MapKind::Urban);
     let aircraft = matches!(def, VehicleDef::FixedWing(_));
     let group = if aircraft {
         // In the air, 150 m up at 1.5 stall speeds, flown by attitude.
@@ -315,8 +319,8 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
             ..Default::default()
         }
     } else if ground {
-        // On rural maps: start in a lane with a route to a farm yard.
-        let (spawn, goals) = if rural {
+        // On maps with roads: start in a lane with a route along them.
+        let (spawn, goals) = if roads {
             let goals = GoalSpec { kind: GoalKind::Route, distance: [150.0, 400.0], radius: 5.0, ..Default::default() };
             (SpawnSpec { on_road: true, min_separation: 10.0, ..Default::default() }, goals)
         } else {
@@ -356,6 +360,13 @@ fn scenario(args: &LiveArgs) -> anyhow::Result<Scenario> {
                 seed: args.seed,
                 count: 1,
                 preset: args.preset.parse::<RuralPreset>().map_err(anyhow::Error::msg)?,
+                config,
+                cache: !args.no_cache,
+            }),
+            MapKind::Urban => MapSource::Urban(UrbanMaps {
+                seed: args.seed,
+                count: 1,
+                preset: args.preset.parse::<UrbanPreset>().map_err(anyhow::Error::msg)?,
                 config,
                 cache: !args.no_cache,
             }),

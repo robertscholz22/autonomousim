@@ -506,6 +506,9 @@ pub(crate) struct Land<'a> {
     pub terrain: &'a TerrainConfig,
     pub erosion: &'a ErosionConfig,
     pub water: &'a WaterConfig,
+    /// Reshapes the final heights before hydrology: `(position, height) → height` (e.g. the
+    /// urban generator's city plateau).
+    pub shape: Option<&'a (dyn Fn(DVec2, f64) -> f64 + Sync)>,
 }
 
 /// Vertex heights, lakes and upstream areas of the final grid.
@@ -565,7 +568,11 @@ pub(crate) fn landform(c: &Land, root: &Seed, stage: &mut dyn FnMut(&'static str
     fine.data.par_chunks_mut(n).enumerate().for_each(|(iy, row)| {
         let y = origin.y + iy as f64 * c.cell;
         for (ix, h) in row.iter_mut().enumerate() {
-            *h += detail_height(c.terrain, &ts, origin.x + ix as f64 * c.cell, y);
+            let x = origin.x + ix as f64 * c.cell;
+            *h += detail_height(c.terrain, &ts, x, y);
+            if let Some(shape) = c.shape {
+                *h = shape(DVec2::new(x, y), *h);
+            }
         }
     });
     let heights: Vec<f32> = fine.data.iter().map(|&h| h as f32).collect();
@@ -602,7 +609,7 @@ pub fn generate(config: &WildConfig, seed: u64) -> Result<(StaticWorld, WildStat
     let origin = DVec2::splat(-0.5 * c.size);
     stats.vertices = n * n;
     let land = landform(
-        &Land { size: c.size, cell: c.cell, terrain: &c.terrain, erosion: &c.erosion, water: &c.water },
+        &Land { size: c.size, cell: c.cell, terrain: &c.terrain, erosion: &c.erosion, water: &c.water, shape: None },
         &root,
         &mut |name| stats.stage(name, &mut t),
     );

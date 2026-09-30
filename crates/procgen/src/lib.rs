@@ -1,4 +1,4 @@
-//! Procedural map generators (wild now; rural and urban later) and the on-disk map cache.
+//! Procedural map generators (wild, rural and urban) and the on-disk map cache.
 //!
 //! Generators are deterministic: the same configuration and seed give a bit-identical map
 //! (and [`MapHash`](autonomousim_world::MapHash)) on any machine and with any number of
@@ -13,6 +13,7 @@ pub mod noise;
 pub mod rural;
 mod scatter;
 mod terrain;
+pub mod urban;
 pub mod wild;
 
 pub use cache::MapCache;
@@ -20,6 +21,7 @@ pub use farmland::{FieldsConfig, ScatterConfig};
 pub use rural::{RuralConfig, RuralPreset, RuralStats};
 pub use scatter::{RocksConfig, TreesConfig};
 pub use terrain::{ErosionConfig, TerrainConfig};
+pub use urban::{UrbanConfig, UrbanPreset, UrbanStats};
 pub use wild::{TilesConfig, WildConfig, WildPreset, WildStats};
 
 use autonomousim_world::MapFileError;

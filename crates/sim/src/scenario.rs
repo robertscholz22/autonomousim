@@ -58,6 +58,7 @@ use autonomousim_core::terrain::Terrain;
 use autonomousim_core::time::Clock;
 use autonomousim_procgen::MapCache;
 use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
+use autonomousim_procgen::urban::{self, UrbanConfig, UrbanPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
 use autonomousim_sensors::{Sensor, SensorConfig, SensorSpec};
 use autonomousim_vehicles::fixedwing::FixedWingInput;
@@ -167,6 +168,8 @@ pub enum MapSource {
     Wild(WildMaps),
     /// A pool of generated rural maps (farmland with roads).
     Rural(RuralMaps),
+    /// A pool of generated urban maps (a town or city with its street network).
+    Urban(UrbanMaps),
 }
 
 /// `count` wild maps with the seeds `seed, seed + 1, …`; each episode draws one of them.
@@ -265,6 +268,54 @@ impl RuralMaps {
     }
 }
 
+/// `count` urban maps with the seeds `seed, seed + 1, …`; each episode draws one of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UrbanMaps {
+    pub seed: u64,
+    pub count: u32,
+    pub preset: UrbanPreset,
+    /// Values that override the preset, in the layout of
+    /// [`UrbanConfig`](autonomousim_procgen::UrbanConfig), e.g. `{ size = 256.0 }`.
+    pub config: Option<serde_json::Value>,
+    /// Keep generated maps in the user's map cache and load them from there.
+    pub cache: bool,
+}
+
+impl Default for UrbanMaps {
+    fn default() -> Self {
+        Self { seed: 0, count: 1, preset: UrbanPreset::Training, config: None, cache: true }
+    }
+}
+
+impl UrbanMaps {
+    pub fn config(&self) -> Result<UrbanConfig, SimError> {
+        UrbanConfig::from_preset(self.preset, self.config.as_ref()).map_err(|e| SimError::Scenario(format!("map: {e}")))
+    }
+
+    fn build(&self) -> Result<Vec<(StaticWorld, MapHash)>, SimError> {
+        if !(1..=256).contains(&self.count) {
+            return Err(SimError::Scenario("map: count must be in 1..=256".into()));
+        }
+        let config = self.config()?;
+        let cache = if self.cache { MapCache::user() } else { None };
+        (0..self.count as u64)
+            .into_par_iter()
+            .map(|k| {
+                let seed = self.seed.wrapping_add(k);
+                match &cache {
+                    Some(c) => c.urban(&config, seed).map(|m| (m.world, m.hash)),
+                    None => urban::generate(&config, seed).map(|(w, _)| {
+                        let h = w.content_hash();
+                        (w, h)
+                    }),
+                }
+                .map_err(|e| SimError::Scenario(format!("map (seed {seed}): {e}")))
+            })
+            .collect()
+    }
+}
+
 impl Default for MapSource {
     fn default() -> Self {
         MapSource::Testworld(Testworld::Flat { size: 200.0 })
@@ -282,6 +333,7 @@ impl MapSource {
             }
             MapSource::Wild(w) => w.build(),
             MapSource::Rural(r) => r.build(),
+            MapSource::Urban(u) => u.build(),
         }
     }
 
@@ -291,6 +343,7 @@ impl MapSource {
             MapSource::Testworld(_) => None,
             MapSource::Wild(w) => Some(w.seed),
             MapSource::Rural(r) => Some(r.seed),
+            MapSource::Urban(u) => Some(u.seed),
         }
     }
 
@@ -300,6 +353,7 @@ impl MapSource {
             MapSource::Testworld(_) => {}
             MapSource::Wild(w) => (w.seed, w.count, w.cache) = (seed, count, cache),
             MapSource::Rural(r) => (r.seed, r.count, r.cache) = (seed, count, cache),
+            MapSource::Urban(u) => (u.seed, u.count, u.cache) = (seed, count, cache),
         }
     }
 
@@ -309,6 +363,7 @@ impl MapSource {
             MapSource::Testworld(_) => {}
             MapSource::Wild(w) => w.seed = seed,
             MapSource::Rural(r) => r.seed = seed,
+            MapSource::Urban(u) => u.seed = seed,
         }
     }
 }

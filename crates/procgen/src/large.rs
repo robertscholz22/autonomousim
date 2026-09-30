@@ -97,6 +97,7 @@ pub fn coarse(config: &WildConfig, seed: u64, stats: &mut WildStats) -> Result<C
             terrain: &terrain,
             erosion: &config.erosion,
             water: &config.water,
+            shape: None,
         },
         &root,
         &mut |name| stats.stage(name, &mut t),

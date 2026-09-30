@@ -7,6 +7,7 @@
 use crate::ProcgenError;
 use crate::large;
 use crate::rural::{self, RURAL_VERSION, RuralConfig, RuralStats};
+use crate::urban::{self, URBAN_VERSION, UrbanConfig, UrbanStats};
 use crate::wild::{self, WILD_VERSION, WildConfig, WildStats};
 use autonomousim_world::{MapHash, StaticWorld, mapfile};
 use serde::Serialize;
@@ -125,6 +126,13 @@ impl MapCache {
         config.validate()?;
         let key = Self::key("rural", RURAL_VERSION, config, seed);
         self.load_or_generate(&key, || rural::generate(config, seed))
+    }
+
+    /// An urban map from the cache, generated on a miss.
+    pub fn urban(&self, config: &UrbanConfig, seed: u64) -> Result<Cached<UrbanStats>, ProcgenError> {
+        config.validate()?;
+        let key = Self::key("urban", URBAN_VERSION, config, seed);
+        self.load_or_generate(&key, || urban::generate(config, seed))
     }
 }
 

@@ -44,7 +44,8 @@ impl Default for RouteGoals {
 /// Offset of the lane centre to the right of `road`'s centre line (m).
 pub fn lane_offset(road: &Road) -> f64 {
     match road.class {
-        RoadClass::Paved => 0.25 * road.width,
+        // Urban roads: a placeholder until the lane graph (M8a step 2) gives their lanes.
+        RoadClass::Paved | RoadClass::Arterial | RoadClass::Collector | RoadClass::Local => 0.25 * road.width,
         RoadClass::Gravel | RoadClass::Track => 0.0,
     }
 }

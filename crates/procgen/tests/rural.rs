@@ -135,6 +135,7 @@ fn check_invariants(c: &RuralConfig, seed: u64) {
             RoadClass::Paved => MaterialId::ASPHALT,
             RoadClass::Gravel => MaterialId::GRAVEL,
             RoadClass::Track => MaterialId::DIRT,
+            c => panic!("rural maps have no {c:?} roads"),
         };
         let yard = |p: DVec2| t.material(p.x, p.y) == MaterialId::CONCRETE;
         let mut s = 0.0;

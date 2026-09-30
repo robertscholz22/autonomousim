@@ -17,7 +17,7 @@ use glam::DVec2;
 /// Height of a road surface above the terrain (m), by class.
 fn lift(class: RoadClass) -> f64 {
     match class {
-        RoadClass::Paved => 0.06,
+        RoadClass::Paved | RoadClass::Arterial | RoadClass::Collector | RoadClass::Local => 0.06,
         RoadClass::Gravel => 0.05,
         RoadClass::Track => 0.04,
     }
@@ -61,7 +61,8 @@ fn layers(world: &StaticWorld, road: &Road) -> Vec<Layer> {
     let base = lift(road.class);
     let span = |a: f64, b: f64, n: usize| (0..=n).map(|k| a + (b - a) * k as f64 / n as f64).collect::<Vec<_>>();
     match road.class {
-        RoadClass::Paved => {
+        // Urban roads are drawn as paved ones until their lanes are (M8a step 5).
+        RoadClass::Paved | RoadClass::Arterial | RoadClass::Collector | RoadClass::Local => {
             let edge = |side: f64| Layer {
                 offsets: band(side * (w - 0.35), side * (w - 0.2)),
                 lift: base + MARKING_LIFT,

@@ -19,6 +19,19 @@ pub enum RoadClass {
     Gravel,
     /// Dirt track to fields.
     Track,
+    /// Urban main road: several lanes per direction, sometimes a median.
+    Arterial,
+    /// Urban street linking neighbourhoods to the arterials.
+    Collector,
+    /// Urban residential or access street.
+    Local,
+}
+
+impl RoadClass {
+    /// Urban classes (with a [`Section`] of their own).
+    pub fn is_urban(self) -> bool {
+        matches!(self, Self::Arterial | Self::Collector | Self::Local)
+    }
 }
 
 /// What lies at a node.
@@ -32,6 +45,8 @@ pub enum NodeKind {
     Yard,
     /// A gate into a field.
     Gate,
+    /// Where a road meets the ring of a roundabout (the ring's roads are one-way).
+    Roundabout,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -176,6 +191,59 @@ pub struct Road {
     pub line: Polyline,
 }
 
+/// Cross-section of a road, from its centre line outwards: the lanes of each direction (the
+/// first entry for travel from `start` to `end`, the second against it), then per side of the
+/// road (the right of each direction) a bike lane, a parking lane and a sidewalk. The median,
+/// if any, is centred on the centre line. The carriageway ([`Road::width`]) spans the median,
+/// the lanes, the bike lanes and the parking lanes; sidewalks lie beyond it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Section {
+    pub lanes: [u8; 2],
+    pub lane_width: f64,
+    pub median: f64,
+    pub bike: [f64; 2],
+    pub parking: [f64; 2],
+    pub sidewalk: [f64; 2],
+}
+
+impl Section {
+    /// Two-way road of `width` with one lane per direction and nothing else (the rural roads).
+    pub fn plain(width: f64) -> Self {
+        Self {
+            lanes: [1, 1],
+            lane_width: 0.5 * width,
+            median: 0.0,
+            bike: [0.0; 2],
+            parking: [0.0; 2],
+            sidewalk: [0.0; 2],
+        }
+    }
+
+    /// Width of the carriageway (m).
+    pub fn width(&self) -> f64 {
+        let lanes = f64::from(self.lanes[0]) + f64::from(self.lanes[1]);
+        lanes * self.lane_width + self.median + self.bike[0] + self.bike[1] + self.parking[0] + self.parking[1]
+    }
+
+    /// Whether traffic runs only from `start` to `end`.
+    pub fn one_way(&self) -> bool {
+        self.lanes[1] == 0
+    }
+
+    /// Carriageway offsets (positive to the left of `start → end`) of the two edges of the
+    /// part of direction `dir` (0 along, 1 against): `(inner, outer)` distances from the
+    /// centre line, the outer edge including the bike and parking lanes. One-way roads have
+    /// their lanes centred.
+    pub fn half_widths(&self, dir: usize) -> (f64, f64) {
+        if self.one_way() {
+            let w = 0.5 * self.width();
+            return if dir == 0 { (-w, w) } else { (0.0, 0.0) };
+        }
+        let inner = 0.5 * self.median;
+        (inner, inner + f64::from(self.lanes[dir]) * self.lane_width + self.bike[dir] + self.parking[dir])
+    }
+}
+
 /// The nearest road to a point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RoadPoint {
@@ -196,6 +264,8 @@ pub struct Route {
 pub struct RoadNetwork {
     nodes: Vec<RoadNode>,
     roads: Vec<Road>,
+    /// One per road, or none (then every road is [`Section::plain`]).
+    sections: Vec<Section>,
     grid: SegmentGrid,
 }
 
@@ -205,6 +275,10 @@ pub enum RoadError {
     MissingNode(usize, u32),
     #[error("road {0} has width {1}")]
     Width(usize, f64),
+    #[error("{0} sections for {1} roads")]
+    Sections(usize, usize),
+    #[error("road {0}: its section is {1} m wide, the road {2} m")]
+    SectionWidth(usize, f64, f64),
 }
 
 impl RoadNetwork {
@@ -220,7 +294,31 @@ impl RoadNetwork {
             }
         }
         let grid = SegmentGrid::build(&roads);
-        Ok(Self { nodes, roads, grid })
+        Ok(Self { nodes, roads, sections: Vec::new(), grid })
+    }
+
+    /// The same network with a cross-section per road, each as wide as its road.
+    pub fn with_sections(mut self, sections: Vec<Section>) -> Result<Self, RoadError> {
+        if !sections.is_empty() && sections.len() != self.roads.len() {
+            return Err(RoadError::Sections(sections.len(), self.roads.len()));
+        }
+        for (i, (s, r)) in sections.iter().zip(&self.roads).enumerate() {
+            if (s.width() - r.width).abs() > 1e-9 || s.lanes[0] == 0 {
+                return Err(RoadError::SectionWidth(i, s.width(), r.width));
+            }
+        }
+        self.sections = sections;
+        Ok(self)
+    }
+
+    /// Cross-section of road `i`.
+    pub fn section(&self, i: usize) -> Section {
+        self.sections.get(i).copied().unwrap_or_else(|| Section::plain(self.roads[i].width))
+    }
+
+    /// Whether the roads have sections of their own (urban maps).
+    pub fn has_sections(&self) -> bool {
+        !self.sections.is_empty()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -514,6 +612,11 @@ struct RoadData {
 }
 
 impl RoadNetwork {
+    /// Stored form of the sections (empty for maps without).
+    pub(crate) fn stored_sections(&self) -> &[Section] {
+        &self.sections
+    }
+
     pub(crate) fn stored(&self) -> RoadsRef<'_> {
         RoadsRef {
             nodes: &self.nodes,

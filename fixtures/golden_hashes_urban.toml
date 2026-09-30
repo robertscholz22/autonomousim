@@ -1,0 +1,17 @@
+# Content hashes of generated urban maps (see crates/procgen/tests/urban.rs).
+# Regenerate: AUTONOMOUSIM_BLESS=1 cargo test -p autonomousim-procgen --test urban
+
+[[urban]]
+preset = "training"
+seed = 1
+hash = "ff586960154717f51eb0b2ac5dc3f27df25a393a5c26525c7e404ae555bd4281"
+
+[[urban]]
+preset = "training"
+seed = 2
+hash = "251f0f975c910118e6f425bed20464adae2795c006f86445a8d4554e84c59152"
+
+[[urban]]
+preset = "showcase"
+seed = 3
+hash = "9c1358f1c944871d68162d4169d44ac13e54274bcdc960e65bad4c0442c37ae2"

@@ -2,8 +2,9 @@
 
 use anyhow::{Context, bail};
 use autonomousim_procgen::rural::{self, RuralConfig, RuralPreset};
+use autonomousim_procgen::urban::{self, UrbanConfig, UrbanPreset};
 use autonomousim_procgen::wild::{self, WildConfig, WildPreset};
-use autonomousim_procgen::{MapCache, RuralStats, WildStats};
+use autonomousim_procgen::{MapCache, RuralStats, UrbanStats, WildStats};
 use autonomousim_world::{RoadClass, StaticWorld, mapfile, obstacles::tags};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -22,7 +23,7 @@ struct Cli {
 enum Command {
     /// Print version information.
     Version,
-    /// Generate a wild or rural map (or load it from the map cache) and print statistics.
+    /// Generate a wild, rural or urban map (or load it from the map cache) and print statistics.
     Mapgen(MapgenArgs),
     /// Print the content hash of map files (verifying each).
     MapHash {
@@ -37,7 +38,7 @@ enum Command {
 struct MapgenArgs {
     #[arg(long, value_enum, default_value_t = Generator::Wild)]
     generator: Generator,
-    /// Starting configuration: training (512 m) or showcase (2 km); wild maps also have
+    /// Starting configuration: training (512 m; urban 1 km) or showcase (2 km); wild maps also have
     /// offroad (512 m, gentle) and large (16 km, tiled).
     #[arg(long, default_value = "training")]
     preset: String,
@@ -96,12 +97,14 @@ fn main() -> anyhow::Result<()> {
 enum Generator {
     Wild,
     Rural,
+    Urban,
 }
 
 /// The effective configuration of either generator.
 enum Config {
     Wild(Box<WildConfig>),
     Rural(Box<RuralConfig>),
+    Urban(Box<UrbanConfig>),
 }
 
 /// Statistics of either generator.
@@ -110,6 +113,7 @@ enum Config {
 enum Stats {
     Wild(WildStats),
     Rural(RuralStats),
+    Urban(UrbanStats),
 }
 
 fn config(args: &MapgenArgs) -> anyhow::Result<Config> {
@@ -140,6 +144,15 @@ fn config(args: &MapgenArgs) -> anyhow::Result<Config> {
             c.validate()?;
             Config::Rural(Box::new(c))
         }
+        Generator::Urban => {
+            let mut c =
+                UrbanConfig::from_preset(args.preset.parse::<UrbanPreset>().map_err(preset)?, overrides.as_ref())?;
+            if let Some(size) = args.size {
+                c.size = size;
+            }
+            c.validate()?;
+            Config::Urban(Box::new(c))
+        }
     })
 }
 
@@ -149,6 +162,7 @@ fn mapgen(args: MapgenArgs) -> anyhow::Result<()> {
         match &config {
             Config::Wild(c) => print!("{}", toml::to_string(c)?),
             Config::Rural(c) => print!("{}", toml::to_string(c)?),
+            Config::Urban(c) => print!("{}", toml::to_string(c)?),
         }
         return Ok(());
     }
@@ -159,6 +173,7 @@ fn mapgen(args: MapgenArgs) -> anyhow::Result<()> {
             let (world, stats) = match &config {
                 Config::Wild(c) => wild::generate(c, args.seed).map(|(w, s)| (w, Stats::Wild(s)))?,
                 Config::Rural(c) => rural::generate(c, args.seed).map(|(w, s)| (w, Stats::Rural(s)))?,
+                Config::Urban(c) => urban::generate(c, args.seed).map(|(w, s)| (w, Stats::Urban(s)))?,
             };
             let hash = world.content_hash();
             Ok((world, hash, Some(stats), "generated (cache disabled)".to_owned()))
@@ -172,6 +187,10 @@ fn mapgen(args: MapgenArgs) -> anyhow::Result<()> {
                 Config::Rural(c) => {
                     let c = cache.rural(c, args.seed)?;
                     (c.world, c.hash, c.path, c.generated.map(Stats::Rural))
+                }
+                Config::Urban(c) => {
+                    let c = cache.urban(c, args.seed)?;
+                    (c.world, c.hash, c.path, c.generated.map(Stats::Urban))
                 }
             };
             let source = match stats {
@@ -204,6 +223,7 @@ fn mapgen(args: MapgenArgs) -> anyhow::Result<()> {
     match &stats {
         Some(Stats::Wild(s)) => print_stats(s),
         Some(Stats::Rural(s)) => print_rural_stats(s),
+        Some(Stats::Urban(s)) => print_urban_stats(s),
         None => {}
     }
     println!("{}", info(&world, &hash.to_string()));
@@ -258,6 +278,32 @@ fn print_rural_stats(s: &RuralStats) {
     println!("materials: {}", shares.join(", "));
 }
 
+fn print_urban_stats(s: &UrbanStats) {
+    println!("stages:");
+    for (name, secs) in &s.stages {
+        println!("  {name:<18} {secs:>7.3} s");
+    }
+    println!("  {:<18} {:>7.3} s", "total", s.total_seconds());
+    let [downtown, grid, organic] = s.districts;
+    println!(
+        "city at ({:.0}, {:.0}) m, radius {:.0} m; districts: {downtown} downtown, {grid} grid, {organic} organic; lakes {}",
+        s.centre[0], s.centre[1], s.radius, s.lakes
+    );
+    println!(
+        "{} nodes, {} junctions, {} dead ends ({} cul-de-sacs), {} roundabouts",
+        s.nodes, s.junctions, s.dead_ends, s.cul_de_sacs, s.roundabouts
+    );
+    let names = ["arterial", "collector", "local", "paved"];
+    let roads: Vec<String> =
+        (0..4).map(|k| format!("{} {} ({:.1} km)", s.roads[k], names[k], 1e-3 * s.road_length[k])).collect();
+    println!("roads: {}", roads.join(", "));
+    println!("heights {:.1} … {:.1} m", s.height_range.0, s.height_range.1);
+    let cells: usize = s.materials.iter().map(|m| m.1).sum();
+    let shares: Vec<String> =
+        s.materials.iter().map(|(n, c)| format!("{n} {:.1}%", 100.0 * *c as f64 / cells as f64)).collect();
+    println!("materials: {}", shares.join(", "));
+}
+
 fn info(w: &StaticWorld, hash: &str) -> String {
     if let Some(tiles) = w.terrain().tiled() {
         let l = tiles.layout();
@@ -296,7 +342,14 @@ fn info(w: &StaticWorld, hash: &str) -> String {
     let roads = if net.is_empty() {
         "none".to_owned()
     } else {
-        let classes = [(RoadClass::Paved, "paved"), (RoadClass::Gravel, "gravel"), (RoadClass::Track, "track")];
+        let classes = [
+            (RoadClass::Arterial, "arterial"),
+            (RoadClass::Collector, "collector"),
+            (RoadClass::Local, "local"),
+            (RoadClass::Paved, "paved"),
+            (RoadClass::Gravel, "gravel"),
+            (RoadClass::Track, "track"),
+        ];
         let parts: Vec<String> = classes
             .iter()
             .filter_map(|&(class, name)| {
