@@ -9,6 +9,9 @@ use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::OnceLock;
+
+use crate::lanes::{Area, LaneGraph};
 
 /// Surface and size class of a road.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,7 +128,7 @@ impl Polyline {
     }
 
     /// Closest point to `p` (horizontally) on segment `i`: (station, squared distance).
-    fn project_segment(&self, i: usize, p: DVec2) -> (f64, f64) {
+    pub(crate) fn project_segment(&self, i: usize, p: DVec2) -> (f64, f64) {
         let (a, b) = (self.points[i].truncate(), self.points[i + 1].truncate());
         let d = b - a;
         let t = ((p - a).dot(d) / d.length_squared()).clamp(0.0, 1.0);
@@ -145,7 +148,7 @@ impl Polyline {
         self.projection(best.0, best.1, p)
     }
 
-    fn projection(&self, segment: usize, station: f64, p: DVec2) -> Projection {
+    pub(crate) fn projection(&self, segment: usize, station: f64, p: DVec2) -> Projection {
         let point = self.point_at(station);
         let d = self.points[segment + 1].truncate() - self.points[segment].truncate();
         let heading = d.y.atan2(d.x);
@@ -267,6 +270,18 @@ pub struct RoadNetwork {
     /// One per road, or none (then every road is [`Section::plain`]).
     sections: Vec<Section>,
     grid: SegmentGrid,
+    /// Built on first use; a function of the rest.
+    lanes: LazyLanes,
+}
+
+/// The lane graph of a network, built when first asked for (it never takes part in equality).
+#[derive(Clone, Debug, Default)]
+struct LazyLanes(OnceLock<LaneGraph>);
+
+impl PartialEq for LazyLanes {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -294,7 +309,7 @@ impl RoadNetwork {
             }
         }
         let grid = SegmentGrid::build(&roads);
-        Ok(Self { nodes, roads, sections: Vec::new(), grid })
+        Ok(Self { nodes, roads, sections: Vec::new(), grid, lanes: LazyLanes::default() })
     }
 
     /// The same network with a cross-section per road, each as wide as its road.
@@ -308,7 +323,20 @@ impl RoadNetwork {
             }
         }
         self.sections = sections;
+        self.lanes = LazyLanes::default();
         Ok(self)
+    }
+
+    /// The lane graph (built on the first call).
+    pub fn lanes(&self) -> &LaneGraph {
+        self.lanes.0.get_or_init(|| LaneGraph::build(&self.nodes, &self.roads, &|i| self.section(i)))
+    }
+
+    /// What lies at `p`: the area class on the nearest road within 30 m, else [`Area::Off`].
+    pub fn area(&self, p: DVec2) -> Area {
+        let Some(rp) = self.nearest(p, 30.0) else { return Area::Off };
+        let section = self.section(rp.road as usize);
+        self.lanes().area(&self.roads, &section, rp.road, rp.projection.station, rp.projection.offset)
     }
 
     /// Cross-section of road `i`.
@@ -481,7 +509,7 @@ pub fn wrap_angle(a: f64) -> f64 {
 
 /// Uniform xy grid listing, per cell, the road segments whose bounding box meets it.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct SegmentGrid {
+pub(crate) struct SegmentGrid {
     cell: f64,
     lo: DVec2,
     nx: usize,
@@ -496,12 +524,17 @@ impl SegmentGrid {
     const CELL: f64 = 16.0;
 
     fn build(roads: &[Road]) -> Self {
+        Self::of_lines(&roads.iter().map(|r| &r.line).collect::<Vec<_>>())
+    }
+
+    /// A grid over the segments of `lines` (ids are indices into `lines`).
+    pub(crate) fn of_lines(lines: &[&Polyline]) -> Self {
         let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
-        for p in roads.iter().flat_map(|r| r.line.points()) {
+        for p in lines.iter().flat_map(|l| l.points()) {
             lo = lo.min(p.truncate());
             hi = hi.max(p.truncate());
         }
-        if roads.is_empty() {
+        if lines.is_empty() {
             return Self::default();
         }
         let cell = Self::CELL;
@@ -509,8 +542,8 @@ impl SegmentGrid {
         let ny = ((hi.y - lo.y) / cell).floor() as usize + 1;
         let mut per_cell: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nx * ny];
         let index = |v: f64, lo: f64, n: usize| (((v - lo) / cell).floor().max(0.0) as usize).min(n - 1);
-        for (r, road) in roads.iter().enumerate() {
-            for (i, w) in road.line.points().windows(2).enumerate() {
+        for (r, line) in lines.iter().enumerate() {
+            for (i, w) in line.points().windows(2).enumerate() {
                 let (a, b) = (w[0].truncate(), w[1].truncate());
                 let (x0, x1) = (index(a.x.min(b.x), lo.x, nx), index(a.x.max(b.x), lo.x, nx));
                 let (y0, y1) = (index(a.y.min(b.y), lo.y, ny), index(a.y.max(b.y), lo.y, ny));
@@ -534,7 +567,7 @@ impl SegmentGrid {
     /// Call `f(road, segment)` for segments in cells ring by ring around `p`, while a ring can
     /// still hold a segment within the radius `f` returns (the best distance so far, at most
     /// `max_dist`). A segment may be visited more than once.
-    fn visit(&self, p: DVec2, max_dist: f64, f: &mut impl FnMut(u32, u32) -> f64) {
+    pub(crate) fn visit(&self, p: DVec2, max_dist: f64, f: &mut impl FnMut(u32, u32) -> f64) {
         if self.items.is_empty() {
             return;
         }

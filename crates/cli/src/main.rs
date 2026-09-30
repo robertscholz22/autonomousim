@@ -290,8 +290,8 @@ fn print_urban_stats(s: &UrbanStats) {
         s.centre[0], s.centre[1], s.radius, s.lakes
     );
     println!(
-        "{} nodes, {} junctions, {} dead ends ({} cul-de-sacs), {} roundabouts",
-        s.nodes, s.junctions, s.dead_ends, s.cul_de_sacs, s.roundabouts
+        "{} nodes, {} junctions, {} dead ends ({} cul-de-sacs), {} roundabouts, {} one-way roads",
+        s.nodes, s.junctions, s.dead_ends, s.cul_de_sacs, s.roundabouts, s.one_way
     );
     let names = ["arterial", "collector", "local", "paved"];
     let roads: Vec<String> =

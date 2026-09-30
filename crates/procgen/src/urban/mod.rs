@@ -44,7 +44,7 @@ use std::f64::consts::TAU;
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const URBAN_VERSION: u32 = 1;
+pub const URBAN_VERSION: u32 = 2;
 
 /// The city's outline and ground.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -603,6 +603,8 @@ pub struct UrbanStats {
     pub dead_ends: usize,
     pub cul_de_sacs: usize,
     pub roundabouts: usize,
+    /// One-way streets (roads), after those that cut the network apart became two-way.
+    pub one_way: usize,
     pub height_range: (f64, f64),
     /// Cells per material id.
     pub materials: Vec<(String, usize)>,
@@ -616,6 +618,47 @@ impl UrbanStats {
 
     pub fn total_seconds(&self) -> f64 {
         self.stages.iter().map(|s| s.1).sum()
+    }
+}
+
+/// The network, with every one-way street next to a lane that cannot reach every other lane
+/// (or be reached from it) made two-way, until each lane reaches each other one.
+fn network_without_strands(
+    nodes: Vec<RoadNode>,
+    mut roads: Vec<Road>,
+    mut sections: Vec<Section>,
+    oneway_ok: &dyn Fn(usize) -> bool,
+) -> Result<RoadNetwork, ProcgenError> {
+    loop {
+        let net = RoadNetwork::new(nodes.clone(), roads.clone())
+            .and_then(|net| net.with_sections(sections.clone()))
+            .map_err(|e| ProcgenError::Config(e.to_string()))?;
+        let g = net.lanes();
+        let mut bad = vec![false; nodes.len()];
+        for l in g.stranded() {
+            let lane = &g.lanes()[l as usize];
+            bad[lane.from_node as usize] = true;
+            bad[lane.to_node as usize] = true;
+        }
+        let cut: Vec<usize> = (0..roads.len())
+            .filter(|&i| {
+                sections[i].one_way() && oneway_ok(i) && (bad[roads[i].start as usize] || bad[roads[i].end as usize])
+            })
+            .collect();
+        if cut.is_empty() {
+            return Ok(net);
+        }
+        for i in cut {
+            let s = sections[i];
+            sections[i] = Section {
+                lanes: [s.lanes[0].div_ceil(2); 2],
+                median: 0.0,
+                bike: [s.bike[0]; 2],
+                parking: [s.parking[0]; 2],
+                ..s
+            };
+            roads[i].width = sections[i].width();
+        }
     }
 }
 
@@ -738,11 +781,14 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
             p.points = if let Some(ring) = rings.iter().find(|r| r.street == p.street) {
                 arc(ring, p.points[0], *p.points.last().expect("points"))
             } else if p.points.len() > 2 {
-                let raw = resample(&p.points, 1.0);
-                let smooth = smooth_path(&p.points, k.class(p.class).min_radius);
-                // Keep the smoothing only while it stays near the graph's chain (it must not
-                // meet another street).
-                if smooth.iter().all(|&q| distance_to(&p.points, q) < 2.5) { smooth } else { raw }
+                // Round the corners as widely as the smoothing stays near the graph's chain (it
+                // must not meet another street); tighter radii first, the raw chain last.
+                let r = k.class(p.class).min_radius;
+                [r, 0.5 * r, 0.25 * r, 8.0]
+                    .into_iter()
+                    .map(|r| smooth_path(&p.points, r))
+                    .find(|smooth| smooth.iter().all(|&q| distance_to(&p.points, q) < 2.5))
+                    .unwrap_or_else(|| resample(&p.points, 1.0))
             } else {
                 resample(&p.points, 1.0)
             };
@@ -812,9 +858,9 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
         stats.roads[class_index(r.class)] += 1;
         stats.road_length[class_index(r.class)] += r.line.length();
     }
-    let network = RoadNetwork::new(nodes, roads)
-        .and_then(|net| net.with_sections(sections))
-        .map_err(|e| ProcgenError::Config(e.to_string()))?;
+    let on_ring = |i: usize| rings.iter().any(|r| r.street == pieces[i].street);
+    let network = network_without_strands(nodes, roads, sections, &|i| !on_ring(i))?;
+    stats.one_way = (0..pieces.len()).filter(|&i| network.section(i).one_way() && !on_ring(i)).count();
     stats.stage("profiles", &mut t);
 
     // 6. Terrain blending.

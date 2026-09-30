@@ -3,6 +3,7 @@
 pub mod environment;
 pub mod geodesy;
 pub mod heightgrid;
+pub mod lanes;
 pub mod mapfile;
 pub mod obstacles;
 pub mod roads;
@@ -12,6 +13,7 @@ pub mod tiles;
 
 pub use geodesy::{GeoOrigin, Geodetic};
 pub use heightgrid::HeightGrid;
+pub use lanes::{Area, Connector, Junction, JunctionKind, Lane, LaneGraph, Turn};
 pub use mapfile::{MapFileError, MapHash};
 pub use obstacles::{Obstacle, ObstacleClass, ObstacleSet, ObstacleShape};
 pub use roads::{NodeKind, Polyline, Road, RoadClass, RoadNetwork, RoadNode, Route, Section};
