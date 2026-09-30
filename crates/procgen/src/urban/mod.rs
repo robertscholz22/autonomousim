@@ -46,7 +46,7 @@ use std::f64::consts::TAU;
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const URBAN_VERSION: u32 = 3;
+pub const URBAN_VERSION: u32 = 4;
 
 /// The city's outline and ground.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -174,11 +174,16 @@ pub struct StreetsConfig {
     /// Shortest segment (m) and smallest angle (deg) between streets at a junction.
     pub min_length: f64,
     pub min_angle_deg: f64,
+    /// Shortest street (m) between two junctions; closer junctions are merged.
+    pub junction_gap: f64,
     /// Dead ends are joined to the streets ahead within this reach (m) and cone (deg); dead
     /// ends shorter than `spur` m (other than cul-de-sacs) are removed.
     pub join_reach: f64,
     pub join_cone_deg: f64,
     pub spur: f64,
+    /// Dead ends lie at least this far (m) from every other street (the turning space of
+    /// their U-turns); closer ones are cut back.
+    pub dead_end_clearance: f64,
     /// Number of radial arterials (range), their segment length (m) and meander (rad per
     /// segment, standard deviation).
     pub radials: [u32; 2],
@@ -201,9 +206,11 @@ impl Default for StreetsConfig {
             snap: 6.0,
             min_length: 15.0,
             min_angle_deg: 30.0,
+            junction_gap: 30.0,
             join_reach: 60.0,
             join_cone_deg: 35.0,
             spur: 30.0,
+            dead_end_clearance: 20.0,
             radials: [4, 6],
             arterial_step: 60.0,
             arterial_wiggle: 0.08,
@@ -545,11 +552,25 @@ impl UrbanConfig {
                 return Err("districts: organic_seed and organic_spacing must be positive".into());
             }
             let s = &self.streets;
-            if !(s.snap > 0.0 && s.min_length > s.snap && (0.0..90.0).contains(&s.min_angle_deg)) {
-                return Err("streets: snap > 0, min_length > snap, min_angle_deg in [0, 90)".into());
+            if !(s.snap > 0.0
+                && s.min_length > s.snap
+                && s.junction_gap >= s.min_length
+                && (0.0..90.0).contains(&s.min_angle_deg))
+            {
+                return Err(
+                    "streets: snap > 0, min_length > snap, junction_gap >= min_length, min_angle_deg in [0, 90)".into(),
+                );
             }
-            if !(s.join_reach >= 0.0 && s.join_cone_deg >= 0.0 && s.spur >= 0.0 && s.water_clearance >= 0.0) {
-                return Err("streets: join_reach, join_cone_deg, spur and water_clearance must be ≥ 0".into());
+            if !(s.join_reach >= 0.0
+                && s.join_cone_deg >= 0.0
+                && s.spur >= 0.0
+                && s.dead_end_clearance >= 0.0
+                && s.water_clearance >= 0.0)
+            {
+                return Err(
+                    "streets: join_reach, join_cone_deg, spur, dead_end_clearance and water_clearance must be ≥ 0"
+                        .into(),
+                );
             }
             if !(s.radials[0] <= s.radials[1]
                 && s.radials[1] <= 12

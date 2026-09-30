@@ -80,12 +80,18 @@ impl Signals {
 
     /// The light for connector `c` at time `t` (green when it is not signalled).
     pub fn light(&self, lanes: &LaneGraph, c: u32, t: f64) -> Light {
+        self.light_left(lanes, c, t).0
+    }
+
+    /// The light for connector `c` at time `t` and how long it stays so (s; infinite when
+    /// it is not signalled).
+    pub fn light_left(&self, lanes: &LaneGraph, c: u32, t: f64) -> (Light, f64) {
         match lanes.connector_signal(c) {
             Some((k, p)) => {
                 let o = self.offsets.get(k as usize).copied().unwrap_or(0.0);
-                lanes.controllers()[k as usize].light(p as usize, t + o)
+                lanes.controllers()[k as usize].light_left(p as usize, t + o)
             }
-            None => Light::Green,
+            None => (Light::Green, f64::INFINITY),
         }
     }
 }

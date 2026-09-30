@@ -887,6 +887,12 @@ pub struct SpawnSpec {
     /// `route` goals); ignores `layout`, `region`, `cluster` and `yaw_deg`. Needs a map with
     /// roads and a vehicle on the ground.
     pub on_road: bool,
+    /// Start parked in a parking bay of the map (lot or street), a different one per agent,
+    /// centred in it and facing along it; ignores `layout`, `region`, `cluster` and
+    /// `yaw_deg`. Needs `on_ground` and maps with at least as many bays as the groups
+    /// spawning in them have agents (other maps are not used).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub in_bays: bool,
     /// Free radius around the vehicle (m).
     pub clearance: f64,
     /// Smallest distance between agents (m).
@@ -931,6 +937,7 @@ impl Default for SpawnSpec {
             on_ground: false,
             airspeed: None,
             on_road: false,
+            in_bays: false,
             clearance: 1.0,
             min_separation: 1.0,
             avoid_water: true,
@@ -1292,6 +1299,15 @@ impl CompiledScenario {
                 )));
             }
         }
+        let parked: usize = groups.iter().filter(|g| g.spec.spawn.in_bays).map(|g| g.spec.count).sum();
+        if parked > 0 {
+            episode_maps.retain(|&k| maps[k].sites().bays.len() >= parked);
+            if episode_maps.is_empty() {
+                return Err(SimError::Scenario(format!(
+                    "{parked} vehicles spawn `in_bays`, no map has as many parking bays"
+                )));
+            }
+        }
         if let Some(g) = groups.iter().find(|g| g.spec.goals.kind == GoalKind::Rooftop) {
             episode_maps.retain(|&k| crate::rooftop::usable(&maps[k]));
             if episode_maps.is_empty() {
@@ -1453,13 +1469,28 @@ impl CompiledGroup {
         if sp.on_road && !sp.on_ground {
             return Err(fail("`spawn.on_road` needs `spawn.on_ground`".into()));
         }
+        if sp.in_bays
+            && (!sp.on_ground
+                || sp.on_road
+                || sp.near.is_some()
+                || def.as_wheeled().is_none()
+                || !matches!(spec.goals.kind, GoalKind::Spawn | GoalKind::Random))
+        {
+            return Err(fail(
+                "`spawn.in_bays` is for ground vehicles `on_ground`, not `on_road` or `near`, with `spawn` or `random` goals"
+                    .into(),
+            ));
+        }
         if let Some(d) = &spec.driver {
             d.validate().map_err(&fail)?;
             let single = def.as_wheeled().is_some_and(|d| d.num_units() == 1 && !d.is_single_track());
-            if !single || !sp.on_road || spec.goals.kind == GoalKind::Route {
+            let parked = matches!(d, DriverSpec::Parked);
+            let placed = if parked { sp.in_bays } else { sp.on_road };
+            if !single || !placed || spec.goals.kind == GoalKind::Route {
                 return Err(fail(format!(
-                    "the `{}` driver drives ground vehicles without trailers (not two-wheelers) spawned `on_road`, without `route` goals",
-                    d.name()
+                    "the `{}` driver drives ground vehicles without trailers (not two-wheelers) spawned {}, without `route` goals",
+                    d.name(),
+                    if parked { "`in_bays`" } else { "`on_road`" }
                 )));
             }
         }

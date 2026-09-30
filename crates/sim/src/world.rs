@@ -21,7 +21,7 @@
 use crate::agent::{Agent, EnvState};
 use crate::camera::Capture;
 use crate::drive::ground_pose;
-use crate::driver::{Driver, DriverSpec, Traffic};
+use crate::driver::{Driver, DriverGeometry, DriverSpec, Traffic};
 use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts, surface_distance};
 use crate::lane;
@@ -31,8 +31,9 @@ use crate::scenario::{
     CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, PhysicsMode, SpawnSpec, TiltrotorStart,
 };
 use crate::traffic::Signals;
-use crate::traffic_driver::{Elem, LaneIndex, lane_spawns};
+use crate::traffic_driver::{Elem, LaneIndex, lane_spawns, respawn_spot};
 use autonomousim_control::Command;
+use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{from_yaw, yaw};
 use autonomousim_core::rng::Seed;
@@ -188,6 +189,7 @@ impl WorldInstance {
         let mut goal_rng = es.child("goals").rng();
         let agent_seed = es.child("agent");
         let mut placed = Vec::with_capacity(self.agents.len());
+        let mut parked_bays = Vec::new();
         for g in &sc.groups {
             let spawn = &g.spec.spawn;
             let ground = g.ground(pick);
@@ -250,6 +252,26 @@ impl WorldInstance {
                 }
                 let n = p.len();
                 (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            } else if spawn.in_bays {
+                // Parked: centred in distinct random bays, facing along them.
+                let d = g.def.as_wheeled().expect("checked when compiled");
+                let geo = DriverGeometry::of(g);
+                let mid = 0.5 * (geo.front + geo.rear);
+                let all = &world.sites().bays;
+                let mut p = Vec::with_capacity(g.spec.count);
+                let mut rs = Vec::with_capacity(g.spec.count);
+                for _ in 0..g.spec.count {
+                    let free: Vec<usize> = (0..all.len()).filter(|k| !parked_bays.contains(k)).collect();
+                    let k = free[spawn_rng.below(free.len() as u64) as usize];
+                    parked_bays.push(k);
+                    let b = &all[k];
+                    let xy = b.point(DVec2::new(-mid, 0.0));
+                    let pose = ground_pose(world, d, &g.rest, xy, b.yaw);
+                    placed.push(pose.pos);
+                    p.push(pose.pos);
+                    rs.push(Some(RoadSpawn { position: pose.pos, yaw: b.yaw, route: None, walk: None }));
+                }
+                (p, rs)
             } else if spawn.on_road
                 && matches!(g.spec.driver, Some(DriverSpec::Traffic(_)))
                 && let Some(ls) =
@@ -404,7 +426,7 @@ impl WorldInstance {
                 match &mut agent.driver {
                     Some(Driver::Road(d)) => agent.route = d.reset(seed.child("driver"), world, walk),
                     Some(Driver::Traffic(d)) => d.reset(seed.child("driver"), world, &agent.vehicle.pose()),
-                    None => {}
+                    Some(Driver::Parked) | None => {}
                 }
                 let contact = g.def.contact_model(agent.vehicle.mass(), sc.dt());
                 self.shapes[id].set_contact(&contact.solid);
@@ -521,7 +543,9 @@ impl WorldInstance {
         if !self.agents.iter().any(|a| a.driver.is_some()) {
             return;
         }
+        self.respawn_traffic();
         let dt = f64::from(self.scenario.decimation) * self.scenario.dt();
+        let t = self.clock.time();
         let world = &*self.map;
         let traffic: Vec<(usize, Traffic)> = (self.shapes.iter().enumerate())
             .filter(|(_, s)| s.active)
@@ -543,7 +567,7 @@ impl WorldInstance {
                 let v = &a.vehicle;
                 if let Some(Driver::Traffic(d)) = &mut a.driver {
                     d.locate(world, &v.pose());
-                    d.occupy(lanes, index, i as u32, ground_speed(v));
+                    d.occupy(lanes, index, i as u32, &v.pose(), ground_speed(v));
                 } else {
                     let s = &self.shapes[i];
                     index.insert_other(world, i as u32, s.center, yaw(v.pose().rot), v.lin_vel_world(), s.radius);
@@ -561,12 +585,60 @@ impl WorldInstance {
                     d.drive(world, &mut a.route, &v.pose(), v.lin_vel_body().x, dt, &others)
                 }
                 Some(Driver::Traffic(d)) => {
-                    let index = self.lane_index.as_ref().expect("built above");
-                    d.drive(world, &v.pose(), ground_speed(v), dt, i as u32, index)
+                    let index = self.lane_index.as_mut().expect("built above");
+                    d.drive(world, &v.pose(), ground_speed(v), dt, i as u32, index, &self.signals, t)
                 }
+                Some(Driver::Parked) => GroundSetpoint::SpeedCurvature { speed: 0.0, curvature: 0.0 },
                 None => continue,
             };
             a.set_command(command);
+        }
+    }
+
+    /// Put back traffic drivers that want it (see [`traffic_driver`](crate::traffic_driver)):
+    /// at rest at a lane point away from the learning agents, drawn from the episode's
+    /// `respawn` stream by step and agent.
+    fn respawn_traffic(&mut self) {
+        let world = self.map.clone();
+        let (lo, hi) = world.extent();
+        let wanted: Vec<usize> = (0..self.agents.len())
+            .filter(|&i| {
+                let a = &self.agents[i];
+                let p = a.vehicle.position();
+                let off_map = p.x < lo.x || p.y < lo.y || p.x > hi.x || p.y > hi.y;
+                !a.disabled && matches!(&a.driver, Some(Driver::Traffic(d)) if d.wants_respawn() || off_map)
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let sc = self.scenario.clone();
+        let seed = self.episode_seed.child("respawn").child_index(self.steps);
+        for i in wanted {
+            let active = |j: usize| !self.agents[j].disabled && self.shapes[j].active && j != i;
+            let at = |j: usize| self.agents[j].vehicle.position().truncate();
+            let learners: Vec<DVec2> = (0..self.agents.len())
+                .filter(|&j| active(j) && sc.groups[self.agents[j].group].learning())
+                .map(at)
+                .collect();
+            let others: Vec<DVec2> = (0..self.agents.len()).filter(|&j| active(j)).map(at).collect();
+            let g = &sc.groups[self.agents[i].group];
+            let Some(Driver::Traffic(d)) = &self.agents[i].driver else { continue };
+            let clear = d.spec().respawn_clear;
+            let s = seed.child_index(i as u64);
+            let (Some(def), Some((xy, heading))) =
+                (g.def.as_wheeled(), respawn_spot(&world, &learners, &others, clear, &mut s.rng()))
+            else {
+                continue;
+            };
+            let pose = ground_pose(&world, def, &g.rest, xy, heading);
+            self.place_agent(i, pose, DVec3::ZERO, DVec3::ZERO);
+            let a = &mut self.agents[i];
+            if let Some(Driver::Traffic(d)) = &mut a.driver {
+                let n = d.respawns;
+                d.reset(s.child("driver"), &world, &a.vehicle.pose());
+                d.respawns = n + 1;
+            }
         }
     }
 
@@ -939,11 +1011,15 @@ impl WorldInstance {
                     for x in [elem, station, d.since_change, d.stuck, f64::from(d.changes)].iter().chain(&change) {
                         f(*x);
                     }
+                    let id = |x: Option<u32>| x.map_or(-1.0, f64::from);
+                    for x in [id(d.granted), id(d.stopped_at), d.waiting, d.standing, d.lost, f64::from(d.respawns)] {
+                        f(x);
+                    }
                     for c in &d.plan {
                         f(f64::from(*c));
                     }
                 }
-                None => {}
+                Some(Driver::Parked) | None => {}
             }
             for s in &a.sensors {
                 hash_sensor(s, &mut f);

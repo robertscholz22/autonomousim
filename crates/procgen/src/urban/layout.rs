@@ -501,9 +501,11 @@ fn clean_up(site: &Site, g: &mut Graph) {
         g.collapse_short(0.5 * s.min_length);
         g.connect_dead_ends(s.join_reach, s.join_cone_deg.to_radians(), min_angle, &ok);
         g.collapse_short(s.min_length);
+        g.collapse_close_junctions(s.junction_gap);
         g.fix_angles(min_angle);
         g.limit_degree(5);
         g.prune_spurs(s.spur);
+        g.trim_crowded_ends(s.dead_end_clearance);
     }
     g.keep_main_component();
 }

@@ -10,6 +10,7 @@ use autonomousim_core::terrain::Terrain;
 use autonomousim_world::{Area, Pad, StaticWorld};
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
+use std::f64::consts::FRAC_PI_4;
 
 /// Settings of `GoalKind::Rooftop`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,6 +52,8 @@ const STREET_COLUMN: [f64; 4] = [0.5, 2.0, 5.0, 10.0];
 /// Steepest ground (rise per metre) of a street start: sidewalks on steep streets tilt a
 /// multirotor on its gear until its frame touches.
 const STREET_SLOPE: f64 = 0.08;
+/// Radius (m) around a street start over which the ground must be that flat.
+const FOOTPRINT: f64 = 1.0;
 /// Tries for a street start per distance range.
 const STREET_TRIES: usize = 400;
 
@@ -118,6 +121,14 @@ fn street_start(world: &StaticWorld, p: DVec2, clearance: f64) -> Option<DVec3> 
     }
     let (ground, normal) = world.grid().height_normal(p.x, p.y);
     if normal.truncate().length() > STREET_SLOPE * normal.z {
+        return None;
+    }
+    // Flat under the whole vehicle too: a sidewalk can end at a bank.
+    let flat = (0..8).all(|k| {
+        let q = p + DVec2::from_angle(f64::from(k) * FRAC_PI_4) * FOOTPRINT;
+        (world.terrain().height(q.x, q.y) - ground).abs() <= STREET_SLOPE * FOOTPRINT + 0.02
+    });
+    if !flat {
         return None;
     }
     let clear = STREET_COLUMN.iter().all(|h| {

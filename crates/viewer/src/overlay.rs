@@ -245,7 +245,7 @@ fn draw_lanes(sim: &Sim, origin: &RenderOrigin, eye: DVec3, gizmos: &mut Gizmos)
         };
         gizmos.linestrip(strip(&c.line), color);
         for k in c.conflicts.iter().filter(|k| k.yields) {
-            let p = origin.pos(c.line.point_at(k.station) + lift);
+            let p = origin.pos(c.line.point_at(k.station + 0.5 * k.length) + lift);
             gizmos.cross(Isometry3d::from_translation(p), 0.4, CONFLICT);
         }
     }

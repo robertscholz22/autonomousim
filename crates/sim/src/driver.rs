@@ -45,6 +45,8 @@ pub enum DriverSpec {
     Road(RoadDriverSpec),
     /// Traffic on the lane graph (IDM, MOBIL; see [`traffic_driver`](crate::traffic_driver)).
     Traffic(TrafficDriverSpec),
+    /// Parked: standing still where it spawned (`spawn.in_bays`), for parked cars.
+    Parked,
 }
 
 impl DriverSpec {
@@ -52,6 +54,7 @@ impl DriverSpec {
         match self {
             DriverSpec::Road(_) => "road",
             DriverSpec::Traffic(_) => "traffic",
+            DriverSpec::Parked => "parked",
         }
     }
 
@@ -59,6 +62,7 @@ impl DriverSpec {
         match self {
             DriverSpec::Road(r) => r.validate(),
             DriverSpec::Traffic(t) => t.validate(),
+            DriverSpec::Parked => Ok(()),
         }
     }
 
@@ -67,6 +71,7 @@ impl DriverSpec {
         match self {
             DriverSpec::Road(r) => Driver::Road(Box::new(RoadDriver::new(r, DriverGeometry::of(group)))),
             DriverSpec::Traffic(t) => Driver::Traffic(Box::new(TrafficDriver::new(t, DriverGeometry::of(group)))),
+            DriverSpec::Parked => Driver::Parked,
         }
     }
 }
@@ -76,20 +81,21 @@ impl DriverSpec {
 pub enum Driver {
     Road(Box<RoadDriver>),
     Traffic(Box<TrafficDriver>),
+    Parked,
 }
 
 impl Driver {
     pub fn as_road(&self) -> Option<&RoadDriver> {
         match self {
             Driver::Road(d) => Some(d),
-            Driver::Traffic(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_traffic(&self) -> Option<&TrafficDriver> {
         match self {
             Driver::Traffic(d) => Some(d),
-            Driver::Road(_) => None,
+            _ => None,
         }
     }
 }

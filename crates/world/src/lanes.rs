@@ -19,6 +19,21 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_6, PI, TAU};
 /// Smallest turning radius (m) the connectors are built for (a car's, at the kerb).
 pub const MIN_TURN_RADIUS: f64 = 5.5;
 
+/// Distance (m) between two connector lines within which vehicles on them are in each other's
+/// way: their conflict zone (a car's width and a margin; less than the narrowest lane).
+pub const CONFLICT_GAP: f64 = 2.5;
+
+/// Lanes shorter than this (m) are cramped: vehicles through the connectors at their ends
+/// follow their lines less closely (the path bends sharply there), so those connectors'
+/// conflict zones reach [`CRAMPED_MARGIN`] m further.
+pub const CRAMPED: f64 = 5.0;
+
+/// See [`CRAMPED`].
+pub const CRAMPED_MARGIN: f64 = 1.0;
+
+/// Sampling step (m) of the conflict zones.
+const ZONE_STEP: f64 = 0.5;
+
 /// Turning radius (m) the junction setbacks leave room for, with a margin over
 /// [`MIN_TURN_RADIUS`] for the Bézier's deviation from an arc.
 const DESIGN_TURN_RADIUS: f64 = 6.5;
@@ -88,20 +103,39 @@ pub enum Turn {
 /// How two connectors meet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConflictKind {
+    /// The lines cross.
     Cross,
     /// Both lead into the same lane.
     Merge,
+    /// The lines pass closer than [`CONFLICT_GAP`] without crossing (such as opposing left
+    /// turns): drivers keep apart, but signals may let both go together.
+    Near,
+    /// Both leave the same lane: the zone is where they have not yet parted, and neither
+    /// gives way (the vehicle behind follows the one ahead).
+    Diverge,
 }
 
-/// Where a connector meets another one.
+impl ConflictKind {
+    /// Whether signals must keep the two connectors in different phases.
+    pub fn exclusive(self) -> bool {
+        matches!(self, Self::Cross | Self::Merge)
+    }
+}
+
+/// Where a connector meets another one: the stretches of both closer than [`CONFLICT_GAP`] to
+/// the other's line (for a merge, up to the common end).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Conflict {
     pub other: u32,
     pub kind: ConflictKind,
-    /// Stations of the conflict point along this connector and along the other one.
+    /// Station (m) where the zone starts along this connector, and its length there.
     pub station: f64,
+    pub length: f64,
+    /// The same along the other connector.
     pub other_station: f64,
-    /// Whether this connector must give way to the other one (exactly one of the two does).
+    pub other_length: f64,
+    /// Whether this connector must give way to the other one (exactly one of the two does,
+    /// except for a [`Diverge`](ConflictKind::Diverge), where neither does).
     pub yields: bool,
 }
 
@@ -271,7 +305,8 @@ fn right(h: f64) -> DVec2 {
 }
 
 /// `points` moved `offset` m to the right of their direction, without the loops an offset
-/// makes on the inside of a sharp bend (points that would run backwards are left out).
+/// makes on the inside of a sharp bend: points that would run backwards, and points before
+/// them that a later point lies behind, are left out (the ends always stay).
 fn offset_line(points: &[DVec3], offset: f64) -> Vec<DVec3> {
     let n = points.len();
     let moved: Vec<(DVec3, DVec2)> = (0..n)
@@ -282,21 +317,18 @@ fn offset_line(points: &[DVec3], offset: f64) -> Vec<DVec3> {
             ((points[i].truncate() + r * offset).extend(points[i].z), d)
         })
         .collect();
-    let mut out: Vec<DVec3> = vec![moved[0].0];
+    let mut out: Vec<(DVec3, DVec2)> = vec![moved[0]];
     for (i, &(p, d)) in moved.iter().enumerate().skip(1) {
-        let last = *out.last().expect("points");
-        let step = (p - last).truncate();
-        if (step.dot(d) > 1e-3 && step.length() > 0.05) || (i == n - 1 && out.len() == 1) {
-            out.push(p);
-        } else if i == n - 1 {
-            // Keep the true end point, dropping what lies beyond it.
-            while out.len() > 1 && (p - *out.last().expect("points")).truncate().dot(d) <= 1e-3 {
-                out.pop();
-            }
-            out.push(p);
+        let behind = |q: &(DVec3, DVec2)| (p - q.0).truncate().dot(q.1) <= 1e-3;
+        while out.len() > 1 && behind(out.last().expect("points")) {
+            out.pop();
+        }
+        let step = (p - out.last().expect("points").0).truncate();
+        if (step.dot(d) > 1e-3 && step.length() > 0.05) || i == n - 1 {
+            out.push((p, d));
         }
     }
-    out
+    out.into_iter().map(|(p, _)| p).collect()
 }
 
 /// A cubic Bézier from `p0` (heading `h0`) to `p3` (heading `h3`), sampled about every metre;
@@ -405,47 +437,57 @@ fn u_turn(p0: DVec3, h: f64, p3: DVec3, d: f64) -> (Vec<DVec3>, f64) {
     (out, reach)
 }
 
-/// Proper crossing of segments `p–q` and `a–b`: the parameters along both.
-fn intersect(p: DVec2, q: DVec2, a: DVec2, b: DVec2) -> Option<(f64, f64)> {
-    let (r, s) = (q - p, b - a);
-    let den = r.perp_dot(s);
-    if den.abs() < 1e-12 {
-        return None;
-    }
-    let t = (a - p).perp_dot(s) / den;
-    let u = (a - p).perp_dot(r) / den;
-    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some((t, u))
-}
-
-/// The first crossing of two polylines: the stations along both.
-fn first_crossing(a: &Polyline, b: &Polyline) -> Option<(f64, f64)> {
-    let (pa, pb) = (a.points(), b.points());
+/// The conflict zone of connectors `a` and `b`: the stations along `a` and along `b` (first,
+/// last) closer than [`CONFLICT_GAP`] (more for [`CRAMPED`] lanes) to the other line, if any.
+fn conflict_zone(lanes: &[Lane], a: &Connector, b: &Connector) -> Option<([f64; 2], [f64; 2])> {
+    let cramped = |c: &Connector| [c.from, c.to].iter().any(|&l| lanes[l as usize].line.length() < CRAMPED);
+    let g = CONFLICT_GAP + if cramped(a) || cramped(b) { CRAMPED_MARGIN } else { 0.0 };
+    let (a, b) = (&a.line, &b.line);
     let bbox = |p: &[DVec3]| {
         p.iter().fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), q| {
             (lo.min(q.truncate()), hi.max(q.truncate()))
         })
     };
-    let (la, ha) = bbox(pa);
-    let (lb, hb) = bbox(pb);
-    if la.x > hb.x || lb.x > ha.x || la.y > hb.y || lb.y > ha.y {
+    let (la, ha) = bbox(a.points());
+    let (lb, hb) = bbox(b.points());
+    if la.x > hb.x + g || lb.x > ha.x + g || la.y > hb.y + g || lb.y > ha.y + g {
         return None;
     }
-    let mut sa = 0.0;
-    for w in pa.windows(2) {
-        let (p, q) = (w[0].truncate(), w[1].truncate());
-        let len = p.distance(q);
-        let mut sb = 0.0;
-        for v in pb.windows(2) {
-            let (c, d) = (v[0].truncate(), v[1].truncate());
-            let lb = c.distance(d);
-            if let Some((t, u)) = intersect(p, q, c, d) {
-                return Some((sa + t * len, sb + u * lb));
+    // Samples of each line near the other, and where they project onto it: z[0] along `a`,
+    // z[1] along `b`.
+    let mut z = [[f64::INFINITY, f64::NEG_INFINITY]; 2];
+    for (x, y, k) in [(a, b, 0), (b, a, 1)] {
+        let n = (x.length() / ZONE_STEP).ceil().max(1.0) as usize;
+        for i in 0..=n {
+            let s = x.length() * i as f64 / n as f64;
+            let pr = y.project(x.point_at(s).truncate());
+            if pr.distance < g {
+                z[k] = [z[k][0].min(s), z[k][1].max(s)];
+                z[1 - k] = [z[1 - k][0].min(pr.station), z[1 - k][1].max(pr.station)];
             }
-            sb += lb;
         }
-        sa += len;
     }
-    None
+    let [za, zb] = z;
+    (za[0] <= za[1]).then_some((za, zb))
+}
+
+/// Whether two polylines cross.
+fn crosses(a: &Polyline, b: &Polyline) -> bool {
+    a.points().windows(2).any(|w| {
+        b.points().windows(2).any(|v| intersect(w[0].truncate(), w[1].truncate(), v[0].truncate(), v[1].truncate()))
+    })
+}
+
+/// Whether segments `p–q` and `a–b` cross.
+fn intersect(p: DVec2, q: DVec2, a: DVec2, b: DVec2) -> bool {
+    let (r, s) = (q - p, b - a);
+    let den = r.perp_dot(s);
+    if den.abs() < 1e-12 {
+        return false;
+    }
+    let t = (a - p).perp_dot(s) / den;
+    let u = (a - p).perp_dot(r) / den;
+    (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)
 }
 
 /// Maximum |curvature| of a polyline (three consecutive points).
@@ -527,20 +569,29 @@ impl LaneGraph {
                                 // Room for the lanes to turn into each other at the turning radius.
                                 let ho = heading_out(o, setbacks[o.road as usize][usize::from(!o.start)]);
                                 let turn = PI - wrap_angle(ho - he).abs();
-                                let reach = reach(&layouts[i]).max(reach(&layouts[o.road as usize]));
+                                // A lane of this road meets a lane of the other where their lines
+                                // cross, the other lane's offset out from the node; the arc's
+                                // tangent runs R·tan(turn/2) on from there.
+                                let lo = &layouts[o.road as usize];
                                 let radius = if turn < 5.0 * PI / 6.0 {
-                                    (DESIGN_TURN_RADIUS + reach) * (0.5 * turn).tan()
+                                    reach(lo) + DESIGN_TURN_RADIUS * (0.5 * turn).tan()
                                 } else {
                                     0.0
                                 } + 0.5;
-                                // Room to shift sideways between lanes at different offsets (an S
-                                // bend of shift d over length L curves at most 6·d/L²).
-                                let shift = spread(&layouts[i], &layouts[o.road as usize]);
-                                let radius = radius + 0.5 * (6.0 * shift * DESIGN_TURN_RADIUS).sqrt();
+                                // Straight on, room to shift sideways between lanes at different
+                                // offsets (an S bend of shift d over length L curves at most 6·d/L²,
+                                // half of L on each side).
+                                let radius = if n == 2 || turn < FRAC_PI_6 {
+                                    let shift = straight_shift(&layouts[i], e.in_dir(), lo, o.out_dir())
+                                        .max(straight_shift(lo, o.in_dir(), &layouts[i], e.out_dir()));
+                                    radius + 0.5 * (6.0 * shift * DESIGN_TURN_RADIUS).sqrt()
+                                } else {
+                                    radius
+                                };
                                 // Clear of the other roads' carriageways and sidewalks.
                                 let clear = if n > 2 {
-                                    let sin = wrap_angle(o.heading - e.heading).sin().abs().max(0.5);
-                                    claim(o.road as usize) / sin + 1.5
+                                    let phi = wrap_angle(o.heading - e.heading);
+                                    clear_of(claim(o.road as usize), 0.5 * roads[i].width, phi) + 1.5
                                 } else {
                                     1.0
                                 };
@@ -561,17 +612,28 @@ impl LaneGraph {
             setbacks = next;
         }
 
-        // Then more room wherever a connector still turns tighter than a car can.
+        // Then more room wherever a connector still turns tighter than a car can, as long as
+        // that helps (a connector's shape can be set by the other road's lanes alone).
         let mut pass = 0;
+        // Per connector: its curvature when last grown for.
+        let mut last: Vec<Option<f64>> = Vec::new();
         loop {
             let g = Self::assemble(nodes, roads, &layouts, &ends, setbacks.clone(), &ring);
             pass += 1;
             let mut grown = false;
+            let curvature: Vec<f64> = g.connectors.iter().map(|c| max_curvature(&c.line)).collect();
+            let mut grew = vec![None; curvature.len()];
             if pass < 6 {
-                for c in &g.connectors {
-                    if max_curvature(&c.line) <= 1.0 / MIN_TURN_RADIUS {
+                for (n, c) in g.connectors.iter().enumerate() {
+                    let k = curvature[n];
+                    // A dead end's bulb keeps its shape wherever the lanes end.
+                    if c.turn == Turn::UTurn
+                        || k <= 1.0 / MIN_TURN_RADIUS
+                        || last.get(n).copied().flatten().is_some_and(|l| k > l - 1e-3)
+                    {
                         continue;
                     }
+                    grew[n] = Some(k);
                     let (a, b) = (&g.lanes[c.from as usize], &g.lanes[c.to as usize]);
                     for (road, side) in [(a.road, usize::from(a.dir == 0)), (b.road, usize::from(b.dir == 1))] {
                         let i = road as usize;
@@ -586,6 +648,7 @@ impl LaneGraph {
                     }
                 }
             }
+            last = grew;
             if !grown {
                 return g.with_signals();
             }
@@ -693,6 +756,30 @@ impl LaneGraph {
             for e in list {
                 let ins = &lane_ids[e.road as usize][e.in_dir() as usize];
                 let n_in = ins.len();
+                // Without a way straight on, the left half of the lanes turns left and the
+                // right half right (all of them one way when the other has no exit), so that
+                // every lane leads somewhere.
+                let h_in = ins.first().map_or(0.0, |&l| {
+                    let l = &lanes[l as usize];
+                    l.line.heading_at(l.line.length())
+                });
+                let exits: Vec<Turn> = list
+                    .iter()
+                    .filter(|o| !(o.road == e.road && o.start == e.start))
+                    .filter_map(|o| {
+                        let outs = &lane_ids[o.road as usize][o.out_dir() as usize];
+                        let theta = wrap_angle(lanes[*outs.first()? as usize].line.heading_at(0.0) - h_in);
+                        Some(if list.len() == 2 || theta.abs() < FRAC_PI_6 {
+                            Turn::Straight
+                        } else if theta > 0.0 {
+                            Turn::Left
+                        } else {
+                            Turn::Right
+                        })
+                    })
+                    .collect();
+                let straight_on = exits.contains(&Turn::Straight);
+                let (lefts, rights) = (exits.contains(&Turn::Left), exits.contains(&Turn::Right));
                 for (i, &lin) in ins.iter().enumerate() {
                     let l = &lanes[lin as usize];
                     let p0 = *l.line.points().last().expect("points");
@@ -705,8 +792,8 @@ impl LaneGraph {
                         let same = o.road == e.road && o.start == e.start;
                         let m = outs.len();
                         let targets: Vec<(u32, Turn)> = if same {
-                            // Turning round only at dead ends, from and into the kerb lanes.
-                            if list.len() != 1 || i + 1 != n_in {
+                            // Turning round only at dead ends, into the kerb lane.
+                            if list.len() != 1 {
                                 continue;
                             }
                             vec![(outs[m - 1], Turn::UTurn)]
@@ -726,8 +813,14 @@ impl LaneGraph {
                             match turn {
                                 // Left turns from the leftmost lane, right turns from the rightmost
                                 // (single lanes do everything).
-                                Turn::Left if n_in == 1 || i == 0 => vec![(outs[0], turn)],
-                                Turn::Right if n_in == 1 || i + 1 == n_in => vec![(outs[m - 1], turn)],
+                                Turn::Left if n_in == 1 || i == 0 || !straight_on && (2 * i < n_in || !rights) => {
+                                    vec![(outs[0], turn)]
+                                }
+                                Turn::Right
+                                    if n_in == 1 || i + 1 == n_in || !straight_on && (2 * i >= n_in || !lefts) =>
+                                {
+                                    vec![(outs[m - 1], turn)]
+                                }
                                 Turn::Straight => {
                                     let mut t = vec![(outs[i.min(m - 1)], turn)];
                                     // Added lanes are fed from the rightmost lane.
@@ -769,39 +862,95 @@ impl LaneGraph {
                     }
                 }
             }
-            // Conflicts between connectors from different lanes.
+            // Conflicts between the junction's connectors.
             let ids: Vec<u32> = (first as u32..connectors.len() as u32).collect();
             for (x, &a) in ids.iter().enumerate() {
                 for &b in &ids[x + 1..] {
                     let (ca, cb) = (&connectors[a as usize], &connectors[b as usize]);
-                    if ca.from == cb.from {
-                        continue;
-                    }
-                    let found = if ca.to == cb.to {
-                        Some((ConflictKind::Merge, ca.line.length(), cb.line.length()))
+                    let Some((za, zb)) = conflict_zone(&lanes, ca, cb) else { continue };
+                    let ck = if ca.from == cb.from {
+                        ConflictKind::Diverge
+                    } else if ca.to == cb.to {
+                        ConflictKind::Merge
+                    } else if crosses(&ca.line, &cb.line) {
+                        ConflictKind::Cross
                     } else {
-                        first_crossing(&ca.line, &cb.line).map(|(sa, sb)| (ConflictKind::Cross, sa, sb))
+                        ConflictKind::Near
                     };
-                    let Some((ck, sa, sb)) = found else { continue };
                     let a_yields = yields(kind, roads, &lanes, ca, cb, a, b, &ring);
+                    let diverge = ck == ConflictKind::Diverge;
                     connectors[a as usize].conflicts.push(Conflict {
                         other: b,
                         kind: ck,
-                        station: sa,
-                        other_station: sb,
-                        yields: a_yields,
+                        station: za[0],
+                        length: za[1] - za[0],
+                        other_station: zb[0],
+                        other_length: zb[1] - zb[0],
+                        yields: a_yields && !diverge,
                     });
                     connectors[b as usize].conflicts.push(Conflict {
                         other: a,
                         kind: ck,
-                        station: sb,
-                        other_station: sa,
-                        yields: !a_yields,
+                        station: zb[0],
+                        length: zb[1] - zb[0],
+                        other_station: za[0],
+                        other_length: za[1] - za[0],
+                        yields: !a_yields && !diverge,
                     });
                 }
             }
             let radius = list.iter().map(|e| setbacks[e.road as usize][usize::from(!e.start)]).fold(0.0, f64::max);
             junctions.push(Junction { node: n as u32, kind, radius, approaches, connectors: ids });
+        }
+        // Conflicts between connectors of different junctions (close ones joined by short
+        // lanes), given way as at an uncontrolled junction.
+        let bbox = |c: &Connector| {
+            c.line
+                .points()
+                .iter()
+                .fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), q| {
+                    (lo.min(q.truncate()), hi.max(q.truncate()))
+                })
+        };
+        let boxes: Vec<(DVec2, DVec2)> = connectors.iter().map(bbox).collect();
+        for a in 0..connectors.len() {
+            for b in a + 1..connectors.len() {
+                let (ca, cb) = (&connectors[a], &connectors[b]);
+                let ((la, ha), (lb, hb)) = (boxes[a], boxes[b]);
+                let g = CONFLICT_GAP + CRAMPED_MARGIN;
+                if ca.node == cb.node
+                    || ca.to == cb.from
+                    || cb.to == ca.from
+                    || la.x > hb.x + g
+                    || lb.x > ha.x + g
+                    || la.y > hb.y + g
+                    || lb.y > ha.y + g
+                {
+                    continue;
+                }
+                let Some((za, zb)) = conflict_zone(&lanes, ca, cb) else { continue };
+                let ck = if crosses(&ca.line, &cb.line) { ConflictKind::Cross } else { ConflictKind::Near };
+                let (a, b) = (a as u32, b as u32);
+                let a_yields = yields(JunctionKind::Uncontrolled, roads, &lanes, ca, cb, a, b, &ring);
+                connectors[a as usize].conflicts.push(Conflict {
+                    other: b,
+                    kind: ck,
+                    station: za[0],
+                    length: za[1] - za[0],
+                    other_station: zb[0],
+                    other_length: zb[1] - zb[0],
+                    yields: a_yields,
+                });
+                connectors[b as usize].conflicts.push(Conflict {
+                    other: a,
+                    kind: ck,
+                    station: zb[0],
+                    length: zb[1] - zb[0],
+                    other_station: za[0],
+                    other_length: za[1] - za[0],
+                    yields: !a_yields,
+                });
+            }
         }
         for (c, conn) in connectors.iter().enumerate() {
             lanes[conn.from as usize].successors.push(c as u32);
@@ -834,6 +983,12 @@ impl LaneGraph {
     /// One per node of the network.
     pub fn junctions(&self) -> &[Junction] {
         &self.junctions
+    }
+
+    /// What traffic in `lane` must do at its end before entering the junction there.
+    pub fn control(&self, lane: u32) -> Control {
+        let j = &self.junctions[self.lanes[lane as usize].to_node as usize];
+        j.approaches.iter().find(|a| a.lanes.contains(&lane)).map_or(Control::None, |a| a.control)
     }
 
     /// Setbacks (m) of the lanes from the start and the end of road `i`.
@@ -1110,11 +1265,44 @@ fn reach(layout: &[(u8, u8, f64, f64)]) -> f64 {
     layout.iter().map(|l| l.2.abs()).fold(0.0, f64::max)
 }
 
-/// Largest sideways distance between a lane of one road and a lane of another (each lane
-/// seen from its own direction of travel, which is how connectors join them).
-fn spread(a: &[(u8, u8, f64, f64)], b: &[(u8, u8, f64, f64)]) -> f64 {
-    let (lo, hi) = a.iter().chain(b).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), l| (lo.min(l.2), hi.max(l.2)));
-    if lo.is_finite() { hi - lo } else { 0.0 }
+/// How far out along a road the edges of its carriageway (`half` m either side of its centre
+/// line) stay within `claim` m of another road leaving the same node at `phi` rad from it
+/// (the other road's strip starts at the node, so a road carrying straight on needs no room).
+fn clear_of(claim: f64, half: f64, phi: f64) -> f64 {
+    let (sin, cos) = phi.sin_cos();
+    // Nearly parallel roads leaving together: as if they parted at 30°.
+    let sin = if cos > 0.0 { sin.signum() * sin.abs().max(0.5) } else { sin };
+    let mut out = 0.0f64;
+    for y in [-half, half] {
+        // Within the strip sideways ...
+        let mut x = if sin.abs() < 1e-9 { f64::NEG_INFINITY } else { y * cos / sin + claim / sin.abs() };
+        // ... and ahead of the node along the other road.
+        if cos < 0.0 {
+            x = x.min(-y * sin / cos);
+        }
+        out = out.max(x);
+    }
+    out
+}
+
+/// Largest sideways shift of a straight-on connector from the lanes of `a` in direction
+/// `din` to those of `b` in direction `dout` (each lane seen from its own direction of
+/// travel): lane i into lane i, the rightmost also into any lanes added.
+fn straight_shift(a: &[(u8, u8, f64, f64)], din: u8, b: &[(u8, u8, f64, f64)], dout: u8) -> f64 {
+    let ins: Vec<f64> = a.iter().filter(|l| l.0 == din).map(|l| l.2).collect();
+    let outs: Vec<f64> = b.iter().filter(|l| l.0 == dout).map(|l| l.2).collect();
+    let (n, m) = (ins.len(), outs.len());
+    if n == 0 || m == 0 {
+        return 0.0;
+    }
+    let mut shift = 0.0f64;
+    for (i, x) in ins.iter().enumerate() {
+        shift = shift.max((x - outs[i.min(m - 1)]).abs());
+    }
+    for y in &outs[n.min(m)..] {
+        shift = shift.max((ins[n - 1] - y).abs());
+    }
+    shift
 }
 
 /// Offsets of the rightmost lanes arriving (`din`) and leaving (`dout`).
@@ -1359,7 +1547,7 @@ mod tests {
                     })
                     .collect();
                 for &a in &go {
-                    for e in &g.connectors()[a as usize].conflicts {
+                    for e in g.connectors()[a as usize].conflicts.iter().filter(|e| e.kind.exclusive()) {
                         assert!(!go.contains(&e.other), "junction {}: {a} and {} at {t}", j.node, e.other);
                     }
                 }

@@ -167,7 +167,7 @@ fn signals(w: &StaticWorld, label: &str) {
             let t = s as f64 * 0.25;
             let go: Vec<u32> = j.connectors.iter().copied().filter(|&c| ctl.light(phase(c), t) != Light::Red).collect();
             for &a in &go {
-                for e in &g.connectors()[a as usize].conflicts {
+                for e in g.connectors()[a as usize].conflicts.iter().filter(|e| e.kind.exclusive()) {
                     assert!(!go.contains(&e.other), "{label}: junction {}: {a} and {} at {t}", j.node, e.other);
                 }
             }

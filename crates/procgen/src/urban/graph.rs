@@ -327,6 +327,16 @@ impl Graph {
     /// Merge the ends of edges shorter than `min` (the lower id into... the node that is
     /// fixed or has the higher degree keeps its place). Returns the number of merges.
     pub fn collapse_short(&mut self, min: f64) -> usize {
+        self.collapse(min, false)
+    }
+
+    /// Merge junctions (three or more edges) joined by an edge shorter than `min`, as
+    /// [`Self::collapse_short`]: closer junctions leave no room for the lanes between them.
+    pub fn collapse_close_junctions(&mut self, min: f64) -> usize {
+        self.collapse(min, true)
+    }
+
+    fn collapse(&mut self, min: f64, junctions: bool) -> usize {
         let mut merges = 0;
         loop {
             let mut changed = false;
@@ -335,6 +345,9 @@ impl Graph {
                     continue;
                 }
                 let (a, b) = (self.edges[e as usize].a, self.edges[e as usize].b);
+                if junctions && (self.degree(a) < 3 || self.degree(b) < 3) {
+                    continue;
+                }
                 let (na, nb) = (&self.nodes[a as usize], &self.nodes[b as usize]);
                 if na.fixed && nb.fixed {
                     continue;
@@ -464,14 +477,15 @@ impl Graph {
         }
     }
 
-    /// Remove dead-end chains shorter than `min` (except from fixed nodes and cul-de-sacs).
+    /// Remove dead-end chains shorter than `min` (except from cul-de-sacs; also those ending
+    /// at the map's edge, whose turning space would lie on the junction).
     pub fn prune_spurs(&mut self, min: f64) -> usize {
         let mut removed = 0;
         loop {
             let mut changed = false;
             for n in 0..self.nodes.len() as NodeId {
                 let node = &self.nodes[n as usize];
-                if node.edges.len() != 1 || node.fixed || node.cul_de_sac {
+                if node.edges.len() != 1 || node.cul_de_sac {
                     continue;
                 }
                 let (edges, len, _) = self.spur(n);
@@ -479,6 +493,32 @@ impl Graph {
                     for e in edges {
                         self.remove_edge(e);
                     }
+                    removed += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return removed;
+            }
+        }
+    }
+
+    /// Cut back dead ends (cul-de-sacs and the map's edge included) lying within `clear` m of
+    /// another edge, one edge at a time, until they are clear (the turning space of a U-turn
+    /// would reach the other street). Returns the edges removed.
+    pub fn trim_crowded_ends(&mut self, clear: f64) -> usize {
+        let mut removed = 0;
+        loop {
+            let mut changed = false;
+            for n in 0..self.nodes.len() as NodeId {
+                let node = &self.nodes[n as usize];
+                if node.edges.len() != 1 {
+                    continue;
+                }
+                let e = node.edges[0];
+                let other = self.other(e, n);
+                if self.edge_near(node.p, clear, &[n, other]).is_some() {
+                    self.remove_edge(e);
                     removed += 1;
                     changed = true;
                 }

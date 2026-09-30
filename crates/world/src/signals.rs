@@ -4,7 +4,9 @@
 //! approaches are paired into groups of opposing approaches, and each group gets a main phase of
 //! the movements that cross nothing else in it (straight and right first, then left), followed
 //! by protected phases for what remains (the left turns across oncoming traffic). No two
-//! connectors that conflict (cross or merge) are ever green in the same phase.
+//! connectors that conflict (cross or merge; see
+//! [`ConflictKind::exclusive`](crate::lanes::ConflictKind::exclusive)) are ever green in
+//! the same phase.
 //!
 //! Phases run in turn: green, amber, then all red. The state is a pure function of the time
 //! into the cycle; the simulation adds a per-episode offset per controller.
@@ -89,15 +91,19 @@ impl Controller {
 
     /// The light of phase `k` at time `t` (s).
     pub fn light(&self, k: usize, t: f64) -> Light {
+        self.light_left(k, t).0
+    }
+
+    /// The light of phase `k` at time `t` (s) and how long it stays so (s).
+    pub fn light_left(&self, k: usize, t: f64) -> (Light, f64) {
         let (a, u) = self.active(t);
-        if a != k {
-            Light::Red
-        } else if u < self.phases[k].green {
-            Light::Green
-        } else if u < self.phases[k].green + self.amber {
-            Light::Amber
+        let green = self.phases[k].green;
+        if a == k && u < green {
+            (Light::Green, green - u)
+        } else if a == k && u < green + self.amber {
+            (Light::Amber, green + self.amber - u)
         } else {
-            Light::Red
+            (Light::Red, (self.start(k) - t).rem_euclid(self.cycle()))
         }
     }
 }
@@ -160,7 +166,8 @@ pub(crate) fn build(
         let width = |g: &Vec<usize>| g.iter().map(|&a| junction.approaches[a].lanes.len()).max().unwrap_or(0);
         groups.sort_by(|g, h| width(h).cmp(&width(g)).then(g.cmp(h)));
 
-        let conflicts = |a: u32, b: u32| connectors[a as usize].conflicts.iter().any(|c| c.other == b);
+        let conflicts =
+            |a: u32, b: u32| connectors[a as usize].conflicts.iter().any(|c| c.other == b && c.kind.exclusive());
         let order = |t: Turn| match t {
             Turn::Straight | Turn::Right => 0,
             Turn::Left => 1,

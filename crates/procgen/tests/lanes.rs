@@ -4,7 +4,7 @@
 use autonomousim_core::rng::Seed;
 use autonomousim_procgen::rural::{self, RuralPreset};
 use autonomousim_procgen::urban::{self, UrbanPreset};
-use autonomousim_world::lanes::{ConflictKind, LaneGraph, MIN_TURN_RADIUS, RouteStep, max_curvature};
+use autonomousim_world::lanes::{ConflictKind, LaneGraph, MIN_TURN_RADIUS, RouteStep, Turn, max_curvature};
 use autonomousim_world::{JunctionKind, RoadNetwork};
 
 /// Lanes reachable from lane 0 forwards and backwards, over connectors and lane changes.
@@ -61,6 +61,21 @@ fn check(roads: &RoadNetwork, seed: u64, label: &str) {
         let seen = reach(g, forward);
         let missing: Vec<usize> = (0..seen.len()).filter(|&i| !seen[i]).collect();
         assert!(missing.is_empty(), "{label}: lanes {missing:?} not reachable (forward {forward})");
+    }
+    // Every lane leads somewhere (no lane change needed at its end).
+    let ends: Vec<usize> = (0..g.lanes().len()).filter(|&i| g.lanes()[i].successors.is_empty()).collect();
+    assert!(ends.is_empty(), "{label}: lanes {ends:?} lead nowhere");
+    // U-turns keep their turning space off other roads' lanes.
+    for (c, k) in g.connectors().iter().enumerate().filter(|(_, k)| k.turn == Turn::UTurn) {
+        let road = g.lanes()[k.from as usize].road;
+        for (i, l) in g.lanes().iter().enumerate().filter(|(_, l)| l.road != road) {
+            let mut s = 0.0;
+            while s <= k.line.length() {
+                let d = l.line.project(k.line.point_at(s).truncate()).distance;
+                assert!(d >= 5.0, "{label}: U-turn {c} comes {d:.2} m from lane {i} of another road");
+                s += 1.0;
+            }
+        }
     }
     // Connector curvature within a car's turning circle, wherever the roads leave room for
     // it (on roads too short for both junctions the lanes shrink to a metre and the turns

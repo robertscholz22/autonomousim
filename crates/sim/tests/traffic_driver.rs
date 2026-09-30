@@ -1,6 +1,7 @@
-//! The `traffic` driver (M8b step 2): IDM car following on a ring road (stop-and-go waves as
-//! in Sugiyama et al. 2008, the equilibrium gaps), MOBIL lane changes, and a long run of
-//! multi-lane traffic without collisions.
+//! The `traffic` driver (M8b steps 2 and 3): IDM car following on a ring road (stop-and-go
+//! waves as in Sugiyama et al. 2008, the equilibrium gaps), MOBIL lane changes, a long run of
+//! multi-lane traffic without collisions, and traffic with parked cars on urban maps
+//! (junction rules: no collisions, no red lights crossed, no lasting gridlock).
 
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::yaw;
@@ -277,4 +278,180 @@ fn traffic_drives_through_an_urban_map() {
     for i in 0..20 {
         assert!(speed(&w, i) > 0.1 || traffic(&w, i).stuck < 10.0, "car {i} stuck");
     }
+}
+
+/// What `urban_traffic` saw.
+#[derive(Debug, Default)]
+struct UrbanStats {
+    crashes: usize,
+    red_lights: usize,
+    respawns: u32,
+    /// Longest time a moving NPC stood still (s).
+    longest_stand: f64,
+    /// Mean speed of the moving NPCs in each 5-minute window (m/s).
+    window_speeds: Vec<f64>,
+    /// Entries into junctions of each kind (`JunctionKind` order), and the kinds on the map.
+    entries: [usize; 7],
+    kinds: [bool; 7],
+    /// Largest distance a parked car moved (m).
+    parked_moved: f64,
+}
+
+/// `n` kinematic traffic NPCs and `parked` parked cars on urban training map `seed` for
+/// `minutes`; prints the first few crashes.
+/// `n` traffic NPCs and `parked` parked cars on urban training map `seed`.
+fn urban_toml(seed: u64, n: usize, parked: usize) -> String {
+    format!(
+        r#"
+        physics_hz = 200
+        policy_hz = 25
+        map = {{ type = "urban", seed = {seed}, count = 1 }}
+        [[groups]]
+        name = "npc"
+        count = {n}
+        vehicle = "sedan_like"
+        physics = "kinematic"
+        driver = {{ type = "traffic" }}
+        spawn = {{ on_ground = true, on_road = true, min_separation = 20.0 }}
+        disable_on_terminal = false
+        [[groups]]
+        name = "parked"
+        count = {parked}
+        vehicle = "sedan_like"
+        physics = "kinematic"
+        driver = {{ type = "parked" }}
+        spawn = {{ on_ground = true, in_bays = true }}
+        disable_on_terminal = false
+        "#
+    )
+}
+
+fn urban_traffic(seed: u64, n: usize, parked: usize, minutes: f64) -> UrbanStats {
+    let mut w = WorldInstance::new(compile(&urban_toml(seed, n, parked)), Seed::from_u64(seed));
+    let g = w.map().roads().lanes().clone();
+    let kind = |c: u32| g.junctions()[g.connectors()[c as usize].node as usize].kind as usize;
+    let mut st = UrbanStats::default();
+    for c in 0..g.connectors().len() as u32 {
+        st.kinds[kind(c)] = true;
+    }
+    let parked_at: Vec<DVec3> = (n..n + parked).map(|i| w.agent(i).vehicle.position()).collect();
+    let mut stand = vec![0.0f64; n];
+    let mut last = vec![None; n];
+    let steps = (25.0 * 60.0 * minutes) as usize;
+    let window = 25 * 300;
+    let mut speed_sum = 0.0;
+    for step in 1..=steps {
+        w.step();
+        for i in 0..n + parked {
+            let e = w.agent(i).events;
+            if e.contains(Events::CRASH_AGENT) {
+                st.crashes += 1;
+                if st.crashes <= 4 {
+                    let d = w.agent(i).driver.as_ref().and_then(Driver::as_traffic);
+                    eprintln!(
+                        "crash at step {}: car {i} at {:.1?} place {:?}",
+                        w.steps(),
+                        w.agent(i).vehicle.position().truncate(),
+                        d.and_then(|d| d.place)
+                    );
+                }
+            }
+            if i >= n {
+                continue;
+            }
+            if e.contains(Events::RED_LIGHT) {
+                st.red_lights += 1;
+                if st.red_lights <= 4 {
+                    let d = traffic(&w, i);
+                    let lights: Vec<_> = d.plan.iter().map(|&c| (c, w.signals().light_left(&g, c, w.time()))).collect();
+                    eprintln!(
+                        "red light at step {}: car {i} v {:.2} place {:?} plan {lights:?} granted {:?} waiting {:.1}",
+                        w.steps(),
+                        speed(&w, i),
+                        d.place,
+                        d.granted,
+                        d.waiting
+                    );
+                }
+            }
+            let v = speed(&w, i);
+            speed_sum += v;
+            stand[i] = if v < 0.5 { stand[i] + 0.04 } else { 0.0 };
+            st.longest_stand = st.longest_stand.max(stand[i]);
+            let elem = traffic(&w, i).place.map(|p| p.elem);
+            if let (Some(Elem::Lane(_)), Some(Elem::Connector(c))) = (last[i], elem) {
+                st.entries[kind(c)] += 1;
+            }
+            last[i] = elem;
+        }
+        if step % window == 0 {
+            st.window_speeds.push(speed_sum / (window * n) as f64);
+            speed_sum = 0.0;
+        }
+    }
+    st.respawns = (0..n).map(|i| traffic(&w, i).respawns).sum();
+    st.parked_moved = (0..parked).map(|k| w.agent(n + k).vehicle.position().distance(parked_at[k])).fold(0.0, f64::max);
+    st
+}
+
+/// The step 3 acceptance checks on `st` of `minutes` of 50 NPCs.
+fn check_urban(seed: u64, st: &UrbanStats, minutes: f64) {
+    eprintln!("seed {seed}: {st:?}");
+    assert_eq!(st.crashes, 0, "seed {seed}: NPC collisions");
+    assert_eq!(st.red_lights, 0, "seed {seed}: red lights crossed");
+    // Gridlocks are rare and broken by respawning (after 120 s standing).
+    assert!(f64::from(st.respawns) <= 2.0 + 0.3 * minutes, "seed {seed}: {} respawns", st.respawns);
+    assert!(st.parked_moved < 0.05, "seed {seed}: a parked car moved {} m", st.parked_moved);
+    // Stable flow: no window much slower than the first.
+    let first = st.window_speeds[0];
+    assert!(st.window_speeds.iter().all(|&v| v > 0.6 * first), "seed {seed}: speeds {:?}", st.window_speeds);
+    // Every kind of junction on the map keeps flowing (entries at signals, stop and yield
+    // signs, roundabouts, uncontrolled junctions, through and dead ends).
+    for k in 0..7 {
+        assert!(!st.kinds[k] || st.entries[k] > 0, "seed {seed}: no entries into junctions of kind {k}");
+    }
+}
+
+#[test]
+fn urban_traffic_keeps_the_rules() {
+    for seed in [1, 2] {
+        let st = urban_traffic(seed, 50, 20, 5.0);
+        check_urban(seed, &st, 5.0);
+    }
+}
+
+/// The step 3 acceptance run: 30 minutes on each of the first eight training maps
+/// (about 10 min of CPU in release).
+#[test]
+#[ignore]
+fn urban_traffic_for_half_an_hour() {
+    for seed in 1..=8 {
+        let st = urban_traffic(seed, 50, 20, 30.0);
+        check_urban(seed, &st, 30.0);
+    }
+}
+
+#[test]
+fn parked_cars_need_bays() {
+    let parked = |spawn: &str, map: &str| {
+        let toml = format!(
+            r#"
+            map = {map}
+            [[groups]]
+            name = "parked"
+            count = 3
+            vehicle = "sedan_like"
+            physics = "kinematic"
+            driver = {{ type = "parked" }}
+            spawn = {spawn}
+            "#
+        );
+        Scenario::from_toml(&toml).unwrap().compile().map(|_| ())
+    };
+    let urban = r#"{ type = "urban", seed = 1, count = 1 }"#;
+    let ring = r#"{ type = "testworld", kind = "ring", radius = 60.0, lanes = [1, 1], class = "local" }"#;
+    assert!(parked("{ on_ground = true, in_bays = true }", urban).is_ok());
+    // On the road, or on a map without bays (wheeled vehicles are always on the ground).
+    assert!(parked("{ on_ground = true, on_road = true }", urban).is_err());
+    assert!(parked("{ on_ground = true, in_bays = true }", ring).is_err());
 }
