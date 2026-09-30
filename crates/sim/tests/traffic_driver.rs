@@ -297,8 +297,6 @@ struct UrbanStats {
     parked_moved: f64,
 }
 
-/// `n` kinematic traffic NPCs and `parked` parked cars on urban training map `seed` for
-/// `minutes`; prints the first few crashes.
 /// `n` traffic NPCs and `parked` parked cars on urban training map `seed`.
 fn urban_toml(seed: u64, n: usize, parked: usize) -> String {
     format!(
@@ -326,6 +324,8 @@ fn urban_toml(seed: u64, n: usize, parked: usize) -> String {
     )
 }
 
+/// `n` kinematic traffic NPCs and `parked` parked cars on urban training map `seed` for
+/// `minutes`; prints the first few crashes.
 fn urban_traffic(seed: u64, n: usize, parked: usize, minutes: f64) -> UrbanStats {
     let mut w = WorldInstance::new(compile(&urban_toml(seed, n, parked)), Seed::from_u64(seed));
     let g = w.map().roads().lanes().clone();

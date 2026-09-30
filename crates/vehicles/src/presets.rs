@@ -14,6 +14,7 @@ const PRESETS: &[(&str, &str)] = &[
     ("tracked_apc", include_str!("../../../assets/vehicles/tracked_apc.toml")),
     ("truck_6x4", include_str!("../../../assets/vehicles/truck_6x4.toml")),
     ("truck_8x8", include_str!("../../../assets/vehicles/truck_8x8.toml")),
+    ("bus_city", include_str!("../../../assets/vehicles/bus_city.toml")),
     ("farm_tractor", include_str!("../../../assets/vehicles/farm_tractor.toml")),
     ("bicycle_benchmark", include_str!("../../../assets/vehicles/bicycle_benchmark.toml")),
     ("bicycle_city", include_str!("../../../assets/vehicles/bicycle_city.toml")),

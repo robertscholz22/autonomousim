@@ -1,0 +1,110 @@
+# 12 m two-axle low-floor city bus (rigid, rear-engined layout, dual tyres on the driven rear
+# axle): a generic vehicle for NPC bus lines.
+type = "wheeled"
+name = "bus_city"
+source = """
+Estimates for a generic 12 m city bus (typical published dimensions: 12.0 m long, 2.55 m wide, \
+5.9 m wheelbase, 2.7 m front and 3.4 m rear overhang, a 21 m turning circle, about 14 t in \
+service): mass and inertia of a uniform box of that size, air suspension at about 1.2 Hz, a \
+six-speed automatic with typical city-bus ratios. Tyres, engine maps and brakes are the Kraz \
+truck's (truck_6x4, from Project Chrono, BSD-3-Clause, Copyright (c) 2014 projectchrono.org); \
+the ground is ≈ 0.53 m below the frame origin, as there."""
+
+[chassis]
+mass = 12500.0
+com = [-3.4, 0.0, 0.9]
+inertia = [19400.0, 153000.0, 150500.0]
+drag_area = [4.6, 20.0, 25.0]
+
+[steering]
+max_angle = 0.66                        # 38°: a 21 m kerb-to-kerb turning circle
+rate = 0.5
+ackermann = 0.5
+
+[[axles]]
+name = "front"
+position = [0.0, 1.05, -0.01657]
+steer = 1.0
+wheel = { mass = 98.6, inertia = [6.704, 12.174, 6.704] }
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 12000.0, delay = 0.1, time_constant = 0.15 }
+
+[axles.suspension]
+carrier_mass = 300.0
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 150000.0 }            # air springs
+damper = { bump = 25000.0, rebound = 25000.0 }
+anti_roll = 150000.0
+bump_stop = { travel = 0.08, stiffness = 2.5e6 }
+rebound_stop = { travel = -0.08, stiffness = 2.5e6 }
+
+[[axles]]
+name = "rear"
+position = [-5.9, 0.9, -0.04571]
+dual = 0.33528
+wheel = { mass = 197.2, inertia = [18.95, 23.948, 18.95] }
+tire = { tir = { file = "Truck_Pac02Tire" } }
+brake = { max_torque = 16000.0, parking_torque = 16000.0, delay = 0.1, time_constant = 0.15 }
+
+[axles.suspension]
+carrier_mass = 400.0
+carrier_inertia = [20.0, 5.0, 20.0]
+spring = { rate = 210000.0 }
+damper = { bump = 35000.0, rebound = 35000.0 }
+anti_roll = 200000.0
+bump_stop = { travel = 0.08, stiffness = 2.5e6 }
+rebound_stop = { travel = -0.08, stiffness = 2.5e6 }
+
+[powertrain]
+type = "combustion"
+driven = [1]
+final_drive = 0.1818                    # 1:5.5
+driveline_inertia = 40.0
+axle_differential = "open"
+
+[powertrain.engine]
+max_rpm = 2700.0
+full_throttle = [[-100, 645.4], [500, 634.8], [1000, 793.5], [1200, 907.8], [1400, 1053.8],
+    [1600, 1131.5], [1800, 1163.3], [2000, 1150.6], [2100, 1137.9], [2200, 1122.0], [2300, 1082.3],
+    [2400, -1269.6], [2500, -430.4]]
+zero_throttle = [[-100, 0], [800, -20], [1000, -20], [1200, -30], [1400, -30], [1600, -30],
+    [1800, -40], [2000, -50], [2200, -70], [2400, -100], [2700, -800]]
+
+[powertrain.gearbox]
+forward = [0.2976, 0.5236, 0.7042, 1.0, 1.25, 1.389]
+reverse = -0.2976
+shift = [[1000, 2200], [1000, 2200], [1000, 2200], [1000, 2200], [1000, 2200], [1000, 2700]]
+
+# The body: spheres along the centre line from the front bumper (x = 2.7) to the rear
+# (x = −9.3), 0.25–2.65 m above the ground.
+[[colliders]]
+center = [1.5, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [0.1, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [-1.3, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [-2.7, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [-4.1, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [-5.5, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [-6.9, 0.0, 0.9]
+radius = 1.2
+
+[[colliders]]
+center = [-8.1, 0.0, 0.9]
+radius = 1.2

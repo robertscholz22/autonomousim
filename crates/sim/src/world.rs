@@ -31,7 +31,7 @@ use crate::scenario::{
     CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, PhysicsMode, SpawnSpec, TiltrotorStart,
 };
 use crate::traffic::Signals;
-use crate::traffic_driver::{Elem, LaneIndex, lane_spawns, respawn_spot};
+use crate::traffic_driver::{Elem, LaneIndex, Network, Sweeps, lane_spawns, respawn_spot};
 use autonomousim_control::Command;
 use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_core::math::Pose;
@@ -190,6 +190,7 @@ impl WorldInstance {
         let agent_seed = es.child("agent");
         let mut placed = Vec::with_capacity(self.agents.len());
         let mut parked_bays = Vec::new();
+        let mut long = Vec::new();
         for g in &sc.groups {
             let spawn = &g.spec.spawn;
             let ground = g.ground(pick);
@@ -198,6 +199,14 @@ impl WorldInstance {
             // terrain on roads and at route goals.
             let lift = ground.map_or(g.bottom, |gs| gs.ride);
             let bay_goals = g.spec.goals.kind == GoalKind::Bay;
+            // Long traffic vehicles keep to the network they can drive on this map.
+            let network = match g.spec.driver {
+                Some(DriverSpec::Traffic(_)) => Network::of_long(world.roads().lanes(), DriverGeometry::of(g)),
+                _ => None,
+            };
+            if let Some(n) = &network {
+                long.push((n.clone(), DriverGeometry::of(g)));
+            }
             let mut bays = Vec::new();
             let mut trips = Vec::new();
             let (positions, mut road_spawns) = if bay_goals {
@@ -274,8 +283,16 @@ impl WorldInstance {
                 (p, rs)
             } else if spawn.on_road
                 && matches!(g.spec.driver, Some(DriverSpec::Traffic(_)))
-                && let Some(ls) =
-                    lane_spawns(world, g.spec.count, spawn.min_separation, lift, &mut placed, &mut spawn_rng)
+                && let Some(ls) = lane_spawns(
+                    world,
+                    g.spec.count,
+                    -DriverGeometry::of(g).rear,
+                    network.as_ref().map(|n| n.lanes.as_slice()),
+                    spawn.min_separation,
+                    lift,
+                    &mut placed,
+                    &mut spawn_rng,
+                )
             {
                 let rs = ls.into_iter().map(|(position, yaw)| RoadSpawn { position, yaw, route: None, walk: None });
                 let rs: Vec<RoadSpawn> = rs.collect();
@@ -425,13 +442,23 @@ impl WorldInstance {
                 agent.follow_leg();
                 match &mut agent.driver {
                     Some(Driver::Road(d)) => agent.route = d.reset(seed.child("driver"), world, walk),
-                    Some(Driver::Traffic(d)) => d.reset(seed.child("driver"), world, &agent.vehicle.pose()),
+                    Some(Driver::Traffic(d)) => {
+                        d.set_network(network.clone());
+                        d.reset(seed.child("driver"), world, &agent.vehicle.pose());
+                    }
                     Some(Driver::Parked) | None => {}
                 }
                 let contact = g.def.contact_model(agent.vehicle.mass(), sc.dt());
                 self.shapes[id].set_contact(&contact.solid);
                 agent.update_shape(&mut self.shapes[id]);
             }
+        }
+        // Stop lines set back clear of the long vehicles' sweeps.
+        if sc.groups.iter().any(|g| matches!(g.spec.driver, Some(DriverSpec::Traffic(_)))) {
+            let lanes = world.roads().lanes();
+            let mut index = LaneIndex::new(lanes);
+            index.set_sweeps(Arc::new(Sweeps::new(lanes, &long)));
+            self.lane_index = Some(index);
         }
         self.grid.build(&self.shapes);
     }
@@ -624,10 +651,11 @@ impl WorldInstance {
             let others: Vec<DVec2> = (0..self.agents.len()).filter(|&j| active(j)).map(at).collect();
             let g = &sc.groups[self.agents[i].group];
             let Some(Driver::Traffic(d)) = &self.agents[i].driver else { continue };
-            let clear = d.spec().respawn_clear;
+            let (clear, back) = (d.spec().respawn_clear, -d.geometry().rear);
+            let only = d.network().map(|n| n.lanes.as_slice());
             let s = seed.child_index(i as u64);
             let (Some(def), Some((xy, heading))) =
-                (g.def.as_wheeled(), respawn_spot(&world, &learners, &others, clear, &mut s.rng()))
+                (g.def.as_wheeled(), respawn_spot(&world, back, only, &learners, &others, clear, &mut s.rng()))
             else {
                 continue;
             };

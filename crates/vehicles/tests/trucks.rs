@@ -1,4 +1,4 @@
-//! Truck and farm presets: they load, their static loads and steering locks match Chrono's
+//! Truck, bus and farm presets: they load, their static loads and steering locks match Chrono's
 //! (fixtures/chrono/truck_*.json, tools/gen_chrono_truck_fixtures.py), they settle at their
 //! static state, drive and brake straight, and the truck features behave: dual tyres,
 //! degressive dampers, geometric multi-axle steering, forced trailer steering and air-brake
@@ -35,12 +35,13 @@ fn rig(vehicle: &str, trailer: Option<&str>) -> WheeledDef {
     }
 }
 
-const RIGS: [(&str, Option<&str>); 5] = [
+const RIGS: [(&str, Option<&str>); 6] = [
     ("truck_6x4", None),
     ("truck_6x4", Some("semitrailer_3axle")),
     ("truck_8x8", None),
     ("farm_tractor", None),
     ("farm_tractor", Some("farm_trailer")),
+    ("bus_city", None),
 ];
 
 struct Flat {
@@ -78,7 +79,7 @@ fn at_rest(d: WheeledDef, speed: f64) -> Wheeled {
 
 #[test]
 fn presets_load() {
-    for name in ["truck_6x4", "truck_8x8", "farm_tractor"] {
+    for name in ["truck_6x4", "truck_8x8", "farm_tractor", "bus_city"] {
         let d = presets::wheeled(name).unwrap();
         assert_eq!(d.name, name);
         assert!(!d.source.is_empty());
@@ -92,6 +93,7 @@ fn presets_load() {
             ("truck_6x4", _) => 12,
             ("truck_8x8", _) => 8,
             ("farm_tractor", None) => 4,
+            ("bus_city", _) => 4,
             _ => 8,
         };
         assert_eq!(v.num_wheels(), expected, "{vehicle} {trailer:?}");
@@ -422,4 +424,22 @@ fn dual_tyres_and_degressive_dampers() {
     }
     // Force still grows with speed, ever more slowly.
     assert!(s.damper_force(1.0) > s.damper_force(0.5) && s.damper_force(0.5) > 0.5 * s.damper_force(1.0));
+}
+
+/// The city bus turns on a 21 m kerb-to-kerb circle (the outer front wheel's) at full lock.
+#[test]
+fn bus_turns_on_a_city_bus_circle() {
+    let flat = Flat::new();
+    let mut v = at_rest(rig("bus_city", None), 2.0);
+    let input = DriveInput { throttle: 0.15, steering: 1.0, ..Default::default() };
+    flat.run(&mut v, &input, 6.0);
+    let mut points = Vec::new();
+    for _ in 0..400 {
+        flat.run(&mut v, &input, 0.1);
+        points.push(v.wheel_pose(1).pos.truncate());
+    }
+    let diameter = points.iter().flat_map(|a| points.iter().map(move |b| a.distance(*b))).fold(0.0, f64::max);
+    assert!(v.speed() > 1.0 && v.speed() < 5.0, "speed {}", v.speed());
+    eprintln!("turning circle {diameter:.2} m at {:.2} m/s", v.speed());
+    assert!((diameter - 21.0).abs() < 1.0, "turning circle {diameter:.2} m");
 }

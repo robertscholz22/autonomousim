@@ -861,10 +861,26 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     // Trucks and tractors (large wheels) with colliders high above the frame: a cab over the
     // frontmost. Cars (wheels larger than a robot's): a cabin over the middle, a
     // little behind centre.
-    let tall = def.colliders.iter().filter(|c| c.center.z + c.radius > top + 1.0);
-    let cab = tall.max_by(|a, b| a.center.x.total_cmp(&b.center.x)).filter(|_| radius >= 0.5);
+    let tall: Vec<_> = def.colliders.iter().filter(|c| c.center.z + c.radius > top + 1.0).collect();
+    let cab = tall.iter().max_by(|a, b| a.center.x.total_cmp(&b.center.x)).filter(|_| radius >= 0.5);
     let car = radius > 0.2;
-    let eye = if let Some(c) = cab {
+    // Buses (tall colliders along more than 6 m): a body over them, a window band and a
+    // windscreen.
+    let (lo, hi) = tall.iter().fold((DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)), |(lo, hi), c| {
+        (lo.min(c.center - DVec3::splat(c.radius)), hi.max(c.center + DVec3::splat(c.radius)))
+    });
+    let bus = radius >= 0.5 && hi.x - lo.x > 6.0;
+    let eye = if bus {
+        let bottom = top - 0.1 * half.z;
+        let half = DVec3::new(0.5 * (hi.x - lo.x), 0.5 * (hi.y - lo.y), 0.5 * (hi.z - bottom));
+        let at = DVec3::new(0.5 * (hi.x + lo.x), 0.5 * (hi.y + lo.y), bottom + half.z);
+        body.append_transformed(&mesh::cuboid(h(half), srgb([220, 190, 60])), DQuat::IDENTITY, at);
+        let band = mesh::cuboid(h(DVec3::new(0.95 * half.x, 1.01 * half.y, 0.2 * half.z)), srgb([40, 50, 60]));
+        body.append_transformed(&band, DQuat::IDENTITY, at + DVec3::new(0.0, 0.0, 0.4 * half.z));
+        let glass = mesh::cuboid(h(DVec3::new(0.02, 0.9 * half.y, 0.35 * half.z)), srgb([40, 50, 60]));
+        body.append_transformed(&glass, DQuat::IDENTITY, at + DVec3::new(half.x, 0.0, 0.3 * half.z));
+        DVec3::new(hi.x - 0.5, at.y + 0.4 * half.y, at.z + 0.5 * half.z)
+    } else if let Some(c) = cab {
         let (bottom, roof) = (top - 0.1 * half.z, c.center.z + c.radius);
         let cab = DVec3::new(0.8 * c.radius, 0.95 * half.y.max(c.radius), 0.5 * (roof - bottom));
         let at = DVec3::new(c.center.x, centre.y, bottom + cab.z);
@@ -880,9 +896,12 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
     } else {
         DVec3::new(centre.x + 0.8 * half.x, centre.y, top + 0.3 * half.z)
     };
-    let mut tops = vec![top];
+    let mut tops = vec![if bus { hi.z } else { top }];
     let mut halves = vec![half.y];
     let mut reach = DVec3::new(centre.x - half.x, 0.0, 0.0).length().max((centre + half).length());
+    if bus {
+        reach = reach.max(lo.length()).max(hi.length());
+    }
     let units = (1..def.num_units())
         .map(|u| {
             let unit = &def.units[u - 1];
@@ -958,7 +977,7 @@ pub fn wheeled(def: &autonomousim_vehicles::ground::WheeledDef) -> WheeledVisual
         .collect();
     let link = mesh::cylinder((0.06 * radius) as f32, 0.5, 8, srgb([90, 90, 95]));
     let wheel_reach = (0..n).map(|w| def.wheel_position_in_line(w).length() + tire(w).radius());
-    let span = wheel_reach.fold(0.0, f64::max).max(if def.num_units() > 1 { reach } else { 0.0 }) as f32;
+    let span = wheel_reach.fold(0.0, f64::max).max(if def.num_units() > 1 || bus { reach } else { 0.0 }) as f32;
     let last = def.num_units() - 1;
     let rear_eye = def.tail() + DVec3::new(0.0, 0.0, 0.9 * tops[last]);
     WheeledVisual { body, units, wheels, span, eye, rear_eye, links, link, single_track: None }
@@ -1332,6 +1351,17 @@ mod tests {
             assert!((v.eye.x as f32) < hi.x && v.eye.z > def.wheel_position(0).z, "{name}: {}", v.eye);
         }
         assert!(wheeled(&presets::wheeled("sedan_like").unwrap()).links.iter().all(Option::is_some));
+    }
+
+    /// The bus: a body over its colliders from bumper to tail, the eye at the front.
+    #[test]
+    fn bus_visual_covers_its_body() {
+        let def = presets::wheeled("bus_city").unwrap();
+        let v = wheeled(&def);
+        let (lo, hi) = v.body.bounds().unwrap();
+        assert!((hi.x - 2.7).abs() < 0.05 && (lo.x + 9.3).abs() < 0.05, "{lo} {hi}");
+        assert!(hi.z > 2.0 && v.span > 9.3 && v.eye.x > 2.0 && v.eye.z > 1.0, "{hi} {} {}", v.span, v.eye);
+        assert!((v.rear_eye.x + 9.3).abs() < 0.05);
     }
 
     /// Rigs: a body per unit behind the tractor, in its frame, and a span over the whole rig.

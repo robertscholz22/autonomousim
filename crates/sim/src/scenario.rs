@@ -1483,13 +1483,16 @@ impl CompiledGroup {
         }
         if let Some(d) = &spec.driver {
             d.validate().map_err(&fail)?;
-            let single = def.as_wheeled().is_some_and(|d| d.num_units() == 1 && !d.is_single_track());
+            // (Only the traffic driver tows trailers.)
+            let towing = matches!(d, DriverSpec::Traffic(_));
+            let fits = def.as_wheeled().is_some_and(|d| (towing || d.num_units() == 1) && !d.is_single_track());
             let parked = matches!(d, DriverSpec::Parked);
             let placed = if parked { sp.in_bays } else { sp.on_road };
-            if !single || !placed || spec.goals.kind == GoalKind::Route {
+            if !fits || !placed || spec.goals.kind == GoalKind::Route {
                 return Err(fail(format!(
-                    "the `{}` driver drives ground vehicles without trailers (not two-wheelers) spawned {}, without `route` goals",
+                    "the `{}` driver drives ground vehicles{} (not two-wheelers) spawned {}, without `route` goals",
                     d.name(),
+                    if towing { "" } else { " without trailers" },
                     if parked { "`in_bays`" } else { "`on_road`" }
                 )));
             }

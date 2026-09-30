@@ -210,28 +210,75 @@ pub struct Traffic<'a> {
     pub spheres: &'a [Sphere],
 }
 
-/// The shape of a vehicle for K-turns: its front and rear ends along x and half its width
-/// (m, chassis frame), and the path curvature of its steering lock (1/m).
+/// The shape of a vehicle for K-turns: its front and rear ends along x (trailers in line) and
+/// half its width (m, chassis frame), and the path curvature of its steering lock (1/m).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DriverGeometry {
     pub front: f64,
     pub rear: f64,
     pub half_width: f64,
     pub max_curvature: f64,
+    /// Whether it tows trailers (it does not bend along `front`–`rear` as one body).
+    pub articulated: bool,
+    /// Effective length for low-speed offtracking (m): on a steady turn with its reference
+    /// point on radius `R`, the last unit's rear axle runs on `√(R² − tracking²)`.
+    pub tracking: f64,
+    /// The reference point's distance ahead of the (towing unit's) rear axle (m).
+    pub wheelbase: f64,
+}
+
+/// [`DriverGeometry::tracking`] of `d` (all units in line): the reference point's distance
+/// ahead of the towing unit's rear axle (the mean of its unsteered axles), then for each unit
+/// behind, its hitch's distance ahead of its own axles, less that ahead of the unit it hangs
+/// from, in squares.
+fn tracking_length(d: &autonomousim_vehicles::ground::WheeledDef) -> f64 {
+    let mut l2 = rear_axle_x(d, 0).powi(2);
+    for u in 1..d.num_units() {
+        let joint = d.unit_origin(u).x;
+        l2 += (joint - rear_axle_x(d, u)).powi(2) - (joint - rear_axle_x(d, d.units[u - 1].parent)).powi(2);
+    }
+    l2.max(0.0).sqrt()
+}
+
+/// Where unit `u`'s rear axle is (the mean of its unsteered axles, else of all; x in line).
+fn rear_axle_x(d: &autonomousim_vehicles::ground::WheeledDef, u: usize) -> f64 {
+    let on: Vec<_> = d.axles.iter().filter(|a| a.unit == u).collect();
+    let fixed: Vec<_> = on.iter().filter(|a| !a.is_steered()).collect();
+    let xs: Vec<f64> = if fixed.is_empty() {
+        on.iter().map(|a| a.position.x).collect()
+    } else {
+        fixed.iter().map(|a| a.position.x).collect()
+    };
+    d.unit_origin(u).x + xs.iter().sum::<f64>() / xs.len().max(1) as f64
 }
 
 impl DriverGeometry {
-    /// That of a group of (single-unit) ground vehicles.
+    /// Offtracking length of what trails the towing unit's rear axle (m): 0 for a rigid
+    /// vehicle, which steers from that axle ([`crate::traffic_driver`]) so it runs on the line.
+    pub fn trailing(&self) -> f64 {
+        (self.tracking * self.tracking - self.wheelbase * self.wheelbase).max(0.0).sqrt()
+    }
+
+    /// How far its front reaches ahead of the towing unit's rear axle (m): in a bend of radius
+    /// `R` of that axle its outer front corner runs `√(R² + reach²) − R` wide.
+    pub fn reach(&self) -> f64 {
+        self.wheelbase + self.front
+    }
+
+    /// That of a group of ground vehicles (with their trailers in line).
     pub fn of(group: &CompiledGroup) -> Self {
         let d = group.def.as_wheeled().expect("drivers drive ground vehicles");
-        let wheels = (0..d.num_wheels()).map(|w| (d.wheel_position(w).x, d.wheel_tire(w).radius()));
-        let spheres = d.sphere_colliders().into_iter().map(|c| (c.center.x, c.radius));
+        let wheels = (0..d.num_wheels()).map(|w| (d.wheel_position_in_line(w).x, d.wheel_tire(w).radius()));
+        let spheres = d.colliders_in_line().into_iter().map(|c| (c.center.x, c.radius));
         let parts: Vec<(f64, f64)> = wheels.chain(spheres).collect();
         Self {
             front: parts.iter().map(|&(x, r)| x + r).fold(0.0, f64::max),
             rear: parts.iter().map(|&(x, r)| x - r).fold(0.0, f64::min),
             half_width: group.half_width,
             max_curvature: group.action_map.as_ground().map_or(0.2, |m| m.curvature()),
+            articulated: d.num_units() > 1,
+            tracking: tracking_length(d),
+            wheelbase: -rear_axle_x(d, 0),
         }
     }
 }

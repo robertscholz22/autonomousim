@@ -16,7 +16,8 @@
 //! - **Routes**: at the end of each lane the driver takes a connector drawn at random among
 //!   those leaving its road's lanes in its direction, weighted by the class rank of the road
 //!   they lead into (U-turns only at dead ends).
-//! - **Steering**: pure pursuit on the lane line (blended across during a change).
+//! - **Steering**: pure pursuit on the lane line (blended across during a change); long
+//!   vehicles from their rear axle.
 //!
 //! Every policy step the world first has each driver find its place on the graph, then builds
 //! a [`LaneIndex`] of every agent on the lanes (drivers by their place, other agents near the
@@ -54,6 +55,19 @@
 //! vehicles that stand waiting themselves (the first in agent order goes, the others then
 //! see its grant).
 //!
+//! **Long vehicles** (offtracking length over [`SWING_LENGTH`] m: trucks, buses) keep to the
+//! connectors their lock allows ([`Network`]) and steer from their rear axle, so that axle runs
+//! on the line and the front swings wide; those towing trailers also swing out in left bends
+//! so that the trailers cut in less. Each allowed connector sweeps a band (the body's reach
+//! both ways, until it has straightened out on the lane after); stop lines of lanes whose
+//! waiting vehicles the band would reach are set back ([`Sweeps`]), for everyone. A long
+//! vehicle does not enter a connector while someone stands in its band or could not stop
+//! short of it, and while one is granted it or sweeps through, the others wait behind that
+//! connector's setback even when allowed through. Other drivers never pass a standing long
+//! vehicle within a junction.
+//!
+//! **Buses** (`bus`) drive a loop with stops instead of at random (see [`BusRoute`]).
+//!
 //! **Respawn**: a driver standing still for `respawn` s, lost off the lanes for
 //! [`LOST_RESPAWN`] s or off the map is put back at rest at a random lane position at least
 //! `respawn_clear` m from every learning agent and 20 m from every other agent (see
@@ -70,6 +84,7 @@ use autonomousim_world::lanes::{ConflictKind, Control, LaneGraph, Turn, class_ra
 use autonomousim_world::{Light, Polyline, StaticWorld};
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Settings of the `traffic` driver; ranges are drawn uniformly per driver and episode.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -108,6 +123,26 @@ pub struct TrafficDriverSpec {
     pub respawn: f64,
     /// Respawns at least this far (m) from every learning agent.
     pub respawn_clear: f64,
+    /// A bus line: drives a loop with stops instead of turning at random.
+    pub bus: Option<BusSpec>,
+}
+
+/// A bus line of a `traffic` driver (see [`BusRoute`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BusSpec {
+    /// Length of the loop (m), drawn per route.
+    pub length: [f64; 2],
+    /// Distance between stops (m).
+    pub stop_spacing: f64,
+    /// Time standing at a stop (s), drawn per stop.
+    pub dwell: [f64; 2],
+}
+
+impl Default for BusSpec {
+    fn default() -> Self {
+        Self { length: [1500.0, 3000.0], stop_spacing: 300.0, dwell: [10.0, 30.0] }
+    }
 }
 
 impl Default for TrafficDriverSpec {
@@ -129,6 +164,7 @@ impl Default for TrafficDriverSpec {
             deadlock: 10.0,
             respawn: 120.0,
             respawn_clear: 100.0,
+            bus: None,
         }
     }
 }
@@ -155,7 +191,10 @@ impl TrafficDriverSpec {
             && range(self.critical_gap, 0.0)
             && self.deadlock > 0.0
             && self.respawn >= 0.0
-            && self.respawn_clear >= 0.0;
+            && self.respawn_clear >= 0.0
+            && self.bus.as_ref().is_none_or(|b| {
+                range(b.length, 0.0) && b.length[1] > 0.0 && b.stop_spacing > 0.0 && range(b.dwell, 0.0)
+            });
         if ok { Ok(()) } else { Err(format!("invalid traffic driver {self:?}")) }
     }
 }
@@ -204,6 +243,14 @@ pub enum Elem {
 }
 
 impl Elem {
+    /// The lane itself, or the lane a connector leads into.
+    pub fn lane_after(self, g: &LaneGraph) -> u32 {
+        match self {
+            Elem::Lane(l) => l,
+            Elem::Connector(c) => g.connectors()[c as usize].to,
+        }
+    }
+
     pub fn line(self, g: &LaneGraph) -> &Polyline {
         match self {
             Elem::Lane(l) => &g.lanes()[l as usize].line,
@@ -256,6 +303,15 @@ pub struct Occupant {
     pub pos: DVec2,
     pub heading: f64,
     pub half_width: f64,
+    /// Whether it tows trailers (`pos`, `heading` are the towing unit's).
+    pub articulated: bool,
+    /// Whether it sweeps wide in turns ([`TrafficDriver::is_long`]), and the connector it
+    /// came onto its lane by ([`ANY`]: none or unknown).
+    pub long: bool,
+    pub via: u32,
+    /// Whether this entry is its tail on an element behind its place (`station` counted on
+    /// from there, past the element's end).
+    pub tail: bool,
 }
 
 /// A connector in [`Occupant::next`] that is not known.
@@ -270,6 +326,8 @@ pub struct Grant {
     pub speed: f64,
     /// Its length (m).
     pub length: f64,
+    /// Whether it is a long vehicle (it sweeps a band; see [`Sweeps`]).
+    pub long: bool,
 }
 
 /// The agents on each lane and connector, sorted by station (then agent), rebuilt each
@@ -279,6 +337,8 @@ pub struct LaneIndex {
     lanes: Vec<Vec<Occupant>>,
     connectors: Vec<Vec<Occupant>>,
     grants: Vec<Vec<Grant>>,
+    /// Where long vehicles sweep past the lines (see [`Sweeps`]).
+    sweeps: Arc<Sweeps>,
 }
 
 /// Search range for leaders and followers (m).
@@ -332,7 +392,35 @@ pub const LOST_RESPAWN: f64 = 5.0;
 impl LaneIndex {
     pub fn new(g: &LaneGraph) -> Self {
         let n = g.connectors().len();
-        Self { lanes: vec![Vec::new(); g.lanes().len()], connectors: vec![Vec::new(); n], grants: vec![Vec::new(); n] }
+        let m = g.lanes().len();
+        Self {
+            lanes: vec![Vec::new(); m],
+            connectors: vec![Vec::new(); n],
+            grants: vec![Vec::new(); n],
+            sweeps: Arc::new(Sweeps::none(g)),
+        }
+    }
+
+    /// Set where long vehicles sweep.
+    pub fn set_sweeps(&mut self, sweeps: Arc<Sweeps>) {
+        assert_eq!(sweeps.hold_back.len(), self.lanes.len(), "one per lane");
+        self.sweeps = sweeps;
+    }
+
+    /// How much farther back than the stop line vehicles wait on `lane` (m).
+    pub fn hold_back(&self, lane: u32) -> f64 {
+        self.sweeps.hold_back[lane as usize]
+    }
+
+    /// Whether a long vehicle sweeps past the line of `sweep.lane` through connector `c` now or
+    /// is about to: granted it, on it, or on the lane after it came by, its last axle not yet
+    /// `sweep.after` m on.
+    fn sweeping(&self, g: &LaneGraph, c: u32, sweep: &Sweep) -> bool {
+        self.connectors[c as usize].iter().any(|o| o.long)
+            || self.grants[c as usize].iter().any(|gr| gr.long)
+            || self.lanes[g.connectors()[c as usize].to as usize]
+                .iter()
+                .any(|o| o.long && !o.tail && o.via == c && o.station - o.rear < sweep.after)
     }
 
     /// Whether it is sized for `g`.
@@ -392,6 +480,10 @@ impl LaneIndex {
             pos: pos.truncate(),
             heading,
             half_width: radius,
+            articulated: false,
+            long: false,
+            via: ANY,
+            tail: false,
         };
         self.lanes[lane as usize].push(o);
     }
@@ -426,7 +518,7 @@ impl LaneIndex {
     fn behind(&self, g: &LaneGraph, lane: u32, from: f64, me: u32) -> Option<(f64, Occupant)> {
         let list = &self.lanes[lane as usize];
         let i = list.partition_point(|o| o.station < from);
-        if let Some(o) = list[..i].iter().rev().find(|o| o.agent != me) {
+        if let Some(o) = list[..i].iter().rev().find(|o| o.agent != me && !o.tail) {
             return Some((from - o.station, *o));
         }
         let mut best: Option<(f64, Occupant)> = None;
@@ -437,13 +529,13 @@ impl LaneIndex {
         };
         for &c in &g.lanes()[lane as usize].predecessors {
             let cl = &g.connectors()[c as usize].line;
-            if let Some(o) = self.connectors[c as usize].iter().rev().find(|o| o.agent != me) {
+            if let Some(o) = self.connectors[c as usize].iter().rev().find(|o| o.agent != me && !o.tail) {
                 consider(from + cl.length() - o.station, o);
                 continue;
             }
             let prev = g.connectors()[c as usize].from;
             let pl = &g.lanes()[prev as usize].line;
-            if let Some(o) = self.lanes[prev as usize].iter().rev().find(|o| o.agent != me) {
+            if let Some(o) = self.lanes[prev as usize].iter().rev().find(|o| o.agent != me && !o.tail) {
                 consider(from + cl.length() + pl.length() - o.station, o);
             }
         }
@@ -455,14 +547,15 @@ impl LaneIndex {
     /// distance from its front to the connector.
     fn approaching(&self, g: &LaneGraph, via: u32, max: f64, me: u32, f: &mut dyn FnMut(f64, &Occupant)) {
         let takes = |x: u32, want: u32| x == want || x == ANY;
+        let me_or_tail = |o: &Occupant| o.agent == me || o.tail;
         let lane = g.connectors()[via as usize].from;
         let len = g.lanes()[lane as usize].line.length();
-        for o in self.lanes[lane as usize].iter().filter(|o| o.agent != me && takes(o.next[0], via)) {
+        for o in self.lanes[lane as usize].iter().filter(|o| !me_or_tail(o) && takes(o.next[0], via)) {
             f((len - o.station - o.front).max(0.0), o);
         }
         for &pc in &g.lanes()[lane as usize].predecessors {
             let cl = g.connectors()[pc as usize].line.length();
-            for o in self.connectors[pc as usize].iter().filter(|o| o.agent != me && takes(o.next[0], via)) {
+            for o in self.connectors[pc as usize].iter().filter(|o| !me_or_tail(o) && takes(o.next[0], via)) {
                 f(cl - o.station - o.front + len, o);
             }
             if cl + len > max {
@@ -471,7 +564,7 @@ impl LaneIndex {
             let pl = g.connectors()[pc as usize].from;
             let pll = g.lanes()[pl as usize].line.length();
             for o in self.lanes[pl as usize].iter() {
-                if o.agent != me && takes(o.next[0], pc) && takes(o.next[1], via) {
+                if !me_or_tail(o) && takes(o.next[0], pc) && takes(o.next[1], via) {
                     let d = pll - o.station - o.front + cl + len;
                     if d <= max {
                         f(d, o);
@@ -479,6 +572,242 @@ impl LaneIndex {
                 }
             }
         }
+    }
+}
+
+/// The part of the lane graph a long vehicle keeps to: the largest strongly connected part
+/// (by lane length, lanes of a road and direction together) of the connectors it can follow,
+/// U-turns and bends more than [`BEND_MARGIN`] times tighter than its steering lock left out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Network {
+    /// Per lane and connector: whether it belongs.
+    pub lanes: Vec<bool>,
+    pub connectors: Vec<bool>,
+}
+
+impl Network {
+    /// That of a vehicle of `geometry` if it is long (see [`TrafficDriver::is_long`]).
+    pub fn of_long(g: &LaneGraph, geometry: DriverGeometry) -> Option<Arc<Self>> {
+        (geometry.tracking > SWING_LENGTH).then(|| Arc::new(Self::new(g, geometry.max_curvature)))
+    }
+
+    pub fn new(g: &LaneGraph, max_curvature: f64) -> Self {
+        let n = g.lanes().len();
+        let group = |mut l: u32| {
+            while let Some(x) = g.lanes()[l as usize].left {
+                l = x;
+            }
+            l as usize
+        };
+        let fits: Vec<bool> = (g.connectors().iter())
+            .map(|c| c.turn != Turn::UTurn && bend(&c.line) <= BEND_MARGIN * max_curvature)
+            .collect();
+        let mut adj = vec![Vec::new(); n];
+        let mut radj = vec![Vec::new(); n];
+        for (conn, _) in g.connectors().iter().zip(&fits).filter(|(_, f)| **f) {
+            let (a, b) = (group(conn.from), group(conn.to));
+            adj[a].push(b);
+            radj[b].push(a);
+        }
+        // Kosaraju: finishing order on the graph, then components on the reversed one.
+        let mut order = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        for s in 0..n {
+            if seen[s] {
+                continue;
+            }
+            seen[s] = true;
+            let mut stack = vec![(s, 0usize)];
+            while let Some(&mut (u, ref mut k)) = stack.last_mut() {
+                if let Some(&v) = adj[u].get(*k) {
+                    *k += 1;
+                    if !seen[v] {
+                        seen[v] = true;
+                        stack.push((v, 0));
+                    }
+                } else {
+                    order.push(u);
+                    stack.pop();
+                }
+            }
+        }
+        let mut comp = vec![usize::MAX; n];
+        let mut count = 0;
+        for &s in order.iter().rev() {
+            if comp[s] != usize::MAX {
+                continue;
+            }
+            comp[s] = count;
+            let mut stack = vec![s];
+            while let Some(u) = stack.pop() {
+                for &v in &radj[u] {
+                    if comp[v] == usize::MAX {
+                        comp[v] = count;
+                        stack.push(v);
+                    }
+                }
+            }
+            count += 1;
+        }
+        // The largest by lane length (the first of equals).
+        let mut length = vec![0.0; count];
+        for l in 0..n {
+            length[comp[group(l as u32)]] += g.lanes()[l].line.length();
+        }
+        let best = (0..count)
+            .fold(None, |b: Option<usize>, k| if b.is_none_or(|b| length[k] > length[b]) { Some(k) } else { b });
+        let lanes: Vec<bool> = (0..n).map(|l| Some(comp[group(l as u32)]) == best).collect();
+        let connectors = (g.connectors().iter().enumerate())
+            .map(|(c, conn)| fits[c] && lanes[conn.from as usize] && lanes[conn.to as usize])
+            .collect();
+        Self { lanes, connectors }
+    }
+}
+
+/// Where long vehicles sweep past the lines of other lanes at junctions: the band of each
+/// connector of their networks (and 3 [`DriverGeometry::tracking`] m on). The band runs from
+/// the front's outer edge (swung wide in left bends, see [`TrafficDriver::reference`]) to the
+/// inner edge of the last unit, which runs the offtracking of the connector's tightest bend
+/// inside the front's path, then less and less on the lane after (decaying over `tracking`, as
+/// a trailing axle's does). Lanes the connector leaves or joins are left out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Sweeps {
+    /// Per connector: the lines its band reaches.
+    pub connectors: Vec<Vec<Sweep>>,
+    /// Per lane: the connectors whose bands reach its line.
+    pub lanes: Vec<Vec<u32>>,
+    /// Per lane: how much farther back than the stop line vehicles wait (m), clear of all
+    /// bands.
+    pub hold_back: Vec<f64>,
+}
+
+/// A connector's band reaching the line of a lane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sweep {
+    pub lane: u32,
+    /// How far back from the stop line vehicles on it stay clear (m).
+    pub back: f64,
+    /// How far on the lane after the connector the band still reaches it (m).
+    pub after: f64,
+}
+
+impl Sweeps {
+    /// None: no long vehicles.
+    pub fn none(g: &LaneGraph) -> Self {
+        Self {
+            connectors: vec![Vec::new(); g.connectors().len()],
+            lanes: vec![Vec::new(); g.lanes().len()],
+            hold_back: vec![0.0; g.lanes().len()],
+        }
+    }
+
+    /// Those of long vehicles of `networks`.
+    pub fn new(g: &LaneGraph, networks: &[(Arc<Network>, DriverGeometry)]) -> Self {
+        /// Half width of the waiting vehicles cleared (m), their margin, and sampling step.
+        const WAITING: f64 = 1.5;
+        const MARGIN: f64 = 0.5;
+        const STEP: f64 = 0.5;
+        let lanes = g.lanes();
+        let mut sweeps = Self::none(g);
+        let mut ending = std::collections::BTreeMap::<u32, Vec<u32>>::new();
+        for (l, lane) in lanes.iter().enumerate() {
+            ending.entry(lane.to_node).or_default().push(l as u32);
+        }
+        // Cross-sections of a band: point, left normal, tangent, extent to the left `[lo, hi]`.
+        // (With the station on the lane after, 0 on the connector.)
+        let mut band: Vec<(DVec2, DVec2, DVec2, f64, f64, f64)> = Vec::new();
+        for (net, geo) in networks {
+            // The trailers' offtracking inside the towing unit's rear axle, which runs on the
+            // line (shifted by the swing), and its front's reach outside.
+            let l = geo.trailing();
+            let off = |k: f64| {
+                let r = 1.0 / k.abs().max(1e-6);
+                if r > l { r - (r * r - l * l).sqrt() } else { r }
+            };
+            let f = geo.reach();
+            let wide = |k: f64| {
+                let r = 1.0 / k.abs().max(1e-6);
+                (r * r + f * f).sqrt() - r
+            };
+            let swings = l > SWING_LENGTH;
+            for (c, conn) in g.connectors().iter().enumerate().filter(|(c, _)| net.connectors[*c]) {
+                let Some(waiting) = ending.get(&conn.node) else { continue };
+                let line = &conn.line;
+                let len = line.length();
+                let smooth = |s: f64| (-5..=5).map(|d| line.curvature_at(s + f64::from(d))).sum::<f64>() / 11.0;
+                let n = (len / STEP).ceil() as usize;
+                let turn = (0..=n).map(|k| smooth(k as f64 * STEP)).sum::<f64>().signum();
+                let cut = (0..=n).map(|k| off(smooth(k as f64 * STEP))).fold(0.0, f64::max);
+                let reach = (0..=n).map(|k| wide(smooth(k as f64 * STEP))).fold(0.0, f64::max);
+                band.clear();
+                // Extents inside (towards the turn) and outside of the line.
+                let mut section = |p: DVec2, heading: f64, swing: f64, inside: f64, outside: f64, after: f64| {
+                    let t = DVec2::from_angle(heading);
+                    let (lo, hi) = if turn > 0.0 { (-swing - outside, inside - swing) } else { (-inside, outside) };
+                    band.push((p, t.perp(), t, lo - geo.half_width, hi + geo.half_width, after));
+                };
+                for k in 0..=n {
+                    let s = (k as f64 * STEP).min(len);
+                    let swing = if swings { (0.5 * off(smooth(s).max(0.0))).min(SWING_MAX) } else { 0.0 };
+                    section(line.point_at(s).truncate(), line.heading_at(s), swing, cut, reach, 0.0);
+                }
+                // After it, the trailers straighten out over about their length, the front
+                // over its reach.
+                let next = &lanes[conn.to as usize].line;
+                let m = ((3.0 * l.max(f)).min(next.length()) / STEP).ceil() as usize;
+                for k in 1..=m {
+                    let s = k as f64 * STEP;
+                    let inside = if l > 0.0 { cut * (-s / l).exp() } else { 0.0 };
+                    section(next.point_at(s).truncate(), next.heading_at(s), 0.0, inside, reach * (-s / f).exp(), s);
+                }
+                // How far on the lane after the band reaches `q`, if it does.
+                let hits = |q: DVec2| {
+                    band.iter()
+                        .filter(|&&(p, n, t, lo, hi, _)| {
+                            let rel = q - p;
+                            let y = rel.dot(n);
+                            let dy = if y < lo {
+                                lo - y
+                            } else if y > hi {
+                                y - hi
+                            } else {
+                                0.0
+                            };
+                            rel.dot(t).hypot(dy) < WAITING + 0.5 * STEP
+                        })
+                        .map(|b| b.5)
+                        .reduce(f64::max)
+                };
+                for &w in waiting.iter().filter(|&&w| w != conn.from && w != conn.to) {
+                    let wl = &lanes[w as usize].line;
+                    let reach = wl.length().min(HOLD_BACK_MAX + STOP_LINE);
+                    let (mut far, mut after) = (None, 0.0f64);
+                    for k in 0..=(reach / STEP) as usize {
+                        let d = k as f64 * STEP;
+                        if let Some(a) = hits(wl.point_at(wl.length() - d).truncate()) {
+                            far = Some(d);
+                            after = after.max(a);
+                        }
+                    }
+                    let Some(d) = far else { continue };
+                    let back = (d + MARGIN - STOP_LINE).clamp(0.0, HOLD_BACK_MAX);
+                    let list = &mut sweeps.connectors[c];
+                    match list.iter_mut().find(|x| x.lane == w) {
+                        Some(x) => {
+                            x.back = x.back.max(back);
+                            x.after = x.after.max(after + STEP);
+                        }
+                        None => {
+                            list.push(Sweep { lane: w, back, after: after + STEP });
+                            sweeps.lanes[w as usize].push(c as u32);
+                        }
+                    }
+                    let b = &mut sweeps.hold_back[w as usize];
+                    *b = b.max(back);
+                }
+            }
+        }
+        sweeps
     }
 }
 
@@ -497,6 +826,10 @@ pub struct TrafficDriver {
     pub change_time: f64,
     /// Where it is on the lane graph (`None`: off the lanes; it stands still).
     pub place: Option<Place>,
+    /// The elements it came along before its place's (the last one last; up to [`TRAIL`]).
+    pub trail: Vec<Elem>,
+    /// Long vehicles: the part of the lane graph they keep to.
+    network: Option<Arc<Network>>,
     /// The next connectors to take (up to two).
     pub plan: Vec<u32>,
     pub change: Option<LaneChange>,
@@ -517,6 +850,40 @@ pub struct TrafficDriver {
     pub lost: f64,
     /// Times put back elsewhere this episode.
     pub respawns: u32,
+    /// A bus's line (see [`TrafficDriverSpec::bus`]).
+    pub bus: Option<BusRoute>,
+    /// Times a bus left its loop and took a new one since its (re)spawn.
+    pub reroutes: u32,
+}
+
+/// The loop of a bus: connectors (movements, made from the lane of each road nearest to the
+/// bus; [`TrafficDriver::equivalent`]) and stops on the lanes between them.
+///
+/// It is drawn inside the bus's [`Network`] (or among all but U-turns): the shortest ways
+/// over lanes, connectors and the lane changes the bus can make before each connector (by
+/// length, a lane change counting [`CHANGE_ROOM`] m) from its lane through two random others
+/// and back, the one of eight draws nearest to a length drawn from [`BusSpec::length`]. Stops lie halfway along
+/// lanes at least [`STOP_LANE`] m long, the first after [`BusSpec::stop_spacing`] m, each
+/// next at least that far on. The bus stops there in its lane (with its front at the stop)
+/// and stands for a time drawn from [`BusSpec::dwell`]. When it takes another movement
+/// (it could not reach the lane of the planned one) it draws a new loop from where it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BusRoute {
+    pub connectors: Vec<u32>,
+    /// Per connector: the stop on the lane after it (station as a fraction of its length).
+    pub stops: Vec<Option<f64>>,
+    /// Its length (m, along the lanes after the connectors and the connectors).
+    pub length: f64,
+    /// Index of the next connector to take.
+    pub next: usize,
+    /// Standing at a stop: time stood and time to stand (s).
+    pub dwelling: Option<(f64, f64)>,
+    /// The stop served last (the index of the connector before it).
+    pub served: Option<usize>,
+    /// Connectors taken along it, and stops served and passed by, since it was drawn.
+    pub taken: u32,
+    pub stops_served: u32,
+    pub stops_missed: u32,
 }
 
 impl TrafficDriver {
@@ -530,6 +897,8 @@ impl TrafficDriver {
             politeness: 0.0,
             change_time: 4.0,
             place: None,
+            trail: Vec::new(),
+            network: None,
             plan: Vec::new(),
             change: None,
             since_change: COOLDOWN,
@@ -542,6 +911,8 @@ impl TrafficDriver {
             standing: 0.0,
             lost: 0.0,
             respawns: 0,
+            bus: None,
+            reroutes: 0,
         };
         d.draw();
         d
@@ -553,6 +924,25 @@ impl TrafficDriver {
 
     pub fn geometry(&self) -> DriverGeometry {
         self.geometry
+    }
+
+    /// Whether it keeps to a [`Network`] (vehicles longer than [`SWING_LENGTH`]).
+    pub fn is_long(&self) -> bool {
+        self.geometry.tracking > SWING_LENGTH
+    }
+
+    /// Set the network it keeps to on the current map (see [`Network`]).
+    pub fn set_network(&mut self, network: Option<Arc<Network>>) {
+        self.network = network;
+    }
+
+    pub fn network(&self) -> Option<&Network> {
+        self.network.as_deref()
+    }
+
+    /// Whether it may take connector `c`.
+    fn allowed(&self, c: u32) -> bool {
+        self.network.as_ref().is_none_or(|n| n.connectors[c as usize])
     }
 
     fn draw(&mut self) {
@@ -573,6 +963,7 @@ impl TrafficDriver {
         self.rng = seed.rng();
         self.draw();
         self.place = None;
+        self.trail.clear();
         self.plan.clear();
         self.change = None;
         self.since_change = COOLDOWN;
@@ -584,7 +975,189 @@ impl TrafficDriver {
         self.standing = 0.0;
         self.lost = 0.0;
         self.respawns = 0;
+        self.bus = None;
+        self.reroutes = 0;
         self.locate(world, pose);
+        if self.spec.bus.is_some()
+            && let Some(p) = self.place
+        {
+            let g = world.roads().lanes();
+            self.bus = self.bus_route(g, p.elem.lane_after(g));
+            self.plan.clear();
+            self.fill_plan(g, world);
+        }
+    }
+
+    /// A new loop for a bus from `lane` (see [`BusRoute`]).
+    fn bus_route(&mut self, g: &LaneGraph, lane: u32) -> Option<BusRoute> {
+        let spec = self.spec.bus.clone()?;
+        let lanes = g.lanes();
+        let n = lanes.len();
+        let step = |c: u32| {
+            let conn = &g.connectors()[c as usize];
+            conn.line.length() + lanes[conn.to as usize].line.length()
+        };
+        // Lanes on: by a connector, or by lane changes along the lane ([`u32::MAX`]).
+        let mut out: Vec<Vec<(u32, u32, f64)>> = vec![Vec::new(); n];
+        for (c, conn) in g.connectors().iter().enumerate() {
+            if conn.turn != Turn::UTurn && self.allowed(c as u32) {
+                out[conn.from as usize].push((conn.to, c as u32, step(c as u32)));
+            }
+        }
+        for l in 0..n as u32 {
+            for k in Self::group(g, l).into_iter().filter(|&k| k != l && Self::reachable(g, l, k)) {
+                out[l as usize].push((k, u32::MAX, CHANGE_ROOM));
+            }
+        }
+        // Shortest way (its connectors) from lane `a` to lane `b` (a ≠ b), by Dijkstra.
+        let way = |a: u32, b: u32| -> Option<Vec<u32>> {
+            let mut dist = vec![f64::INFINITY; n];
+            let mut via = vec![(u32::MAX, u32::MAX); n];
+            let mut heap = std::collections::BinaryHeap::new();
+            dist[a as usize] = 0.0;
+            heap.push((std::cmp::Reverse(OrdF64(0.0)), a));
+            while let Some((std::cmp::Reverse(OrdF64(d)), u)) = heap.pop() {
+                if d > dist[u as usize] {
+                    continue;
+                }
+                if u == b {
+                    break;
+                }
+                for &(v, c, cost) in &out[u as usize] {
+                    let nd = d + cost;
+                    if nd < dist[v as usize] {
+                        dist[v as usize] = nd;
+                        via[v as usize] = (u, c);
+                        heap.push((std::cmp::Reverse(OrdF64(nd)), v));
+                    }
+                }
+            }
+            if !dist[b as usize].is_finite() {
+                return None;
+            }
+            let mut path = Vec::new();
+            let mut at = b;
+            while at != a {
+                let (u, c) = via[at as usize];
+                if c != u32::MAX {
+                    path.push(c);
+                }
+                at = u;
+            }
+            path.reverse();
+            Some(path)
+        };
+        let start = lane;
+        let candidates: Vec<u32> =
+            (0..n as u32).filter(|&l| out[l as usize].iter().any(|&(_, c, _)| c != u32::MAX)).collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let target = if spec.length[1] > spec.length[0] {
+            self.rng.range(spec.length[0], spec.length[1])
+        } else {
+            spec.length[0]
+        };
+        let mut best: Option<(f64, Vec<u32>)> = None;
+        for _ in 0..8 {
+            let pick = |r: &mut SimRng| {
+                candidates[((r.uniform() * candidates.len() as f64) as usize).min(candidates.len() - 1)]
+            };
+            let (w1, w2) = (pick(&mut self.rng), pick(&mut self.rng));
+            if w1 == start || w2 == w1 || w2 == start {
+                continue;
+            }
+            let (Some(a), Some(b), Some(c)) = (way(start, w1), way(w1, w2), way(w2, start)) else { continue };
+            let route: Vec<u32> = a.into_iter().chain(b).chain(c).collect();
+            let length: f64 = route.iter().map(|&c| step(c)).sum();
+            if best.as_ref().is_none_or(|(l, _)| (length - target).abs() < (l - target).abs()) {
+                best = Some((length, route));
+            }
+        }
+        let (length, connectors) = best?;
+        let mut stops = vec![None; connectors.len()];
+        let mut since = 0.0;
+        for (k, &c) in connectors.iter().enumerate() {
+            let to = lanes[g.connectors()[c as usize].to as usize].line.length();
+            since += g.connectors()[c as usize].line.length();
+            if to >= STOP_LANE && since + 0.5 * to >= spec.stop_spacing {
+                stops[k] = Some(0.5);
+                since = 0.5 * to;
+            } else {
+                since += to;
+            }
+        }
+        Some(BusRoute {
+            connectors,
+            stops,
+            length,
+            next: 0,
+            dwelling: None,
+            served: None,
+            taken: 0,
+            stops_served: 0,
+            stops_missed: 0,
+        })
+    }
+
+    /// A bus taking connector `c`: on along its loop, or a new loop from after `c`.
+    fn bus_took(&mut self, g: &LaneGraph, c: u32) {
+        let Some(route) = &self.bus else {
+            // (One without a loop tries again.)
+            if self.spec.bus.is_some() {
+                self.plan.clear();
+                self.bus = self.bus_route(g, g.connectors()[c as usize].to);
+            }
+            return;
+        };
+        let planned = route.connectors[route.next];
+        if same_movement(g, c, planned) {
+            let route = self.bus.as_mut().expect("a bus");
+            route.next = (route.next + 1) % route.connectors.len();
+            route.taken += 1;
+        } else {
+            self.reroutes += 1;
+            self.plan.clear();
+            self.bus = self.bus_route(g, g.connectors()[c as usize].to);
+        }
+    }
+
+    /// A bus at its stops: the stop ahead on its lane as a standing obstacle, standing
+    /// there for the drawn time.
+    fn bus_stop(&mut self, g: &LaneGraph, p: Place, v: f64, idm: &Idm, dt: f64) -> f64 {
+        let front = self.geometry.front;
+        let Some(dwell) = self.spec.bus.as_ref().map(|b| b.dwell) else { return f64::INFINITY };
+        let Some(route) = self.bus.as_mut() else { return f64::INFINITY };
+        let n = route.connectors.len();
+        let leg = (route.next + n - 1) % n;
+        let Elem::Lane(l) = p.elem else { return f64::INFINITY };
+        let (Some(f), true) = (route.stops[leg], route.served != Some(leg)) else { return f64::INFINITY };
+        let to = g.connectors()[route.connectors[leg] as usize].to;
+        if TrafficDriver::group(g, to)[0] != TrafficDriver::group(g, l)[0] {
+            return f64::INFINITY;
+        }
+        let gap = f * g.lanes()[l as usize].line.length() - p.station - front;
+        if let Some((stood, time)) = &mut route.dwelling {
+            *stood += dt;
+            if *stood >= *time {
+                route.dwelling = None;
+                route.served = Some(leg);
+                route.stops_served += 1;
+                return f64::INFINITY;
+            }
+            return hold(idm, v, 0.0).min(0.0);
+        }
+        if gap < -STOP_MISSED {
+            route.served = Some(leg);
+            route.stops_missed += 1;
+            return f64::INFINITY;
+        }
+        if gap < STOP_REACHED && v < STANDING {
+            let time = if dwell[1] > dwell[0] { self.rng.range(dwell[0], dwell[1]) } else { dwell[0] };
+            self.bus.as_mut().expect("a bus").dwelling = Some((0.0, time));
+            return hold(idm, v, 0.0).min(0.0);
+        }
+        hold(idm, v, gap)
     }
 
     /// Where the lane graph goes on from the place: the elements with the distance from the
@@ -636,7 +1209,7 @@ impl TrafficDriver {
     /// The connector making the same movement as `c` (the same turn into the same road and
     /// direction) from the lane of `lane`'s group nearest to `lane` (the right one of two)
     /// that can be reached along it.
-    fn equivalent(g: &LaneGraph, c: u32, lane: u32) -> Option<u32> {
+    fn equivalent(g: &LaneGraph, c: u32, lane: u32, ok: &dyn Fn(u32) -> bool) -> Option<u32> {
         let cc = &g.connectors()[c as usize];
         let target = &g.lanes()[cc.to as usize];
         let here = i32::from(g.lanes()[lane as usize].index);
@@ -646,7 +1219,7 @@ impl TrafficDriver {
             for &k in &from.successors {
                 let kc = &g.connectors()[k as usize];
                 let to = &g.lanes()[kc.to as usize];
-                if kc.turn == cc.turn && to.road == target.road && to.dir == target.dir {
+                if kc.turn == cc.turn && to.road == target.road && to.dir == target.dir && ok(k) {
                     let key = ((i32::from(from.index) - here).abs(), -i32::from(from.index), k);
                     if best.is_none_or(|b| key < b) {
                         best = Some(key);
@@ -662,7 +1235,7 @@ impl TrafficDriver {
     fn remap(&mut self, g: &LaneGraph, world: &StaticWorld, lane: u32) {
         let mut base = lane;
         for k in 0..self.plan.len() {
-            match Self::equivalent(g, self.plan[k], base) {
+            match Self::equivalent(g, self.plan[k], base, &|c| self.allowed(c)) {
                 Some(c) => {
                     self.plan[k] = c;
                     base = g.connectors()[c as usize].to;
@@ -678,7 +1251,8 @@ impl TrafficDriver {
 
     /// A connector leaving the lanes of `lane`'s group (only `lane` itself when `own`), drawn
     /// with weight 1 + the class rank of the road it leads into; U-turns only when nothing
-    /// else leaves.
+    /// else leaves, and bends tighter than the steering lock only when nothing else fits (then
+    /// the least bent).
     fn choose(&mut self, g: &LaneGraph, world: &StaticWorld, lane: u32, own: bool) -> Option<u32> {
         let leaving = |lanes: &[u32]| -> Vec<u32> {
             lanes.iter().flat_map(|&l| g.lanes()[l as usize].successors.iter().copied()).collect()
@@ -692,6 +1266,9 @@ impl TrafficDriver {
             // Nothing leaves within reach: any lane of the road.
             if all.is_empty() { leaving(&group) } else { all }
         };
+        // Long vehicles: within their network, if it leaves from here.
+        let kept: Vec<u32> = all.iter().copied().filter(|&c| self.allowed(c)).collect();
+        let all = if kept.is_empty() { all } else { kept };
         // Into lanes with a way on (connectors leaving lanes within reach), and U-turns only
         // when nothing else is left.
         let way_on = |c: &u32| {
@@ -704,6 +1281,14 @@ impl TrafficDriver {
         let all = if on.is_empty() { all } else { on };
         let turns: Vec<u32> = all.iter().copied().filter(|&c| g.connectors()[c as usize].turn != Turn::UTurn).collect();
         let options = if turns.is_empty() { all } else { turns };
+        // Within the steering lock, or else the least bent.
+        let bent = |c: u32| bend(&g.connectors()[c as usize].line);
+        let fit: Vec<u32> = options.iter().copied().filter(|&c| bent(c) <= self.geometry.max_curvature).collect();
+        let options = if fit.is_empty() {
+            options.iter().copied().min_by(|&a, &b| bent(a).total_cmp(&bent(b))).into_iter().collect()
+        } else {
+            fit
+        };
         let roads = world.roads().roads();
         let weight = |c: u32| {
             let to = &g.lanes()[g.connectors()[c as usize].to as usize];
@@ -733,9 +1318,33 @@ impl TrafficDriver {
         if let Some(&c) = self.plan.last() {
             lane = g.connectors()[c as usize].to;
         }
+        // Buses: along their loop; a new one when its next movement cannot be made from here
+        // (and when that one cannot either, its first movement all the same).
+        let mut fresh = false;
+        while self.bus.is_some() && self.plan.len() < 2 {
+            let route = self.bus.as_ref().expect("a bus");
+            let c = route.connectors[(route.next + self.plan.len()) % route.connectors.len()];
+            match Self::equivalent(g, c, lane, &|c| self.allowed(c)) {
+                Some(c) => {
+                    self.plan.push(c);
+                    lane = g.connectors()[c as usize].to;
+                }
+                None if fresh => {
+                    self.plan.push(c);
+                    lane = g.connectors()[c as usize].to;
+                }
+                None => {
+                    self.reroutes += 1;
+                    self.plan.clear();
+                    lane = p.elem.lane_after(g);
+                    self.bus = self.bus_route(g, lane);
+                    fresh = true;
+                }
+            }
+        }
         while self.plan.len() < 2 {
             let Some(c) = self.choose(g, world, lane, false) else { break };
-            let c = Self::equivalent(g, c, lane).unwrap_or(c);
+            let c = Self::equivalent(g, c, lane, &|c| self.allowed(c)).unwrap_or(c);
             self.plan.push(c);
             lane = g.connectors()[c as usize].to;
         }
@@ -751,6 +1360,7 @@ impl TrafficDriver {
         }
         let xy = pose.pos.truncate();
         if let Some(mut p) = self.place {
+            let mut passed = Vec::new();
             for _ in 0..4 {
                 let line = p.elem.line(g);
                 let lo = (p.station - 2.0).max(0.0);
@@ -777,26 +1387,34 @@ impl TrafficDriver {
                             if self.plan.first() == Some(&c) {
                                 self.plan.remove(0);
                             }
+                            self.bus_took(g, c);
                             self.change = None;
                             Elem::Connector(c)
                         }
                         Elem::Connector(c) => Elem::Lane(g.connectors()[c as usize].to),
                     };
+                    passed.push(p.elem);
                     p = Place { elem: next, station: 0.0 };
                     continue;
                 }
                 break;
             }
             let off = p.elem.line(g).point_at(p.station).truncate().distance(xy);
-            let allowed = LOST + self.change.map_or(0.0, |_| 4.0);
+            // (Long vehicles swing wide, and run wider still on bends beyond their lock.)
+            let long = if self.geometry.tracking > SWING_LENGTH { SWING_MAX + LOST_WIDE } else { 0.0 };
+            let allowed = LOST + self.change.map_or(0.0, |_| 4.0) + long;
             if off <= allowed {
                 self.place = Some(p);
+                self.trail.extend(passed);
+                let extra = self.trail.len().saturating_sub(TRAIL);
+                self.trail.drain(..extra);
                 self.fill_plan(g, world);
                 return;
             }
         }
         // Lost (or new): the nearest lane or connector along the heading.
         self.plan.clear();
+        self.trail.clear();
         self.change = None;
         self.place = find(g, xy, yaw(pose.rot));
         self.fill_plan(g, world);
@@ -822,8 +1440,24 @@ impl TrafficDriver {
             pos: pose.pos.truncate(),
             heading: yaw(pose.rot),
             half_width: geo.half_width,
+            articulated: geo.articulated,
+            long: self.is_long(),
+            via: match (p.elem, self.trail.last()) {
+                (Elem::Lane(_), Some(&Elem::Connector(c))) => c,
+                _ => ANY,
+            },
+            tail: false,
         };
         index.insert(p.elem, o);
+        // Its tail on the elements behind, as far back as it reaches.
+        let mut station = p.station;
+        for &e in self.trail.iter().rev() {
+            if station - o.rear >= 0.0 {
+                break;
+            }
+            station += e.line(g).length();
+            index.insert(e, Occupant { station, tail: true, ..o });
+        }
         if let (Some(c), Elem::Lane(l)) = (self.change, p.elem) {
             let s = p.station * g.lanes()[c.from as usize].line.length() / g.lanes()[l as usize].line.length();
             index.insert(Elem::Lane(c.from), Occupant { station: s, ..o });
@@ -840,7 +1474,10 @@ impl TrafficDriver {
                 _ => None,
             };
             if let Some(d) = distance {
-                index.grant(c, Grant { agent, distance: d.max(0.0), speed, length: geo.front - geo.rear });
+                index.grant(
+                    c,
+                    Grant { agent, distance: d.max(0.0), speed, length: geo.front - geo.rear, long: self.is_long() },
+                );
             }
         }
     }
@@ -913,6 +1550,7 @@ impl TrafficDriver {
             self.granted = None;
         }
         let dl = base - geo.front;
+        let back = index.hold_back(lane);
         acc = acc.min(self.shared_leader(g, index, c, base, me, v, idm));
         let granted = self.granted == Some(c);
         if dl > DECIDE.max(reach + 2.0 * v) && !granted {
@@ -924,16 +1562,34 @@ impl TrafficDriver {
         {
             if granted || dl < GRANT.max(3.0 * v) {
                 self.granted = Some(c);
-                index.grant(c, Grant { agent: me, distance: dl.max(0.0), speed: v, length: geo.front - geo.rear });
+                index.grant(
+                    c,
+                    Grant {
+                        agent: me,
+                        distance: dl.max(0.0),
+                        speed: v,
+                        length: geo.front - geo.rear,
+                        long: self.is_long(),
+                    },
+                );
             }
             self.waiting = 0.0;
         } else {
             self.granted = None;
-            acc = acc.min(hold(idm, v, dl - STOP_LINE));
-            self.waiting = if v < STANDING && dl < 5.0 { self.waiting + dt } else { 0.0 };
+            acc = acc.min(hold(idm, v, dl - STOP_LINE - back));
+            self.waiting = if v < STANDING && dl < 5.0 + back { self.waiting + dt } else { 0.0 };
         }
-        if g.control(lane) == Control::Stop && v < STANDING && dl < 3.0 {
+        if g.control(lane) == Control::Stop && v < STANDING && dl < 3.0 + back {
             self.stopped_at = Some(lane);
+        }
+        // Even when allowed through: clear of long vehicles sweeping past the line now
+        // (unless already past where it would wait).
+        for &c2 in &index.sweeps.lanes[lane as usize] {
+            let sweep = index.sweeps.connectors[c2 as usize].iter().find(|x| x.lane == lane).expect("listed both ways");
+            let gap = dl - STOP_LINE - sweep.back;
+            if gap > -0.5 && index.sweeping(g, c2, sweep) {
+                acc = acc.min(hold(idm, v, gap));
+            }
         }
         // Committed: stop before conflict zones that others occupy.
         if self.granted == Some(c)
@@ -948,7 +1604,7 @@ impl TrafficDriver {
                 (chain.get(j + 1), chain.get(j + 2))
                 && g.lanes()[l as usize].line.length() < self.room_needed()
             {
-                let d2 = base - geo.front;
+                let d2 = base - geo.front - index.hold_back(l);
                 let (light, left) = signals.light_left(g, c2, t);
                 if self.stops_at(g, c2, d2, v, light, left) {
                     acc = acc.min(hold(idm, v, d2 - STOP_LINE));
@@ -1039,6 +1695,7 @@ impl TrafficDriver {
         let hard = self.spec.safe_decel.max(b);
         let granted = self.granted == Some(c);
         // Deceleration to stop at the line.
+        let dl = dl - index.hold_back(lane);
         let need = v * v / (2.0 * (dl - STOP_LINE).max(0.1));
         // (Asked ahead, the light is left out: it only delays.)
         let (light, left) = if ahead { (Light::Green, f64::INFINITY) } else { signals.light_left(g, c, t) };
@@ -1056,6 +1713,20 @@ impl TrafficDriver {
         }
         if granted {
             return need > b || self.room(index, chain, k, me);
+        }
+        // Long vehicles: not while others stand in the band they would sweep, or could not
+        // stop short of it.
+        if self.is_long()
+            && index.sweeps.connectors[c as usize].iter().any(|sw| {
+                let end = g.lanes()[sw.lane as usize].line.length() - STOP_LINE - sw.back;
+                index.lanes[sw.lane as usize].iter().any(|o| {
+                    o.agent != me
+                        && !o.tail
+                        && o.station + o.front + o.speed * o.speed / (2.0 * SWEEP_BRAKE) > end + 0.3
+                })
+            })
+        {
+            return false;
         }
         if !ahead && g.control(lane) == Control::Stop && self.stopped_at != Some(lane) {
             return false;
@@ -1167,9 +1838,10 @@ impl TrafficDriver {
     /// Whether occupant `o` of connector `other` stands clear of the driver's path along
     /// `line`: every corner of it on the same side, at least half the driver's width and
     /// [`PASSING`] m away, and its own path on up to station `end` keeping that far too (it
-    /// may move on).
+    /// may move on). Never a long vehicle (towing trailers, they do not line up behind it;
+    /// rigid, its front swings wide in bends).
     fn passes(&self, line: &Polyline, other: &Polyline, end: f64, o: &Occupant) -> bool {
-        if o.speed >= STANDING {
+        if o.speed >= STANDING || o.articulated || o.long {
             return false;
         }
         let need = self.geometry.half_width + PASSING;
@@ -1303,8 +1975,9 @@ impl TrafficDriver {
             }
         }
 
-        // Junctions.
+        // Junctions, and a bus's stops.
         acc = acc.min(self.junction(g, index, &chain, p, me, v, &idm, signals, t, dt));
+        acc = acc.min(self.bus_stop(g, p, v, &idm, dt));
 
         // Lane changes.
         if self.change.is_none()
@@ -1329,7 +2002,15 @@ impl TrafficDriver {
         let look = self.spec.lookahead[0] + self.spec.lookahead[1] * v;
         let target = self.reference(g, &chain, place, look);
         let heading = yaw(pose.rot);
-        let local = DVec2::from_angle(-heading).rotate(target - pose.pos.truncate());
+        // Long vehicles from their rear axle (the look-ahead still counted from the front):
+        // from the front, a look-ahead as short as their wheelbase and slow steering make
+        // them weave.
+        let from = if self.is_long() {
+            pose.pos.truncate() - self.geometry.wheelbase * DVec2::from_angle(heading)
+        } else {
+            pose.pos.truncate()
+        };
+        let local = DVec2::from_angle(-heading).rotate(target - from);
         let d2 = local.length_squared();
         let curvature = if d2 > 1e-6 { 2.0 * local.y / d2 } else { 0.0 };
         let limit = self.geometry.max_curvature;
@@ -1343,7 +2024,20 @@ impl TrafficDriver {
         let Some((e, s)) = at_distance(g, chain, ahead) else {
             return place.elem.line(g).point_at(place.station).truncate();
         };
-        let point = e.line(g).point_at(s).truncate();
+        let line = e.line(g);
+        let mut point = line.point_at(s).truncate();
+        // Vehicles towing trailers swing wide in left bends: their towing unit's rear axle
+        // out by half the offtracking of the trailers' (up to SWING_MAX), which then run as far
+        // inside (curvature averaged over ±5 m). In right bends they would swing into the
+        // oncoming lane, where traffic waits at the line; there the trailers cut over the
+        // corner instead.
+        let l = self.geometry.trailing();
+        if l > SWING_LENGTH {
+            let k = ((-5..=5).map(|d| line.curvature_at(s + f64::from(d))).sum::<f64>() / 11.0).max(0.0);
+            let r = 1.0 / k.abs().max(1e-6);
+            let off = if r > l { r - (r * r - l * l).sqrt() } else { r };
+            point -= k.signum() * (0.5 * off).min(SWING_MAX) * DVec2::from_angle(line.heading_at(s)).perp();
+        }
         match (self.change, e) {
             (Some(c), Elem::Lane(l)) if e == place.elem => {
                 let t = ((s - c.start) / c.length).clamp(0.0, 1.0);
@@ -1492,9 +2186,42 @@ fn at_distance(g: &LaneGraph, chain: &[(Elem, f64)], d: f64) -> Option<(Elem, f6
     found
 }
 
+/// Whether connectors `a` and `b` make the same movement: from the same road and direction,
+/// the same turn into the same road and direction.
+fn same_movement(g: &LaneGraph, a: u32, b: u32) -> bool {
+    let (ca, cb) = (&g.connectors()[a as usize], &g.connectors()[b as usize]);
+    let lane = |l: u32| &g.lanes()[l as usize];
+    let (fa, fb, ta, tb) = (lane(ca.from), lane(cb.from), lane(ca.to), lane(cb.to));
+    ca.turn == cb.turn && fa.road == fb.road && fa.dir == fb.dir && ta.road == tb.road && ta.dir == tb.dir
+}
+
+/// An f64 ordered by [`f64::total_cmp`] (for heaps).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrdF64(f64);
+
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// IDM acceleration of a driver at speed `v` that is to stop `d` m ahead.
 fn hold(idm: &Idm, v: f64, d: f64) -> f64 {
     idm.accel(v, Some((d.max(0.0) + idm.min_gap, v)))
+}
+
+/// Largest |curvature| along `line` (1/m), sampled every metre.
+fn bend(line: &Polyline) -> f64 {
+    let n = line.length().ceil() as usize;
+    (0..=n).map(|k| line.curvature_at(k as f64).abs()).fold(0.0, f64::max)
 }
 
 /// Time (s) to cover `d` m from speed `v`, accelerating at `a` up to `vmax`.
@@ -1516,44 +2243,55 @@ fn beyond(line: &Polyline, p: DVec2) -> f64 {
     (p - end).dot(DVec2::from_angle(line.heading_at(line.length())))
 }
 
-/// Lanes long enough to spawn on (with their lengths), for [`draw_lane_point`].
-fn spawn_lanes(g: &LaneGraph) -> Vec<(u32, f64)> {
+/// Lanes long enough to spawn on (with their lengths), for [`draw_lane_point`]: a vehicle
+/// reaching `back` m behind its reference point, keeping to `only` lanes if given.
+fn spawn_lanes(g: &LaneGraph, back: f64, only: Option<&[bool]>) -> Vec<(u32, f64)> {
     (g.lanes().iter().enumerate())
-        .filter(|(_, l)| l.line.length() > 12.0)
+        .filter(|(k, l)| l.line.length() > spawn_start(back) + 7.0 && only.is_none_or(|o| o[*k]))
         .map(|(k, l)| (k as u32, l.line.length()))
         .collect()
 }
 
-/// A point of a random lane of `lanes` (drawn by length, 5 m clear of its ends) and the lane's
-/// heading there.
-fn draw_lane_point(g: &LaneGraph, lanes: &[(u32, f64)], rng: &mut SimRng) -> (DVec2, f64) {
-    let total: f64 = lanes.iter().map(|l| l.1 - 10.0).sum();
+/// Smallest station of a spawn (m): 5 m, or 1 m more than the vehicle reaches back.
+fn spawn_start(back: f64) -> f64 {
+    5.0f64.max(back + 1.0)
+}
+
+/// A point of a random lane of `lanes` (drawn by length, 5 m clear of its end and
+/// [`spawn_start`] of its start) and the lane's heading there.
+fn draw_lane_point(g: &LaneGraph, lanes: &[(u32, f64)], back: f64, rng: &mut SimRng) -> (DVec2, f64) {
+    let lo = spawn_start(back);
+    let total: f64 = lanes.iter().map(|l| l.1 - lo - 5.0).sum();
     let mut x = rng.uniform() * total;
     let &(k, len) = lanes
         .iter()
         .find(|l| {
-            x -= l.1 - 10.0;
+            x -= l.1 - lo - 5.0;
             x < 0.0
         })
         .unwrap_or(lanes.last().expect("lanes"));
-    let s = 5.0 + rng.uniform() * (len - 10.0);
+    let s = lo + rng.uniform() * (len - lo - 5.0);
     let line = &g.lanes()[k as usize].line;
     (line.point_at(s).truncate(), wrap_angle(line.heading_at(s)))
 }
 
-/// `count` spawns in random lanes (drawn by length, 5 m clear of their ends) along their
-/// direction, at least `min_separation` from `placed` where possible (appended to it); `lift`
-/// above the ground. `None` on maps without lanes.
+/// `count` spawns in random lanes ([`draw_lane_point`], for vehicles reaching `back` m behind
+/// their reference point, on `only` lanes if given) along their direction, at least
+/// `min_separation` from `placed` where possible (appended to it); `lift` above the ground.
+/// `None` on maps without (such) lanes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lane_spawns(
     world: &StaticWorld,
     count: usize,
+    back: f64,
+    only: Option<&[bool]>,
     min_separation: f64,
     lift: f64,
     placed: &mut Vec<DVec3>,
     rng: &mut SimRng,
 ) -> Option<Vec<(DVec3, f64)>> {
     let g = world.roads().lanes();
-    let lanes = spawn_lanes(g);
+    let lanes = spawn_lanes(g, back, only);
     if lanes.is_empty() {
         return None;
     }
@@ -1561,7 +2299,7 @@ pub(crate) fn lane_spawns(
     for _ in 0..count {
         let mut best: Option<(f64, DVec3, f64)> = None;
         for _ in 0..64 {
-            let (xy, heading) = draw_lane_point(g, &lanes, rng);
+            let (xy, heading) = draw_lane_point(g, &lanes, back, rng);
             let pos = xy.extend(world.terrain().height(xy.x, xy.y) + lift);
             let apart = placed.iter().map(|q| q.truncate().distance(xy)).fold(f64::INFINITY, f64::min);
             if best.is_none_or(|b| apart > b.0) {
@@ -1578,31 +2316,62 @@ pub(crate) fn lane_spawns(
     Some(out)
 }
 
+/// Vehicles whose [`DriverGeometry::tracking`] length exceeds this (m) swing wide in bends.
+const SWING_LENGTH: f64 = 3.0;
+
+/// A long vehicle's [`Network`] takes bends up to this factor tighter than its lock (it runs
+/// a little wide there).
+const BEND_MARGIN: f64 = 1.25;
+
+/// Largest outward shift of a long vehicle's steering reference in bends (m).
+const SWING_MAX: f64 = 1.5;
+
+/// How much farther (m) than [`LOST`] and its swing a long vehicle may be off its line before
+/// it is lost (on bends tighter than its lock it runs wide).
+const LOST_WIDE: f64 = 3.0;
+/// Shortest lane with a bus stop (m).
+const STOP_LANE: f64 = 40.0;
+/// A bus stands at its stop within this distance of it (m), and passes it by when this far
+/// beyond (m).
+const STOP_REACHED: f64 = 1.0;
+const STOP_MISSED: f64 = 5.0;
+/// Deceleration (m/s²) others are counted on to stop with short of a long vehicle's sweep.
+const SWEEP_BRAKE: f64 = 2.5;
+/// Largest setback of a stop line for long vehicles' sweeps (m; [`hold_backs`]).
+const HOLD_BACK_MAX: f64 = 25.0;
+
+/// Elements a driver remembers behind its place, for its tail ([`TrafficDriver::trail`]).
+const TRAIL: usize = 8;
+
 /// Step (m) of the check that a standing vehicle's path stays clear ([`TrafficDriver::passes`]).
 const ZONE_STEP: f64 = 0.5;
 
 /// Clearance (m) of a respawn from every other agent.
 const RESPAWN_APART: f64 = 20.0;
 
-/// Where a driver respawns: a random lane point (and heading) at least `clear` m from every
-/// learning agent in `learners` and [`RESPAWN_APART`] m from `others`, or the draw of 64 that
-/// comes closest. `None` on maps without lanes.
+/// Where a driver respawns: a random lane point (and heading; [`draw_lane_point`], reaching
+/// `back` m behind it, on `only` lanes if given) at least `clear` m from every learning agent in `learners` and
+/// [`RESPAWN_APART`] m from `others`, or the draw of 64 that comes closest. `None` on maps
+/// without lanes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn respawn_spot(
     world: &StaticWorld,
+    back: f64,
+    only: Option<&[bool]>,
     learners: &[DVec2],
     others: &[DVec2],
     clear: f64,
     rng: &mut SimRng,
 ) -> Option<(DVec2, f64)> {
     let g = world.roads().lanes();
-    let lanes = spawn_lanes(g);
+    let lanes = spawn_lanes(g, back, only);
     if lanes.is_empty() {
         return None;
     }
     let nearest = |set: &[DVec2], p: DVec2| set.iter().map(|q| q.distance(p)).fold(f64::INFINITY, f64::min);
     let mut best: Option<(f64, DVec2, f64)> = None;
     for _ in 0..64 {
-        let (xy, heading) = draw_lane_point(g, &lanes, rng);
+        let (xy, heading) = draw_lane_point(g, &lanes, back, rng);
         let score = (nearest(learners, xy) / clear.max(1e-9)).min(1.0) + (nearest(others, xy) / RESPAWN_APART).min(1.0);
         if best.is_none_or(|b| score > b.0) {
             best = Some((score, xy, heading));
