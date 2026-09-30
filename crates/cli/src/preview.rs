@@ -1,4 +1,5 @@
-//! Top-down preview image of a map: material colours with hill shading, water, trees and rocks.
+//! Top-down preview image of a map: material colours with hill shading, water, trees, rocks,
+//! buildings and parking bays.
 
 use autonomousim_world::ObstacleShape;
 use autonomousim_world::StaticWorld;
@@ -46,9 +47,10 @@ pub fn write_ppm(world: &StaticWorld, stride: usize, path: &Path) -> std::io::Re
     let obstacles = world.obstacles().set().map_or(&[][..], |s| s.obstacles());
     for o in obstacles {
         let footprint = match (o.tag, &o.shape) {
-            (tags::HEDGE | tags::FENCE | tags::BUILDING, ObstacleShape::Cuboid { half_extents: he }) => {
-                Some((*he, [40u8, 90, 35]))
-            }
+            (
+                tags::HEDGE | tags::FENCE | tags::BUILDING | tags::WALL | tags::BLOCK | tags::PAD,
+                ObstacleShape::Cuboid { half_extents: he },
+            ) => Some((*he, [40u8, 90, 35])),
             (tags::SILO, ObstacleShape::Cylinder { radius, .. }) => {
                 Some((DVec3::new(*radius, *radius, 0.0), [200, 200, 205]))
             }
@@ -61,6 +63,9 @@ pub fn write_ppm(world: &StaticWorld, stride: usize, path: &Path) -> std::io::Re
             match o.tag {
                 tags::FENCE => color = [140, 100, 60],
                 tags::BUILDING => color = [150, 60, 45],
+                tags::WALL => color = [170, 170, 165],
+                tags::BLOCK => color = [95, 100, 125],
+                tags::PAD => color = [230, 150, 40],
                 _ => {}
             }
             let (nx, ny) = ((he.x / 0.25).ceil() as i32, (he.y / 0.25).ceil() as i32);
@@ -91,6 +96,22 @@ pub fn write_ppm(world: &StaticWorld, stride: usize, path: &Path) -> std::io::Re
                 if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
                     let i = ((h - 1 - y as usize) * w + x as usize) * 3;
                     rgb[i..i + 3].copy_from_slice(&color);
+                }
+            }
+        }
+    }
+    // Parking bays: outlines.
+    for bay in &world.sites().bays {
+        let c = bay.corners();
+        for k in 0..4 {
+            let (a, b) = (c[k], c[(k + 1) % 4]);
+            let steps = (a.distance(b) / (0.25 * cell)).ceil().max(1.0) as usize;
+            for s in 0..=steps {
+                let q = (a.lerp(b, s as f64 / steps as f64) - origin) / cell;
+                let (x, y) = (q.x as isize, q.y as isize);
+                if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                    let i = ((h - 1 - y as usize) * w + x as usize) * 3;
+                    rgb[i..i + 3].copy_from_slice(&[235, 235, 235]);
                 }
             }
         }

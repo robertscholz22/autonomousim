@@ -27,6 +27,20 @@ pub mod tags {
     /// Farm building (cuboid) and silo (cylinder).
     pub const BUILDING: u16 = 9;
     pub const SILO: u16 = 10;
+    /// Urban building piece (cuboid; a building is one or more).
+    pub const BLOCK: u16 = 11;
+    /// Gable roof (convex prism) on an urban building.
+    pub const ROOF: u16 = 12;
+    /// Parapet around a flat roof.
+    pub const PARAPET: u16 = 13;
+    /// Plant box on a flat roof.
+    pub const ROOF_UNIT: u16 = 14;
+    /// Rooftop landing pad (a thin slab).
+    pub const PAD: u16 = 15;
+    /// Street lamp post.
+    pub const LAMP: u16 = 16;
+    /// Traffic signal pole and head.
+    pub const SIGNAL: u16 = 17;
 }
 
 /// Obstacle geometry in its local frame. Axisymmetric shapes use the local `z` axis.

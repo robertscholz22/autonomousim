@@ -4,6 +4,7 @@ use crate::geodesy::GeoOrigin;
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::ObstacleSet;
 use crate::roads::RoadNetwork;
+use crate::sites::Sites;
 use crate::tiles::TiledMap;
 use autonomousim_core::geometry::{HitMask, Ray, RayHit, StaticGeometry, SurfacePoint};
 use autonomousim_core::material::{Material, MaterialId, MaterialTable};
@@ -173,6 +174,8 @@ pub struct StaticWorld {
     obstacles: MapObstacles,
     materials: MaterialTable,
     roads: RoadNetwork,
+    /// Lots, buildings, pads and bays (urban maps).
+    sites: Arc<Sites>,
     /// Content hash of a tiled map (fixed by its generator; grids are hashed from content).
     tiled_hash: Option<crate::MapHash>,
 }
@@ -185,6 +188,7 @@ impl StaticWorld {
             obstacles: MapObstacles::Set(obstacles),
             materials,
             roads: RoadNetwork::default(),
+            sites: Arc::default(),
             tiled_hash: None,
         }
     }
@@ -197,6 +201,7 @@ impl StaticWorld {
             obstacles: MapObstacles::Tiled(tiles),
             materials,
             roads: RoadNetwork::default(),
+            sites: Arc::default(),
             tiled_hash: Some(hash),
         }
     }
@@ -216,6 +221,17 @@ impl StaticWorld {
     pub fn with_roads(mut self, roads: RoadNetwork) -> Self {
         self.roads = roads;
         self
+    }
+
+    /// The same map with lots, buildings, pads and bays.
+    pub fn with_sites(mut self, sites: Sites) -> Self {
+        self.sites = Arc::new(sites);
+        self
+    }
+
+    /// Lots, buildings, pads and bays (empty for maps without).
+    pub fn sites(&self) -> &Sites {
+        &self.sites
     }
 
     /// The road network (empty for maps without roads).

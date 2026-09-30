@@ -187,13 +187,13 @@ impl WorldInstance {
             let mut bays = Vec::new();
             let mut trips = Vec::new();
             let (positions, mut road_spawns) = if bay_goals {
-                // Spawn and goal in a farm yard.
+                // Spawn and goal in a farm yard or at a parking bay.
                 let d = g.def.as_wheeled().expect("bay goals are for ground vehicles");
-                let yards = crate::bay::yards(world);
+                let slots = crate::bay::slots(world, &g.spec.goals.bay);
                 let mut used = Vec::new();
                 for _ in 0..g.spec.count {
-                    let b = crate::bay::sample(world, &yards, &g.spec.goals, d, lift, &mut used, &mut goal_rng)
-                        .expect("maps of bay goals have yards");
+                    let b = crate::bay::sample(world, &slots, &g.spec.goals, d, lift, &mut used, &mut goal_rng)
+                        .expect("maps of bay goals have yards or bays");
                     placed.push(b.xy.extend(0.0));
                     bays.push(b);
                 }

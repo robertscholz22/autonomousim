@@ -856,10 +856,10 @@ pub enum GoalKind {
     /// agent keeps the route for the `road` and `route` observation terms. Needs a map with
     /// roads.
     Route,
-    /// One goal: a bay at the far side of a farm yard for the tail of the vehicle's last unit
-    /// (see [`BayGoals`]); the vehicle spawns in the yard ahead of it, facing the yard's road
-    /// (the spawn spec's position settings are ignored). Ground vehicles on maps with farm
-    /// yards.
+    /// One goal: a bay at the far side of a farm yard or a marked parking bay of an urban
+    /// map, for the tail of the vehicle's last unit (see [`BayGoals`]); the vehicle spawns
+    /// ahead of it (the spawn spec's position settings are ignored). Ground vehicles on maps
+    /// with farm yards or parking bays.
     Bay,
     /// One goal: the pad of a farm yard `distance` (horizontally) from the pad of another
     /// where the vehicle spawns, `agl` above the surface (the closest yard to the range when
@@ -1026,7 +1026,7 @@ pub struct CompiledScenario {
     pub maps: Vec<Arc<StaticWorld>>,
     pub map_hashes: Vec<MapHash>,
     /// The maps episodes are drawn from: all of them, or with `bay` goals those with farm
-    /// yards.
+    /// yards or parking bays.
     pub episode_maps: Vec<usize>,
     pub groups: Vec<CompiledGroup>,
 }
@@ -1153,10 +1153,10 @@ impl CompiledScenario {
         }
         let mut episode_maps: Vec<usize> = (0..maps.len()).collect();
         if let Some(g) = groups.iter().find(|g| g.spec.goals.kind == GoalKind::Bay) {
-            episode_maps.retain(|&k| !crate::bay::yards(&maps[k]).is_empty());
+            episode_maps.retain(|&k| !crate::bay::slots(&maps[k], &g.spec.goals.bay).is_empty());
             if episode_maps.is_empty() {
                 return Err(SimError::Scenario(format!(
-                    "group {:?}: `bay` goals need farm yards, no map has any",
+                    "group {:?}: `bay` goals need farm yards or parking bays, no map has any",
                     g.spec.name
                 )));
             }

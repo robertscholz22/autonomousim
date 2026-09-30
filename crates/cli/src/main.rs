@@ -297,6 +297,12 @@ fn print_urban_stats(s: &UrbanStats) {
     let roads: Vec<String> =
         (0..4).map(|k| format!("{} {} ({:.1} km)", s.roads[k], names[k], 1e-3 * s.road_length[k])).collect();
     println!("roads: {}", roads.join(", "));
+    let [d, c, r, i, p, k] = s.lots;
+    println!(
+        "lots: {d} downtown, {c} commercial, {r} residential, {i} industrial, {p} park, {k} parking; {} buildings, {} rooftop pads",
+        s.buildings, s.pads
+    );
+    println!("parking bays: {} in lots, {} on streets; {} obstacles", s.bays[0], s.bays[1], s.obstacles);
     println!("heights {:.1} … {:.1} m", s.height_range.0, s.height_range.1);
     let cells: usize = s.materials.iter().map(|m| m.1).sum();
     let shares: Vec<String> =
@@ -334,6 +340,13 @@ fn info(w: &StaticWorld, hash: &str) -> String {
         tags::FENCE => "fence pieces".to_owned(),
         tags::BUILDING => "buildings".to_owned(),
         tags::SILO => "silos".to_owned(),
+        tags::BLOCK => "building pieces".to_owned(),
+        tags::ROOF => "gable roofs".to_owned(),
+        tags::PARAPET => "parapets".to_owned(),
+        tags::ROOF_UNIT => "roof units".to_owned(),
+        tags::PAD => "rooftop pads".to_owned(),
+        tags::LAMP => "lamp posts".to_owned(),
+        tags::SIGNAL => "signal poles".to_owned(),
         t => format!("tag {t}"),
     };
     let obstacles: Vec<String> = by_tag.iter().map(|(t, n)| format!("{n} {}", tag(*t))).collect();

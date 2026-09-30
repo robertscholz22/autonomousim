@@ -361,6 +361,32 @@ impl RoadNetwork {
         &self.roads
     }
 
+    /// Distance from `p` to the nearest road edge among the roads whose centre line lies
+    /// within `reach` (negative on a road), with that road; `None` when no road is that close.
+    /// The edge is the carriageway's, plus the sidewalk on `p`'s side when `sidewalks`;
+    /// road `except` does not count. Ties go to the lower road.
+    pub fn edge_distance(&self, p: DVec2, reach: f64, sidewalks: bool, except: Option<u32>) -> Option<(f64, u32)> {
+        let mut best: Option<(f64, u32)> = None;
+        self.grid.visit(p, reach, &mut |road, seg| {
+            if except == Some(road) {
+                return reach;
+            }
+            let r = &self.roads[road as usize];
+            let (s, d2) = r.line.project_segment(seg as usize, p);
+            if d2 <= reach * reach {
+                let pr = r.line.projection(seg as usize, s, p);
+                let walk =
+                    if sidewalks { self.section(road as usize).sidewalk[usize::from(pr.offset > 0.0)] } else { 0.0 };
+                let d = pr.distance - 0.5 * r.width - walk;
+                if best.is_none_or(|(b, k)| d < b || (d == b && road < k)) {
+                    best = Some((d, road));
+                }
+            }
+            reach
+        });
+        best
+    }
+
     /// Nearest road point to `p` within `max_dist` (horizontal); ties go to the lower road
     /// and segment index.
     pub fn nearest(&self, p: DVec2, max_dist: f64) -> Option<RoadPoint> {

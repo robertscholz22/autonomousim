@@ -115,6 +115,9 @@ pub fn obstacle_class(o: &Obstacle) -> SemanticClass {
         tags::HEDGE => SemanticClass::Trunk,
         tags::ROCK => SemanticClass::Boulder,
         tags::PILLAR | tags::WALL | tags::FENCE | tags::BUILDING | tags::SILO => SemanticClass::Building,
+        tags::BLOCK | tags::ROOF | tags::PARAPET | tags::ROOF_UNIT | tags::PAD | tags::LAMP | tags::SIGNAL => {
+            SemanticClass::Building
+        }
         _ if o.class == ObstacleClass::Foliage => SemanticClass::Canopy,
         _ => match o.material {
             MaterialId::ROCK | MaterialId::SCREE => SemanticClass::Boulder,

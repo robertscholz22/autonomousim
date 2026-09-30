@@ -22,6 +22,7 @@
 
 mod graph;
 mod layout;
+mod sites;
 
 use crate::ProcgenError;
 use crate::farmland::{FieldsConfig, ParcelKind, Parcels};
@@ -32,19 +33,20 @@ use crate::wild::{Land, WaterConfig, landform, merge, nearby_water};
 use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_world::{
-    GeoOrigin, HeightGrid, MapMeta, NodeKind, ObstacleSet, Polyline, Road, RoadClass, RoadNetwork, RoadNode, Section,
-    StaticWorld,
+    BayKind, GeoOrigin, HeightGrid, MapMeta, NodeKind, ObstacleSet, Polyline, Road, RoadClass, RoadNetwork, RoadNode,
+    Section, StaticWorld, Zone,
 };
 use glam::DVec2;
 use graph::{Graph, NodeId};
 use layout::{Districts, Ring, Site};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+pub use sites::{FurnitureConfig, LotsConfig, ZoneConfig};
 use std::f64::consts::TAU;
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const URBAN_VERSION: u32 = 2;
+pub const URBAN_VERSION: u32 = 3;
 
 /// The city's outline and ground.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -393,6 +395,10 @@ pub struct UrbanConfig {
     /// Field parcels of the countryside around the city.
     pub fields: FieldsConfig,
     pub materials: UrbanMaterialsConfig,
+    /// Blocks, lots and what stands on them.
+    pub lots: LotsConfig,
+    /// Trees, lamps and parking along the streets.
+    pub furniture: FurnitureConfig,
 }
 
 impl Default for UrbanConfig {
@@ -463,6 +469,8 @@ impl UrbanConfig {
             classes: StreetClassesConfig::default(),
             fields: FieldsConfig::default(),
             materials: UrbanMaterialsConfig::default(),
+            lots: LotsConfig::default(),
+            furniture: FurnitureConfig::default(),
         }
     }
 
@@ -569,6 +577,8 @@ impl UrbanConfig {
                 class.validate(name)?;
             }
             self.fields.validate()?;
+            self.lots.validate()?;
+            self.furniture.validate()?;
             if !(self.materials.rock_slope_deg > 0.0 && self.materials.rock_slope_deg < 90.0) {
                 return Err("materials: rock_slope_deg in (0, 90)".into());
             }
@@ -606,6 +616,13 @@ pub struct UrbanStats {
     /// One-way streets (roads), after those that cut the network apart became two-way.
     pub one_way: usize,
     pub height_range: (f64, f64),
+    /// Lots per zone (in [`Zone::ALL`] order), buildings, rooftop pads, parking bays in lots
+    /// and along streets, and obstacles.
+    pub lots: [usize; 6],
+    pub buildings: usize,
+    pub pads: usize,
+    pub bays: [usize; 2],
+    pub obstacles: usize,
     /// Cells per material id.
     pub materials: Vec<(String, usize)>,
 }
@@ -867,8 +884,34 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
     blend(c, &mut heights, n, origin, &network, max_half);
     stats.stage("blending", &mut t);
 
-    // 7. Materials.
+    // 7. Lots, buildings and street furniture.
     let hs = Heights { h: &heights, n, origin, cell: c.cell };
+    let lot_wet = |p: DVec2| {
+        let q = ((p - origin) / c.cell).floor();
+        let (cx, cy) = ((q.x.max(0.0) as usize).min(n - 2), (q.y.max(0.0) as usize).min(n - 2));
+        !water[cy * (n - 1) + cx].is_nan()
+    };
+    let town = sites::Town {
+        centre: city.centre,
+        radius: city.radius,
+        share: &city_share,
+        districts: &districts,
+        wet: &lot_wet,
+        rings: rings.iter().map(|r| (r.centre, r.radius)).collect(),
+    };
+    let built = sites::generate(c, &network, &hs, &town, &root.child("sites"));
+    for lot in &built.sites.lots {
+        stats.lots[Zone::ALL.iter().position(|&z| z == lot.zone).expect("zone")] += 1;
+    }
+    stats.buildings = built.sites.buildings.len();
+    stats.pads = built.sites.pads.len();
+    for b in &built.sites.bays {
+        stats.bays[usize::from(b.kind == BayKind::Street)] += 1;
+    }
+    stats.obstacles = built.obstacles.len();
+    stats.stage("sites", &mut t);
+
+    // 8. Materials.
     let slope = |p: DVec2| {
         let d = 10.0;
         let gx = hs.at(p + DVec2::X * d) - hs.at(p - DVec2::X * d);
@@ -876,7 +919,7 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
         (gx * gx + gy * gy).sqrt() / (2.0 * d)
     };
     let parcels = Parcels::new(&c.fields, c.size, &slope, &root.child("parcels"));
-    let materials = materials(c, origin, &heights, &water, &network, &city, &parcels, max_half);
+    let materials = materials(c, origin, &heights, &water, &network, &city, &parcels, &built.zones, max_half);
     let table = MaterialTable::rural();
     let mut counts = [0usize; 256];
     for id in &materials {
@@ -896,7 +939,9 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
     let mut meta = MapMeta::new("urban", "urban", seed);
     meta.generator_version = URBAN_VERSION;
     meta.geo_origin = c.geo_origin;
-    let world = StaticWorld::new(meta, grid, ObstacleSet::new(Vec::new()), table).with_roads(network);
+    let world = StaticWorld::new(meta, grid, ObstacleSet::new(built.obstacles), table)
+        .with_roads(network)
+        .with_sites(built.sites);
     stats.stage("obstacle index", &mut t);
     Ok((world, stats))
 }
@@ -1080,6 +1125,7 @@ fn materials(
     net: &RoadNetwork,
     city: &City,
     parcels: &Parcels,
+    zones: &sites::ZoneRaster,
     max_half: f64,
 ) -> Vec<MaterialId> {
     let n = c.vertices();
@@ -1114,6 +1160,13 @@ fn materials(
                 MaterialId::CONCRETE
             } else if slope > rock {
                 MaterialId::ROCK
+            } else if let Some(zone) = zones.at(p) {
+                match zone {
+                    Zone::Downtown | Zone::Commercial => MaterialId::CONCRETE,
+                    Zone::Industrial => MaterialId::GRAVEL,
+                    Zone::Parking => MaterialId::ASPHALT,
+                    Zone::Residential | Zone::Park => MaterialId::GRASS,
+                }
             } else if city.share(p) >= 0.5 || road.is_some_and(|r| r.0 < headland) {
                 MaterialId::GRASS
             } else {

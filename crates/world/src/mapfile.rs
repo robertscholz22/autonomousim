@@ -6,7 +6,9 @@
 //! (format 2 on, written only for maps with roads) the road nodes and polylines. The height
 //! pyramid, the obstacle BVH and the road grid are rebuilt on load. Format 3 adds, after the
 //! roads and only for networks with them, `postcard(sections)`: the roads' cross-sections
-//! (urban maps). Format 1 and 2 files still load.
+//! (urban maps). Format 4 adds, for maps with them, `postcard(sites)` (lots, buildings, pads and
+//! bays) after the sections (the roads and sections are then written even when empty). Older
+//! files still load.
 //!
 //! The **content hash** is blake3 over a domain tag and the same postcard encoding (the roads
 //! and sections only when there are any, so older maps keep their hashes), so two maps
@@ -16,6 +18,7 @@
 use crate::heightgrid::HeightGrid;
 use crate::obstacles::{Obstacle, ObstacleClass, ObstacleSet, ObstacleShape};
 use crate::roads::{RoadNetwork, RoadsData, Section};
+use crate::sites::Sites;
 use crate::static_world::{MapMeta, StaticWorld};
 use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::math::Pose;
@@ -27,7 +30,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 const MAGIC: &[u8; 8] = b"AUTOSIMM";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const HASH_DOMAIN: &[u8] = b"autonomousim map v1";
 
 /// blake3 content hash of a map (see the module docs).
@@ -226,11 +229,15 @@ pub fn content_hash(world: &StaticWorld) -> MapHash {
     let mut h = blake3::Hasher::new();
     h.update(HASH_DOMAIN);
     postcard::to_io(&view(world), &mut h).expect("hashing cannot fail");
-    if !world.roads().is_empty() {
+    let sites = !world.sites().is_empty();
+    if !world.roads().is_empty() || sites {
         postcard::to_io(&world.roads().stored(), &mut h).expect("hashing cannot fail");
     }
-    if world.roads().has_sections() {
+    if world.roads().has_sections() || sites {
         postcard::to_io(world.roads().stored_sections(), &mut h).expect("hashing cannot fail");
+    }
+    if sites {
+        postcard::to_io(world.sites(), &mut h).expect("hashing cannot fail");
     }
     MapHash(*h.finalize().as_bytes())
 }
@@ -247,12 +254,16 @@ pub fn write(world: &StaticWorld, w: impl Write, level: i32) -> Result<MapHash, 
     w.write_all(&hash.0)?;
     let enc = zstd::Encoder::new(w, level)?;
     let mut enc = postcard::to_io(&view(world), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
-    if !world.roads().is_empty() {
+    let sites = !world.sites().is_empty();
+    if !world.roads().is_empty() || sites {
         enc = postcard::to_io(&world.roads().stored(), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
     }
-    if world.roads().has_sections() {
+    if world.roads().has_sections() || sites {
         enc =
             postcard::to_io(world.roads().stored_sections(), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+    }
+    if sites {
+        enc = postcard::to_io(world.sites(), enc).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
     }
     enc.finish()?.flush()?;
     Ok(hash)
@@ -274,17 +285,19 @@ pub fn read(r: impl Read) -> Result<(StaticWorld, MapHash), MapFileError> {
     let bytes = zstd::decode_all(r)?;
     let (d, rest): (MapData, _) =
         postcard::take_from_bytes(&bytes).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
-    let roads = if rest.is_empty() {
-        RoadNetwork::default()
+    let corrupt = |e: postcard::Error| MapFileError::Corrupt(e.to_string());
+    let (roads, sites) = if rest.is_empty() {
+        (RoadNetwork::default(), Sites::default())
     } else {
-        let corrupt = |e: postcard::Error| MapFileError::Corrupt(e.to_string());
         let (r, rest): (RoadsData, _) = postcard::take_from_bytes(rest).map_err(corrupt)?;
         let net = RoadNetwork::try_from(r).map_err(MapFileError::Corrupt)?;
         if rest.is_empty() {
-            net
+            (net, Sites::default())
         } else {
-            let sections: Vec<Section> = postcard::from_bytes(rest).map_err(corrupt)?;
-            net.with_sections(sections).map_err(|e| MapFileError::Corrupt(e.to_string()))?
+            let (sections, rest): (Vec<Section>, _) = postcard::take_from_bytes(rest).map_err(corrupt)?;
+            let net = net.with_sections(sections).map_err(|e| MapFileError::Corrupt(e.to_string()))?;
+            let sites = if rest.is_empty() { Sites::default() } else { postcard::from_bytes(rest).map_err(corrupt)? };
+            (net, sites)
         }
     };
     let (nx, ny) = (d.nx as usize, d.ny as usize);
@@ -309,7 +322,8 @@ pub fn read(r: impl Read) -> Result<(StaticWorld, MapHash), MapFileError> {
         ObstacleSet::new(d.obstacles.into_iter().map(Obstacle::from).collect()),
         d.material_table,
     )
-    .with_roads(roads);
+    .with_roads(roads)
+    .with_sites(sites);
     let actual = content_hash(&world);
     if actual != stored {
         return Err(MapFileError::HashMismatch { stored, actual });
@@ -430,7 +444,21 @@ mod tests {
         let (back, h) = read(&old[..]).unwrap();
         assert_eq!(h, before);
         assert!(back.roads().is_empty());
-        old[8..12].copy_from_slice(&4u32.to_le_bytes());
-        assert!(matches!(read(&old[..]), Err(MapFileError::Version(4))));
+        old[8..12].copy_from_slice(&5u32.to_le_bytes());
+        assert!(matches!(read(&old[..]), Err(MapFileError::Version(5))));
+        // Sites (format 4) round-trip and change the hash, also on a map without roads.
+        use crate::sites::{BayKind, ParkingBay, Sites};
+        let bay =
+            ParkingBay { centre: DVec3::new(1.0, 2.0, 3.0), yaw: 0.5, size: DVec2::new(5.0, 2.5), kind: BayKind::Lot };
+        let sites = Sites { bays: vec![bay], ..Sites::default() };
+        for base in [urban.clone(), plain.clone()] {
+            let with_sites = base.clone().with_sites(sites.clone());
+            assert_ne!(with_sites.content_hash(), base.content_hash());
+            let mut buf = Vec::new();
+            write(&with_sites, &mut buf, 3).unwrap();
+            let (back, _) = read(&buf[..]).unwrap();
+            assert_eq!(back.sites(), &sites);
+            assert_eq!(back.roads(), base.roads());
+        }
     }
 }

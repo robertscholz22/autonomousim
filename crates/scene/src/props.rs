@@ -66,6 +66,15 @@ fn base_color(table: &MaterialTable, o: &Obstacle) -> [u8; 3] {
             MaterialId::WOOD => [142, 98, 66],
             _ => [166, 170, 176],
         },
+        tags::BLOCK | tags::PARAPET => match o.material {
+            MaterialId::METAL => [150, 156, 164],
+            _ => [196, 190, 180],
+        },
+        tags::ROOF => [150, 74, 54],
+        tags::PAD => [72, 74, 78],
+        tags::ROOF_UNIT => [172, 174, 178],
+        tags::LAMP => [64, 66, 70],
+        tags::SIGNAL => [44, 46, 48],
         _ => {
             if (o.material.0 as usize) < table.len() {
                 table.get(o.material).color
