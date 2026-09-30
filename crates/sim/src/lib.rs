@@ -21,6 +21,7 @@ pub mod lane;
 pub mod obs;
 pub mod policy;
 pub mod record;
+pub mod rooftop;
 pub mod scenario;
 pub mod traffic;
 pub mod world;

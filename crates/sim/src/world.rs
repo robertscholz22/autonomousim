@@ -226,6 +226,23 @@ impl WorldInstance {
                 }
                 let n = p.len();
                 (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            } else if g.spec.goals.kind == GoalKind::Rooftop {
+                // Spawn on a sidewalk or a pad, the goal on another pad.
+                let mut used = Vec::new();
+                let mut p = Vec::with_capacity(g.spec.count);
+                for _ in 0..g.spec.count {
+                    let t = crate::rooftop::trip(world, &g.spec.goals, &mut used, &mut goal_rng)
+                        .expect("maps of rooftop goals have two pads");
+                    let z = t.from.z
+                        + if spawn.on_ground { g.bottom + 1e-3 } else { spawn_rng.range(spawn.agl[0], spawn.agl[1]) };
+                    let agl = goal_rng.range(g.spec.goals.agl[0], g.spec.goals.agl[1]);
+                    let from = t.from.truncate();
+                    placed.push(from.extend(z));
+                    p.push(from.extend(z));
+                    trips.push(Goal { position: t.to.centre + DVec3::Z * agl, yaw: t.to.yaw });
+                }
+                let n = p.len();
+                (p, (0..n).map(|_| None).collect::<Vec<_>>())
             } else if spawn.on_road {
                 let only = self.agents[g.first_agent].driver.as_ref().map(|d| d.roads(world));
                 let rs = lane::road_spawns(

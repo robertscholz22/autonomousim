@@ -25,7 +25,9 @@ Importing the package registers the Gymnasium environments:
 - ``autonomousim/TiltrotorDelivery-v0``: take a quad tiltrotor off from a farm yard, cruise
   kilometres on the wing across farmland and land on another farm's yard;
 - ``autonomousim/DroneLandOnCar-v0``: follow a car driving on rural roads with a downward
-  camera and land on its roof (``Dict`` observations with an image).
+  camera and land on its roof (``Dict`` observations with an image);
+- ``autonomousim/DroneRooftopDelivery-v0``: fly a quadrotor across a generated city from a
+  sidewalk or a roof to a landing pad on another roof, with LiDAR.
 
 ``gym.make_vec(id, num_envs=N, ...)`` gives the native vector environment
 (``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Worlds with several
@@ -67,6 +69,7 @@ ENVS = {
     "HeliLandingZone-v0": "heli_landing_zone",
     "TiltrotorDelivery-v0": "tiltrotor_delivery",
     "DroneLandOnCar-v0": "land_on_car",
+    "DroneRooftopDelivery-v0": "rooftop_delivery",
 }
 
 for _name, _task in ENVS.items():

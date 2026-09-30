@@ -13,7 +13,7 @@ from autonomousim._native import TERMINAL_EVENTS
 from autonomousim.scenario import deep_merge
 
 #: Map shortcuts accepted by ``map=``. A dict is used as the map source itself.
-MAPS = ("flat", "forest", "wild", "offroad", "rural", "farmland", "delivery", "large")
+MAPS = ("flat", "forest", "wild", "offroad", "rural", "farmland", "delivery", "large", "urban")
 
 
 def map_source(name: str | dict[str, Any], seed: int, count: int) -> dict[str, Any]:
@@ -24,8 +24,9 @@ def map_source(name: str | dict[str, Any], seed: int, count: int) -> dict[str, A
     maps with a paved road, gravel roads to the farms and dirt tracks to the fields),
     ``farmland`` (2 km of farmland at 2 m cells with about 16 farms, for aircraft between
     farm yards), ``delivery`` (the same over 6 km with farms 400 m apart; about 100 s to
-    generate, then cached) or ``large`` (``count`` tiled 16 km wild maps with 900 m of relief, generated in tiles on
-    demand; for aircraft)."""
+    generate, then cached), ``large`` (``count`` tiled 16 km wild maps with 900 m of relief, generated in tiles on
+    demand; for aircraft) or ``urban`` (a pool of 512 m cities: streets with lanes and
+    signals, buildings, rooftop pads and parking)."""
     if isinstance(name, dict):
         return name
     if name == "flat":
@@ -36,6 +37,8 @@ def map_source(name: str | dict[str, Any], seed: int, count: int) -> dict[str, A
         return {"type": "wild", "seed": seed, "count": count, "preset": "training" if name == "wild" else "offroad"}
     if name == "large":
         return {"type": "wild", "seed": seed, "count": count, "preset": "large"}
+    if name == "urban":
+        return {"type": "urban", "seed": seed, "count": count, "preset": "training"}
     if name == "rural":
         return {"type": "rural", "seed": seed, "count": count, "preset": "training"}
     if name == "farmland":

@@ -43,6 +43,7 @@ use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::driver::DriverSpec;
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
+use crate::rooftop::RooftopGoals;
 use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
 use autonomousim_control::ground::{GroundActionLimits, GroundConfig};
 use autonomousim_control::multirotor::{ActionLimits, ControllerConfig};
@@ -875,6 +876,11 @@ pub enum GoalKind {
     /// none lies in it; the spawn spec's position settings are ignored, its height settings
     /// and `on_ground` apply). Aerial vehicles on maps with at least two farm yards.
     Yard,
+    /// One goal: a landing pad on a flat roof of an urban map, `agl` above its surface; the
+    /// vehicle starts on a sidewalk or on another pad `distance` (horizontally) away (see
+    /// [`RooftopGoals`]; the spawn spec's position settings are ignored, its height settings
+    /// and `on_ground` apply). Aerial vehicles on maps with at least two rooftop pads.
+    Rooftop,
 }
 
 /// Slot layout of `GoalKind::Formation`.
@@ -916,6 +922,9 @@ pub struct GoalSpec {
     /// Settings of `GoalKind::Bay`.
     #[serde(skip_serializing_if = "is_default")]
     pub bay: BayGoals,
+    /// Settings of `GoalKind::Rooftop`.
+    #[serde(skip_serializing_if = "is_default")]
+    pub rooftop: RooftopGoals,
     /// `Random` goals of ground vehicles: plan the cheapest drivable path from the spawn
     /// through the goals ([`DriveGrid::legs`](crate::drive::DriveGrid::legs), weighted by
     /// `drivable.resistance_cost`). The agent follows the leg to its current goal as its route,
@@ -961,6 +970,7 @@ impl Default for GoalSpec {
             spacing: 2.0,
             route: RouteGoals::default(),
             bay: BayGoals::default(),
+            rooftop: RooftopGoals::default(),
             path: false,
             off_road: false,
             grade: None,
@@ -1141,9 +1151,9 @@ impl CompiledScenario {
                         g.name
                     )));
                 }
-                if g.spawn.on_road || matches!(g.goals.kind, GoalKind::Bay | GoalKind::Yard) {
+                if g.spawn.on_road || matches!(g.goals.kind, GoalKind::Bay | GoalKind::Yard | GoalKind::Rooftop) {
                     return Err(SimError::Scenario(format!(
-                        "group {:?}: `spawn.near` does not go with `on_road` spawns or `bay` and `yard` goals",
+                        "group {:?}: `spawn.near` does not go with `on_road` spawns or `bay`, `yard` and `rooftop` goals",
                         g.name
                     )));
                 }
@@ -1175,6 +1185,15 @@ impl CompiledScenario {
             if episode_maps.is_empty() {
                 return Err(SimError::Scenario(format!(
                     "group {:?}: `yard` goals need two farm yards, no map has them",
+                    g.spec.name
+                )));
+            }
+        }
+        if let Some(g) = groups.iter().find(|g| g.spec.goals.kind == GoalKind::Rooftop) {
+            episode_maps.retain(|&k| crate::rooftop::usable(&maps[k]));
+            if episode_maps.is_empty() {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: `rooftop` goals need two rooftop pads, no map has them",
                     g.spec.name
                 )));
             }
@@ -1367,11 +1386,15 @@ impl CompiledGroup {
             return Err(fail(format!("invalid goals {gl:?}")));
         }
         gl.bay.validate().map_err(&fail)?;
+        gl.rooftop.validate().map_err(&fail)?;
         if gl.kind == GoalKind::Bay && family != Family::Wheeled {
             return Err(fail("`bay` goals need a ground vehicle".into()));
         }
-        if gl.kind == GoalKind::Yard && family == Family::Wheeled {
-            return Err(fail("`yard` goals need an aerial vehicle".into()));
+        if matches!(gl.kind, GoalKind::Yard | GoalKind::Rooftop) && family == Family::Wheeled {
+            return Err(fail(format!(
+                "`{}` goals need an aerial vehicle",
+                if gl.kind == GoalKind::Yard { "yard" } else { "rooftop" }
+            )));
         }
         if (gl.path || gl.off_road) && (gl.kind != GoalKind::Random || family != Family::Wheeled) {
             return Err(fail("`goals.path` and `goals.off_road` need `random` goals and a ground vehicle".into()));
@@ -1768,7 +1791,12 @@ impl GoalSpec {
         use autonomousim_core::math::quat::yaw;
         match self.kind {
             // Route goals come from `lane`; this is the fallback when no route is found.
-            GoalKind::Spawn | GoalKind::Formation | GoalKind::Route | GoalKind::Bay | GoalKind::Yard => {
+            GoalKind::Spawn
+            | GoalKind::Formation
+            | GoalKind::Route
+            | GoalKind::Bay
+            | GoalKind::Yard
+            | GoalKind::Rooftop => {
                 vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }]
             }
             GoalKind::Random => {

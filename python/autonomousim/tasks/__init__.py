@@ -13,6 +13,7 @@ from autonomousim.tasks.motorcycle_road import MotorcycleRoadRural
 from autonomousim.tasks.multi import MultiAgentTask, Team
 from autonomousim.tasks.recover import QuadRecover
 from autonomousim.tasks.road_follow import RoadFollowRural
+from autonomousim.tasks.rooftop_delivery import DroneRooftopDelivery
 from autonomousim.tasks.swarm import FormationHover, SwarmForestDrone, SwarmHover, SwarmWaypointForest
 from autonomousim.tasks.tiltrotor_delivery import TiltrotorDelivery
 from autonomousim.tasks.tracked_cross_country import TrackedCrossCountry
@@ -33,13 +34,14 @@ TASKS: dict[str, type[Task]] = {
     "heli_landing_zone": HeliLandingZone,
     "tiltrotor_delivery": TiltrotorDelivery,
     "land_on_car": DroneLandOnCar,
+    "rooftop_delivery": DroneRooftopDelivery,
 }
 
 
 def make_task(task: str | Task, **kwargs: Any) -> Task:
     """A task instance from its name (``hover``, ``hover_pad``, ``recover``, ``waypoint_forest``,
     ``car_waypoint``, ``road_follow``, ``trailer_reverse``, ``tracked_cross_country``,
-    ``motorcycle_road``, ``fixed_wing_waypoints``, ``heli_landing_zone``, ``tiltrotor_delivery``, ``land_on_car``) and keyword
+    ``motorcycle_road``, ``fixed_wing_waypoints``, ``heli_landing_zone``, ``tiltrotor_delivery``, ``land_on_car``, ``rooftop_delivery``) and keyword
     arguments, or the instance itself."""
     if isinstance(task, Task):
         if kwargs:
@@ -56,6 +58,7 @@ __all__ = [
     "TASKS",
     "CarWaypointOffroad",
     "DroneLandOnCar",
+    "DroneRooftopDelivery",
     "FixedWingWaypoints",
     "FormationHover",
     "HeliLandingZone",

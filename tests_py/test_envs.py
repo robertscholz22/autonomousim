@@ -24,6 +24,8 @@ RURAL = {"type": "rural", "seed": 0, "count": 2, "cache": False}
 # A 4 km tiled map (the aircraft task defaults to the 16 km one).
 # A 1 km rural map with farms every ~200 m (the delivery task defaults to a 6 km one).
 FARMS = {"type": "rural", "seed": 5, "count": 1, "cache": False, "config": {"size": 1024.0, "farms": {"spacing": 200.0}}}
+# One 512 m city (the rooftop task defaults to a pool of 8).
+URBAN = {"type": "urban", "seed": 2, "count": 1}
 LARGE = {"type": "wild", "preset": "large", "seed": 0, "count": 1, "cache": False, "config": {"size": 4096.0}}
 KWARGS = {
     "autonomousim/QuadWaypointForest-v0": {"map": "forest"},
@@ -36,6 +38,7 @@ KWARGS = {
     "autonomousim/HeliLandingZone-v0": {"map_count": 1},
     "autonomousim/TiltrotorDelivery-v0": {"map": FARMS, "goal_distance": (300.0, 700.0)},
     "autonomousim/DroneLandOnCar-v0": {"map": RURAL, "image_size": 16},
+    "autonomousim/DroneRooftopDelivery-v0": {"map": URBAN},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
@@ -47,6 +50,7 @@ OBS_DIM = {
     "autonomousim/FixedWingWaypoints-v0": 46,
     "autonomousim/HeliLandingZone-v0": 19,
     "autonomousim/TiltrotorDelivery-v0": 22,
+    "autonomousim/DroneRooftopDelivery-v0": 88,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
@@ -846,6 +850,76 @@ def test_tiltrotor_delivery_scripted_pilot_lands():
     assert (task.distance(envs.unwrapped.state) < task.landing_radius).all()
     assert (ret > task.landing_bonus).all(), ret
     envs.close()
+
+
+def test_rooftop_delivery_scripted_pilot_lands():
+    n = 8
+    envs = gym.make_vec(
+        "autonomousim/DroneRooftopDelivery-v0",
+        num_envs=n,
+        num_threads=4,
+        map=URBAN,
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    task = envs.unwrapped.task
+    assert [t[0] for t in envs.unwrapped.obs_layout] == [
+        "goal_rel_heading",
+        "goal_rel_heading",
+        "lin_vel_body",
+        "ang_vel_body",
+        "rot6d",
+        "agl",
+        "range",
+        "last_action",
+        "lidar_log",
+    ]
+    obs, _ = envs.reset(seed=0)
+    # On the gear on a sidewalk or a roof, 200–600 m from the goal pad.
+    state = envs.unwrapped.state
+    assert (np.abs(state[:, STATE["velocity"]]) < 0.1).all()
+    d = np.hypot(*(state[:, STATE["goal"]] - state[:, STATE["position"]])[:, :2].T)
+    assert ((d > 200.0) & (d < 600.0)).sum() >= n - 1, d
+    ret, done, success = np.zeros(n), np.zeros(n, bool), np.zeros(n, bool)
+    while not done.all():
+        obs, reward, terminated, truncated, info = envs.step(task.scripted(obs))
+        live = ~done
+        ret[live] += reward[live]
+        success |= live & task.success
+        done |= terminated | truncated
+    # Up, over the roofs and down onto the pad: progress and the bonus pay.
+    assert success.sum() >= n - 1, success
+    assert (ret[success] > task.landing_bonus).all(), ret
+    envs.close()
+
+
+def test_rooftop_delivery_rewards():
+    task = make_task("rooftop_delivery", map="flat")
+    task.bind(3, 0.1, 4)
+    state = np.zeros((3, autonomousim.STATE_DIM))
+    state[:, STATE["goal"]] = [300.0, 0.0, 30.0]
+    state[:, STATE["position"]] = [[0.0, 0.0, 1.0], [290.0, 0.0, 40.0], [299.0, 0.0, 30.2]]
+    state[:, STATE["clearance"]] = 20.0
+    task.reset(None, state)
+    # 10 m on, close by a wall (0.5 m); 5 m down 10 m out; landed on the pad: the bonus (no
+    # proximity cost at the pad).
+    state[:, STATE["position"]] = [[10.0, 0.0, 1.0], [290.0, 0.0, 35.0], [299.0, 0.0, 30.2]]
+    state[:, STATE["clearance"]] = [[0.5], [20.0], [0.1]]
+    events = np.array([0, 0, int(autonomousim.Event.LANDED)], np.uint32)
+    action = np.zeros((3, 4), np.float32)
+    r = task.reward(state, action, action, events)
+    before = [np.hypot(300.0, 29.0), np.hypot(10.0, 10.0), np.hypot(1.0, 0.2)]
+    after = [np.hypot(290.0, 29.0), np.hypot(10.0, 5.0), np.hypot(1.0, 0.2)]
+    expected = 0.05 * (np.array(before) - after) - 0.002 + [-0.1 * 0.75**2, 0.0, 20.0]
+    np.testing.assert_allclose(r, expected)
+    assert task.succeeded(state, events).tolist() == [False, False, True]
+    # Landed beside the pad, or on the street below it: no success.
+    state[2, STATE["position"]] = [304.0, 0.0, 30.2]
+    assert not task.succeeded(state, events)[2]
+    state[2, STATE["position"]] = [299.0, 0.0, 1.0]
+    assert not task.succeeded(state, events)[2]
+    group = task.scenario()["groups"][0]
+    assert group["spawn"]["on_ground"] and group["goals"]["kind"] == "rooftop"
+    assert make_task("rooftop_delivery").scenario()["map"]["type"] == "urban"
 
 
 def test_tiltrotor_delivery_rewards():

@@ -5,6 +5,7 @@ use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::wrap_angle;
 use autonomousim_core::rng::Seed;
+use autonomousim_core::terrain::Terrain;
 use autonomousim_sim::drive::ground_pose;
 use autonomousim_sim::record::{MemorySink, Recorder, RecorderConfig, Recording};
 use autonomousim_sim::{CompiledScenario, Events, STATE_DIM, STATE_FIELDS, Scenario, WorldInstance};
@@ -46,6 +47,98 @@ fn drones_rest_on_rooftop_pads() {
         assert!((p.z - bottom - pad.centre.z).abs() < 0.05, "pad {k}: at {p}, pad at {}", pad.centre);
         assert!(p.truncate().distance(pad.centre.truncate()) < 0.2);
     }
+}
+
+/// Rooftop goals: the goal is a pad (at its surface, its heading); the drone starts on its
+/// gear on a sidewalk clear of obstacles or on another pad, mostly within the distance range,
+/// and rests there with motors idle without events. Both kinds of start occur; the draws are
+/// deterministic.
+#[test]
+fn rooftop_goals_start_on_sidewalks_and_pads() {
+    let sc = compile(
+        r#"
+        map = { type = "urban", seed = 2, count = 1 }
+        [[groups]]
+        vehicle = "iris_like"
+        spawn = { on_ground = true }
+        goals = { kind = "rooftop", distance = [200.0, 600.0], agl = [0.0, 0.0], rooftop = { roof_start = 0.4 } }
+        "#,
+    );
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(3));
+    let map = w.map().clone();
+    let pads = &map.sites().pads;
+    let bottom = sc.groups[0].bottom;
+    let (mut roofs, mut streets, mut in_range) = (0, 0, 0);
+    let mut first = Vec::new();
+    for episode in 0..24u64 {
+        w.reset(Some(episode));
+        let goal = w.agent(0).goal();
+        let pad = pads.iter().find(|p| p.centre.distance(goal.position) < 1e-9).expect("goal on a pad");
+        assert!(wrap_angle(goal.yaw - pad.yaw).abs() < 1e-9);
+        let p = w.agent(0).vehicle.position();
+        first.push(p);
+        let start = pads.iter().find(|q| q.centre.truncate().distance(p.truncate()) < 1e-9);
+        match start {
+            Some(q) => {
+                roofs += 1;
+                assert!((p.z - bottom - q.centre.z).abs() < 0.01, "{episode}: {p}");
+            }
+            None => {
+                streets += 1;
+                assert_eq!(map.roads().area(p.truncate()), autonomousim_world::Area::Sidewalk, "{episode}: {p}");
+                let ground = map.terrain().height(p.x, p.y);
+                assert!((p.z - bottom - ground).abs() < 0.01, "{episode}: {p}");
+            }
+        }
+        let d = p.truncate().distance(goal.position.truncate());
+        in_range += usize::from((200.0..=600.0).contains(&d));
+        for _ in 0..(1.0 / w.scenario().policy_dt()) as usize {
+            w.set_action(0, &[0.0, 0.0, 0.0, -1.0]);
+            w.step();
+            let q = w.agent(0).vehicle.position();
+            assert!(
+                !w.agent(0).events.is_terminal(),
+                "{episode}: {:?} at {q}, from {p} ({start:?})",
+                w.agent(0).events
+            );
+        }
+        assert!(w.agent(0).events.contains(Events::LANDED), "{episode}");
+    }
+    assert!(roofs >= 4 && streets >= 8, "{roofs} roof and {streets} street starts");
+    assert!(in_range >= 20, "{in_range} of 24 in range");
+    let mut again = WorldInstance::new(sc, Seed::from_u64(3));
+    for (episode, p) in first.iter().enumerate() {
+        again.reset(Some(episode as u64));
+        assert_eq!(again.agent(0).vehicle.position(), *p);
+    }
+}
+
+/// Rooftop goals need an aircraft and a map with two pads.
+#[test]
+fn rooftop_goals_are_checked() {
+    let err = |toml: &str| Scenario::from_toml(toml).unwrap().compile().err().map(|e| e.to_string());
+    let flat = err(r#"
+        map = { type = "testworld", kind = "flat", size = 200.0 }
+        [[groups]]
+        vehicle = "iris_like"
+        goals = { kind = "rooftop" }
+        "#);
+    assert!(flat.as_deref().is_some_and(|e| e.contains("two rooftop pads")), "{flat:?}");
+    let car = err(r#"
+        map = { type = "urban", seed = 1, count = 1 }
+        [[groups]]
+        vehicle = "sedan_like"
+        action_mode = "vk"
+        goals = { kind = "rooftop" }
+        "#);
+    assert!(car.as_deref().is_some_and(|e| e.contains("aerial vehicle")), "{car:?}");
+    let share = err(r#"
+        map = { type = "urban", seed = 1, count = 1 }
+        [[groups]]
+        vehicle = "iris_like"
+        goals = { kind = "rooftop", rooftop = { roof_start = 1.5 } }
+        "#);
+    assert!(share.as_deref().is_some_and(|e| e.contains("roof_start")), "{share:?}");
 }
 
 fn tail(w: &WorldInstance) -> (DVec2, f64) {
