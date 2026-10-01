@@ -446,7 +446,8 @@ impl BatchSim {
         camera_hz: u32,
     ) -> PyResult<()> {
         let i = self.env(env)?;
-        let recorder = Recorder::create(&path, RecorderConfig { state_hz, lidar, camera_hz }).map_err(sim_err)?;
+        let recorder = Recorder::create(&path, RecorderConfig { state_hz, lidar, camera_hz, ..Default::default() })
+            .map_err(sim_err)?;
         let sim = self.sim.get_mut().unwrap_or_else(PoisonError::into_inner);
         match sim.attach_recorder(i, recorder) {
             Some(old) => old.finish().map_err(sim_err),

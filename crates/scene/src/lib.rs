@@ -5,6 +5,7 @@
 //! Meshes are plain arrays ([`MeshData`]) in the simulator's frames (ENU for the world, FLU
 //! for vehicles); renderers convert them (see `autonomousim_core::math::frames`).
 
+pub mod figures;
 pub mod mesh;
 pub mod props;
 pub mod rig;

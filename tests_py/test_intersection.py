@@ -14,10 +14,10 @@ def test_intersection_spawns_on_different_arms_of_one_junction():
     n, count = 4, 3
     envs = MultiAgentVectorEnv(n, "intersection_multi", count=count, map=URBAN, num_threads=2)
     assert envs.groups == ["cars"]
-    assert envs.single_observation_spaces["cars"].shape == (73,)
+    assert envs.single_observation_spaces["cars"].shape == (81,)
     assert envs.single_action_spaces["cars"].shape == (2,)
     obs, _ = envs.reset(seed=0)
-    assert obs["cars"].shape == (n, count, 73) and np.isfinite(obs["cars"]).all()
+    assert obs["cars"].shape == (n, count, 81) and np.isfinite(obs["cars"]).all()
     state = envs.sim.state("cars").reshape(n, count, -1)
     pos = state[..., STATE["position"]][..., :2]
     goal = state[..., STATE["goal"]][..., :2]

@@ -52,6 +52,7 @@ use autonomousim_world::lanes::CROSSWALK;
 use autonomousim_world::signals::CLEARANCE_SPEED;
 use autonomousim_world::{PlaceKind, StaticWorld, WalkKind, Walkways};
 use glam::DVec2;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Longest step of the crowd (s): it moves at about 25 Hz whatever the physics rate.
@@ -258,6 +259,12 @@ impl Pedestrian {
     }
 }
 
+/// Crowds from this size compute their forces over threads.
+const PARALLEL_PEDESTRIANS: usize = 256;
+
+/// Margin over how far the pushes apart move a pedestrian in an update (m).
+const PUSH_MARGIN: f64 = 1.0;
+
 /// Counts over the episode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrowdStats {
@@ -441,10 +448,11 @@ impl Crowd {
         let (lo, hi) = world.extent();
         self.grid.build(lo, hi, sf.range.max(1.0), self.peds.iter().map(|p| p.pos));
         let snapshot: Vec<(DVec2, DVec2)> = self.peds.iter().map(|p| (p.pos, p.vel)).collect();
-        let mut accel = vec![DVec2::ZERO; n];
-        let mut stats = self.stats;
-        for i in 0..n {
-            let p = &mut self.peds[i];
+        // Each pedestrian's acceleration and counts (independent of each other: over threads
+        // in large crowds, summed in order).
+        let grid = &self.grid;
+        let force = |(i, p): (usize, &mut Pedestrian)| {
+            let mut stats = CrowdStats::default();
             let desired = match p.state {
                 PedState::Dwelling | PedState::Hit => {
                     p.timer -= dt;
@@ -455,20 +463,31 @@ impl Crowd {
             let mut a = sf.driving(p.vel, desired);
             if p.state != PedState::Hit {
                 let (pi, vi) = snapshot[i];
-                self.grid.visit(pi, sf.range, |j| {
+                grid.visit(pi, sf.range, |j| {
                     if j as usize != i {
                         let (q, wj) = snapshot[j as usize];
                         a += sf.interaction(pi, vi, q, wj);
                     }
                 });
             }
-            accel[i] = a;
+            (a, stats)
+        };
+        let forces: Vec<(DVec2, CrowdStats)> = if n >= PARALLEL_PEDESTRIANS {
+            self.peds.par_iter_mut().enumerate().map(force).collect()
+        } else {
+            self.peds.iter_mut().enumerate().map(force).collect()
+        };
+        let mut stats = self.stats;
+        for (_, d) in &forces {
+            stats.crossings += d.crossings;
+            stats.red_starts += d.red_starts;
+            stats.arrivals += d.arrivals;
         }
         // Integrate, keep to the walkways.
-        for (p, a) in self.peds.iter_mut().zip(&accel) {
+        let integrate = |(p, (a, _)): (&mut Pedestrian, &(DVec2, CrowdStats))| {
             if p.state == PedState::Hit {
                 p.vel = DVec2::ZERO;
-                continue;
+                return;
             }
             p.vel += *a * dt;
             let cap = SPEED_CAP * p.speed * if p.state == PedState::Crossing { HURRY } else { 1.0 };
@@ -480,18 +499,24 @@ impl Crowd {
             if p.vel.length() > 0.1 {
                 p.heading = p.vel.to_angle();
             }
+        };
+        if n >= PARALLEL_PEDESTRIANS {
+            self.peds.par_iter_mut().zip(&forces).for_each(integrate);
+        } else {
+            self.peds.iter_mut().zip(&forces).for_each(integrate);
         }
-        // Push overlapping bodies apart (half each).
+        // Push overlapping bodies apart (half each, from the positions after integrating).
         self.grid.build(lo, hi, sf.range.max(1.0), self.peds.iter().map(|p| p.pos));
-        for i in 0..n {
-            let (pi, ri) = (self.peds[i].pos, self.peds[i].radius);
+        let (grid, peds) = (&self.grid, &self.peds);
+        let push = |i: usize| {
+            let (pi, ri) = (peds[i].pos, peds[i].radius);
             let mut push = DVec2::ZERO;
-            self.grid.visit(pi, 2.0 * ri + 0.5, |j| {
+            grid.visit(pi, 2.0 * ri + 0.5, |j| {
                 let j = j as usize;
                 if j == i {
                     return;
                 }
-                let q = &self.peds[j];
+                let q = &peds[j];
                 let r = pi - q.pos;
                 let d = r.length();
                 let overlap = ri + q.radius - d;
@@ -500,18 +525,37 @@ impl Crowd {
                     push += 0.5 * overlap * dir;
                 }
             });
-            let p = &mut self.peds[i];
+            push
+        };
+        let pushes: Vec<DVec2> = if n >= PARALLEL_PEDESTRIANS {
+            (0..n).into_par_iter().map(push).collect()
+        } else {
+            (0..n).map(push).collect()
+        };
+        let apply = |(p, push): (&mut Pedestrian, &DVec2)| {
             if p.state != PedState::Hit {
-                p.pos += push;
+                p.pos += *push;
                 confine(p, w);
             }
             p.z = world.terrain().height(p.pos.x, p.pos.y);
+        };
+        if n >= PARALLEL_PEDESTRIANS {
+            self.peds.par_iter_mut().zip(&pushes).for_each(apply);
+        } else {
+            self.peds.iter_mut().zip(&pushes).for_each(apply);
         }
-        // Hits.
+        // Hits (among the pedestrians near each car: the grid is of the positions before the
+        // pushes, which move them less than `PUSH_MARGIN`).
+        let max_radius = self.peds.iter().map(|p| p.radius).fold(0.0, f64::max);
+        let mut near = Vec::new();
         for c in cars.iter().filter(|c| c.vel.length() > HIT_SPEED) {
             let s = &shapes[c.agent];
-            for p in self.peds.iter_mut().filter(|p| p.state != PedState::Hit) {
-                if p.pos.distance(c.pos) > c.reach + p.radius {
+            near.clear();
+            self.grid.visit(c.pos, c.reach + max_radius + PUSH_MARGIN, |j| near.push(j as usize));
+            near.sort_unstable();
+            for &j in &near {
+                let p = &mut self.peds[j];
+                if p.state == PedState::Hit || p.pos.distance(c.pos) > c.reach + p.radius {
                     continue;
                 }
                 let touch = s.spheres.iter().any(|sp| {
@@ -872,23 +916,26 @@ fn avoid(p: &Pedestrian, w: &Walkways, leg: (u32, bool), s: f64, cars: &[Car]) -
     best.2
 }
 
-/// A uniform grid over the map of point indices, rebuilt by counting sort.
+/// A uniform grid over the map of point indices: the points sorted by cell (row by row, then
+/// by index), so that building and memory scale with the points, not with the map.
 #[derive(Clone, Debug, Default)]
 struct Grid {
     lo: DVec2,
     cell: f64,
     nx: usize,
     ny: usize,
-    start: Vec<u32>,
-    items: Vec<u32>,
+    /// (cell, point index), ascending.
+    items: Vec<(u32, u32)>,
     points: Vec<DVec2>,
 }
 
 impl Grid {
-    fn key(&self, p: DVec2) -> usize {
-        let x = (((p.x - self.lo.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1);
-        let y = (((p.y - self.lo.y) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);
-        y * self.nx + x
+    fn cx(&self, x: f64) -> usize {
+        (((x - self.lo.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1)
+    }
+
+    fn cy(&self, y: f64) -> usize {
+        (((y - self.lo.y) / self.cell).floor().max(0.0) as usize).min(self.ny - 1)
     }
 
     fn build(&mut self, lo: DVec2, hi: DVec2, cell: f64, points: impl Iterator<Item = DVec2>) {
@@ -896,25 +943,14 @@ impl Grid {
         self.cell = cell;
         self.nx = (((hi.x - lo.x) / cell).ceil() as usize).max(1);
         self.ny = (((hi.y - lo.y) / cell).ceil() as usize).max(1);
+        assert!(self.nx * self.ny <= u32::MAX as usize, "grid of {} × {} cells", self.nx, self.ny);
         self.points.clear();
         self.points.extend(points);
-        self.start.clear();
-        self.start.resize(self.nx * self.ny + 1, 0);
-        for k in 0..self.points.len() {
-            let c = self.key(self.points[k]);
-            self.start[c + 1] += 1;
-        }
-        for c in 0..self.nx * self.ny {
-            self.start[c + 1] += self.start[c];
-        }
         self.items.clear();
-        self.items.resize(self.points.len(), 0);
-        let mut fill = self.start.clone();
-        for k in 0..self.points.len() {
-            let c = self.key(self.points[k]);
-            self.items[fill[c] as usize] = k as u32;
-            fill[c] += 1;
+        for (k, p) in self.points.iter().enumerate() {
+            self.items.push(((self.cy(p.y) * self.nx + self.cx(p.x)) as u32, k as u32));
         }
+        self.items.sort_unstable();
     }
 
     /// Call `f` with every point within `r` of `p` (in cell order).
@@ -922,15 +958,16 @@ impl Grid {
         if self.points.is_empty() {
             return;
         }
-        let cx = |x: f64| (((x - self.lo.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1);
-        let cy = |y: f64| (((y - self.lo.y) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);
-        for y in cy(p.y - r)..=cy(p.y + r) {
-            for x in cx(p.x - r)..=cx(p.x + r) {
-                let c = y * self.nx + x;
-                for &k in &self.items[self.start[c] as usize..self.start[c + 1] as usize] {
-                    if self.points[k as usize].distance_squared(p) <= r * r {
-                        f(k);
-                    }
+        let (x0, x1) = (self.cx(p.x - r), self.cx(p.x + r));
+        for y in self.cy(p.y - r)..=self.cy(p.y + r) {
+            let (a, b) = ((y * self.nx + x0) as u32, (y * self.nx + x1) as u32);
+            let from = self.items.partition_point(|&(c, _)| c < a);
+            for &(c, k) in &self.items[from..] {
+                if c > b {
+                    break;
+                }
+                if self.points[k as usize].distance_squared(p) <= r * r {
+                    f(k);
                 }
             }
         }

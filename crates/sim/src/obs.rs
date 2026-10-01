@@ -42,7 +42,8 @@
 //! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
 //!
 //! | `signal` | 4 | ground vehicles on urban maps: the light (one-hot green, amber, red) for the movement ahead (the one nearest the route, else straight on) at the end of the lane followed, if that is a signalized junction, then the distance to its stop line (m); all 0 without |
-//! | `traffic` | 13 × `count` | ground vehicles: the `count` (default 8) nearest other active ground vehicles with footprint centres within `range` (default 50 m), nearest first (ties by agent index): footprint centre relative to this agent and velocity, in the heading frame (m, m/s), sin, cos of its heading − the heading, its length and width (m), its lane relative to the lane followed (one-hot: same, a lane to the left, to the right, any other or none), then 1; empty slots are all 0. The one-hot and the 1 are neither scaled nor clipped |
+//! | `traffic` | 15 × `count` | ground vehicles: the `count` (default 8) nearest other road users with centres within `range` (default 50 m), nearest first (ties by agent index, pedestrians after the agents): the other active ground vehicles, and the pedestrians crossing a carriageway (or standing on it, hit). Per slot: footprint centre relative to this agent and velocity, in the heading frame (m, m/s), sin, cos of its heading − the heading, its length and width (m; a pedestrian's diameter), its lane relative to the lane followed (one-hot: same, a lane to the left, to the right, any other or none; pedestrians: none), then its kind (one-hot: vehicle, two-wheeler, pedestrian); empty slots are all 0. The one-hots are neither scaled nor clipped |
+//! | `pedestrians` | 6 × `count` | ground vehicles: the `count` (default 8) nearest pedestrians within `range` (default 30 m), nearest first (ties by index): position relative to this agent and velocity, in the heading frame (m, m/s), 1 if on a carriageway (else 0), then 1; empty slots are all 0. The last two are neither scaled nor clipped |
 //! | `lane_route` | 6 | ground vehicles on urban maps: the lane changes to the lane the next movement leaves from (+ left; the movement ending nearest the route, else straight on from the lane followed), the distance to the end of the lane followed (m), and the movement's turn (one-hot: left, straight, right, U-turn; neither scaled nor clipped); all 0 without a lane |
 //! | `lanes` | 12 | ground vehicles on urban maps: the lane followed 5, 10, 20 and 40 m ahead in the heading frame (x, y; m; through the connectors `signal` picks), its speed limit (m/s), 1 if a lane to its left / right of the same direction exists (else 0), the offset from its centre (m, + left); all 0 without a lane |
 //!
@@ -69,6 +70,7 @@
 
 use crate::interaction::{AgentGrid, AgentShape};
 use crate::lane::Follow;
+use crate::pedestrians::Pedestrian;
 use crate::scenario::Goal;
 use crate::traffic::{RoadTrack, Signals, next_connector, next_movement, walk};
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
@@ -94,12 +96,28 @@ pub const MAX_NEIGHBORS: usize = 16;
 pub const TRAFFIC_COUNT: usize = 8;
 pub const TRAFFIC_RANGE: f64 = 50.0;
 
-/// Width of a vehicle's slot in the `traffic` term.
-const TRAFFIC_SLOT: usize = 13;
+/// Width of a road user's slot in the `traffic` term.
+const TRAFFIC_SLOT: usize = 15;
 
-/// Another ground vehicle as the `traffic` term sees it.
+/// Default `count` and `range` (m) of the `pedestrians` term.
+pub const PEDESTRIAN_COUNT: usize = 8;
+pub const PEDESTRIAN_RANGE: f64 = 30.0;
+
+/// Width of a pedestrian's slot in the `pedestrians` term.
+const PEDESTRIAN_SLOT: usize = 6;
+
+/// What a road user seen by the `traffic` term is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeenKind {
+    Vehicle,
+    TwoWheeler,
+    Pedestrian,
+}
+
+/// Another road user as the `traffic` term sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seen {
+    pub kind: SeenKind,
     /// Centre of its footprint (m, world) and its velocity (m/s, world).
     pub center: DVec2,
     pub velocity: DVec2,
@@ -168,6 +186,7 @@ pub enum TermKind {
     Signal,
     Lanes,
     Traffic,
+    Pedestrians,
     LaneRoute,
 }
 
@@ -371,6 +390,8 @@ pub struct ObsInput<'a> {
     /// Per agent, the ground vehicles as the `traffic` term sees them (empty unless a term
     /// needs them; see [`CompiledObs::needs_traffic`]).
     pub vehicles: &'a [Option<Seen>],
+    /// The pedestrians in the world.
+    pub pedestrians: &'a [Pedestrian],
     pub signals: &'a Signals,
     pub time: f64,
 }
@@ -431,14 +452,20 @@ impl CompiledObs {
             if t.term.needs_wheels() && num_wheels == 0 {
                 return Err(format!("observation {:?} needs a ground vehicle", t.term));
             }
-            let agent_term = matches!(t.term, TermKind::Neighbors | TermKind::NearestAgent | TermKind::Traffic);
-            let counted = matches!(t.term, TermKind::Neighbors | TermKind::Traffic);
+            let agent_term = matches!(
+                t.term,
+                TermKind::Neighbors | TermKind::NearestAgent | TermKind::Traffic | TermKind::Pedestrians
+            );
+            let counted = matches!(t.term, TermKind::Neighbors | TermKind::Traffic | TermKind::Pedestrians);
             if (t.count.is_some() && !counted) || (t.range.is_some() && !agent_term) {
                 return Err(format!("observation {:?} takes no count or range", t.term));
             }
-            let traffic = t.term == TermKind::Traffic;
-            let count = t.count.unwrap_or(if traffic { TRAFFIC_COUNT } else { NEIGHBOR_COUNT });
-            let range = t.range.unwrap_or(if traffic { TRAFFIC_RANGE } else { NEIGHBOR_RANGE });
+            let (count, range) = match t.term {
+                TermKind::Traffic => (TRAFFIC_COUNT, TRAFFIC_RANGE),
+                TermKind::Pedestrians => (PEDESTRIAN_COUNT, PEDESTRIAN_RANGE),
+                _ => (NEIGHBOR_COUNT, NEIGHBOR_RANGE),
+            };
+            let (count, range) = (t.count.unwrap_or(count), t.range.unwrap_or(range));
             if agent_term && (!(1..=MAX_NEIGHBORS).contains(&count) || !(range > 0.0 && range.is_finite())) {
                 return Err(format!("observation {:?}: count must be 1–{MAX_NEIGHBORS} and range positive", t.term));
             }
@@ -469,6 +496,7 @@ impl CompiledObs {
                 (TermKind::NearestAgent, _) => (1, range),
                 (TermKind::Neighbors, _) => (7 * count, range),
                 (TermKind::Traffic, _) => (TRAFFIC_SLOT * count, range),
+                (TermKind::Pedestrians, _) => (PEDESTRIAN_SLOT * count, range),
                 (TermKind::LaneRoute, _) => (6, 0.0),
                 (TermKind::WheelSpeeds | TermKind::WheelSlip, _) => (num_wheels, 0.0),
                 (TermKind::Rot6d | TermKind::Imu, _) => (6, 0.0),
@@ -799,7 +827,27 @@ impl CompiledObs {
                         let h = wrap_angle(o.heading - y);
                         put(&mut slot[0..8], &[r.x, r.y, v.x, v.y, h.sin(), h.cos(), o.length, o.width], t);
                         slot[8 + lane_relation(lanes, inp.track.lane, o.lane)] = 1.0;
-                        slot[12] = 1.0;
+                        slot[12 + o.kind as usize] = 1.0;
+                    }
+                }
+                TermKind::Pedestrians => {
+                    dst.fill(0.0);
+                    let me = k.position.truncate();
+                    let r2 = t.max_range * t.max_range;
+                    let mut near: Vec<(f64, usize)> = (inp.pedestrians.iter().enumerate())
+                        .map(|(j, p)| (p.pos.distance_squared(me), j))
+                        .filter(|&(d, _)| d <= r2)
+                        .collect();
+                    near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    let to_heading = heading.inverse();
+                    let roads = inp.world.roads();
+                    for (slot, &(_, j)) in dst.as_chunks_mut::<PEDESTRIAN_SLOT>().0.iter_mut().zip(&near) {
+                        let p = &inp.pedestrians[j];
+                        let r = to_heading * (p.pos - me).extend(0.0);
+                        let v = to_heading * p.vel.extend(0.0);
+                        put(&mut slot[0..4], &[r.x, r.y, v.x, v.y], t);
+                        slot[4] = f32::from(u8::from(roads.on_road(p.pos).is_some()));
+                        slot[5] = 1.0;
                     }
                 }
                 TermKind::LaneRoute => {
@@ -995,6 +1043,7 @@ mod tests {
             route: None,
             track: &RoadTrack::default(),
             vehicles: &[],
+            pedestrians: &[],
             signals: &Signals::default(),
             time: 0.0,
         };
@@ -1055,6 +1104,7 @@ mod tests {
             route: None,
             track: &RoadTrack::default(),
             vehicles: &[],
+            pedestrians: &[],
             signals: &Signals::default(),
             time: 0.0,
         };

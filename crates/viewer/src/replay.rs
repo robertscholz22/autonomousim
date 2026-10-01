@@ -11,6 +11,7 @@ use autonomousim_vehicles::ground::{PowertrainStatus, WheelState, WheeledInit};
 use autonomousim_vehicles::rotorcraft::{HelicopterDisplay, HelicopterInput};
 use autonomousim_vehicles::tiltrotor::TiltrotorDisplay;
 use glam::DVec3;
+use std::f64::consts::{PI, TAU};
 
 pub struct Replay {
     pub recording: Recording,
@@ -212,8 +213,38 @@ impl Replay {
                 agent.route = ep.route_at(i, self.time).cloned();
             }
         }
+        self.apply_pedestrians(world);
+    }
+
+    /// Put the crowd where the recording has it, interpolated between its samples (not
+    /// across a respawn).
+    fn apply_pedestrians(&self, world: &mut WorldInstance) {
+        let frames = &self.current().pedestrians;
+        let Some(first) = frames.first() else { return };
+        let k = frames.partition_point(|f| f.time <= self.time);
+        let (a, b) = match k {
+            0 => (first, first),
+            k if k == frames.len() => (&frames[k - 1], &frames[k - 1]),
+            k => (&frames[k - 1], &frames[k]),
+        };
+        let alpha = if b.time > a.time { ((self.time - a.time) / (b.time - a.time)).clamp(0.0, 1.0) } else { 0.0 };
+        for (i, p) in world.crowd_mut().peds.iter_mut().enumerate() {
+            let (Some(x), Some(y)) = (a.get(i), b.get(i)) else { continue };
+            let alpha = if x.position.distance(y.position) > RESPAWN_JUMP { 0.0 } else { alpha };
+            let at = x.position.lerp(y.position, alpha);
+            p.pos = at.truncate();
+            p.z = at.z;
+            p.vel = x.velocity.lerp(y.velocity, alpha);
+            let turn = (y.heading - x.heading + PI).rem_euclid(TAU) - PI;
+            p.heading = x.heading + turn * alpha;
+            p.height = x.height;
+            p.state = x.state;
+        }
     }
 }
+
+/// A pedestrian moving farther than this (m) between two samples was respawned.
+const RESPAWN_JUMP: f64 = 5.0;
 
 fn lerp_wheel(a: &RecordedWheel, b: &RecordedWheel, alpha: f64) -> RecordedWheel {
     let l = |x: f64, y: f64| x + (y - x) * alpha;
@@ -618,5 +649,61 @@ mod tests {
                 world.agents().len()
             );
         }
+    }
+
+    /// The crowd replays as recorded: at a sample's time exactly the (rounded) recorded
+    /// pedestrians, between samples in between, and a respawned one not dragged across.
+    #[test]
+    fn replayed_crowds_walk() {
+        let sc = Scenario::from_toml(
+            r#"
+            physics_hz = 200
+            policy_hz = 25
+            map = { type = "urban", seed = 2, count = 1 }
+            [pedestrians]
+            count = 30
+            [[groups]]
+            vehicle = "sedan_like"
+            physics = "kinematic"
+            driver = { type = "traffic" }
+            spawn = { on_ground = true, on_road = true }
+            "#,
+        )
+        .unwrap();
+        let sc = Arc::new(sc.compile().unwrap());
+        let path = std::env::temp_dir().join(format!("autonomousim-replay-crowd-{}.mcap", std::process::id()));
+        let mut rec = Recorder::create(&path, RecorderConfig::default()).unwrap();
+        let mut w = WorldInstance::new(sc, Seed::from_u64(1));
+        rec.on_reset(&w);
+        for _ in 0..50 {
+            w.step_with(&mut |w| rec.on_tick(w));
+        }
+        rec.finish().unwrap();
+        let recording = Recording::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut world = WorldInstance::new(Arc::new(recording.compile().unwrap()), Seed::from_u64(0));
+        let mut r = Replay::new(recording, 0);
+        let frames = r.current().pedestrians.clone();
+        assert_eq!(frames.len(), 11);
+        r.seek(frames[3].time);
+        r.apply(&mut world);
+        for (i, p) in world.crowd().peds.iter().enumerate() {
+            let f = frames[3].get(i).unwrap();
+            assert_eq!((p.pos.extend(p.z), p.heading, p.state), (f.position, f.heading, f.state));
+        }
+        r.seek(0.5 * (frames[3].time + frames[4].time));
+        r.apply(&mut world);
+        let mut moved = 0;
+        for (i, p) in world.crowd().peds.iter().enumerate() {
+            let (a, b) = (frames[3].get(i).unwrap(), frames[4].get(i).unwrap());
+            let at = p.pos.extend(p.z);
+            if a.position.distance(b.position) > RESPAWN_JUMP {
+                assert_eq!(at, a.position);
+            } else {
+                assert!((at - a.position.lerp(b.position, 0.5)).length() < 1e-9);
+                moved += usize::from(a.position != b.position);
+            }
+        }
+        assert!(moved > 10, "{moved} moved");
     }
 }

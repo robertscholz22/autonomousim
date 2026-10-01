@@ -524,26 +524,39 @@ pub fn sync_vehicles(
     >,
     discs: Query<(&RotorDisc, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    camera: Query<
+        &Transform,
+        (
+            With<Camera3d>,
+            Without<VehicleVisual>,
+            Without<WheelVisual>,
+            Without<LinkVisual>,
+            Without<UnitVisual>,
+            Without<SurfacePart>,
+        ),
+    >,
 ) {
+    let near = near_camera(&sim, &origin, camera.single().ok());
     for (sp, mut t) in &mut surfaces {
         let Some(f) = sim.world.agent(sp.agent).vehicle.as_fixed_wing() else { continue };
         *t = surface_transform(&sp.visual, surface_angle(f, &sp.visual));
     }
 
+    // (Written only when changed, which spares standing vehicles the propagation.)
     for (v, mut t) in &mut roots {
-        *t = origin.transform(&sim.render_pose(v.0));
+        t.set_if_neq(origin.transform(&sim.render_pose(v.0)));
     }
     for (uv, mut t) in &mut units {
         let Some(w) = sim.world.agent(uv.agent).vehicle.as_wheeled() else { continue };
-        *t = convert::transform(&unit_local(w, uv.unit));
+        t.set_if_neq(convert::transform(&unit_local(w, uv.unit)));
     }
     for (wv, mut t) in &mut wheels {
-        let Some(w) = sim.world.agent(wv.agent).vehicle.as_wheeled() else { continue };
-        *t = convert::transform(&wheel_local(w, wv.wheel));
+        let Some(w) = sim.world.agent(wv.agent).vehicle.as_wheeled().filter(|_| near[wv.agent]) else { continue };
+        t.set_if_neq(convert::transform(&wheel_local(w, wv.wheel)));
     }
     for (l, mut t) in &mut links {
-        let Some(w) = sim.world.agent(l.agent).vehicle.as_wheeled() else { continue };
-        *t = link_transform(l.mount, wheel_local(w, l.wheel).pos);
+        let Some(w) = sim.world.agent(l.agent).vehicle.as_wheeled().filter(|_| near[l.agent]) else { continue };
+        t.set_if_neq(link_transform(l.mount, wheel_local(w, l.wheel).pos));
     }
     for (d, m) in &discs {
         let vehicle = &sim.world.agent(d.agent).vehicle;
@@ -603,15 +616,32 @@ fn part_transform(s: &SingleTrackVisual, w: &Wheeled, kind: PartKind) -> Transfo
 /// Pose the fork, the rider's upper body and limbs from the steering angle, lean and feet.
 pub fn sync_riders(
     sim: Res<Sim>,
+    origin: Res<RenderOrigin>,
     roots: Query<&SingleTrack>,
     mut parts: Query<(&RiderPart, &ChildOf, &mut Transform)>,
+    camera: Query<&Transform, (With<Camera3d>, Without<RiderPart>)>,
 ) {
+    let near = near_camera(&sim, &origin, camera.single().ok());
     for (p, parent, mut t) in &mut parts {
         let (Ok(s), Some(w)) = (roots.get(parent.parent()), sim.world.agent(p.agent).vehicle.as_wheeled()) else {
             continue;
         };
-        *t = part_transform(&s.0, w, p.kind);
+        if near[p.agent] {
+            t.set_if_neq(part_transform(&s.0, w, p.kind));
+        }
     }
+}
+
+/// Vehicles farther from the camera than this keep their wheels, links and riders as they were
+/// (a few pixels at 1080p; m).
+const DETAIL_RANGE: f64 = 250.0;
+
+/// Per agent: whether it is within [`DETAIL_RANGE`] of the camera (all, without one).
+fn near_camera(sim: &Sim, origin: &RenderOrigin, camera: Option<&Transform>) -> Vec<bool> {
+    let n = sim.world.agents().len();
+    let Some(c) = camera else { return vec![true; n] };
+    let eye = origin.0 + convert::enu(c.translation);
+    (0..n).map(|i| sim.render_pose(i).pos.distance(eye) <= DETAIL_RANGE).collect()
 }
 
 /// Rebuild the track bands from the road wheels' travel and spin.

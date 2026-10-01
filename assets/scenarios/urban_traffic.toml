@@ -1,5 +1,5 @@
-# A sedan among 300 traffic cars, 8 buses and 12 trucks on the urban showcase map, with 60
-# cars parked in bays. A scenario for the viewer (`--scenario assets/scenarios/urban_traffic.toml`,
+# A sedan among 300 traffic cars, 8 buses, 12 trucks and 40 cyclists on the urban showcase
+# map, with 60 cars parked in bays and 1,000 pedestrians on the sidewalks. A scenario for the viewer (`--scenario assets/scenarios/urban_traffic.toml`,
 # or with `--demo` to drive the sedan from place to place); NPCs within 40 m of the sedan are
 # simulated in full, the others kinematically (O shows grey rings over kinematic NPCs, orange
 # ones over those in full physics).
@@ -8,6 +8,10 @@ physics_hz = 1000
 policy_hz = 50
 
 map = { type = "urban", seed = 0, count = 1, preset = "showcase" }
+
+[pedestrians]
+count = 1000
+jaywalk = 0.02
 
 [[groups]]
 name = "ego"
@@ -40,6 +44,15 @@ trailers = ["semitrailer_3axle"]
 physics = "kinematic"
 driver = { type = "traffic", speed_factor = [0.8, 0.9], headway = [1.5, 2.5], accel = [0.5, 0.8], decel = [1.5, 2.0], lateral_accel = 1.5, safe_decel = 3.0 }
 spawn = { on_ground = true, on_road = true, min_separation = 40.0 }
+disable_on_terminal = false
+
+[[groups]]
+name = "cyclists"
+count = 40
+vehicle = "bicycle_city"
+physics = "hybrid"
+driver = { type = "traffic", speed = [4.0, 6.0], lateral_accel = 1.5, attention = 0.9 }
+spawn = { on_ground = true, on_road = true, min_separation = 20.0 }
 disable_on_terminal = false
 
 [[groups]]

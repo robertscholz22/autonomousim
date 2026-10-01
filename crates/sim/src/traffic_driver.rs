@@ -51,7 +51,9 @@
 //! held back for sweeps and crossings) leads to: the
 //! next one is asked for beforehand (and so on; its light and stop sign aside, as they only
 //! delay), so that it does not wait inside a junction for other traffic; once committed, it
-//! brakes in time for a light there.
+//! brakes in time for a light there. Likewise it does not enter (and, granted, gives up while
+//! it can stop comfortably) while pedestrians are on a crossing just beyond the junction
+//! that it would wait for with its rear still on the connector.
 //!
 //! **Deadlocks**: a driver that has waited at a line for `deadlock` s no longer gives way to
 //! vehicles that stand waiting themselves (the first in agent order goes, the others then
@@ -2068,7 +2070,7 @@ impl TrafficDriver {
         // From here on measured from the line.
         let dl = dl - back;
         if granted {
-            return need > b || self.room(index, chain, k, me);
+            return need > b || (self.room(index, chain, k, me) && !self.exit_crossing_busy(g, index, c));
         }
         // Long vehicles: not while others stand in the band they would sweep, or could not
         // stop short of it.
@@ -2087,7 +2089,7 @@ impl TrafficDriver {
         if !ahead && g.control(lane) == Control::Stop && self.stopped_at != Some(lane) {
             return false;
         }
-        if !self.room(index, chain, k, me) {
+        if !self.room(index, chain, k, me) || self.exit_crossing_busy(g, index, c) {
             return false;
         }
         // Conflicts: its own passage of each zone from now, at full acceleration.
@@ -2442,6 +2444,24 @@ impl TrafficDriver {
             command = command.max(CYCLIST_START.min(idm.v0));
         }
         GroundSetpoint::SpeedCurvature { speed: command, curvature }
+    }
+
+    /// Whether a crossing just beyond connector `c` (one it would wait for inside the
+    /// junction, its rear not yet clear of the connector) has pedestrians on it (or committed
+    /// to it) that have not passed the lane yet.
+    fn exit_crossing_busy(&self, g: &LaneGraph, index: &LaneIndex, c: u32) -> bool {
+        let l = g.connectors()[c as usize].to;
+        let lane = &g.lanes()[l as usize];
+        let length = self.geometry.front - self.geometry.rear;
+        index.lane_crossings[l as usize].iter().any(|&(k, station)| {
+            let users = &index.crossing_users[k as usize];
+            if users.is_empty() || station - 0.5 * CROSSWALK - CROSSWALK_GAP > length {
+                return false;
+            }
+            let at = lane.line.point_at(station).truncate();
+            let clear = 0.5 * lane.width + CROSSWALK_CLEAR;
+            users.iter().any(|&(p, d)| (at - p).dot(d) > -clear)
+        })
     }
 
     /// Crossings ahead along `chain` with pedestrians on them (or committed to them) that have

@@ -28,9 +28,9 @@ class JunctionCar(Task):
     The car keeps its lane-level route through the junction for the ``route`` and ``road``
     terms.
 
-    Observation (73 values): the goal in the heading frame (scaled 1/20), the ``route`` term
+    Observation (81 values): the goal in the heading frame (scaled 1/20), the ``route`` term
     (scaled 1/20), the ``road`` term, speed, steering angle, last action and the ``traffic``
-    term (the ``traffic`` nearest other cars within 40 m: 13 values each).
+    term (the ``traffic`` nearest other cars within 40 m: 15 values each).
 
     Reward per step (``d``: horizontal distance to the goal):
 

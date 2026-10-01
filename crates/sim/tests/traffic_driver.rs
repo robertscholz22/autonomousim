@@ -507,7 +507,7 @@ fn traffic_and_lane_route_terms() {
         disable_on_terminal = false
     "#;
     let sc = compile(&toml);
-    assert_eq!(sc.groups[1].obs_dim(), 2 * 13 + 6);
+    assert_eq!(sc.groups[1].obs_dim(), 2 * 15 + 6);
     let mut w = WorldInstance::new(sc, Seed::from_u64(5));
     // Ego in the right (outer) lane, the NPC 8 m ahead in the left one (clear of the ring's
     // nodes at angles 0 and π).
@@ -515,7 +515,7 @@ fn traffic_and_lane_route_terms() {
     put(&mut w, 0, radius - 1.75, 0.5 + 8.0 / radius, 0.0);
     w.set_action(1, &[0.0, 0.0]);
     w.step();
-    let mut o = vec![0.0f32; 32];
+    let mut o = vec![0.0f32; 36];
     w.observe(1, &mut o);
     let geo = traffic(&w, 0).geometry();
     let (x, y) = (f64::from(o[0]), f64::from(o[1]));
@@ -525,12 +525,13 @@ fn traffic_and_lane_route_terms() {
         (f64::from(o[6]) - (geo.front - geo.rear)).abs() < 1e-5
             && (f64::from(o[7]) - 2.0 * geo.half_width).abs() < 1e-5
     );
-    assert_eq!(&o[8..13], &[0.0, 1.0, 0.0, 0.0, 1.0], "left lane, present");
-    assert!(o[13..26].iter().all(|&v| v == 0.0), "one vehicle only");
+    assert_eq!(&o[8..12], &[0.0, 1.0, 0.0, 0.0], "left lane");
+    assert_eq!(&o[12..15], &[1.0, 0.0, 0.0], "a vehicle");
+    assert!(o[15..30].iter().all(|&v| v == 0.0), "one vehicle only");
     // No route: straight on from its own lane.
-    assert_eq!(o[26], 0.0);
-    assert!(o[27] > 0.0, "distance to the lane's end {o:?}");
-    assert_eq!(&o[28..32], &[0.0, 1.0, 0.0, 0.0]);
+    assert_eq!(o[30], 0.0);
+    assert!(o[31] > 0.0, "distance to the lane's end {o:?}");
+    assert_eq!(&o[32..36], &[0.0, 1.0, 0.0, 0.0]);
 }
 
 /// NPC traffic with a learning car on an urban map, recorded: the NPCs go into `/npcs` (no

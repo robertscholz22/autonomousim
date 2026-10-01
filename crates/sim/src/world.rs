@@ -27,8 +27,8 @@ use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts, surface_distance};
 use crate::lane;
 use crate::lane::RoadSpawn;
-use crate::obs::{CLEARANCE_RANGE, Seen};
-use crate::pedestrians::Crowd;
+use crate::obs::{CLEARANCE_RANGE, Seen, SeenKind};
+use crate::pedestrians::{Crowd, PedState};
 use crate::scenario::{
     CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, PhysicsMode, SpawnSpec, TiltrotorStart,
 };
@@ -667,13 +667,28 @@ impl WorldInstance {
             }
             let index = self.lane_index.as_mut().expect("made");
             index.clear();
+            // Each driver finds its place on its own (over threads in large worlds), then all
+            // take theirs in the index in order.
+            let shapes = &self.shapes;
+            let locate = |(i, a): (usize, &mut Agent)| {
+                if let Some(Driver::Traffic(d)) = &mut a.driver
+                    && !a.disabled
+                    && shapes[i].active
+                {
+                    d.locate(world, &a.vehicle.pose());
+                }
+            };
+            if self.agents.len() >= PARALLEL_AGENTS {
+                self.agents.par_iter_mut().enumerate().for_each(locate);
+            } else {
+                self.agents.iter_mut().enumerate().for_each(locate);
+            }
             for (i, a) in self.agents.iter_mut().enumerate() {
                 if a.disabled || !self.shapes[i].active {
                     continue;
                 }
                 let v = &a.vehicle;
                 if let Some(Driver::Traffic(d)) = &mut a.driver {
-                    d.locate(world, &v.pose());
                     d.occupy(lanes, index, i as u32, &v.pose(), ground_speed(v));
                 } else {
                     let s = &self.shapes[i];
@@ -872,8 +887,20 @@ impl WorldInstance {
 
     // ------------------------------------------------------------------------ outputs
 
-    /// Every active ground vehicle as the `traffic` term sees it (by agent).
+    /// Every active ground vehicle as the `traffic` term sees it (by agent), then every
+    /// pedestrian on a carriageway (crossing, or standing there hit; the others `None`).
     fn seen(&self) -> Vec<Option<Seen>> {
+        let peds = self.crowd.peds.iter().map(|p| {
+            matches!(p.state, PedState::Crossing | PedState::Hit).then(|| Seen {
+                kind: SeenKind::Pedestrian,
+                center: p.pos,
+                velocity: p.vel,
+                heading: p.heading,
+                length: 2.0 * p.radius,
+                width: 2.0 * p.radius,
+                lane: None,
+            })
+        });
         (self.agents.iter().enumerate())
             .map(|(i, a)| {
                 let geo = self.footprints[a.group].filter(|_| !a.disabled && self.shapes[i].active)?;
@@ -881,6 +908,7 @@ impl WorldInstance {
                 let heading = yaw(pose.rot);
                 let center = pose.pos.truncate() + 0.5 * (geo.front + geo.rear) * DVec2::from_angle(heading);
                 Some(Seen {
+                    kind: if geo.single_track { SeenKind::TwoWheeler } else { SeenKind::Vehicle },
                     center,
                     velocity: a.vehicle.lin_vel_world().truncate(),
                     heading,
@@ -889,6 +917,7 @@ impl WorldInstance {
                     lane: a.track.lane,
                 })
             })
+            .chain(peds)
             .collect()
     }
 
@@ -905,7 +934,18 @@ impl WorldInstance {
         let write = |(k, o): (usize, &mut [f32])| {
             let me = g.first_agent + k;
             let a = &self.agents[me];
-            a.observe(g, &self.map, &self.shapes, &self.grid, me, &vehicles, &self.signals, self.clock.time(), o);
+            a.observe(
+                g,
+                &self.map,
+                &self.shapes,
+                &self.grid,
+                me,
+                &vehicles,
+                &self.crowd.peds,
+                &self.signals,
+                self.clock.time(),
+                o,
+            );
         };
         if g.spec.count >= PARALLEL_AGENTS {
             out.par_chunks_exact_mut(dim).enumerate().for_each(write);

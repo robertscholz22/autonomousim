@@ -25,6 +25,7 @@ mod autopilot;
 mod camera;
 mod camera_view;
 mod convert;
+mod crowd_view;
 mod history;
 mod hud;
 mod lidar_view;
@@ -531,6 +532,7 @@ fn main() -> anyhow::Result<()> {
         .insert_resource(history::History::default())
         .insert_resource(overlay::Overlay::default())
         .init_resource::<signals_view::SignalLamps>()
+        .init_resource::<crowd_view::Figures>()
         .insert_resource(sim)
         .insert_resource(DemoRoute::default())
         .insert_resource(hud::Hud { visible: true, help: display.screenshot.is_none(), plots: display.plots })
@@ -589,6 +591,7 @@ fn main() -> anyhow::Result<()> {
                     vehicle_view::sync_tiltrotors,
                     world_view::sync_pads,
                     signals_view::sync_signals,
+                    crowd_view::sync_crowd,
                 )
                     .chain(),
                 camera::update_camera,
@@ -888,7 +891,12 @@ fn capture(
         let recent = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS).and_then(|d| d.average()).unwrap_or(0.0);
         let mean = capture.measured.map_or(f64::NAN, |(t, n)| f64::from(n) / t.elapsed().as_secs_f64());
         let p = sim.render_pose(sim.pilot).pos;
-        info!("{mean:.1} fps after warm-up, {recent:.1} over the last frames; t = {:.1} s at {p:.1}", sim.time());
+        info!(
+            "{mean:.1} fps after warm-up, {recent:.1} over the last frames; t = {:.1} s at {p:.1}; stepping {:.2} s per simulated second, real-time factor {:.2}",
+            sim.time(),
+            sim.step_cost,
+            sim.real_time_factor
+        );
         exit.write(AppExit::Success);
     }
 }

@@ -122,7 +122,17 @@ impl Polyline {
         let len = self.length();
         let h = H.min(0.5 * len);
         let s = s.clamp(h, len - h);
-        let (a, b, c) = (self.point_at(s - h).truncate(), self.point_at(s).truncate(), self.point_at(s + h).truncate());
+        // As `point_at` at each station, its segment found by walking on from the first.
+        let mut i = self.segment_at(s - h);
+        let mut at = |x: f64| {
+            let x = x.clamp(0.0, len);
+            while i + 2 < self.points.len() && self.stations[i + 1] <= x {
+                i += 1;
+            }
+            let (s0, s1) = (self.stations[i], self.stations[i + 1]);
+            self.points[i].lerp(self.points[i + 1], (x - s0) / (s1 - s0)).truncate()
+        };
+        let (a, b, c) = (at(s - h), at(s), at(s + h));
         let denom = a.distance(b) * b.distance(c) * a.distance(c);
         if denom < 1e-12 { 0.0 } else { 2.0 * (b - a).perp_dot(c - b) / denom }
     }
@@ -814,6 +824,33 @@ mod tests {
         let r = line.slice(12.5, 10.5);
         assert_eq!((r[0].x, r[r.len() - 1].x), (12.5, 10.5));
         assert!((wrap_angle(3.5 * std::f64::consts::PI) + 0.5 * std::f64::consts::PI).abs() < 1e-12);
+    }
+
+    /// `curvature_at` (walking the segments) is exactly the circle through `point_at` at the
+    /// three stations.
+    #[test]
+    fn curvature_matches_the_three_points() {
+        let three = |l: &Polyline, s: f64| {
+            let h = 2f64.min(0.5 * l.length());
+            let s = s.clamp(h, l.length() - h);
+            let (a, b, c) = (l.point_at(s - h).truncate(), l.point_at(s).truncate(), l.point_at(s + h).truncate());
+            let denom = a.distance(b) * b.distance(c) * a.distance(c);
+            if denom < 1e-12 { 0.0 } else { 2.0 * (b - a).perp_dot(c - b) / denom }
+        };
+        let net = lattice();
+        let short = Polyline::new(vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 0.0)]);
+        let lines = net.roads().iter().map(|r| r.line.clone()).chain([short]);
+        for l in lines {
+            for k in -10..=(l.length() * 4.0) as i64 + 10 {
+                let s = 0.25 * k as f64;
+                assert_eq!(l.curvature_at(s).to_bits(), three(&l, s).to_bits(), "at {s}");
+            }
+            // On the vertices.
+            for i in 0..l.points().len() {
+                let s = l.length() * i as f64 / (l.points().len() - 1).max(1) as f64;
+                assert_eq!(l.curvature_at(s).to_bits(), three(&l, s).to_bits());
+            }
+        }
     }
 
     #[test]

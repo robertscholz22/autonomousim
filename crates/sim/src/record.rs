@@ -10,6 +10,7 @@
 //! | `/agent/<id>/lidar` | each scan, if enabled | sensor pose and ranges |
 //! | `/agent/<id>/camera/<sensor>` | frames captured at multiples of `1/camera_hz`, if enabled | the visible RGB image as `foxglove.RawImage` (`rgb8`, base64) |
 //! | `/npcs` | `state_hz` (scenarios with scripted groups) | the scripted agents (NPCs) packed into one message instead of their own `state`, `pose` and `action` channels, exactly: time, agent ids, poses, velocities, body rates, steering angles, kinematic or full physics, event bits, disabled flags, trailer joints and wheels (spin, angle, steering, travel) ([`RecordedNpcs`]) |
+//! | `/pedestrians` | `pedestrian_hz` and at resets (scenarios with pedestrians) | the crowd packed into one message, rounded to cm, cm/s and mrad: time, then per pedestrian position (x, y, z), velocity (x, y), heading, height and state ([`RecordedPedestrians`]) |
 //! | `/route` | when a scripted agent's route changes (scenarios with scripted groups) | time, agent id and the route's lane points |
 //! | `/events` | when an agent gets new event bits | agent id and event names |
 //! | `/signals` | at resets and whenever a controller's phase or light changes (map pools with traffic signals) | time, controller, junction node, phase and light (`green`, `amber`, `red`) |
@@ -28,12 +29,13 @@
 //! rebuilds its scenario with the maps checked against their recorded hashes.
 
 use crate::SimError;
+use crate::pedestrians::PedState;
 use crate::scenario::{CompiledScenario, Goal, Scenario};
 use crate::world::{STATE_FIELDS, WorldInstance};
 use autonomousim_sensors::Sensor;
 use autonomousim_vehicles::{SharedDef, Vehicle, VehicleDef};
 use autonomousim_world::{Light, Polyline};
-use glam::{DQuat, DVec3};
+use glam::{DQuat, DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -158,6 +160,8 @@ pub struct RecorderConfig {
     /// for other tools (e.g. Foxglove).
     #[serde(skip_serializing_if = "is_zero_hz")]
     pub camera_hz: u32,
+    /// Rate of the `/pedestrians` messages (0: none; must divide the physics rate).
+    pub pedestrian_hz: u32,
 }
 
 fn is_zero_hz(x: &u32) -> bool {
@@ -166,7 +170,7 @@ fn is_zero_hz(x: &u32) -> bool {
 
 impl Default for RecorderConfig {
     fn default() -> Self {
-        Self { state_hz: 50, lidar: false, camera_hz: 0 }
+        Self { state_hz: 50, lidar: false, camera_hz: 0, pedestrian_hz: 5 }
     }
 }
 
@@ -222,6 +226,9 @@ pub struct Recorder {
     lights: Vec<Option<(usize, Light)>>,
     /// The `/npcs` channel (scenarios with scripted groups).
     npcs: Option<u16>,
+    /// The `/pedestrians` channel (scenarios with pedestrians) and its rate divider.
+    pedestrians: Option<u16>,
+    pedestrian_divider: u64,
     seen: Vec<u32>,
     error: Option<SimError>,
 }
@@ -244,6 +251,8 @@ impl Recorder {
             signals: None,
             lights: Vec::new(),
             npcs: None,
+            pedestrians: None,
+            pedestrian_divider: 1,
             seen: Vec::new(),
             error: None,
         }
@@ -289,6 +298,11 @@ impl Recorder {
         }
         if sc.maps.iter().any(|m| m.roads().has_sections() && !m.roads().lanes().controllers().is_empty()) {
             self.signals = Some(self.sink.add_channel("/signals", "autonomousim.Signals", OBJECT_SCHEMA)?);
+        }
+        if sc.spec.pedestrians.count > 0 && self.config.pedestrian_hz > 0 {
+            self.pedestrian_divider = u64::from(sc.clock.divider("recorder pedestrians", self.config.pedestrian_hz)?);
+            self.pedestrians =
+                Some(self.sink.add_channel("/pedestrians", "autonomousim.Pedestrians", OBJECT_SCHEMA)?);
         }
         if self.config.camera_hz > 0 {
             self.camera_divider = u64::from(sc.clock.divider("recorder camera", self.config.camera_hz)?);
@@ -359,7 +373,7 @@ impl Recorder {
                 })
             })
             .collect();
-        let msg = json!({
+        let mut msg = json!({
             "format": 1,
             "scenario": sc.spec,
             "maps": maps,
@@ -370,6 +384,9 @@ impl Recorder {
             "agents": agents,
             "vehicles": vehicles,
         });
+        if self.pedestrians.is_some() {
+            msg["pedestrian_hz"] = json!(self.config.pedestrian_hz);
+        }
         let data = serde_json::to_vec(&msg).expect("JSON");
         self.sink.write(meta, self.time_ns(), &data)?;
         Ok((meta, episode, events))
@@ -425,6 +442,7 @@ impl Recorder {
         self.lights.clear();
         self.write_signals(w);
         self.write_states(w);
+        self.write_pedestrians(w);
     }
 
     /// `/signals` messages for the controllers whose phase or light changed.
@@ -504,6 +522,9 @@ impl Recorder {
         self.on_frames(w);
         if w.clock().tick.is_multiple_of(self.divider) {
             self.write_states(w);
+        }
+        if w.clock().tick.is_multiple_of(self.pedestrian_divider) {
+            self.write_pedestrians(w);
         }
     }
 
@@ -678,6 +699,22 @@ impl Recorder {
         }
         if m.wheels.iter().all(Vec::is_empty) {
             m.wheels.clear();
+        }
+        self.send(ch, &serde_json::to_value(&m).expect("JSON"));
+    }
+
+    /// One `/pedestrians` message with the crowd (see [`RecordedPedestrians`]).
+    fn write_pedestrians(&mut self, w: &WorldInstance) {
+        let Some(ch) = self.pedestrians else { return };
+        let peds = &w.crowd().peds;
+        let cm = |x: f64| (x * 100.0).round() as i32;
+        let mut m = RecordedPedestrians { time: w.time(), ..Default::default() };
+        for p in peds {
+            m.position.extend([cm(p.pos.x), cm(p.pos.y), cm(p.z)]);
+            m.velocity.extend([cm(p.vel.x), cm(p.vel.y)]);
+            m.heading.push((p.heading * 1000.0).round() as i32);
+            m.height.push(cm(p.height));
+            m.state.push(state_code(p.state));
         }
         self.send(ch, &serde_json::to_value(&m).expect("JSON"));
     }
@@ -863,6 +900,73 @@ impl RecordedNpcs {
     }
 }
 
+/// A `/pedestrians` message: the crowd, packed and rounded (`position` holds x, y, z in cm
+/// per pedestrian, `velocity` x, y in cm/s, `heading` mrad, `height` cm; `state` is 0
+/// walking, 1 waiting, 2 crossing, 3 dwelling, 4 hit).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordedPedestrians {
+    pub time: f64,
+    pub position: Vec<i32>,
+    pub velocity: Vec<i32>,
+    pub heading: Vec<i32>,
+    pub height: Vec<i32>,
+    pub state: Vec<u8>,
+}
+
+/// A pedestrian of a `/pedestrians` message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecordedPedestrian {
+    pub position: DVec3,
+    pub velocity: DVec2,
+    pub heading: f64,
+    pub height: f64,
+    pub state: PedState,
+}
+
+impl RecordedPedestrians {
+    pub fn len(&self) -> usize {
+        self.state.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    /// Pedestrian `i`, if there is one.
+    pub fn get(&self, i: usize) -> Option<RecordedPedestrian> {
+        let m = |x: i32| f64::from(x) * 0.01;
+        let p = self.position.get(3 * i..3 * i + 3)?;
+        let v = self.velocity.get(2 * i..2 * i + 2)?;
+        Some(RecordedPedestrian {
+            position: DVec3::new(m(p[0]), m(p[1]), m(p[2])),
+            velocity: DVec2::new(m(v[0]), m(v[1])),
+            heading: f64::from(*self.heading.get(i)?) * 1e-3,
+            height: m(*self.height.get(i)?),
+            state: state_from_code(*self.state.get(i)?),
+        })
+    }
+}
+
+fn state_code(s: PedState) -> u8 {
+    match s {
+        PedState::Walking => 0,
+        PedState::Waiting => 1,
+        PedState::Crossing => 2,
+        PedState::Dwelling => 3,
+        PedState::Hit => 4,
+    }
+}
+
+fn state_from_code(c: u8) -> PedState {
+    match c {
+        1 => PedState::Waiting,
+        2 => PedState::Crossing,
+        3 => PedState::Dwelling,
+        4 => PedState::Hit,
+        _ => PedState::Walking,
+    }
+}
+
 /// A wheel in a ground vehicle's state message.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -951,6 +1055,8 @@ pub struct RecordedEpisode {
     pub events: Vec<RecordedEvents>,
     /// Offsets (s) of the map's signal controllers (empty without signals).
     pub signal_offsets: Vec<f64>,
+    /// The crowd in time order (empty without pedestrians).
+    pub pedestrians: Vec<RecordedPedestrians>,
 }
 
 impl RecordedEpisode {
@@ -977,6 +1083,8 @@ pub struct Recording {
     pub physics_hz: u32,
     pub policy_hz: u32,
     pub state_hz: u32,
+    /// Rate of the `/pedestrians` messages (0: none recorded).
+    pub pedestrian_hz: u32,
     pub agents: Vec<RecordedAgent>,
     pub episodes: Vec<RecordedEpisode>,
     /// The `/meta` message as written.
@@ -1006,6 +1114,8 @@ impl Recording {
             physics_hz: u32,
             policy_hz: u32,
             state_hz: u32,
+            #[serde(default)]
+            pedestrian_hz: u32,
             agents: Vec<RecordedAgent>,
         }
         #[derive(Deserialize)]
@@ -1046,6 +1156,7 @@ impl Recording {
                     physics_hz: parsed.physics_hz,
                     policy_hz: parsed.policy_hz,
                     state_hz: parsed.state_hz,
+                    pedestrian_hz: parsed.pedestrian_hz,
                     agents: parsed.agents,
                     episodes: Vec::new(),
                     meta,
@@ -1077,12 +1188,17 @@ impl Recording {
                     scans: vec![Vec::new(); n],
                     events: Vec::new(),
                     signal_offsets: e.signals,
+                    pedestrians: Vec::new(),
                 });
                 continue;
             }
             let Some(ep) = r.episodes.last_mut() else { return Err(record_err(format!("{topic} before /episode"))) };
             if topic == "/events" {
                 ep.events.push(parse(topic, &m.data)?);
+                continue;
+            }
+            if topic == "/pedestrians" {
+                ep.pedestrians.push(parse(topic, &m.data)?);
                 continue;
             }
             if topic == "/npcs" {

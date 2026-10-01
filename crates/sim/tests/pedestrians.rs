@@ -297,3 +297,91 @@ fn lidar_sees_pedestrians() {
     let gap = w.crowd().peds[0].pos.distance(w.agent(0).vehicle.position().truncate()) - w.crowd().peds[0].radius;
     assert!((f64::from(scan.ranges[0]) - gap).abs() < 0.1, "range {} for {gap:.2}", scan.ranges[0]);
 }
+
+/// A car on an urban map that sees the nearest pedestrians, and the road users near it.
+const OBSERVED: &str = r#"
+    physics_hz = 200
+    policy_hz = 25
+    map = { type = "urban", seed = 1, count = 1 }
+    [pedestrians]
+    count = 3
+    [[groups]]
+    name = "ego"
+    vehicle = "sedan_like"
+    physics = "kinematic"
+    action_mode = "vk"
+    spawn = { on_ground = true, on_road = true }
+    obs = [{ term = "pedestrians", count = 3 }, { term = "traffic", count = 2 }]
+    disable_on_terminal = false
+"#;
+
+/// The `pedestrians` term sees the pedestrians within its range, nearest first; `traffic` only
+/// those on the carriageway (here: one standing there, hit), as pedestrians.
+#[test]
+fn pedestrians_and_traffic_terms_see_pedestrians() {
+    let sc = compile(OBSERVED);
+    assert_eq!(sc.groups[0].obs_dim(), 3 * 6 + 2 * 15);
+    let mut w = WorldInstance::new(sc, Seed::from_u64(3));
+    let pose = w.agent(0).vehicle.pose();
+    let (me, yaw) = (pose.pos.truncate(), autonomousim_core::math::quat::yaw(pose.rot));
+    let at = |x: f64, y: f64| me + DVec2::from_angle(yaw).rotate(DVec2::new(x, y));
+    let on_road = |p: DVec2| w.map().roads().on_road(p).is_some();
+    let (hit, near, far) = (at(6.0, 0.5), at(12.0, -3.0), at(40.0, 0.0));
+    let flags = [f32::from(u8::from(on_road(hit))), f32::from(u8::from(on_road(near)))];
+    let peds = &mut w.crowd_mut().peds;
+    peds[0].stand_at(near, 100.0);
+    peds[1].stand_at(far, 100.0);
+    peds[2].stand_at(hit, 100.0);
+    peds[2].state = PedState::Hit;
+    let mut o = vec![0.0f32; 48];
+    w.observe(0, &mut o);
+    // Nearest first: the one hit, then the one 12 m ahead; the far one is out of range.
+    assert!((o[0] - 6.0).abs() < 1e-4 && (o[1] - 0.5).abs() < 1e-4, "{o:?}");
+    assert_eq!(&o[2..6], &[0.0, 0.0, flags[0], 1.0]);
+    assert!((o[6] - 12.0).abs() < 1e-4 && (o[7] + 3.0).abs() < 1e-4, "{o:?}");
+    assert_eq!(&o[8..12], &[0.0, 0.0, flags[1], 1.0]);
+    assert!(o[12..18].iter().all(|&v| v == 0.0), "{o:?}");
+    // `traffic`: the one hit only, a pedestrian in no lane.
+    let t = &o[18..];
+    assert!((t[0] - 6.0).abs() < 1e-4 && (t[1] - 0.5).abs() < 1e-4, "{t:?}");
+    assert_eq!(&t[8..15], &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+    assert!(t[15..].iter().all(|&v| v == 0.0), "{t:?}");
+}
+
+/// The crowd is recorded to `/pedestrians` at its rate (and at resets), rounded to cm and mrad.
+#[test]
+fn crowds_are_recorded() {
+    use autonomousim_sim::record::{Recorder, RecorderConfig, Recording};
+    let sc = compile(&urban(2, 2, 50, ""));
+    let path = std::env::temp_dir().join(format!("autonomousim-crowd-{}.mcap", std::process::id()));
+    let mut rec = Recorder::create(&path, RecorderConfig { pedestrian_hz: 5, ..Default::default() }).unwrap();
+    let mut w = WorldInstance::new(sc, Seed::from_u64(4));
+    rec.on_reset(&w);
+    let mut live = vec![(w.time(), w.crowd().peds.clone())];
+    for _ in 0..50 {
+        w.step_with(&mut |w| {
+            rec.on_tick(w);
+            if w.clock().tick.is_multiple_of(40) {
+                live.push((w.time(), w.crowd().peds.clone()));
+            }
+        });
+    }
+    rec.finish().unwrap();
+    let recording = Recording::read(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(recording.pedestrian_hz, 5);
+    let frames = &recording.episodes[0].pedestrians;
+    assert_eq!(frames.len(), live.len());
+    for (f, (time, peds)) in frames.iter().zip(&live) {
+        assert_eq!(f.time, *time);
+        assert_eq!(f.len(), 50);
+        for (i, p) in peds.iter().enumerate() {
+            let r = f.get(i).unwrap();
+            assert!((r.position - p.pos.extend(p.z)).abs().max_element() <= 0.005 + 1e-9);
+            assert!((r.velocity - p.vel).abs().max_element() <= 0.005 + 1e-9);
+            assert!((r.heading - p.heading).abs() <= 5e-4 + 1e-12 && (r.height - p.height).abs() <= 0.005 + 1e-9);
+            assert_eq!(r.state, p.state);
+        }
+    }
+    assert!(frames.first().unwrap().position != frames.last().unwrap().position, "the crowd moved");
+}
