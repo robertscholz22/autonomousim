@@ -43,7 +43,7 @@ use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::driver::DriverSpec;
 use crate::hybrid::CruiseTrim;
 use crate::junction::JunctionGoals;
-use crate::lane::RouteGoals;
+use crate::lane::{RouteDestination, RouteGoals};
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use crate::pedestrians::{PEDESTRIAN_PERIOD, PedestrianSpec};
 use crate::rooftop::RooftopGoals;
@@ -1352,6 +1352,18 @@ impl CompiledScenario {
                 )));
             }
         }
+        if let Some(g) = groups
+            .iter()
+            .find(|g| g.spec.goals.kind == GoalKind::Route && g.spec.goals.route.destination == RouteDestination::Lanes)
+        {
+            episode_maps.retain(|&k| !maps[k].roads().lanes().lanes().is_empty());
+            if episode_maps.is_empty() {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: `route` goals to `lanes` need a lane graph (urban maps), no map has one",
+                    g.spec.name
+                )));
+            }
+        }
         if let Some(g) = groups.iter().find(|g| g.spec.goals.kind == GoalKind::Rooftop) {
             episode_maps.retain(|&k| crate::rooftop::usable(&maps[k]));
             if episode_maps.is_empty() {
@@ -1559,9 +1571,10 @@ impl CompiledGroup {
                 (towing || d.num_units() == 1) && (towing || !d.is_single_track()) && d.supports_kinematic()
             });
             let parked = matches!(d, DriverSpec::Parked);
-            let junction = towing && spec.goals.kind == GoalKind::Junction;
+            let trips = spec.goals.kind == GoalKind::Route && spec.goals.route.destination == RouteDestination::Lanes;
+            let junction = towing && (spec.goals.kind == GoalKind::Junction || trips);
             let placed = if parked { sp.in_bays } else { sp.on_road || junction };
-            if !fits || !placed || spec.goals.kind == GoalKind::Route {
+            if !fits || !placed || (spec.goals.kind == GoalKind::Route && !(towing && trips)) {
                 return Err(fail(format!(
                     "the `{}` driver drives ground vehicles{} spawned {}, without `route` goals",
                     d.name(),

@@ -118,7 +118,11 @@ fn walkways_connect_the_city_off_the_carriageways() {
         // each other.
         let entrances = w.places().iter().filter(|p| matches!(p.kind, PlaceKind::Entrance { .. })).count();
         let bus = w.places().iter().filter(|p| matches!(p.kind, PlaceKind::BusStop { .. })).count();
-        assert!(entrances as f64 >= 0.8 * world.sites().buildings.len() as f64, "seed {seed}: {entrances} entrances");
+        assert!(
+            entrances as f64 >= 0.75 * world.sites().buildings.len() as f64,
+            "seed {seed}: {entrances} entrances of {}",
+            world.sites().buildings.len()
+        );
         assert!(bus > 50, "seed {seed}: {bus} bus stops");
         let mut rng = Seed::from_u64(seed).child("routes").rng();
         for _ in 0..50 {

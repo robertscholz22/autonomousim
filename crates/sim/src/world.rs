@@ -26,7 +26,7 @@ use crate::driver::{Driver, DriverGeometry, DriverSpec, Traffic};
 use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts, surface_distance};
 use crate::lane;
-use crate::lane::RoadSpawn;
+use crate::lane::{RoadSpawn, RouteDestination};
 use crate::obs::{CLEARANCE_RANGE, Seen, SeenKind};
 use crate::pedestrians::{Crowd, PedState};
 use crate::scenario::{
@@ -286,6 +286,29 @@ impl WorldInstance {
                 }
                 let n = p.len();
                 (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            } else if g.spec.goals.kind == GoalKind::Route && g.spec.goals.route.destination == RouteDestination::Lanes
+            {
+                // Lane trips through the city, each from its own spawn.
+                let d = g.def.as_wheeled().expect("lane trips are for ground vehicles");
+                let separation = spawn.min_separation.max(10.0);
+                let mut p = Vec::with_capacity(g.spec.count);
+                let mut rs = Vec::with_capacity(g.spec.count);
+                for _ in 0..g.spec.count {
+                    let c =
+                        crate::junction::trip(world, g.spec.goals.distance, &placed, separation, lift, &mut goal_rng)
+                            .expect("maps of lane trips have lanes");
+                    let pose = ground_pose(world, d, &g.rest, c.position.truncate(), c.yaw);
+                    placed.push(pose.pos);
+                    p.push(pose.pos);
+                    rs.push(Some(RoadSpawn {
+                        position: pose.pos,
+                        yaw: c.yaw,
+                        route: Some(c.route.clone()),
+                        walk: None,
+                    }));
+                    crossings.push(c);
+                }
+                (p, rs)
             } else if g.spec.goals.kind == GoalKind::Junction {
                 // On different entries of one junction, routed through it.
                 let d = g.def.as_wheeled().expect("junction goals are for ground vehicles");
@@ -473,7 +496,7 @@ impl WorldInstance {
                 let goals = match (formation.next(), &route) {
                     _ if bay_goals => vec![bays[k].goal],
                     _ if !trips.is_empty() => vec![trips[k]],
-                    _ if !crossings.is_empty() => vec![crossings[k].goal],
+                    _ if !crossings.is_empty() && g.spec.goals.kind == GoalKind::Junction => vec![crossings[k].goal],
                     (Some(slot), _) => vec![slot],
                     (None, Some(lane)) => lane::route_goals(world, lane, g.spec.goals.route.step, lift),
                     (None, None) => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),

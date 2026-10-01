@@ -8,11 +8,14 @@
 //! A site is one junction, or all the junctions of a roundabout's ring (one-way roads between
 //! roundabout nodes). Its entries are the approach lanes from other roads, grouped into arms
 //! by road and direction; its exits are the lanes leaving it onto other roads.
+//!
+//! Lane trips ([`trip`], `route` goals to `lanes`) are the long version: a lane-level route
+//! of a drawn length through the city from a random lane, without lane changes.
 
 use crate::scenario::{Goal, GoalSpec};
 use autonomousim_core::rng::SimRng;
 use autonomousim_core::terrain::Terrain;
-use autonomousim_world::lanes::{JunctionKind, LaneGraph, RouteStep};
+use autonomousim_world::lanes::{JunctionKind, LaneGraph, RouteStep, Turn};
 use autonomousim_world::{NodeKind, Polyline, StaticWorld};
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
@@ -248,6 +251,95 @@ fn route_line(g: &LaneGraph, steps: &[RouteStep], s0: f64, s1: f64) -> Option<(P
         }
     }
     (points.len() >= 2 && !connectors.is_empty()).then(|| (Polyline::new(points), connectors))
+}
+
+/// Lanes and connectors of a trip keep this far from the map's edges (m).
+const TRIP_EDGE_CLEARANCE: f64 = 40.0;
+/// A trip starts at least this far (m) from a lane's ends, and ends at least this far into
+/// its last lane.
+const TRIP_START_MARGIN: f64 = 10.0;
+/// A trip ends on a lane at least this long (m; not on a short one between close junctions).
+const TRIP_END_LANE: f64 = 20.0;
+
+/// A lane trip: from a random point of a random lane (clear of the map's edges, at least
+/// `separation` m from every point of `placed`), along a random walk over the lane graph's
+/// connectors clear of the map's edges (no lane changes; no U-turns but at dead ends; lanes not
+/// yet driven first; a walk hemmed in by the edge is drawn again) until its length reaches one
+/// drawn from `distance` (or more: it ends at least [`TRIP_START_MARGIN`] m into a lane of at
+/// least [`TRIP_END_LANE`] m); the goal at its end, `lift` above the terrain. None when no lane fits (after a number of draws).
+pub fn trip(
+    world: &StaticWorld,
+    distance: [f64; 2],
+    placed: &[DVec3],
+    separation: f64,
+    lift: f64,
+    rng: &mut SimRng,
+) -> Option<Crossing> {
+    let g = world.roads().lanes();
+    let (lo, hi) = world.extent();
+    let inside = |p: DVec3| {
+        let p = p.truncate();
+        p.cmpge(lo + TRIP_EDGE_CLEARANCE).all() && p.cmple(hi - TRIP_EDGE_CLEARANCE).all()
+    };
+    let starts: Vec<u32> = (0..g.lanes().len() as u32)
+        .filter(|&l| {
+            let line = &g.lanes()[l as usize].line;
+            line.length() > 2.0 * TRIP_START_MARGIN && line.points().iter().all(|&p| inside(p))
+        })
+        .collect();
+    if starts.is_empty() {
+        return None;
+    }
+    for _ in 0..64 {
+        let first = starts[rng.below(starts.len() as u64) as usize];
+        let line = &g.lanes()[first as usize].line;
+        let s0 = rng.range(TRIP_START_MARGIN, line.length() - TRIP_START_MARGIN);
+        let start = line.point_at(s0);
+        if placed.iter().any(|q| q.truncate().distance(start.truncate()) < separation) {
+            continue;
+        }
+        let target = rng.range(distance[0], distance[1]);
+        let mut steps = vec![RouteStep::Lane(first)];
+        let mut driven = vec![first];
+        let (mut lane, mut length) = (first, line.length() - s0);
+        let s1 = loop {
+            let len = g.lanes()[lane as usize].line.length();
+            if length >= target && len >= TRIP_END_LANE {
+                break Some((len - (length - target)).max(TRIP_START_MARGIN));
+            }
+            let succ = &g.lanes()[lane as usize].successors;
+            let rank = |c: u32| {
+                let k = &g.connectors()[c as usize];
+                let to = &g.lanes()[k.to as usize];
+                let clear = k.line.points().iter().chain(to.line.points()).all(|&p| inside(p));
+                clear.then_some((k.turn == Turn::UTurn, driven.contains(&k.to)))
+            };
+            // Hemmed in by the map's edge: draw another trip.
+            let Some(best) = succ.iter().filter_map(|&c| rank(c)).min() else { break None };
+            let options: Vec<u32> = succ.iter().copied().filter(|&c| rank(c) == Some(best)).collect();
+            let c = options[rng.below(options.len() as u64) as usize];
+            let to = g.connectors()[c as usize].to;
+            steps.push(RouteStep::Connector(c));
+            steps.push(RouteStep::Lane(to));
+            driven.push(to);
+            length += g.connectors()[c as usize].line.length() + g.lanes()[to as usize].line.length();
+            lane = to;
+        };
+        let Some(s1) = s1 else { continue };
+        let Some((route, connectors)) = route_line(g, &steps, s0, s1) else { continue };
+        let end = route.length();
+        let p = route.point_at(end);
+        let goal =
+            Goal { position: p.truncate().extend(world.terrain().height(p.x, p.y) + lift), yaw: route.heading_at(end) };
+        return Some(Crossing {
+            position: start.truncate().extend(world.terrain().height(start.x, start.y) + lift),
+            yaw: route.heading_at(0.0),
+            goal,
+            route,
+            connectors,
+        });
+    }
+    None
 }
 
 fn shuffle<T>(v: &mut [T], rng: &mut SimRng) {

@@ -13,7 +13,8 @@
 //!    with each corner filleted), with a cross-section per street and class (lanes,
 //!    median, bike and parking lanes, sidewalks) drawn from the street's own random stream.
 //! 5. Road profiles as for rural maps: terrain heights along each road, smoothed, pinned to the
-//!    node heights and limited to the class's maximum grade.
+//!    node heights and limited to the class's maximum grade; on a junction's approaches they
+//!    keep close to its height (see [`JUNCTION_APPROACH`]), so that its arms meet level.
 //! 6. Terrain blending: carriageways (with a crown) and sidewalks (flat, level with the
 //!    carriageway's edge) are cut or filled into the terrain, with shoulders beyond. Junctions
 //!    are paved over as far as their lanes leave free (the area their connectors cross), and
@@ -49,7 +50,7 @@ use std::f64::consts::TAU;
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const URBAN_VERSION: u32 = 6;
+pub const URBAN_VERSION: u32 = 7;
 
 /// The city's outline and ground.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -873,14 +874,19 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
         })
         .collect();
     let lengths: Vec<f64> = pieces.iter().map(|p| p.points.windows(2).map(|w| w[0].distance(w[1])).sum()).collect();
-    reach_nodes(c, &pieces, &lengths, &mut node_z);
+    // Junctions have level approaches (all nodes but dead ends: connectors cut the corners
+    // of bends too).
+    let level: Vec<bool> = kinds.iter().map(|&kind| kind != NodeKind::End).collect();
+    reach_nodes(c, &pieces, &lengths, &level, &mut node_z);
     let roads: Vec<Road> = pieces
         .iter()
         .zip(&sections)
         .map(|(p, s)| {
             let cc = k.class(p.class);
             let (z0, z1) = (node_z[p.start as usize], node_z[p.end as usize]);
-            let z = profile(&p.points, &hs, z0, z1, cc.max_grade, c.streets.profile_window);
+            let mut z = profile(&p.points, &hs, z0, z1, cc.max_grade, c.streets.profile_window);
+            let ends = [(z0, level[p.start as usize]), (z1, level[p.end as usize])];
+            level_approaches(&p.points, &mut z, ends, cc.max_grade, c.streets.profile_window);
             let points = p.points.iter().zip(z).map(|(q, z)| q.extend(z)).collect();
             Road { class: p.class, width: s.width(), start: p.start, end: p.end, line: Polyline::new(points) }
         })
@@ -1124,14 +1130,84 @@ fn extract(g: &Graph, rings: &[Ring]) -> (Vec<Piece>, Vec<NodeId>, Vec<NodeKind>
     (pieces, node_ids, kinds)
 }
 
+/// Over this distance (m) from a junction (beyond its area, which the lanes leave free, and
+/// the blending around it) a road climbs or falls at most [`JUNCTION_GRADE`] on average: its
+/// height keeps within that grade's reach of the junction's (and beyond, within the class's
+/// maximum grade's), so that the junction's surface, blended between its arms, is level
+/// enough to drive across.
+const JUNCTION_APPROACH: f64 = 25.0;
+const JUNCTION_GRADE: f64 = 0.02;
+
+/// Length (m) of a road's approach to a level junction: [`JUNCTION_APPROACH`], or half the
+/// road when it is shorter.
+fn approach_length(len: f64) -> f64 {
+    JUNCTION_APPROACH.min(0.5 * len)
+}
+
+/// Keep a road's profile `z` within reach of the heights of its level ends (`ends`: height,
+/// and whether it is a level junction): [`JUNCTION_GRADE`] over the approach, the grade
+/// limit beyond. The bounds rise no faster than the grade limit, so neither does the profile.
+/// Where it was clamped, the profile is then smoothed with a moving average over `window` m
+/// (which keeps the grade limit), so that it bends gently where it meets the bounds, eased
+/// into its nodes' heights at the ends and grade-limited again.
+fn level_approaches(points: &[DVec2], z: &mut [f64], ends: [(f64, bool); 2], max_grade: f64, window: f64) {
+    let n = points.len();
+    let mut s = vec![0.0; n];
+    for i in 1..n {
+        s[i] = s[i - 1] + points[i - 1].distance(points[i]);
+    }
+    let len = s[n - 1];
+    let a = approach_length(len);
+    let reach = |d: f64| JUNCTION_GRADE * d.min(a) + max_grade * (d - a).max(0.0);
+    let mut clamped = false;
+    for (i, zi) in z.iter_mut().enumerate() {
+        for (k, &(zn, level)) in ends.iter().enumerate() {
+            if level {
+                let r = reach(if k == 0 { s[i] } else { len - s[i] });
+                let c = zi.clamp(zn - r, zn + r);
+                clamped |= c != *zi;
+                *zi = c;
+            }
+        }
+    }
+    if clamped && n > 2 {
+        let half = (0.5 * window / (len / (n - 1) as f64)).round() as usize;
+        let raw = z.to_vec();
+        let ease = (0.5 * window).min(0.5 * len);
+        for (i, zi) in z.iter_mut().enumerate() {
+            let (a, b) = (i.saturating_sub(half), (i + half).min(n - 1));
+            let w0 = 1.0 - smoothstep(0.0, ease, s[i]);
+            let w1 = 1.0 - smoothstep(0.0, ease, len - s[i]);
+            let mean = raw[a..=b].iter().sum::<f64>() / (b - a + 1) as f64;
+            *zi = mean * (1.0 - w0 - w1).max(0.0) + ends[0].0 * w0 + ends[1].0 * w1;
+        }
+    }
+    z[0] = ends[0].0;
+    z[n - 1] = ends[1].0;
+    // The easing may steepen it a little: limit the grade forward and backward again (between
+    // the ends).
+    for i in 1..n - 1 {
+        let lim = max_grade * (s[i] - s[i - 1]);
+        z[i] = z[i].clamp(z[i - 1] - lim, z[i - 1] + lim);
+    }
+    for i in (1..n - 1).rev() {
+        let lim = max_grade * (s[i + 1] - s[i]);
+        z[i] = z[i].clamp(z[i + 1] - lim, z[i + 1] + lim);
+    }
+}
+
 /// Move the node heights so that every road can climb from one end to the other within 90 %
-/// of its class's grade limit (as for rural maps; see `rural::reach_nodes`).
-fn reach_nodes(c: &UrbanConfig, pieces: &[Piece], lengths: &[f64], node_z: &mut [f64]) {
+/// of its class's grade limit, and of [`JUNCTION_GRADE`] on the approaches of `level` nodes
+/// (as for rural maps; see `rural::reach_nodes`).
+fn reach_nodes(c: &UrbanConfig, pieces: &[Piece], lengths: &[f64], level: &[bool], node_z: &mut [f64]) {
     for _ in 0..200 {
         let mut moved = false;
         for (p, &len) in pieces.iter().zip(lengths) {
             let (a, b) = (p.start as usize, p.end as usize);
-            let allowed = 0.9 * c.classes.class(p.class).max_grade * len;
+            let g = c.classes.class(p.class).max_grade;
+            let approach = |l: bool| if l { approach_length(len) } else { 0.0 };
+            let flat = approach(level[a]) + approach(level[b]);
+            let allowed = 0.9 * (g * (len - flat) + JUNCTION_GRADE * flat);
             let excess = (node_z[b] - node_z[a]).abs() - allowed;
             if excess <= 1e-9 || a == b {
                 continue;

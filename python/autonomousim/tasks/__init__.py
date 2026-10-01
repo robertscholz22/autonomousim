@@ -4,6 +4,7 @@ from typing import Any
 
 from autonomousim.tasks.base import Task, map_source
 from autonomousim.tasks.car_parking import CarParking, ParkingPilot
+from autonomousim.tasks.car_urban_drive import CarUrbanDrive
 from autonomousim.tasks.car_waypoint import CarWaypointOffroad
 from autonomousim.tasks.fixed_wing_waypoints import FixedWingWaypoints
 from autonomousim.tasks.heli_landing_zone import HeliLandingZone
@@ -38,6 +39,7 @@ TASKS: dict[str, type[Task]] = {
     "land_on_car": DroneLandOnCar,
     "rooftop_delivery": DroneRooftopDelivery,
     "car_parking": CarParking,
+    "car_urban_drive": CarUrbanDrive,
 }
 
 
@@ -45,7 +47,7 @@ def make_task(task: str | Task, **kwargs: Any) -> Task:
     """A task instance from its name (``hover``, ``hover_pad``, ``recover``, ``waypoint_forest``,
     ``car_waypoint``, ``road_follow``, ``trailer_reverse``, ``tracked_cross_country``,
     ``motorcycle_road``, ``fixed_wing_waypoints``, ``heli_landing_zone``, ``tiltrotor_delivery``, ``land_on_car``, ``rooftop_delivery``,
-    ``car_parking``) and keyword
+    ``car_parking``, ``car_urban_drive``) and keyword
     arguments, or the instance itself."""
     if isinstance(task, Task):
         if kwargs:
@@ -61,6 +63,7 @@ def make_task(task: str | Task, **kwargs: Any) -> Task:
 __all__ = [
     "TASKS",
     "CarParking",
+    "CarUrbanDrive",
     "CarWaypointOffroad",
     "DroneLandOnCar",
     "DroneRooftopDelivery",

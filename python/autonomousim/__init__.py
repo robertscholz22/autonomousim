@@ -29,7 +29,9 @@ Importing the package registers the Gymnasium environments:
 - ``autonomousim/DroneRooftopDelivery-v0``: fly a quadrotor across a generated city from a
   sidewalk or a roof to a landing pad on another roof, with LiDAR;
 - ``autonomousim/CarParking-v0``: park a car in a free bay of a generated city, reversing
-  into a parking lot's bay or parallel parking between cars on the street.
+  into a parking lot's bay or parallel parking between cars on the street;
+- ``autonomousim/CarUrbanDrive-v0``: drive a car along a lane-level route of 0.5–1.5 km
+  through a generated city in traffic, with buses, cyclists, pedestrians and traffic lights.
 
 ``gym.make_vec(id, num_envs=N, ...)`` gives the native vector environment
 (``autonomousim.vector_env``); ``gym.make(id)`` a single environment. Worlds with several
@@ -73,6 +75,7 @@ ENVS = {
     "DroneLandOnCar-v0": "land_on_car",
     "DroneRooftopDelivery-v0": "rooftop_delivery",
     "CarParking-v0": "car_parking",
+    "CarUrbanDrive-v0": "car_urban_drive",
 }
 
 for _name, _task in ENVS.items():

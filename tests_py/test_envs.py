@@ -40,6 +40,7 @@ KWARGS = {
     "autonomousim/DroneLandOnCar-v0": {"map": RURAL, "image_size": 16},
     "autonomousim/DroneRooftopDelivery-v0": {"map": URBAN},
     "autonomousim/CarParking-v0": {"map": URBAN, "parked": 4},
+    "autonomousim/CarUrbanDrive-v0": {"map": URBAN, "distance": (200.0, 300.0), "npcs": 4, "pedestrians": 20},
 }
 OBS_DIM = {
     "autonomousim/QuadWaypointForest-v0": 148,
@@ -53,6 +54,7 @@ OBS_DIM = {
     "autonomousim/TiltrotorDelivery-v0": 22,
     "autonomousim/DroneRooftopDelivery-v0": 88,
     "autonomousim/CarParking-v0": 80,
+    "autonomousim/CarUrbanDrive-v0": 211,
 }
 ACT_DIM = {
     "autonomousim/CarWaypointOffroad-v0": 2,
@@ -64,6 +66,7 @@ ACT_DIM = {
     "autonomousim/HeliLandingZone-v0": 4,
     "autonomousim/TiltrotorDelivery-v0": 4,
     "autonomousim/CarParking-v0": 2,
+    "autonomousim/CarUrbanDrive-v0": 2,
 }
 
 # ctbr: roll, pitch, yaw rate, thrust. Rotors off: the drone falls and crashes.

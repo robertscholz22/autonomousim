@@ -24,6 +24,10 @@ pub enum RouteDestination {
     Yard,
     /// A random point on a road.
     Road,
+    /// A lane-level trip over the lane graph of an urban map from a random lane, without
+    /// lane changes ([`junction::trip`](crate::junction::trip)); the vehicle spawns at its
+    /// start (the spawn spec's position settings are ignored, `min_separation` applies).
+    Lanes,
 }
 
 /// Settings of `GoalKind::Route`: a route along the roads to a destination whose route length
@@ -237,6 +241,8 @@ pub(crate) fn plan_route(world: &StaticWorld, from: DVec2, spec: &GoalSpec, rng:
             best_route(world, from, yards.collect(), spec.distance, rng)
         }
         RouteDestination::Road => None,
+        // (Planned with the spawn.)
+        RouteDestination::Lanes => return None,
     };
     // Some maps have no farm (or none reachable): a road point instead, clear of the map's
     // edges (roads leave the map).

@@ -22,9 +22,9 @@
 //!   (probability `attention`, drawn per crossing) also needs a gap: every vehicle heading for
 //!   the crossing must be able to stop before it at [`YIELD_DECEL`] (pedestrians have
 //!   priority) or arrive only after the pedestrian is across; a vehicle standing on the band
-//!   blocks it. On the carriageway an attentive pedestrian avoids vehicles by time to
-//!   collision: it walks on, hurries or stops, whichever keeps clear of every vehicle over
-//!   [`HORIZON`] s (or keeps clear longest, or passes farthest).
+//!   blocks it. On the carriageway an attentive pedestrian avoids moving vehicles by time to
+//!   collision: it walks on, hurries or stops, whichever keeps clear of every one over
+//!   [`HORIZON`] s (or keeps clear longest, or passes farthest); it walks past standing ones.
 //! - **Drivers** see the pedestrians on each crossing and those committed to it
 //!   ([`Crowd::crossing_users`]): a `traffic` driver stops before a crossing until every
 //!   pedestrian on it has passed its lane, and does not drive into one in its path.
@@ -889,7 +889,9 @@ fn avoid(p: &Pedestrian, w: &Walkways, leg: (u32, bool), s: f64, cars: &[Car]) -
         // Earliest time within the horizon at which it would come too close to a vehicle, and
         // the least margin by which it passes them.
         let (mut first, mut margin) = (f64::INFINITY, f64::INFINITY);
-        for c in cars.iter().filter(|c| c.pos.distance(p.pos) < VEHICLE_RANGE * 0.5) {
+        // (Standing vehicles hit no one, and one waiting for it would wait forever.)
+        let moving = cars.iter().filter(|c| c.vel.length_squared() >= HIT_SPEED * HIT_SPEED);
+        for c in moving.filter(|c| c.pos.distance(p.pos) < VEHICLE_RANGE * 0.5) {
             let r = c.pos - p.pos;
             let u = c.vel - dir * v;
             let need = c.reach + p.radius + VEHICLE_CLEARANCE;

@@ -207,8 +207,8 @@ fn check_invariants(c: &UrbanConfig, seed: u64) {
         }
     }
 
-    // Through junctions the ground is smooth: hardly any steep stretches along the connectors
-    // and no steps (some remain where a road passes a junction's area at another height).
+    // Through junctions the ground is smooth: their approaches are level, so hardly any steep
+    // stretches along the connectors and no steps.
     let (mut steep, mut samples) = (0, 0);
     for (k, conn) in net.lanes().connectors().iter().enumerate() {
         let line = &conn.line;
@@ -220,7 +220,7 @@ fn check_invariants(c: &UrbanConfig, seed: u64) {
         for i in 0..n {
             let grade = (h(i + 1) - h(i)).abs() / (line.length() / n as f64);
             assert!(
-                grade < 0.8,
+                grade < 0.3,
                 "seed {seed} connector {k}: grade {grade:.2} at {}",
                 line.point_at(line.length() * i as f64 / n as f64)
             );
@@ -228,7 +228,7 @@ fn check_invariants(c: &UrbanConfig, seed: u64) {
             samples += 1;
         }
     }
-    assert!(steep * 50 < samples, "seed {seed}: {steep} of {samples} connector samples steeper than 0.2");
+    assert!(steep * 1000 < samples, "seed {seed}: {steep} of {samples} connector samples steeper than 0.2");
 }
 
 #[test]

@@ -4,14 +4,14 @@
 [[urban]]
 preset = "training"
 seed = 1
-hash = "6780b10653b4a6c8f141b5b825e133389577484ec7eaed05ea6966cdb9336309"
+hash = "0d7b6d18cab9f620dcba63842c0965615b1c31ce06791246a4e30cbdbe25dbe1"
 
 [[urban]]
 preset = "training"
 seed = 2
-hash = "a4eabb2b48e81ab11af2b6dff6d1f72f20a13ee2f8969e8f3939facd7abad38c"
+hash = "8d8f6a46e6a1f7f386ad3e57d304cb9e44b63a664575be28e3116fc510b9db56"
 
 [[urban]]
 preset = "showcase"
 seed = 3
-hash = "84b62044315a019af67b80d17729ea90c267592f672233beb3c078e10a8498ec"
+hash = "217c339308d0ce7a83ad2550894067186b6c180cb51cff5a7c9e914cbadbedae"
