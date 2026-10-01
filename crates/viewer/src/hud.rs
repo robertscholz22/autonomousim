@@ -294,6 +294,22 @@ fn status_window(
                 "{state} · ×{} · real time ×{:.2} · {fps:.0} fps · camera {camera_mode}",
                 sim.time_scale, sim.real_time_factor
             ));
+            let npcs: Vec<bool> =
+                (0..sim.world.agents().len()).filter_map(|i| crate::overlay::npc_kinematic(sim, i)).collect();
+            if !npcs.is_empty() || sim.step_cost > 0.0 {
+                let kinematic = npcs.iter().filter(|&&k| k).count();
+                let npcs = if npcs.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} NPCs ({kinematic} kinematic, {} full physics) · ", npcs.len(), npcs.len() - kinematic)
+                };
+                let cost = if sim.replay.is_none() && sim.step_cost > 0.0 {
+                    format!("stepping {:.1} ms per simulated s", 1e3 * sim.step_cost)
+                } else {
+                    String::new()
+                };
+                ui.label(format!("{npcs}{cost}"));
+            }
             if sim.is_recording() {
                 ui.colored_label(egui::Color32::from_rgb(230, 80, 60), "● recording");
             }

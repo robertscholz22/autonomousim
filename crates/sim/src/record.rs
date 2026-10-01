@@ -9,6 +9,7 @@
 //! | `/agent/<id>/action` | each action | the normalised action |
 //! | `/agent/<id>/lidar` | each scan, if enabled | sensor pose and ranges |
 //! | `/agent/<id>/camera/<sensor>` | frames captured at multiples of `1/camera_hz`, if enabled | the visible RGB image as `foxglove.RawImage` (`rgb8`, base64) |
+//! | `/npcs` | `state_hz` (scenarios with scripted groups) | the scripted agents (NPCs) packed into one message instead of their own `state`, `pose` and `action` channels, exactly: time, agent ids, poses, velocities, body rates, steering angles, kinematic or full physics, event bits, disabled flags, trailer joints and wheels (spin, angle, steering, travel) ([`RecordedNpcs`]) |
 //! | `/route` | when a scripted agent's route changes (scenarios with scripted groups) | time, agent id and the route's lane points |
 //! | `/events` | when an agent gets new event bits | agent id and event names |
 //! | `/signals` | at resets and whenever a controller's phase or light changes (map pools with traffic signals) | time, controller, junction node, phase and light (`green`, `amber`, `red`) |
@@ -185,9 +186,10 @@ const POSE_IN_FRAME_SCHEMA: &str = r#"{"title":"foxglove.PoseInFrame","type":"ob
 
 #[derive(Clone, Copy, Debug)]
 struct AgentChannels {
-    state: u16,
-    pose: u16,
-    action: u16,
+    /// `None` for scripted agents (NPCs; in `/npcs`).
+    state: Option<u16>,
+    pose: Option<u16>,
+    action: Option<u16>,
     lidar: Option<u16>,
 }
 
@@ -218,6 +220,8 @@ pub struct Recorder {
     /// per controller.
     signals: Option<u16>,
     lights: Vec<Option<(usize, Light)>>,
+    /// The `/npcs` channel (scenarios with scripted groups).
+    npcs: Option<u16>,
     seen: Vec<u32>,
     error: Option<SimError>,
 }
@@ -239,6 +243,7 @@ impl Recorder {
             routes: Vec::new(),
             signals: None,
             lights: Vec::new(),
+            npcs: None,
             seen: Vec::new(),
             error: None,
         }
@@ -280,6 +285,7 @@ impl Recorder {
         let events = self.sink.add_channel("/events", "autonomousim.Events", OBJECT_SCHEMA)?;
         if sc.groups.iter().any(|g| g.scripted()) {
             self.route = Some(self.sink.add_channel("/route", "autonomousim.Route", OBJECT_SCHEMA)?);
+            self.npcs = Some(self.sink.add_channel("/npcs", "autonomousim.Npcs", OBJECT_SCHEMA)?);
         }
         if sc.maps.iter().any(|m| m.roads().has_sections() && !m.roads().lanes().controllers().is_empty()) {
             self.signals = Some(self.sink.add_channel("/signals", "autonomousim.Signals", OBJECT_SCHEMA)?);
@@ -300,10 +306,14 @@ impl Recorder {
             }
             self.cameras.push(cameras);
             let lidar = a.sensors.iter().any(|s| matches!(s, Sensor::Lidar(_))) && self.config.lidar;
+            let own = !sc.groups[a.group].scripted();
+            let mut channel = |topic: String, schema_name: &str, schema: &str| -> Result<Option<u16>, SimError> {
+                if own { self.sink.add_channel(&topic, schema_name, schema).map(Some) } else { Ok(None) }
+            };
             self.agents.push(AgentChannels {
-                state: self.sink.add_channel(&format!("{p}/state"), "autonomousim.AgentState", OBJECT_SCHEMA)?,
-                pose: self.sink.add_channel(&format!("{p}/pose"), "foxglove.PoseInFrame", POSE_IN_FRAME_SCHEMA)?,
-                action: self.sink.add_channel(&format!("{p}/action"), "autonomousim.Action", OBJECT_SCHEMA)?,
+                state: channel(format!("{p}/state"), "autonomousim.AgentState", OBJECT_SCHEMA)?,
+                pose: channel(format!("{p}/pose"), "foxglove.PoseInFrame", POSE_IN_FRAME_SCHEMA)?,
+                action: channel(format!("{p}/action"), "autonomousim.Action", OBJECT_SCHEMA)?,
                 lidar: if lidar {
                     Some(self.sink.add_channel(&format!("{p}/lidar"), "autonomousim.LidarScan", OBJECT_SCHEMA)?)
                 } else {
@@ -448,8 +458,9 @@ impl Recorder {
         }
         let time = w.time();
         for a in w.agents() {
-            let ch = self.agents[a.id as usize].action;
-            self.send(ch, &json!({"time": time, "action": a.action.as_slice()}));
+            if let Some(ch) = self.agents[a.id as usize].action {
+                self.send(ch, &json!({"time": time, "action": a.action.as_slice()}));
+            }
         }
     }
 
@@ -534,8 +545,10 @@ impl Recorder {
         let time = w.time();
         let t_ns = self.time_ns();
         let stamp = json!({"sec": t_ns / 1_000_000_000, "nsec": t_ns % 1_000_000_000});
+        self.write_npcs(w);
         for a in w.agents() {
             let ch = self.agents[a.id as usize];
+            let (Some(state_ch), Some(pose_ch)) = (ch.state, ch.pose) else { continue };
             let v = &a.vehicle;
             let (p, q) = (v.position(), v.orientation());
             let goal = a.goal();
@@ -626,14 +639,47 @@ impl Recorder {
                     m.insert("beta".into(), json!(flow.beta));
                 }
             }
-            self.send(ch.state, &msg);
+            self.send(state_ch, &msg);
             let pose = json!({
                 "timestamp": stamp,
                 "frame_id": "world",
                 "pose": {"position": xyz(p), "orientation": {"x": q.x, "y": q.y, "z": q.z, "w": q.w}},
             });
-            self.send(ch.pose, &pose);
+            self.send(pose_ch, &pose);
         }
+    }
+
+    /// One `/npcs` message with the state of every scripted agent (see [`RecordedNpcs`]).
+    fn write_npcs(&mut self, w: &WorldInstance) {
+        let Some(ch) = self.npcs else { return };
+        let mut m = RecordedNpcs { time: w.time(), tick: w.clock().tick, ..Default::default() };
+        for a in w.agents().iter().filter(|a| self.agents[a.id as usize].state.is_none()) {
+            let v = &a.vehicle;
+            let q = v.orientation();
+            m.agents.push(a.id);
+            m.pose.extend(v.position().to_array());
+            m.pose.extend(q.to_array());
+            m.velocity.extend((q * v.lin_vel_body()).to_array());
+            m.rates.extend(v.ang_vel_body().to_array());
+            let wheeled = v.as_wheeled();
+            m.steering.push(wheeled.map_or(0.0, |v| v.steering_angle()));
+            m.kinematic.push(a.is_kinematic());
+            m.events.push(a.events.0);
+            m.disabled.push(a.disabled);
+            m.joints.push(wheeled.map_or(Vec::new(), |v| v.joints().to_vec()));
+            m.wheels.push(
+                wheeled.map_or(Vec::new(), |v| {
+                    v.wheels().flat_map(|w| [w.spin, w.spin_angle, w.steer, w.travel]).collect()
+                }),
+            );
+        }
+        if m.joints.iter().all(Vec::is_empty) {
+            m.joints.clear();
+        }
+        if m.wheels.iter().all(Vec::is_empty) {
+            m.wheels.clear();
+        }
+        self.send(ch, &serde_json::to_value(&m).expect("JSON"));
     }
 
     /// Finish the file; returns the first error of the recording, if any.
@@ -670,8 +716,8 @@ fn base64(data: &[u8]) -> String {
 
 // ---------------------------------------------------------------------------- reading
 
-/// A `/agent/<id>/state` message.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+/// A `/agent/<id>/state` message (or an agent's part of an `/npcs` one).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct RecordedState {
     /// Time since the episode started (s).
     pub time: f64,
@@ -749,6 +795,72 @@ pub struct RecordedState {
     /// Event bits since the last policy step.
     pub events: u32,
     pub disabled: bool,
+    /// Scripted agents (`/npcs`): whether it moves kinematically.
+    #[serde(default)]
+    pub kinematic: bool,
+}
+
+/// An `/npcs` message: the scripted agents' states, packed and exact (`pose` holds x, y, z,
+/// then the quaternion x, y, z, w per agent, `velocity` the world velocity and `rates` the
+/// body rates; `wheels` holds spin rate, spin angle, steering angle and travel per wheel;
+/// `joints` and `wheels` are empty when no agent has any).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordedNpcs {
+    pub time: f64,
+    pub tick: u64,
+    pub agents: Vec<u32>,
+    pub pose: Vec<f64>,
+    pub velocity: Vec<f64>,
+    pub rates: Vec<f64>,
+    /// Bicycle steering angle (rad; 0 but for ground vehicles).
+    pub steering: Vec<f64>,
+    /// Whether it moves kinematically (else in full physics).
+    pub kinematic: Vec<bool>,
+    pub events: Vec<u32>,
+    pub disabled: Vec<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joints: Vec<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wheels: Vec<Vec<f64>>,
+}
+
+impl RecordedNpcs {
+    /// Each agent's state (what a `/agent/<id>/state` message would hold of it for its pose,
+    /// motion and visuals; tyre forces, powertrain and goals 0), with its id.
+    pub fn states(&self) -> impl Iterator<Item = (usize, RecordedState)> + '_ {
+        self.agents.iter().enumerate().map(|(k, &id)| {
+            let p = &self.pose[7 * k..7 * k + 7];
+            let v = |x: &[f64]| DVec3::new(x[3 * k], x[3 * k + 1], x[3 * k + 2]);
+            let wheels = self.wheels.get(k).map_or(&[][..], |w| &w[..]);
+            let state = RecordedState {
+                time: self.time,
+                tick: self.tick,
+                position: DVec3::new(p[0], p[1], p[2]),
+                orientation: DQuat::from_xyzw(p[3], p[4], p[5], p[6]),
+                velocity: v(&self.velocity),
+                rates: v(&self.rates),
+                steering: self.steering[k],
+                joints: self.joints.get(k).cloned().unwrap_or_default(),
+                wheels: wheels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| RecordedWheel {
+                        spin: w[0],
+                        spin_angle: w[1],
+                        steer: w[2],
+                        travel: w[3],
+                        ..Default::default()
+                    })
+                    .collect(),
+                events: self.events[k],
+                disabled: self.disabled[k],
+                kinematic: self.kinematic[k],
+                ..Default::default()
+            };
+            (id as usize, state)
+        })
+    }
 }
 
 /// A wheel in a ground vehicle's state message.
@@ -971,6 +1083,16 @@ impl Recording {
             let Some(ep) = r.episodes.last_mut() else { return Err(record_err(format!("{topic} before /episode"))) };
             if topic == "/events" {
                 ep.events.push(parse(topic, &m.data)?);
+                continue;
+            }
+            if topic == "/npcs" {
+                let npcs: RecordedNpcs = parse(topic, &m.data)?;
+                for (id, state) in npcs.states() {
+                    if id >= n {
+                        return Err(record_err(format!("{topic}: no agent {id} in /meta")));
+                    }
+                    ep.states[id].push(state);
+                }
                 continue;
             }
             if topic == "/route" {

@@ -55,6 +55,11 @@
 //! vehicles that stand waiting themselves (the first in agent order goes, the others then
 //! see its grant).
 //!
+//! **Learning agents** near the ground are on the lanes as leaders, followers and crossing
+//! traffic like any vehicle, but a driver notices each only with probability `attention`,
+//! drawn when it first comes within [`ENCOUNTER`] m (and again once it has been farther than
+//! [`ENCOUNTER_END`] m); an agent not noticed is not there for that driver.
+//!
 //! **Long vehicles** (offtracking length over [`SWING_LENGTH`] m: trucks, buses) keep to the
 //! connectors their lock allows ([`Network`]) and steer from their rear axle, so that axle runs
 //! on the line and the front swings wide; those towing trailers also swing out in left bends
@@ -125,6 +130,9 @@ pub struct TrafficDriverSpec {
     pub respawn_clear: f64,
     /// A bus line: drives a loop with stops instead of turning at random.
     pub bus: Option<BusSpec>,
+    /// Probability (0–1) that the driver notices a learning agent on the lanes, drawn per
+    /// encounter; one not noticed is not there for it (0: oblivious).
+    pub attention: f64,
 }
 
 /// A bus line of a `traffic` driver (see [`BusRoute`]).
@@ -165,6 +173,7 @@ impl Default for TrafficDriverSpec {
             respawn: 120.0,
             respawn_clear: 100.0,
             bus: None,
+            attention: 1.0,
         }
     }
 }
@@ -192,6 +201,7 @@ impl TrafficDriverSpec {
             && self.deadlock > 0.0
             && self.respawn >= 0.0
             && self.respawn_clear >= 0.0
+            && (0.0..=1.0).contains(&self.attention)
             && self.bus.as_ref().is_none_or(|b| {
                 range(b.length, 0.0) && b.length[1] > 0.0 && b.stop_spacing > 0.0 && range(b.dwell, 0.0)
             });
@@ -309,6 +319,8 @@ pub struct Occupant {
     /// came onto its lane by ([`ANY`]: none or unknown).
     pub long: bool,
     pub via: u32,
+    /// Whether it is a learning agent (subject to drivers' `attention`).
+    pub learner: bool,
     /// Whether this entry is its tail on an element behind its place (`station` counted on
     /// from there, past the element's end).
     pub tail: bool,
@@ -339,6 +351,10 @@ pub struct LaneIndex {
     grants: Vec<Vec<Grant>>,
     /// Where long vehicles sweep past the lines (see [`Sweeps`]).
     sweeps: Arc<Sweeps>,
+    /// Learning agents on the lanes and where they are.
+    learners: Vec<(u32, DVec2)>,
+    /// Learning agents the driver deciding now has not noticed (sorted).
+    ignored: Vec<u32>,
 }
 
 /// Search range for leaders and followers (m).
@@ -398,6 +414,8 @@ impl LaneIndex {
             connectors: vec![Vec::new(); n],
             grants: vec![Vec::new(); n],
             sweeps: Arc::new(Sweeps::none(g)),
+            learners: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -432,6 +450,14 @@ impl LaneIndex {
     pub fn clear(&mut self) {
         self.lanes.iter_mut().chain(&mut self.connectors).for_each(Vec::clear);
         self.grants.iter_mut().for_each(Vec::clear);
+        self.learners.clear();
+        self.ignored.clear();
+    }
+
+    /// Whether the driver `me` deciding now does not see occupant `o`: itself, or a learning
+    /// agent it has not noticed.
+    fn skips(&self, o: &Occupant, me: u32) -> bool {
+        o.agent == me || (o.learner && self.ignored.binary_search(&o.agent).is_ok())
     }
 
     /// Enter a grant of connector `c`.
@@ -456,8 +482,19 @@ impl LaneIndex {
     }
 
     /// Add an agent that is not a traffic driver at `pos`, heading `heading`, moving at
-    /// `vel`, reaching `radius` around its centre: to the lane under it, if any.
-    pub fn insert_other(&mut self, world: &StaticWorld, agent: u32, pos: DVec3, heading: f64, vel: DVec3, radius: f64) {
+    /// `vel`, reaching `radius` around its centre: to the lane under it, if any. A `learner`
+    /// is also listed for the drivers' encounters (see [`TrafficDriverSpec::attention`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_other(
+        &mut self,
+        world: &StaticWorld,
+        agent: u32,
+        pos: DVec3,
+        heading: f64,
+        vel: DVec3,
+        radius: f64,
+        learner: bool,
+    ) {
         let g = world.roads().lanes();
         if g.is_empty() || pos.z - world.terrain().height(pos.x, pos.y) > GROUND_HEIGHT {
             return;
@@ -483,9 +520,13 @@ impl LaneIndex {
             articulated: false,
             long: false,
             via: ANY,
+            learner,
             tail: false,
         };
         self.lanes[lane as usize].push(o);
+        if learner {
+            self.learners.push((agent, o.pos));
+        }
     }
 
     /// Sort every list by station (then agent).
@@ -506,7 +547,7 @@ impl LaneIndex {
             let list = self.list(e);
             let start = if k == 0 { from } else { f64::NEG_INFINITY };
             let i = list.partition_point(|o| o.station <= start);
-            if let Some(o) = list[i..].iter().find(|o| o.agent != me) {
+            if let Some(o) = list[i..].iter().find(|o| !self.skips(o, me)) {
                 return Some((base + o.station, *o));
             }
         }
@@ -518,7 +559,7 @@ impl LaneIndex {
     fn behind(&self, g: &LaneGraph, lane: u32, from: f64, me: u32) -> Option<(f64, Occupant)> {
         let list = &self.lanes[lane as usize];
         let i = list.partition_point(|o| o.station < from);
-        if let Some(o) = list[..i].iter().rev().find(|o| o.agent != me && !o.tail) {
+        if let Some(o) = list[..i].iter().rev().find(|o| !self.skips(o, me) && !o.tail) {
             return Some((from - o.station, *o));
         }
         let mut best: Option<(f64, Occupant)> = None;
@@ -529,13 +570,13 @@ impl LaneIndex {
         };
         for &c in &g.lanes()[lane as usize].predecessors {
             let cl = &g.connectors()[c as usize].line;
-            if let Some(o) = self.connectors[c as usize].iter().rev().find(|o| o.agent != me && !o.tail) {
+            if let Some(o) = self.connectors[c as usize].iter().rev().find(|o| !self.skips(o, me) && !o.tail) {
                 consider(from + cl.length() - o.station, o);
                 continue;
             }
             let prev = g.connectors()[c as usize].from;
             let pl = &g.lanes()[prev as usize].line;
-            if let Some(o) = self.lanes[prev as usize].iter().rev().find(|o| o.agent != me && !o.tail) {
+            if let Some(o) = self.lanes[prev as usize].iter().rev().find(|o| !self.skips(o, me) && !o.tail) {
                 consider(from + cl.length() + pl.length() - o.station, o);
             }
         }
@@ -547,7 +588,7 @@ impl LaneIndex {
     /// distance from its front to the connector.
     fn approaching(&self, g: &LaneGraph, via: u32, max: f64, me: u32, f: &mut dyn FnMut(f64, &Occupant)) {
         let takes = |x: u32, want: u32| x == want || x == ANY;
-        let me_or_tail = |o: &Occupant| o.agent == me || o.tail;
+        let me_or_tail = |o: &Occupant| self.skips(o, me) || o.tail;
         let lane = g.connectors()[via as usize].from;
         let len = g.lanes()[lane as usize].line.length();
         for o in self.lanes[lane as usize].iter().filter(|o| !me_or_tail(o) && takes(o.next[0], via)) {
@@ -817,6 +858,12 @@ pub struct TrafficDriver {
     spec: TrafficDriverSpec,
     geometry: DriverGeometry,
     rng: SimRng,
+    /// For the encounters with learning agents (its own stream, so that they do not change
+    /// the other draws).
+    attention_rng: SimRng,
+    /// Learning agents met (within [`ENCOUNTER`] m, until beyond [`ENCOUNTER_END`] m) and
+    /// whether it noticed them.
+    pub encounters: Vec<(u32, bool)>,
     /// Drawn per episode.
     pub factor: f64,
     /// Car-following parameters; `v0` is the desired speed of the last step (after the
@@ -892,6 +939,8 @@ impl TrafficDriver {
             spec: spec.clone(),
             geometry,
             rng: Seed::from_u64(0).rng(),
+            attention_rng: Seed::from_u64(0).rng(),
+            encounters: Vec::new(),
             factor: 1.0,
             idm: Idm::OTHER,
             politeness: 0.0,
@@ -961,6 +1010,8 @@ impl TrafficDriver {
     /// Start an episode with a new random stream at `pose`.
     pub fn reset(&mut self, seed: Seed, world: &StaticWorld, pose: &Pose) {
         self.rng = seed.rng();
+        self.attention_rng = seed.child("attention").rng();
+        self.encounters.clear();
         self.draw();
         self.place = None;
         self.trail.clear();
@@ -1446,6 +1497,7 @@ impl TrafficDriver {
                 (Elem::Lane(_), Some(&Elem::Connector(c))) => c,
                 _ => ANY,
             },
+            learner: false,
             tail: false,
         };
         index.insert(p.elem, o);
@@ -1720,7 +1772,7 @@ impl TrafficDriver {
             && index.sweeps.connectors[c as usize].iter().any(|sw| {
                 let end = g.lanes()[sw.lane as usize].line.length() - STOP_LINE - sw.back;
                 index.lanes[sw.lane as usize].iter().any(|o| {
-                    o.agent != me
+                    !index.skips(o, me)
                         && !o.tail
                         && o.station + o.front + o.speed * o.speed / (2.0 * SWEEP_BRAKE) > end + 0.3
                 })
@@ -1751,7 +1803,7 @@ impl TrafficDriver {
             for o in index.list(Elem::Connector(conf.other)) {
                 let (front, rear) = (o.station + o.front, o.station - o.rear);
                 let (line, other) = (&g.connectors()[c as usize].line, &g.connectors()[conf.other as usize].line);
-                if o.agent == me || rear > eo || self.passes(line, other, eo, o) {
+                if index.skips(o, me) || rear > eo || self.passes(line, other, eo, o) {
                     continue;
                 }
                 let ti = if front >= so { 0.0 } else { (so - front) / o.speed.max(1.0) };
@@ -1810,7 +1862,7 @@ impl TrafficDriver {
         let mut acc = f64::INFINITY;
         for conf in &g.connectors()[c as usize].conflicts {
             let other = g.connectors()[conf.other as usize].line.length();
-            for o in index.list(Elem::Connector(conf.other)).iter().filter(|o| o.agent != me) {
+            for o in index.list(Elem::Connector(conf.other)).iter().filter(|o| !index.skips(o, me)) {
                 let gap = match conf.kind {
                     ConflictKind::Diverge => {
                         let end = conf.other_station + conf.other_length + ZONE;
@@ -1876,7 +1928,7 @@ impl TrafficDriver {
             let (so, eo) = (conf.other_station - ZONE, conf.other_station + conf.other_length + ZONE);
             let (line, other) = (&g.connectors()[c as usize].line, &g.connectors()[conf.other as usize].line);
             let busy = index.list(Elem::Connector(conf.other)).iter().any(|o| {
-                o.agent != me
+                !index.skips(o, me)
                     && o.station + o.front >= so
                     && o.station - o.rear <= eo
                     && !self.passes(line, other, eo, o)
@@ -1893,6 +1945,42 @@ impl TrafficDriver {
     /// `signals` at time `t`.
     #[allow(clippy::too_many_arguments)]
     pub fn drive(
+        &mut self,
+        world: &StaticWorld,
+        pose: &Pose,
+        speed: f64,
+        dt: f64,
+        me: u32,
+        index: &mut LaneIndex,
+        signals: &Signals,
+        t: f64,
+    ) -> GroundSetpoint {
+        self.notice(index, pose.pos.truncate());
+        index.ignored.extend(self.encounters.iter().filter(|e| !e.1).map(|e| e.0));
+        index.ignored.sort_unstable();
+        let command = self.decide(world, pose, speed, dt, me, index, signals, t);
+        index.ignored.clear();
+        command
+    }
+
+    /// Meet the learning agents on the lanes near `pos`: each new one is noticed with
+    /// probability `attention`; those gone or beyond [`ENCOUNTER_END`] m are forgotten.
+    fn notice(&mut self, index: &LaneIndex, pos: DVec2) {
+        if self.spec.attention >= 1.0 {
+            return;
+        }
+        let near = |a: u32, r: f64| index.learners.iter().any(|&(b, p)| b == a && p.distance(pos) < r);
+        self.encounters.retain(|e| near(e.0, ENCOUNTER_END));
+        for &(a, p) in &index.learners {
+            if p.distance(pos) < ENCOUNTER && !self.encounters.iter().any(|e| e.0 == a) {
+                let noticed = self.attention_rng.uniform() < self.spec.attention;
+                self.encounters.push((a, noticed));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide(
         &mut self,
         world: &StaticWorld,
         pose: &Pose,
@@ -2329,6 +2417,10 @@ const SWING_MAX: f64 = 1.5;
 /// How much farther (m) than [`LOST`] and its swing a long vehicle may be off its line before
 /// it is lost (on bends tighter than its lock it runs wide).
 const LOST_WIDE: f64 = 3.0;
+/// A learning agent is met within this distance (m) and forgotten beyond the second (see
+/// [`TrafficDriverSpec::attention`]).
+const ENCOUNTER: f64 = 60.0;
+const ENCOUNTER_END: f64 = 80.0;
 /// Shortest lane with a bus stop (m).
 const STOP_LANE: f64 = 40.0;
 /// A bus stands at its stop within this distance of it (m), and passes it by when this far

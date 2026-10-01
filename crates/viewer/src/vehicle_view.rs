@@ -18,8 +18,9 @@ use autonomousim_scene::props;
 use autonomousim_scene::rig::{flapping, surface_angle, track_band, unit_local, wheel_local};
 use autonomousim_scene::single_track::{Limb, SingleTrackVisual};
 use autonomousim_vehicles::Vehicle;
-use autonomousim_vehicles::ground::Wheeled;
+use autonomousim_vehicles::ground::{Wheeled, WheeledDef};
 use bevy::prelude::*;
+use std::sync::Arc;
 
 /// Root entity of agent `0`'s visual.
 #[derive(Component)]
@@ -214,6 +215,15 @@ pub fn sync_rotors(
     }
 }
 
+/// The meshes of a wheeled vehicle's parts, shared by the vehicles of one definition.
+#[derive(Clone)]
+struct WheeledMeshes {
+    body: Handle<Mesh>,
+    units: Vec<Handle<Mesh>>,
+    wheels: Vec<Handle<Mesh>>,
+    link: Handle<Mesh>,
+}
+
 pub fn spawn_vehicles(
     mut commands: Commands,
     sim: Res<Sim>,
@@ -227,6 +237,9 @@ pub fn spawn_vehicles(
         metallic: 0.1,
         ..default()
     });
+    // Wheeled vehicles built from the same definition share their meshes, so the renderer
+    // draws a street of like cars in a few batches.
+    let mut shared: Vec<(*const WheeledDef, WheeledMeshes)> = Vec::new();
     for (i, agent) in sim.world.agents().iter().enumerate() {
         let pose = sim.render_pose(i);
         let root = (VehicleVisual(i), origin.transform(&pose), Visibility::default());
@@ -362,19 +375,31 @@ pub fn spawn_vehicles(
             }
             Vehicle::Wheeled(w) => {
                 let v = props::wheeled(w.def());
-                let link = meshes.add(convert::mesh(&v.link));
+                let key = Arc::as_ptr(w.shared_def());
+                let m = match shared.iter().find(|(k, _)| *k == key) {
+                    Some((_, m)) => m.clone(),
+                    None => {
+                        let mut add = |mesh: &autonomousim_scene::MeshData| meshes.add(convert::mesh(mesh));
+                        let m = WheeledMeshes {
+                            body: add(&v.body),
+                            units: v.units.iter().map(&mut add).collect(),
+                            wheels: v.wheels.iter().map(&mut add).collect(),
+                            link: add(&v.link),
+                        };
+                        shared.push((key, m.clone()));
+                        m
+                    }
+                };
                 let root = commands.spawn(root).id();
                 if let Some(s) = &v.single_track {
                     commands.entity(root).insert(SingleTrack(Box::new(s.clone())));
                 }
                 let mut parents = vec![root];
-                commands
-                    .entity(root)
-                    .with_child((Mesh3d(meshes.add(convert::mesh(&v.body))), MeshMaterial3d(body_material.clone())));
-                for (u, mesh) in v.units.iter().enumerate() {
+                commands.entity(root).with_child((Mesh3d(m.body.clone()), MeshMaterial3d(body_material.clone())));
+                for (u, mesh) in m.units.iter().enumerate() {
                     let unit = commands
                         .spawn((
-                            Mesh3d(meshes.add(convert::mesh(mesh))),
+                            Mesh3d(mesh.clone()),
                             MeshMaterial3d(body_material.clone()),
                             convert::transform(&unit_local(w, u + 1)),
                             UnitVisual { agent: i, unit: u + 1 },
@@ -383,11 +408,14 @@ pub fn spawn_vehicles(
                     commands.entity(root).add_child(unit);
                     parents.push(unit);
                 }
-                for (k, mounts) in v.links.iter().enumerate() {
+                // Scripted NPCs leave out the suspension links (hidden under the body but for
+                // close looks; a street full of them would double the entities drawn).
+                let links = if agent.driver.is_none() { &v.links[..] } else { &[] };
+                for (k, mounts) in links.iter().enumerate() {
                     let centre = wheel_local(w, k).pos;
                     for &mount in mounts.iter().flatten() {
                         commands.entity(parents[w.def().wheel_unit(k)]).with_child((
-                            Mesh3d(link.clone()),
+                            Mesh3d(m.link.clone()),
                             MeshMaterial3d(body_material.clone()),
                             link_transform(mount, centre),
                             LinkVisual { agent: i, wheel: k, mount },
@@ -429,9 +457,9 @@ pub fn spawn_vehicles(
                         }
                     }
                 }
-                for (k, mesh) in v.wheels.iter().enumerate() {
+                for (k, mesh) in m.wheels.iter().enumerate() {
                     commands.entity(parents[w.def().wheel_unit(k)]).with_child((
-                        Mesh3d(meshes.add(convert::mesh(mesh))),
+                        Mesh3d(mesh.clone()),
                         MeshMaterial3d(body_material.clone()),
                         convert::transform(&wheel_local(w, k)),
                         WheelVisual { agent: i, wheel: k },

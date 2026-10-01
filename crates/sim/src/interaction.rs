@@ -206,10 +206,22 @@ pub(crate) fn agent_contacts(
     for p in &mut state.bristles {
         p.seen = false;
     }
+    // The sweep order of the last tick with the new keys is nearly sorted, which the stable
+    // sort takes in about linear time (the keys are unique, so the result is the same as from
+    // scratch); rebuilt when agents came or went.
+    let key = |i: usize| (shapes[i].center.x - shapes[i].radius, i as u32);
     let order = &mut state.order;
-    order.clear();
-    order.extend(shapes.iter().enumerate().filter(|(_, s)| s.active).map(|(i, s)| (s.center.x - s.radius, i as u32)));
-    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let active = shapes.iter().filter(|s| s.active).count();
+    order.retain(|&(_, i)| shapes.get(i as usize).is_some_and(|s| s.active));
+    if order.len() == active {
+        for e in order.iter_mut() {
+            *e = key(e.1 as usize);
+        }
+    } else {
+        order.clear();
+        order.extend((0..shapes.len()).filter(|&i| shapes[i].active).map(key));
+    }
+    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     let order = std::mem::take(order);
     for (n, &(_, i)) in order.iter().enumerate() {
         let x_max = shapes[i as usize].center.x + shapes[i as usize].radius;

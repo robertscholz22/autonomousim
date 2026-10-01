@@ -11,7 +11,7 @@ use crate::driver::Driver;
 use crate::events::Events;
 use crate::hybrid::CruiseTrim;
 use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
-use crate::obs::ObsInput;
+use crate::obs::{ObsInput, Seen};
 use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, PhysicsMode, Placement};
 use crate::traffic::{RoadTrack, Signals};
 use autonomousim_control::ground::{GroundEstimate, GroundSetpoint};
@@ -104,6 +104,9 @@ pub struct Agent {
     /// The kinematic state while the vehicle is driven kinematically (`kinematic` and
     /// `hybrid` groups; `None` while simulated in full).
     pub kinematic: Option<KinematicState>,
+    /// The target under which the kinematic state last stood still (its last step changed
+    /// nothing): further steps under it are skipped.
+    resting: Option<KinematicTarget>,
     kinematic_limits: KinematicLimits,
     cruise: CruiseTrim,
     /// Time since the last contact with another agent (s).
@@ -166,6 +169,7 @@ impl Agent {
             track: RoadTrack::default(),
             driver: group.spec.driver.as_ref().map(|d| d.driver(group)),
             kinematic: None,
+            resting: None,
             kinematic_limits: {
                 let c = &group.spec.ground_controller;
                 KinematicLimits {
@@ -297,6 +301,7 @@ impl Agent {
             self.turbulence = self.turbulence.with_rotational(&mut self.turbulence_rng);
         }
         self.kinematic = None;
+        self.resting = None;
         self.calm = 0.0;
         if group.spec.physics != PhysicsMode::Full {
             self.demote(world);
@@ -320,12 +325,14 @@ impl Agent {
         let mut k = w.kinematic_state();
         w.place_kinematic(&mut k, world.terrain());
         self.kinematic = Some(k);
+        self.resting = None;
     }
 
     /// Switch to the multibody model from the kinematic state (no-op when simulated in full),
     /// with the controller's speed loop trimmed for the speed and grade (see
     /// [`hybrid`](crate::hybrid)); `g` is the gravity.
     pub fn promote(&mut self, world: &StaticWorld, g: f64) {
+        self.resting = None;
         if self.kinematic.take().is_none() {
             return;
         }
@@ -349,6 +356,7 @@ impl Agent {
 
     /// Re-derive the kinematic state after the vehicle was placed by hand.
     pub(crate) fn replace_kinematic(&mut self, world: &StaticWorld) {
+        self.resting = None;
         if self.kinematic.take().is_some() {
             self.demote(world);
         }
@@ -498,19 +506,23 @@ impl Agent {
         env: &EnvState,
         time: f64,
         env_step: Option<f64>,
+        kinematic_step: Option<f64>,
         agents: &AgentContacts,
     ) {
         if self.disabled {
             return;
         }
-        self.update_air(world, env, time, env_step);
         if self.kinematic.is_some() {
-            // No forces act on a kinematic vehicle.
+            // No forces act on a kinematic vehicle; its air only as often as it moves.
+            if kinematic_step.is_some() {
+                self.update_air(world, env, time, env_step);
+            }
             if agents.crashed {
                 self.events |= Events::CRASH_AGENT;
             }
             return;
         }
+        self.update_air(world, env, time, env_step);
         let scene =
             StaticScene { terrain: world.terrain(), obstacles: world.obstacles(), materials: world.materials() };
         match (&mut self.vehicle, &mut self.controller, &self.command) {
@@ -579,6 +591,7 @@ impl Agent {
         dt: f64,
         events: &EventConfig,
         disable_on_terminal: bool,
+        kinematic_step: Option<f64>,
         agents: &AgentContacts,
         shape: &mut AgentShape,
     ) {
@@ -590,7 +603,15 @@ impl Agent {
         let target = self.kinematic_target();
         let ok = match (&mut self.kinematic, &mut self.vehicle) {
             (Some(k), Vehicle::Wheeled(w)) => {
-                w.step_kinematic(k, target, &self.kinematic_limits, world.terrain());
+                // Between its steps a kinematic vehicle stays where it is.
+                let Some(step) = kinematic_step else { return };
+                // Standing still under the same target: the step would change nothing.
+                if self.resting == Some(target) {
+                    return;
+                }
+                let before = k.clone();
+                w.step_kinematic(k, target, &self.kinematic_limits, world.terrain(), step);
+                self.resting = (*k == before).then_some(target);
                 true
             }
             _ => self.vehicle.finish_step(env.gravity).is_ok(),
@@ -821,6 +842,7 @@ impl Agent {
         agents: &[AgentShape],
         grid: &AgentGrid,
         me: usize,
+        vehicles: &[Option<Seen>],
         signals: &Signals,
         time: f64,
         out: &mut [f32],
@@ -846,6 +868,7 @@ impl Agent {
                 grid,
                 route: self.route.as_deref(),
                 track: &self.track,
+                vehicles,
                 signals,
                 time,
             },

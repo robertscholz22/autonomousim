@@ -326,6 +326,11 @@ impl Wheeled {
         &self.def
     }
 
+    /// The definition as shared with the other vehicles built from it.
+    pub fn shared_def(&self) -> &Arc<WheeledDef> {
+        &self.def
+    }
+
     pub fn dt(&self) -> f64 {
         self.dt
     }

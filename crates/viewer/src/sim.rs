@@ -139,6 +139,8 @@ pub struct Sim {
     pub latched: Vec<Events>,
     /// Real-time factor over the last frames.
     pub real_time_factor: f64,
+    /// Real seconds spent stepping per simulated second, over the last frames.
+    pub step_cost: f64,
     /// Episodes started.
     pub episodes: u64,
     /// Playing back a recording instead of simulating.
@@ -185,6 +187,7 @@ impl Sim {
             previous: Vec::new(),
             latched: vec![Events::NONE; n],
             real_time_factor: 1.0,
+            step_cost: 0.0,
             episodes: 1,
             replay: None,
             autopilot: None,
@@ -664,6 +667,7 @@ impl Sim {
             self.world.set_command(pilot, command);
         }
         let mut stepped = 0.0;
+        let start = std::time::Instant::now();
         while self.accumulator >= dt {
             if self.accumulator < 2.0 * dt {
                 self.snapshot_poses();
@@ -671,14 +675,20 @@ impl Sim {
             if let Some(a) = &mut self.autopilot {
                 a.before_tick(&mut self.world, manual);
             }
-            // Scripted groups (`driver`) at every policy step.
-            if self.world.clock().tick.is_multiple_of(u64::from(self.world.scenario().decimation)) {
+            // Hybrid physics and scripted groups (`driver`) at every policy step.
+            let decimation = u64::from(self.world.scenario().decimation);
+            if self.world.clock().tick.is_multiple_of(decimation) {
+                self.world.switch_physics();
                 self.world.drive();
             }
             for a in 0..self.world.agents().len() {
                 self.world.agent_mut(a).events = Events::NONE;
             }
             self.world.tick();
+            // Lane tracking once per policy step, as `WorldInstance::step` does.
+            if self.world.clock().tick.is_multiple_of(decimation) {
+                self.world.track_roads();
+            }
             if let Some(a) = &self.autopilot {
                 a.after_tick(&mut self.world, manual);
             }
@@ -694,6 +704,10 @@ impl Sim {
         }
         if real_dt > 0.0 {
             self.real_time_factor = 0.9 * self.real_time_factor + 0.1 * stepped / real_dt;
+        }
+        if stepped > 0.0 {
+            let cost = start.elapsed().as_secs_f64() / stepped;
+            self.step_cost = if self.step_cost > 0.0 { 0.9 * self.step_cost + 0.1 * cost } else { cost };
         }
         self.autoreset(manual);
         // A diverged state cannot be drawn; start over.

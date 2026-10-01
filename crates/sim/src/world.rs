@@ -8,8 +8,9 @@
 //! 3. the clock advances, then every agent's sensors sample the new state (skipped when no
 //!    agent has sensors).
 //!
-//! Steps 2 and 3 run in parallel over agents when there are at least [`PARALLEL_AGENTS`]
-//! (two fork–joins per tick); each agent only writes its own state, so results do not depend
+//! Steps 2 and 3 run in parallel over agents when at least [`PARALLEL_AGENTS`] are simulated
+//! in full, or at the ticks kinematic vehicles move when there are at least
+//! [`PARALLEL_KINEMATIC`] agents (two fork–joins per tick); each agent only writes its own state, so results do not depend
 //! on the thread count. Parallel phases are cheapest when the world is stepped on a rayon
 //! worker thread, as [`BatchSim`](crate::BatchSim) does.
 //!
@@ -26,7 +27,7 @@ use crate::events::Events;
 use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape, agent_contacts, surface_distance};
 use crate::lane;
 use crate::lane::RoadSpawn;
-use crate::obs::CLEARANCE_RANGE;
+use crate::obs::{CLEARANCE_RANGE, Seen};
 use crate::scenario::{
     CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, PhysicsMode, SpawnSpec, TiltrotorStart,
 };
@@ -50,8 +51,12 @@ use glam::{DQuat, DVec2, DVec3};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-/// Agent count from which the per-agent phases run in parallel.
+/// Count of agents simulated in full (not kinematic) from which the per-agent phases run in
+/// parallel.
 pub const PARALLEL_AGENTS: usize = 32;
+/// Agent count from which the per-agent phases of a tick at which kinematic vehicles move run
+/// in parallel.
+pub const PARALLEL_KINEMATIC: usize = 128;
 
 /// With `path` goals a ground vehicle starts facing the point of its path this far away (m),
 /// turned by its sampled heading.
@@ -126,6 +131,8 @@ pub struct WorldInstance {
     signals: Signals,
     /// Scratch index of the agents on the lanes for traffic drivers (rebuilt every step).
     lane_index: Option<LaneIndex>,
+    /// Per group of ground vehicles: its footprint (for the `traffic` term).
+    footprints: Vec<Option<DriverGeometry>>,
 }
 
 impl WorldInstance {
@@ -152,6 +159,7 @@ impl WorldInstance {
             grid: AgentGrid::default(),
             signals: Signals::default(),
             lane_index: None,
+            footprints: scenario.groups.iter().map(|g| g.def.as_wheeled().map(|_| DriverGeometry::of(g))).collect(),
             map,
             map_index: 0,
             scenario,
@@ -597,7 +605,16 @@ impl WorldInstance {
                     d.occupy(lanes, index, i as u32, &v.pose(), ground_speed(v));
                 } else {
                     let s = &self.shapes[i];
-                    index.insert_other(world, i as u32, s.center, yaw(v.pose().rot), v.lin_vel_world(), s.radius);
+                    let learner = a.driver.is_none();
+                    index.insert_other(
+                        world,
+                        i as u32,
+                        s.center,
+                        yaw(v.pose().rot),
+                        v.lin_vel_world(),
+                        s.radius,
+                        learner,
+                    );
                 }
             }
             index.sort();
@@ -679,8 +696,12 @@ impl WorldInstance {
         }
         let t = self.clock.time();
         let cfg = &self.scenario.spec.events;
-        for a in &mut self.agents {
-            a.update_track(world, &self.signals, t, cfg);
+        let signals = &self.signals;
+        let track = |a: &mut Agent| a.update_track(world, signals, t, cfg);
+        if self.agents.len() >= PARALLEL_AGENTS {
+            self.agents.par_iter_mut().for_each(track);
+        } else {
+            self.agents.iter_mut().for_each(track);
         }
     }
 
@@ -713,17 +734,24 @@ impl WorldInstance {
         let sc = &**scenario;
         let world = &**map;
         let env = &*env;
-        let parallel = agents.len() >= PARALLEL_AGENTS;
         let time = clock.time();
         let env_step = (clock.is_due(sc.environment_divider))
             .then(|| if clock.tick == 0 { 0.0 } else { sc.dt() * f64::from(sc.environment_divider) });
 
         agent_contacts(shapes, sc.dt(), sc.spec.events.crash_speed, agent_contact_state, contacts);
 
+        // Kinematic vehicles move at the end of every `kinematic_divider` ticks.
+        let kinematic_step = (clock.tick + 1)
+            .is_multiple_of(u64::from(sc.kinematic_divider))
+            .then(|| sc.dt() * f64::from(sc.kinematic_divider));
+        // Kinematic vehicles cost little between their steps and little more at them: spread
+        // over threads are the agents simulated in full, and crowds at a kinematic step.
+        let full = agents.iter().filter(|a| !a.is_kinematic()).count();
+        let parallel = full >= PARALLEL_AGENTS || (kinematic_step.is_some() && agents.len() >= PARALLEL_KINEMATIC);
         let step = |((a, s), c): ((&mut Agent, &mut AgentShape), &AgentContacts)| {
             let g = &sc.groups[a.group];
-            a.pre_step(world, env, time, env_step, c);
-            a.post_step(world, env, sc.dt(), &sc.spec.events, g.spec.disable_on_terminal, c, s);
+            a.pre_step(world, env, time, env_step, kinematic_step, c);
+            a.post_step(world, env, sc.dt(), &sc.spec.events, g.spec.disable_on_terminal, kinematic_step, c, s);
         };
         if parallel {
             agents.par_iter_mut().zip(shapes.par_iter_mut()).zip(contacts.par_iter()).for_each(step);
@@ -747,6 +775,26 @@ impl WorldInstance {
 
     // ------------------------------------------------------------------------ outputs
 
+    /// Every active ground vehicle as the `traffic` term sees it (by agent).
+    fn seen(&self) -> Vec<Option<Seen>> {
+        (self.agents.iter().enumerate())
+            .map(|(i, a)| {
+                let geo = self.footprints[a.group].filter(|_| !a.disabled && self.shapes[i].active)?;
+                let pose = a.vehicle.pose();
+                let heading = yaw(pose.rot);
+                let center = pose.pos.truncate() + 0.5 * (geo.front + geo.rear) * DVec2::from_angle(heading);
+                Some(Seen {
+                    center,
+                    velocity: a.vehicle.lin_vel_world().truncate(),
+                    heading,
+                    length: geo.front - geo.rear,
+                    width: 2.0 * geo.half_width,
+                    lane: a.track.lane,
+                })
+            })
+            .collect()
+    }
+
     /// Observations of `group` (`count × obs_dim` values).
     pub fn observe(&self, group: usize, out: &mut [f32]) {
         let g = &self.scenario.groups[group];
@@ -756,9 +804,11 @@ impl WorldInstance {
             // Camera terms only.
             return;
         }
+        let vehicles = if g.obs.needs_traffic() { self.seen() } else { Vec::new() };
         let write = |(k, o): (usize, &mut [f32])| {
             let me = g.first_agent + k;
-            self.agents[me].observe(g, &self.map, &self.shapes, &self.grid, me, &self.signals, self.clock.time(), o);
+            let a = &self.agents[me];
+            a.observe(g, &self.map, &self.shapes, &self.grid, me, &vehicles, &self.signals, self.clock.time(), o);
         };
         if g.spec.count >= PARALLEL_AGENTS {
             out.par_chunks_exact_mut(dim).enumerate().for_each(write);

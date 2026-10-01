@@ -1,6 +1,6 @@
 //! Markers drawn over the scene with gizmos: the goals of every agent and the line to the
-//! current one, the route of agents with `route` goals, the path flown over the last seconds,
-//! the hits of the latest LiDAR scan, and on urban maps the lane graph near the camera (lanes,
+//! current one, the route of agents with `route` goals, the path flown over the last seconds
+//! (scripted NPCs get a ring instead: grey while kinematic, orange in full physics), the hits of the latest LiDAR scan, and on urban maps the lane graph near the camera (lanes,
 //! connectors in their signals' colours, yield points and stop lines).
 //! O cycles through goals and trails, those with the lane graph, and nothing; L toggles the
 //! LiDAR points.
@@ -46,6 +46,22 @@ const TO_GOAL: Color = Color::srgba(1.0, 0.8, 0.1, 0.6);
 const ROUTE: Color = Color::srgba(1.0, 0.45, 0.1, 0.8);
 const TRAIL_COLOR: Color = Color::srgb(0.2, 0.9, 1.0);
 const PILOT_TRAIL: Color = Color::srgb(1.0, 0.35, 0.8);
+
+/// Scripted NPCs: a ring over those driven kinematically, a brighter one over those promoted
+/// to full physics.
+const NPC_KINEMATIC: Color = Color::srgba(0.6, 0.65, 0.7, 0.7);
+const NPC_PROMOTED: Color = Color::srgb(1.0, 0.3, 0.1);
+
+/// Whether scripted agent `agent` is driven kinematically (live, or as recorded); `None` for
+/// the agents not scripted.
+pub fn npc_kinematic(sim: &Sim, agent: usize) -> Option<bool> {
+    let a = sim.world.agent(agent);
+    a.driver.as_ref()?;
+    Some(match &sim.replay {
+        Some(r) => r.sample(agent).is_some_and(|s| s.last.kinematic),
+        None => a.is_kinematic(),
+    })
+}
 
 /// Hit colour by range: red near, through yellow, to green far.
 pub fn range_color(r: f64, max: f64) -> Color {
@@ -121,6 +137,9 @@ pub fn draw(
     }
     if sim.replay.is_none() && !sim.paused {
         for (i, trail) in overlay.trails.iter_mut().enumerate() {
+            if sim.world.agent(i).driver.is_some() {
+                continue;
+            }
             if trail.back().is_none_or(|&(t, _)| t < now) {
                 trail.push_back((now, sim.render_pose(i).pos));
             }
@@ -134,9 +153,17 @@ pub fn draw(
         for i in 0..n {
             let agent = sim.world.agent(i);
             let pos = sim.render_pose(i).pos;
+            let group = &sim.world.scenario().groups[agent.group];
+            // Scripted NPCs get a ring only (no goals, route or trail; streets are full of them).
+            if let Some(kinematic) = npc_kinematic(&sim, i) {
+                let lift = DVec3::Z * (2.0 * group.radius / 1.5).max(1.0);
+                let ring = Isometry3d::new(origin.pos(pos + lift), Quat::from_rotation_x(std::f32::consts::FRAC_PI_2));
+                let color = if kinematic { NPC_KINEMATIC } else { NPC_PROMOTED };
+                gizmos.circle(ring, 0.5, color);
+                continue;
+            }
             // Goals: the current one solid, the ones after it faint and joined up; as large as
             // the vehicle.
-            let group = &sim.world.scenario().groups[agent.group];
             let arm = match agent.vehicle.as_multirotor() {
                 Some(m) => m.def().rotors.iter().map(|r| r.position.length()).fold(0.0, f64::max),
                 None => group.radius / 1.5,

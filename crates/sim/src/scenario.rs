@@ -82,6 +82,9 @@ use std::sync::Arc;
 /// Default physics rates of worlds with and without ground vehicles (Hz).
 pub const GROUND_PHYSICS_HZ: u32 = 1000;
 pub const AERIAL_PHYSICS_HZ: u32 = 500;
+/// Longest step of the kinematic model (s): kinematic vehicles move at about 100 Hz whatever the
+/// physics rate (every [`CompiledScenario::kinematic_divider`] physics steps).
+pub const KINEMATIC_PERIOD: f64 = 0.01;
 
 /// Candidate positions tried before falling back to the best one seen.
 const MAX_ATTEMPTS: usize = 200;
@@ -1143,6 +1146,8 @@ pub struct CompiledScenario {
     pub decimation: u32,
     /// Physics steps per environment update.
     pub environment_divider: u32,
+    /// Physics steps per step of the kinematic model (see [`KINEMATIC_PERIOD`]).
+    pub kinematic_divider: u32,
     /// The map pool (one map is drawn per episode) and the content hashes of its maps.
     pub maps: Vec<Arc<StaticWorld>>,
     pub map_hashes: Vec<MapHash>,
@@ -1330,7 +1335,23 @@ impl CompiledScenario {
         for (s, g) in spec.groups.iter_mut().zip(&groups) {
             s.clone_from(&g.spec);
         }
-        Ok(Self { spec, clock, decimation, environment_divider, maps, map_hashes, episode_maps, groups })
+        // The largest divisor of the decimation within the kinematic period, so that the
+        // kinematic model is current at every policy step.
+        let kinematic_divider = (1..=decimation)
+            .rev()
+            .find(|&k| decimation.is_multiple_of(k) && f64::from(k) * clock.dt() <= KINEMATIC_PERIOD + 1e-12)
+            .unwrap_or(1);
+        Ok(Self {
+            spec,
+            clock,
+            decimation,
+            environment_divider,
+            kinematic_divider,
+            maps,
+            map_hashes,
+            episode_maps,
+            groups,
+        })
     }
 
     pub fn num_agents(&self) -> usize {

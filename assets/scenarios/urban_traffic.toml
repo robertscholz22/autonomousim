@@ -1,0 +1,52 @@
+# A sedan among 300 traffic cars, 8 buses and 12 trucks on the urban showcase map, with 60
+# cars parked in bays. A scenario for the viewer (`--scenario assets/scenarios/urban_traffic.toml`,
+# or with `--demo` to drive the sedan from place to place); NPCs within 40 m of the sedan are
+# simulated in full, the others kinematically (O shows grey rings over kinematic NPCs, orange
+# ones over those in full physics).
+name = "urban_traffic"
+physics_hz = 1000
+policy_hz = 50
+
+map = { type = "urban", seed = 0, count = 1, preset = "showcase" }
+
+[[groups]]
+name = "ego"
+vehicle = "sedan_like"
+spawn = { on_ground = true, on_road = true }
+
+[[groups]]
+name = "cars"
+count = 300
+vehicle = "sedan_like"
+physics = "hybrid"
+driver = { type = "traffic", attention = 0.9 }
+spawn = { on_ground = true, on_road = true, min_separation = 20.0 }
+disable_on_terminal = false
+
+[[groups]]
+name = "buses"
+count = 8
+vehicle = "bus_city"
+physics = "kinematic"
+driver = { type = "traffic", speed_factor = [0.8, 0.9], headway = [1.5, 2.5], accel = [0.5, 0.8], decel = [1.5, 2.0], lateral_accel = 1.5, safe_decel = 3.0, bus = { length = [1500.0, 3000.0], stop_spacing = 300.0, dwell = [10.0, 30.0] } }
+spawn = { on_ground = true, on_road = true, min_separation = 40.0 }
+disable_on_terminal = false
+
+[[groups]]
+name = "trucks"
+count = 12
+vehicle = "truck_6x4"
+trailers = ["semitrailer_3axle"]
+physics = "kinematic"
+driver = { type = "traffic", speed_factor = [0.8, 0.9], headway = [1.5, 2.5], accel = [0.5, 0.8], decel = [1.5, 2.0], lateral_accel = 1.5, safe_decel = 3.0 }
+spawn = { on_ground = true, on_road = true, min_separation = 40.0 }
+disable_on_terminal = false
+
+[[groups]]
+name = "parked"
+count = 60
+vehicle = "sedan_like"
+physics = "kinematic"
+driver = { type = "parked" }
+spawn = { on_ground = true, in_bays = true }
+disable_on_terminal = false

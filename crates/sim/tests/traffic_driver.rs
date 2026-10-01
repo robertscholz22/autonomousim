@@ -455,3 +455,143 @@ fn parked_cars_need_bays() {
     assert!(parked("{ on_ground = true, on_road = true }", urban).is_err());
     assert!(parked("{ on_ground = true, in_bays = true }", ring).is_err());
 }
+
+/// An NPC closing in on a learning car standing in its lane: whether it touched it, and its
+/// speed at the end.
+fn meet_learner(attention: f64) -> (bool, f64) {
+    let radius = 80.0;
+    let mut toml = ring(radius, "[1, 0]", "local", &[("npc", 1, &format!("attention = {attention}"))]);
+    toml += r#"
+        [[groups]]
+        name = "ego"
+        vehicle = "sedan_like"
+        physics = "kinematic"
+        action_mode = "vk"
+        spawn = { on_ground = true, on_road = true }
+        disable_on_terminal = false
+    "#;
+    let mut w = WorldInstance::new(compile(&toml), Seed::from_u64(4));
+    put(&mut w, 0, radius, 0.0, 8.0);
+    put(&mut w, 1, radius, 1.0, 0.0);
+    let mut touched = false;
+    for _ in 0..25 * 30 {
+        w.set_action(1, &[0.0, 0.0]);
+        w.step();
+        touched |= w.agent(0).events.contains(Events::CRASH_AGENT);
+    }
+    assert!(speed(&w, 1) < 0.5 || touched, "the learning car stands: {}", speed(&w, 1));
+    (touched, speed(&w, 0))
+}
+
+#[test]
+fn npcs_yield_to_learners_they_notice() {
+    let (touched, v) = meet_learner(1.0);
+    assert!(!touched && v < 0.5, "attention 1: stops behind ({touched}, {v})");
+    let (touched, _) = meet_learner(0.0);
+    assert!(touched, "attention 0: runs into it");
+}
+
+/// The `traffic` term sees an NPC in the lane to the left, and `lane_route` the way straight on.
+#[test]
+fn traffic_and_lane_route_terms() {
+    let radius = 80.0;
+    let mut toml = ring(radius, "[2, 0]", "arterial", &[("npc", 1, "speed_factor = [0.5, 0.5]")]);
+    toml += r#"
+        [[groups]]
+        name = "ego"
+        vehicle = "sedan_like"
+        physics = "kinematic"
+        action_mode = "vk"
+        spawn = { on_ground = true, on_road = true }
+        obs = [{ term = "traffic", count = 2 }, { term = "lane_route" }]
+        disable_on_terminal = false
+    "#;
+    let sc = compile(&toml);
+    assert_eq!(sc.groups[1].obs_dim(), 2 * 13 + 6);
+    let mut w = WorldInstance::new(sc, Seed::from_u64(5));
+    // Ego in the right (outer) lane, the NPC 8 m ahead in the left one (clear of the ring's
+    // nodes at angles 0 and π).
+    put(&mut w, 1, radius + 1.75, 0.5, 0.0);
+    put(&mut w, 0, radius - 1.75, 0.5 + 8.0 / radius, 0.0);
+    w.set_action(1, &[0.0, 0.0]);
+    w.step();
+    let mut o = vec![0.0f32; 32];
+    w.observe(1, &mut o);
+    let geo = traffic(&w, 0).geometry();
+    let (x, y) = (f64::from(o[0]), f64::from(o[1]));
+    assert!((6.0..10.0).contains(&x) && (2.5..4.5).contains(&y), "{o:?}");
+    assert!(o[4].abs() < 0.2 && o[5] > 0.98, "heading {o:?}");
+    assert!(
+        (f64::from(o[6]) - (geo.front - geo.rear)).abs() < 1e-5
+            && (f64::from(o[7]) - 2.0 * geo.half_width).abs() < 1e-5
+    );
+    assert_eq!(&o[8..13], &[0.0, 1.0, 0.0, 0.0, 1.0], "left lane, present");
+    assert!(o[13..26].iter().all(|&v| v == 0.0), "one vehicle only");
+    // No route: straight on from its own lane.
+    assert_eq!(o[26], 0.0);
+    assert!(o[27] > 0.0, "distance to the lane's end {o:?}");
+    assert_eq!(&o[28..32], &[0.0, 1.0, 0.0, 0.0]);
+}
+
+/// NPC traffic with a learning car on an urban map, recorded: the NPCs go into `/npcs` (no
+/// channels of their own), read back as states; the same seed and actions give the same run
+/// (also with drivers that notice the learner only at random).
+#[test]
+fn npcs_are_recorded_packed_and_runs_repeat() {
+    let toml = format!(
+        "{}{}",
+        urban_toml(2, 20, 2).replace("type = \"traffic\"", "type = \"traffic\", attention = 0.5"),
+        r#"
+        [[groups]]
+        name = "ego"
+        vehicle = "sedan_like"
+        physics = "kinematic"
+        action_mode = "vk"
+        spawn = { on_ground = true, on_road = true }
+        disable_on_terminal = false
+    "#
+    );
+    let sc = compile(&toml);
+    let n = sc.num_agents();
+    let run = |record: bool| {
+        let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(9));
+        let sink = Arc::new(std::sync::Mutex::new(autonomousim_sim::record::MemorySink::default()));
+        let mut rec = autonomousim_sim::record::Recorder::new(
+            Box::new(sink.clone()),
+            autonomousim_sim::record::RecorderConfig::default(),
+        );
+        if record {
+            rec.on_reset(&w);
+        }
+        for k in 0..25 * 20 {
+            w.set_action(n - 1, &[0.4, if (k / 50) % 2 == 0 { 0.1 } else { -0.1 }]);
+            if record {
+                rec.on_actions(&w);
+                w.step_with(&mut |w| rec.on_tick(w));
+            } else {
+                w.step();
+            }
+        }
+        rec.finish().unwrap();
+        let sink = Arc::try_unwrap(sink).ok().unwrap().into_inner().unwrap();
+        (w.state_hash(), sink, w)
+    };
+    let (a, sink, w) = run(true);
+    let (b, _, _) = run(false);
+    assert_eq!(a, b, "the same run");
+    // The NPCs are packed: no channels of their own, the learner has its own.
+    let npcs = sink.topic("/npcs");
+    assert!(!npcs.is_empty());
+    assert!(sink.topic("/agent/0/state").is_empty() && sink.topic("/agent/0/action").is_empty());
+    assert_eq!(sink.topic(&format!("/agent/{}/state", n - 1)).len(), npcs.len());
+    let last: autonomousim_sim::record::RecordedNpcs = serde_json::from_value(npcs.last().unwrap().1.clone()).unwrap();
+    assert_eq!(last.agents.len(), n - 1);
+    assert!(last.kinematic.iter().all(|&k| k));
+    for (id, s) in last.states() {
+        let v = &w.agent(id).vehicle;
+        assert_eq!((s.position, s.orientation), (v.position(), v.orientation()), "agent {id}");
+        assert_eq!(s.wheels.len(), 4, "agent {id}");
+    }
+    let bytes: usize = npcs.iter().map(|m| serde_json::to_vec(&m.1).unwrap().len()).sum::<usize>() / npcs.len();
+    eprintln!("/npcs: {bytes} bytes per message for {} NPCs", n - 1);
+}

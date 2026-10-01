@@ -258,6 +258,32 @@ pub fn walk(lanes: &LaneGraph, lane: u32, s: f64, ahead: f64, route: Option<&Pol
     extend(&lanes.lanes()[l as usize].line, 0.0)
 }
 
+/// The next movement from `lane`'s road in its direction: the connector (among those leaving
+/// its lane and the lanes beside it) ending nearest to `route` if given (fewest lane changes
+/// among equals), else the one [`next_connector`] picks from `lane`; with the lane changes to
+/// the lane it leaves from (positive to the left).
+pub fn next_movement(lanes: &LaneGraph, lane: u32, route: Option<&Polyline>) -> Option<(u32, i32)> {
+    let Some(r) = route else { return next_connector(lanes, lane, None).map(|c| (c, 0)) };
+    let side = |step: fn(&Lane) -> Option<u32>, sign: i32| {
+        std::iter::successors(step(&lanes.lanes()[lane as usize]).map(|l| (l, sign)), move |&(l, k)| {
+            step(&lanes.lanes()[l as usize]).map(|m| (m, k + sign))
+        })
+        .take(MAX_SIDE)
+    };
+    let miss = |c: u32| {
+        let line = &lanes.connectors()[c as usize].line;
+        r.project(line.point_at(0.75 * line.length()).truncate()).distance
+    };
+    std::iter::once((lane, 0))
+        .chain(side(|l| l.left, 1))
+        .chain(side(|l| l.right, -1))
+        .flat_map(|(l, k)| lanes.lanes()[l as usize].successors.iter().map(move |&c| (c, k)))
+        .min_by(|a, b| miss(a.0).total_cmp(&miss(b.0)).then(a.1.abs().cmp(&b.1.abs())).then(a.0.cmp(&b.0)))
+}
+
+/// Most lanes beside a lane looked at.
+const MAX_SIDE: usize = 8;
+
 /// The point `d` metres straight on past the end of `line`.
 fn extend(line: &Polyline, d: f64) -> DVec2 {
     let end = line.points().last().expect("points").truncate();
@@ -386,5 +412,35 @@ mod tests {
         assert_eq!(net.area(walk[10].0), Area::Sidewalk);
         assert!(drive(net, &signals, &walk, 0.0, 5.0, false).contains(Events::OFF_ROAD));
         assert!(!drive(net, &signals, &walk, 0.0, 1.0, false).contains(Events::OFF_ROAD));
+    }
+
+    /// The next movement along a route that turns from the lane beside: one lane change over.
+    #[test]
+    fn next_movement_counts_the_lane_changes() {
+        let (w, _) = urban::generate(&UrbanPreset::Training.config(), 2).unwrap();
+        let g = w.roads().lanes();
+        let turns =
+            |l: u32, t: Turn| g.lanes()[l as usize].successors.iter().any(|&c| g.connectors()[c as usize].turn == t);
+        let mut checked = 0;
+        for (l, lane) in g.lanes().iter().enumerate() {
+            let l = l as u32;
+            let Some(m) = lane.left else { continue };
+            if turns(l, Turn::Left) || !turns(m, Turn::Left) {
+                continue;
+            }
+            let &c = g.lanes()[m as usize]
+                .successors
+                .iter()
+                .find(|&&c| g.connectors()[c as usize].turn == Turn::Left)
+                .expect("a left turn");
+            let route = &g.connectors()[c as usize].line;
+            let (got, changes) = next_movement(g, l, Some(route)).expect("a movement");
+            assert_eq!((got, changes), (c, 1), "lane {l}");
+            assert_eq!(next_movement(g, m, Some(route)), Some((c, 0)));
+            // Without a route: straight on from its own lane.
+            assert_eq!(next_movement(g, l, None).map(|x| x.1), Some(0));
+            checked += 1;
+        }
+        assert!(checked >= 3, "{checked} lanes");
     }
 }

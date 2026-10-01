@@ -42,6 +42,8 @@
 //! | `nearest_agent` | 1 | distance between this agent's colliders and the nearest other active agent's, up to `range` (default 20 m) |
 //!
 //! | `signal` | 4 | ground vehicles on urban maps: the light (one-hot green, amber, red) for the movement ahead (the one nearest the route, else straight on) at the end of the lane followed, if that is a signalized junction, then the distance to its stop line (m); all 0 without |
+//! | `traffic` | 13 × `count` | ground vehicles: the `count` (default 8) nearest other active ground vehicles with footprint centres within `range` (default 50 m), nearest first (ties by agent index): footprint centre relative to this agent and velocity, in the heading frame (m, m/s), sin, cos of its heading − the heading, its length and width (m), its lane relative to the lane followed (one-hot: same, a lane to the left, to the right, any other or none), then 1; empty slots are all 0. The one-hot and the 1 are neither scaled nor clipped |
+//! | `lane_route` | 6 | ground vehicles on urban maps: the lane changes to the lane the next movement leaves from (+ left; the movement ending nearest the route, else straight on from the lane followed), the distance to the end of the lane followed (m), and the movement's turn (one-hot: left, straight, right, U-turn; neither scaled nor clipped); all 0 without a lane |
 //! | `lanes` | 12 | ground vehicles on urban maps: the lane followed 5, 10, 20 and 40 m ahead in the heading frame (x, y; m; through the connectors `signal` picks), its speed limit (m/s), 1 if a lane to its left / right of the same direction exists (else 0), the offset from its centre (m, + left); all 0 without a lane |
 //!
 //! `road` and `route` follow the lane of the agent's route (`route` goals), or else the lane
@@ -68,13 +70,14 @@
 use crate::interaction::{AgentGrid, AgentShape};
 use crate::lane::Follow;
 use crate::scenario::Goal;
-use crate::traffic::{RoadTrack, Signals, next_connector, walk};
+use crate::traffic::{RoadTrack, Signals, next_connector, next_movement, walk};
 use autonomousim_core::math::quat::{from_yaw, rot6d, wrap_angle, yaw};
 use autonomousim_sensors::{BodyKinematics, Sensor, SensorConfig, SensorSpec};
 use autonomousim_vehicles::aero::AirData;
 use autonomousim_vehicles::ground::Wheeled;
+use autonomousim_world::lanes::{LaneGraph, Turn};
 use autonomousim_world::{Polyline, StaticWorld};
-use glam::{DQuat, DVec3, EulerRot};
+use glam::{DQuat, DVec2, DVec3, EulerRot};
 use serde::{Deserialize, Serialize};
 
 /// Largest distance the `clearance` term looks (m).
@@ -86,6 +89,26 @@ pub const NEIGHBOR_RANGE: f64 = 20.0;
 /// Default and largest `count` of the `neighbors` term.
 pub const NEIGHBOR_COUNT: usize = 3;
 pub const MAX_NEIGHBORS: usize = 16;
+
+/// Default `count` and `range` (m) of the `traffic` term.
+pub const TRAFFIC_COUNT: usize = 8;
+pub const TRAFFIC_RANGE: f64 = 50.0;
+
+/// Width of a vehicle's slot in the `traffic` term.
+const TRAFFIC_SLOT: usize = 13;
+
+/// Another ground vehicle as the `traffic` term sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seen {
+    /// Centre of its footprint (m, world) and its velocity (m/s, world).
+    pub center: DVec2,
+    pub velocity: DVec2,
+    pub heading: f64,
+    pub length: f64,
+    pub width: f64,
+    /// The lane it follows.
+    pub lane: Option<u32>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +167,8 @@ pub enum TermKind {
     Pitot,
     Signal,
     Lanes,
+    Traffic,
+    LaneRoute,
 }
 
 /// Distances ahead at which the `road` and `route` terms look (m).
@@ -182,6 +207,7 @@ impl TermKind {
                 | Feet
                 | Signal
                 | Lanes
+                | LaneRoute
         )
     }
 }
@@ -342,6 +368,9 @@ pub struct ObsInput<'a> {
     pub route: Option<&'a Polyline>,
     /// Where the agent is on the roads, the signals and the time (s).
     pub track: &'a RoadTrack,
+    /// Per agent, the ground vehicles as the `traffic` term sees them (empty unless a term
+    /// needs them; see [`CompiledObs::needs_traffic`]).
+    pub vehicles: &'a [Option<Seen>],
     pub signals: &'a Signals,
     pub time: f64,
 }
@@ -402,12 +431,14 @@ impl CompiledObs {
             if t.term.needs_wheels() && num_wheels == 0 {
                 return Err(format!("observation {:?} needs a ground vehicle", t.term));
             }
-            let agent_term = matches!(t.term, TermKind::Neighbors | TermKind::NearestAgent);
-            if (t.count.is_some() && t.term != TermKind::Neighbors) || (t.range.is_some() && !agent_term) {
+            let agent_term = matches!(t.term, TermKind::Neighbors | TermKind::NearestAgent | TermKind::Traffic);
+            let counted = matches!(t.term, TermKind::Neighbors | TermKind::Traffic);
+            if (t.count.is_some() && !counted) || (t.range.is_some() && !agent_term) {
                 return Err(format!("observation {:?} takes no count or range", t.term));
             }
-            let count = t.count.unwrap_or(NEIGHBOR_COUNT);
-            let range = t.range.unwrap_or(NEIGHBOR_RANGE);
+            let traffic = t.term == TermKind::Traffic;
+            let count = t.count.unwrap_or(if traffic { TRAFFIC_COUNT } else { NEIGHBOR_COUNT });
+            let range = t.range.unwrap_or(if traffic { TRAFFIC_RANGE } else { NEIGHBOR_RANGE });
             if agent_term && (!(1..=MAX_NEIGHBORS).contains(&count) || !(range > 0.0 && range.is_finite())) {
                 return Err(format!("observation {:?}: count must be 1–{MAX_NEIGHBORS} and range positive", t.term));
             }
@@ -437,6 +468,8 @@ impl CompiledObs {
                 (TermKind::Route, _) => (2 * LOOKAHEAD.len(), 0.0),
                 (TermKind::NearestAgent, _) => (1, range),
                 (TermKind::Neighbors, _) => (7 * count, range),
+                (TermKind::Traffic, _) => (TRAFFIC_SLOT * count, range),
+                (TermKind::LaneRoute, _) => (6, 0.0),
                 (TermKind::WheelSpeeds | TermKind::WheelSlip, _) => (num_wheels, 0.0),
                 (TermKind::Rot6d | TermKind::Imu, _) => (6, 0.0),
                 (TermKind::Quat, _) => (4, 0.0),
@@ -468,6 +501,11 @@ impl CompiledObs {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Whether it reads the other vehicles ([`ObsInput::vehicles`]).
+    pub fn needs_traffic(&self) -> bool {
+        self.terms.iter().any(|t| t.kind == TermKind::Traffic)
     }
 
     /// `[height, width, channels]` of the image, if there are camera terms.
@@ -742,6 +780,48 @@ impl CompiledObs {
                     rest[3] = inp.track.offset;
                     put(dst, &v, t)
                 }
+                TermKind::Traffic => {
+                    dst.fill(0.0);
+                    let me = k.position.truncate();
+                    let mut near: Vec<(f64, usize)> = (inp.vehicles.iter().enumerate())
+                        .filter(|&(j, _)| j != inp.me)
+                        .filter_map(|(j, s)| s.map(|s| (s.center.distance(me), j)))
+                        .filter(|&(d, _)| d <= t.max_range)
+                        .collect();
+                    near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    let lanes = inp.world.roads().lanes();
+                    let y = yaw(q);
+                    let to_heading = heading.inverse();
+                    for (slot, &(_, j)) in dst.as_chunks_mut::<TRAFFIC_SLOT>().0.iter_mut().zip(&near) {
+                        let o = inp.vehicles[j].expect("listed");
+                        let r = to_heading * (o.center - me).extend(0.0);
+                        let v = to_heading * o.velocity.extend(0.0);
+                        let h = wrap_angle(o.heading - y);
+                        put(&mut slot[0..8], &[r.x, r.y, v.x, v.y, h.sin(), h.cos(), o.length, o.width], t);
+                        slot[8 + lane_relation(lanes, inp.track.lane, o.lane)] = 1.0;
+                        slot[12] = 1.0;
+                    }
+                }
+                TermKind::LaneRoute => {
+                    let mut v = [0.0; 6];
+                    let lanes = inp.world.roads().lanes();
+                    if let Some(l) = inp.track.lane
+                        && let Some((c, changes)) = next_movement(lanes, l, inp.route)
+                    {
+                        v[0] = f64::from(changes);
+                        v[1] = (lanes.lanes()[l as usize].line.length() - inp.track.station).max(0.0);
+                        v[2 + match lanes.connectors()[c as usize].turn {
+                            Turn::Left => 0,
+                            Turn::Straight => 1,
+                            Turn::Right => 2,
+                            Turn::UTurn => 3,
+                        }] = 1.0;
+                    }
+                    put(dst, &v[..2], t);
+                    for (d, x) in dst[2..].iter_mut().zip(&v[2..]) {
+                        *d = *x as f32;
+                    }
+                }
                 TermKind::OnRoad => {
                     let on = inp.world.roads().on_road(k.position.truncate()).is_some();
                     put(dst, &[f64::from(u8::from(on))], t)
@@ -829,6 +909,27 @@ pub fn canonical(q: DQuat) -> DQuat {
     if q.w < 0.0 { -q } else { q }
 }
 
+/// Where lane `theirs` lies from lane `mine`: 0 the same, 1 to the left, 2 to the right (lanes
+/// of the same direction beside it), 3 anything else.
+fn lane_relation(lanes: &LaneGraph, mine: Option<u32>, theirs: Option<u32>) -> usize {
+    let (Some(a), Some(b)) = (mine, theirs) else { return 3 };
+    if a == b {
+        return 0;
+    }
+    let beside = |step: fn(&autonomousim_world::Lane) -> Option<u32>| {
+        std::iter::successors(step(&lanes.lanes()[a as usize]), |&l| step(&lanes.lanes()[l as usize]))
+            .take(8)
+            .any(|l| l == b)
+    };
+    if beside(|l| l.left) {
+        1
+    } else if beside(|l| l.right) {
+        2
+    } else {
+        3
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +994,7 @@ mod tests {
             grid: &AgentGrid::default(),
             route: None,
             track: &RoadTrack::default(),
+            vehicles: &[],
             signals: &Signals::default(),
             time: 0.0,
         };
@@ -952,6 +1054,7 @@ mod tests {
             grid: &AgentGrid::default(),
             route: None,
             track: &RoadTrack::default(),
+            vehicles: &[],
             signals: &Signals::default(),
             time: 0.0,
         };

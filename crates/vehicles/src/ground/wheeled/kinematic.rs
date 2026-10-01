@@ -320,16 +320,17 @@ impl Wheeled {
         out
     }
 
-    /// Advance kinematic state `k` by one step towards `target` within `limits`, and place the
-    /// vehicle there (see [`place_kinematic`](Self::place_kinematic)).
+    /// Advance kinematic state `k` by `dt` towards `target` within `limits`, and place the
+    /// vehicle there (see [`place_kinematic`](Self::place_kinematic)). The step need not be the
+    /// physics step: kinematic vehicles may move less often.
     pub fn step_kinematic<T: Terrain + ?Sized>(
         &mut self,
         k: &mut KinematicState,
         target: KinematicTarget,
         limits: &KinematicLimits,
         terrain: &T,
+        dt: f64,
     ) {
-        let dt = self.dt;
         let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
         let v_ref = match target {
             KinematicTarget::SpeedCurvature { speed, .. } | KinematicTarget::SpeedYawRate { speed, .. } => {
@@ -655,7 +656,7 @@ mod tests {
         let mut k = w.kinematic_state();
         let target = KinematicTarget::SpeedCurvature { speed: 10.0, curvature: 0.02 };
         for _ in 0..10_000 {
-            w.step_kinematic(&mut k, target, &KinematicLimits::default(), &FLAT);
+            w.step_kinematic(&mut k, target, &KinematicLimits::default(), &FLAT, w.dt());
         }
         assert!((k.speed - 10.0).abs() < 1e-6, "{}", k.speed);
         assert!((k.yaw_rate - 0.2).abs() < 1e-4, "{}", k.yaw_rate);
