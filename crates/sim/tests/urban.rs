@@ -200,6 +200,61 @@ fn bay_goals_in_lots_and_on_streets() {
     }
 }
 
+/// Parking between parked cars: nobody parks in the goal bay, and `near_bay_goals` parks the
+/// cars in the bays nearest to it.
+#[test]
+fn parked_cars_leave_the_goal_bay_and_gather_around_it() {
+    for kind in ["lot", "street"] {
+        let sc = compile(&format!(
+            r#"
+            map = {{ type = "urban", seed = 2, count = 1 }}
+            [[groups]]
+            name = "ego"
+            vehicle = "sedan_like"
+            action_mode = "vk"
+            goals = {{ kind = "bay", distance = [6.0, 12.0], bay = {{ kinds = ["{kind}"] }} }}
+            [[groups]]
+            name = "parked"
+            count = 6
+            vehicle = "sedan_like"
+            physics = "kinematic"
+            driver = {{ type = "parked" }}
+            spawn = {{ on_ground = true, in_bays = true, near_bay_goals = true }}
+            "#
+        ));
+        let mut w = WorldInstance::new(sc, Seed::from_u64(0));
+        for episode in 0..10u64 {
+            w.reset(Some(episode));
+            let goal = w.agent(0).goal().position.truncate();
+            let bays = &w.map().sites().bays;
+            let near = |p: DVec2| {
+                (0..bays.len())
+                    .min_by(|&a, &b| {
+                        bays[a].centre.truncate().distance(p).total_cmp(&bays[b].centre.truncate().distance(p))
+                    })
+                    .unwrap()
+            };
+            let at = near(goal);
+            let gap = |k: usize| bays[k].centre.truncate().distance(bays[at].centre.truncate());
+            let mut gaps: Vec<f64> = (0..bays.len()).filter(|&k| k != at).map(gap).collect();
+            gaps.sort_by(f64::total_cmp);
+            for i in 1..7 {
+                let p = w.agent(i).vehicle.position().truncate();
+                let k = near(p);
+                assert_ne!(k, at, "{kind} {episode}: car {i} parks in the goal bay");
+                assert!(gap(k) <= gaps[11] + 1e-9, "{kind} {episode}: car {i} parks far from the goal");
+            }
+        }
+    }
+    let far = r#"
+        map = { type = "urban", seed = 2, count = 1 }
+        [[groups]]
+        vehicle = "sedan_like"
+        spawn = { on_ground = true, near_bay_goals = true }
+        "#;
+    assert!(Scenario::from_toml(far).unwrap().compile().is_err());
+}
+
 /// Traffic signals: per-episode offsets drawn deterministically within each cycle; the
 /// `signal` and `lanes` terms read the lane a car stands in before a stop line; recordings
 /// carry the offsets and the light changes.

@@ -95,27 +95,30 @@ pub fn yards(world: &StaticWorld) -> Vec<Yard> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Slot {
     Yard(Yard),
-    Bay(ParkingBay),
+    /// A bay and its index in the map's `sites().bays`.
+    Bay(usize, ParkingBay),
 }
 
 /// The slots of `world` for bay goals: its farm yards, then the bays of the kinds in
 /// `settings.kinds`.
 pub fn slots(world: &StaticWorld, settings: &BayGoals) -> Vec<Slot> {
     let mut out: Vec<Slot> = yards(world).into_iter().map(Slot::Yard).collect();
-    let bays = world.sites().bays.iter().filter(|b| settings.kinds.contains(&b.kind));
-    out.extend(bays.map(|b| Slot::Bay(*b)));
+    let bays = world.sites().bays.iter().enumerate().filter(|(_, b)| settings.kinds.contains(&b.kind));
+    out.extend(bays.map(|(k, b)| Slot::Bay(k, *b)));
     out
 }
 
 /// Clearance (m) of the tail from the inner end of a marked bay.
 const BAY_END: f64 = 0.3;
 
-/// A spawn and bay: the towing unit's position (horizontal) and heading, and the goal.
+/// A spawn and bay: the towing unit's position (horizontal) and heading, and the goal; the
+/// index of a marked bay in the map's `sites().bays`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BaySpawn {
     pub xy: DVec2,
     pub yaw: f64,
     pub goal: Goal,
+    pub bay: Option<usize>,
 }
 
 /// Sample a bay in one of `slots` (preferring one not in `used`, which it is added to) and a
@@ -149,6 +152,10 @@ pub fn sample(
     let b = &spec.bay;
     // The tail with all units in line, in the towing unit's frame.
     let behind = (def.unit_origin(def.num_units() - 1) + def.tail()).truncate();
+    let index = match slots[k] {
+        Slot::Bay(i, _) => Some(i),
+        Slot::Yard(_) => None,
+    };
     let (bay, heading, tail, yaw) = match slots[k] {
         Slot::Yard(yard) => {
             let across = rng.range(-b.offset, b.offset);
@@ -158,7 +165,7 @@ pub fn sample(
             let yaw = yard.heading + rng.range(-b.yaw_deg, b.yaw_deg).to_radians();
             (bay, yard.heading, tail, yaw)
         }
-        Slot::Bay(bay) => {
+        Slot::Bay(_, bay) => {
             let half = 0.5 * bay.size.x;
             let d = rng.range(spec.distance[0], spec.distance[1]);
             let jitter = rng.range(-b.yaw_deg, b.yaw_deg).to_radians();
@@ -197,7 +204,7 @@ pub fn sample(
     };
     let xy = tail - DVec2::from_angle(yaw).rotate(behind);
     let z = world.surface_height(bay.x, bay.y) + lift;
-    Some(BaySpawn { xy, yaw, goal: Goal { position: bay.extend(z), yaw: heading } })
+    Some(BaySpawn { xy, yaw, goal: Goal { position: bay.extend(z), yaw: heading }, bay: index })
 }
 
 /// A yard-to-yard trip: the spawn pad and the goal pad (horizontal positions).

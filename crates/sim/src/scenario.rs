@@ -893,9 +893,15 @@ pub struct SpawnSpec {
     /// Start parked in a parking bay of the map (lot or street), a different one per agent,
     /// centred in it and facing along it; ignores `layout`, `region`, `cluster` and
     /// `yaw_deg`. Needs `on_ground` and maps with at least as many bays as the groups
-    /// spawning in them have agents (other maps are not used).
+    /// spawning in them have agents (other maps are not used). Goal bays of earlier groups
+    /// (bay goals) and bays whose car would overlap their spawns stay free.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub in_bays: bool,
+    /// With `in_bays`: park in the free bays nearest to the goal bays of earlier groups (bay
+    /// goals), at random among twice as many as the group has agents, so that the goals lie
+    /// between parked cars. Goal bays are never parked in.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub near_bay_goals: bool,
     /// Free radius around the vehicle (m).
     pub clearance: f64,
     /// Smallest distance between agents (m).
@@ -941,6 +947,7 @@ impl Default for SpawnSpec {
             airspeed: None,
             on_road: false,
             in_bays: false,
+            near_bay_goals: false,
             clearance: 1.0,
             min_separation: 1.0,
             avoid_water: true,
@@ -1501,6 +1508,9 @@ impl CompiledGroup {
                 "`spawn.in_bays` is for ground vehicles `on_ground`, not `on_road` or `near`, with `spawn` or `random` goals"
                     .into(),
             ));
+        }
+        if sp.near_bay_goals && !sp.in_bays {
+            return Err(fail("`spawn.near_bay_goals` needs `spawn.in_bays`".into()));
         }
         if let Some(d) = &spec.driver {
             d.validate().map_err(&fail)?;

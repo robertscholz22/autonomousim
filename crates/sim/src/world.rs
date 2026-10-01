@@ -198,6 +198,9 @@ impl WorldInstance {
         let agent_seed = es.child("agent");
         let mut placed = Vec::with_capacity(self.agents.len());
         let mut parked_bays = Vec::new();
+        let mut goal_bays = Vec::new();
+        // Footprints of the bay-goal spawns: centre, heading and half extents.
+        let mut footprints: Vec<(DVec2, f64, DVec2)> = Vec::new();
         let mut long = Vec::new();
         for g in &sc.groups {
             let spawn = &g.spec.spawn;
@@ -226,6 +229,12 @@ impl WorldInstance {
                     let b = crate::bay::sample(world, &slots, &g.spec.goals, d, lift, &mut used, &mut goal_rng)
                         .expect("maps of bay goals have yards or bays");
                     placed.push(b.xy.extend(0.0));
+                    // Nobody parks in a goal bay or on the spawn.
+                    parked_bays.extend(b.bay);
+                    goal_bays.extend(b.bay);
+                    let geo = DriverGeometry::of(g);
+                    let centre = b.xy + DVec2::from_angle(b.yaw) * (0.5 * (geo.front + geo.rear));
+                    footprints.push((centre, b.yaw, DVec2::new(0.5 * (geo.front - geo.rear), geo.half_width)));
                     bays.push(b);
                 }
                 let p: Vec<DVec3> = bays.iter().map(|b| b.xy.extend(0.0)).collect();
@@ -277,8 +286,37 @@ impl WorldInstance {
                 let all = &world.sites().bays;
                 let mut p = Vec::with_capacity(g.spec.count);
                 let mut rs = Vec::with_capacity(g.spec.count);
+                // Bays whose car would overlap an earlier bay-goal spawn (with 0.3 m to spare)
+                // are taken.
+                let half = DVec2::new(0.5 * (geo.front - geo.rear), geo.half_width + 0.3);
+                for (k, b) in all.iter().enumerate() {
+                    if footprints.iter().any(|f| rects_overlap(f, &(b.centre.truncate(), b.yaw, half))) {
+                        parked_bays.push(k);
+                    }
+                }
+                // With `near_bay_goals`: the free bays nearest to the goal bays, twice as many
+                // as park.
+                let near = (spawn.near_bay_goals && !goal_bays.is_empty()).then(|| {
+                    let gap = |k: usize| {
+                        let c = all[k].centre.truncate();
+                        goal_bays.iter().map(|&j| all[j].centre.truncate().distance(c)).fold(f64::INFINITY, f64::min)
+                    };
+                    let mut free: Vec<usize> = (0..all.len()).filter(|k| !parked_bays.contains(k)).collect();
+                    free.sort_by(|&a, &b| gap(a).total_cmp(&gap(b)));
+                    free.truncate(2 * g.spec.count);
+                    free
+                });
                 for _ in 0..g.spec.count {
-                    let free: Vec<usize> = (0..all.len()).filter(|k| !parked_bays.contains(k)).collect();
+                    let pool = near.as_ref().filter(|n| n.iter().any(|k| !parked_bays.contains(k)));
+                    let mut free: Vec<usize> = match pool {
+                        Some(n) => n.iter().copied().filter(|k| !parked_bays.contains(k)).collect(),
+                        None => (0..all.len()).filter(|k| !parked_bays.contains(k)).collect(),
+                    };
+                    if free.is_empty() {
+                        // (Only taken bays left: any not parked in.)
+                        let parked = &parked_bays[parked_bays.len() - p.len()..];
+                        free = (0..all.len()).filter(|k| !parked.contains(k)).collect();
+                    }
                     let k = free[spawn_rng.below(free.len() as u64) as usize];
                     parked_bays.push(k);
                     let b = &all[k];
@@ -1230,4 +1268,18 @@ fn hash_sensor(s: &Sensor, f: &mut impl FnMut(f64)) {
             }
         }
     }
+}
+
+/// Whether two rectangles (centre, heading, half extents) overlap (separating axes).
+fn rects_overlap(a: &(DVec2, f64, DVec2), b: &(DVec2, f64, DVec2)) -> bool {
+    let axes = |r: &(DVec2, f64, DVec2)| {
+        let x = DVec2::from_angle(r.1);
+        [x, x.perp()]
+    };
+    let extent = |r: &(DVec2, f64, DVec2), n: DVec2| {
+        let [x, y] = axes(r);
+        r.2.x * x.dot(n).abs() + r.2.y * y.dot(n).abs()
+    };
+    let d = b.0 - a.0;
+    axes(a).into_iter().chain(axes(b)).all(|n| d.dot(n).abs() <= extent(a, n) + extent(b, n))
 }
