@@ -46,7 +46,8 @@
 //! lane (diverging) are no conflict for entering: the driver follows a vehicle ahead on the
 //! other one until they have parted; inside a merge zone it follows the vehicle nearer the
 //! common end. A driver also does not enter a junction when it could not go on through the
-//! next one that a lane too short to wait on (its length and standstill gap) leads to: the
+//! next one that a lane too short to wait on (its length and standstill gap before its line,
+//! held back for sweeps and crossings) leads to: the
 //! next one is asked for beforehand (and so on; its light and stop sign aside, as they only
 //! delay), so that it does not wait inside a junction for other traffic; once committed, it
 //! brakes in time for a light there.
@@ -71,6 +72,12 @@
 //! connector's setback even when allowed through. Other drivers never pass a standing long
 //! vehicle within a junction.
 //!
+//! **Pedestrians** ([`crate::pedestrians`]): a driver stops [`CROSSWALK_GAP`] m before a
+//! crossing ahead while a pedestrian on it (or committed to it) has not passed its lane by
+//! [`CROSSWALK_CLEAR`] m; a crossing its front has reached is cleared once rolling (over
+//! [`CROSSWALK_ROLLING`]), but pedestrians in its path stay obstacles. Stop lines of lanes
+//! ending at a crossing are set back behind the band.
+//!
 //! **Buses** (`bus`) drive a loop with stops instead of at random (see [`BusRoute`]).
 //!
 //! **Respawn**: a driver standing still for `respawn` s, lost off the lanes for
@@ -85,7 +92,7 @@ use autonomousim_core::math::Pose;
 use autonomousim_core::math::quat::{wrap_angle, yaw};
 use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_core::terrain::Terrain;
-use autonomousim_world::lanes::{ConflictKind, Control, LaneGraph, Turn, class_rank};
+use autonomousim_world::lanes::{CROSSWALK, ConflictKind, Control, LaneGraph, Turn, class_rank};
 use autonomousim_world::{Light, Polyline, StaticWorld};
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
@@ -355,6 +362,13 @@ pub struct LaneIndex {
     learners: Vec<(u32, DVec2)>,
     /// Learning agents the driver deciding now has not noticed (sorted).
     ignored: Vec<u32>,
+    /// Per lane: the crossings over it, with the station of their band's centre.
+    lane_crossings: Vec<Vec<(u32, f64)>>,
+    /// Per crossing: the pedestrians on it or committed to it (position, unit direction of
+    /// travel; see [`Crowd::crossing_users`](crate::pedestrians::Crowd::crossing_users)).
+    crossing_users: Vec<Vec<(DVec2, DVec2)>>,
+    /// Per lane: the setback of its stop line behind a crossing at its end (m).
+    crosswalk_back: Vec<f64>,
 }
 
 /// Search range for leaders and followers (m).
@@ -389,6 +403,14 @@ const STUCK: f64 = 10.0;
 pub const DECIDE: f64 = 30.0;
 /// An allowed entry is granted within this far (m) of the line, or 3 s.
 pub const GRANT: f64 = 15.0;
+/// Drivers stop this far (m) before a crossing's band for pedestrians.
+const CROSSWALK_GAP: f64 = 1.0;
+/// A pedestrian has passed a lane once this far (m) beyond its side.
+const CROSSWALK_CLEAR: f64 = 1.0;
+/// Pedestrians on a crossing less than this beside a vehicle's path are in its way (m).
+const CROSSWALK_SIDE: f64 = 1.0;
+/// Above this speed (m/s) a vehicle whose front is on a crossing's band goes on over it.
+const CROSSWALK_ROLLING: f64 = 1.0;
 /// Waiting vehicles stop this far (m) before the line.
 const STOP_LINE: f64 = 1.0;
 /// Margin (m) added to both ends of a conflict zone.
@@ -416,6 +438,32 @@ impl LaneIndex {
             sweeps: Arc::new(Sweeps::none(g)),
             learners: Vec::new(),
             ignored: Vec::new(),
+            lane_crossings: {
+                let mut lc = vec![Vec::new(); m];
+                for (k, c) in g.crossings().iter().enumerate() {
+                    for &(l, s) in &c.lanes {
+                        lc[l as usize].push((k as u32, s));
+                    }
+                }
+                lc
+            },
+            crossing_users: vec![Vec::new(); g.crossings().len()],
+            crosswalk_back: (0..m)
+                .map(|l| {
+                    let len = g.lanes()[l].line.length();
+                    (g.crossings().iter().flat_map(|c| &c.lanes))
+                        .filter(|&&(cl, s)| cl as usize == l && s > len - 2.0 * CROSSWALK)
+                        .map(|&(_, s)| (len - (s - 0.5 * CROSSWALK) - STOP_LINE + CROSSWALK_GAP).max(0.0))
+                        .fold(0.0, f64::max)
+                })
+                .collect(),
+        }
+    }
+
+    /// Set the pedestrians on (or committed to) each crossing for this step.
+    pub fn set_crossing_users(&mut self, users: &[Vec<(DVec2, DVec2)>]) {
+        for (mine, u) in self.crossing_users.iter_mut().zip(users) {
+            mine.clone_from(u);
         }
     }
 
@@ -425,9 +473,10 @@ impl LaneIndex {
         self.sweeps = sweeps;
     }
 
-    /// How much farther back than the stop line vehicles wait on `lane` (m).
+    /// How much farther back than the stop line vehicles wait on `lane` (m): clear of long
+    /// vehicles' sweeps and [`CROSSWALK_GAP`] m before a crossing at the lane's end.
     pub fn hold_back(&self, lane: u32) -> f64 {
-        self.sweeps.hold_back[lane as usize]
+        self.sweeps.hold_back[lane as usize].max(self.crosswalk_back[lane as usize])
     }
 
     /// Whether a long vehicle sweeps past the line of `sweep.lane` through connector `c` now or
@@ -1673,12 +1722,12 @@ impl TrafficDriver {
             let mut j = k;
             while let (Some(&(Elem::Lane(l), _)), Some(&(Elem::Connector(c2), base))) =
                 (chain.get(j + 1), chain.get(j + 2))
-                && g.lanes()[l as usize].line.length() < self.room_needed()
+                && !self.can_wait_on(g, index, l)
             {
-                let d2 = base - geo.front - index.hold_back(l);
+                let (d2, back) = (base - geo.front, index.hold_back(l));
                 let (light, left) = signals.light_left(g, c2, t);
-                if self.stops_at(g, c2, d2, v, light, left) {
-                    acc = acc.min(hold(idm, v, d2 - STOP_LINE));
+                if self.stops_at(g, c2, d2, back, v, light, left) {
+                    acc = acc.min(hold(idm, v, d2 - back - STOP_LINE));
                     break;
                 }
                 j += 2;
@@ -1692,12 +1741,18 @@ impl TrafficDriver {
         self.geometry.front - self.geometry.rear + self.idm.min_gap
     }
 
+    /// Whether `lane` is long enough to wait on before its (held back) line.
+    fn can_wait_on(&self, g: &LaneGraph, index: &LaneIndex, lane: u32) -> bool {
+        g.lanes()[lane as usize].line.length() - index.hold_back(lane) >= self.room_needed()
+    }
+
     /// Whether a driver not yet allowed into connector `c`, its front `dl` m before it, stops
-    /// for the `light` there (`left` s): always at red; at amber if comfortable, or when it
-    /// would not get through before red (the reference point crossing the line, no faster
-    /// than the connector allows) and can stop.
-    fn stops_at(&self, g: &LaneGraph, c: u32, dl: f64, v: f64, light: Light, left: f64) -> bool {
-        let need = v * v / (2.0 * (dl - STOP_LINE).max(0.1));
+    /// for the `light` there (`left` s) at its line held `back` m: always at red; at amber if
+    /// comfortable, or when it would not get through before red (the reference point
+    /// crossing the line, no faster than the connector allows) and can stop.
+    #[allow(clippy::too_many_arguments)]
+    fn stops_at(&self, g: &LaneGraph, c: u32, dl: f64, back: f64, v: f64, light: Light, left: f64) -> bool {
+        let need = v * v / (2.0 * (dl - back - STOP_LINE).max(0.1));
         match light {
             Light::Red => true,
             Light::Amber => {
@@ -1724,11 +1779,10 @@ impl TrafficDriver {
         signals: &Signals,
         t: f64,
     ) -> bool {
-        let room = self.room_needed();
         let mut j = k;
         while let (Some(&(Elem::Lane(l), _)), Some(&(Elem::Connector(_), base))) = (chain.get(j + 1), chain.get(j + 2))
         {
-            if g.lanes()[l as usize].line.length() >= room {
+            if self.can_wait_on(g, index, l) {
                 return true;
             }
             let dl = base - self.geometry.front;
@@ -1766,14 +1820,14 @@ impl TrafficDriver {
         let hard = self.spec.safe_decel.max(b);
         let granted = self.granted == Some(c);
         // Deceleration to stop at the line.
-        let dl = dl - index.hold_back(lane);
-        let need = v * v / (2.0 * (dl - STOP_LINE).max(0.1));
+        let back = index.hold_back(lane);
+        let need = v * v / (2.0 * (dl - back - STOP_LINE).max(0.1));
         // (Asked ahead, the light is left out: it only delays.)
         let (light, left) = if ahead { (Light::Green, f64::INFINITY) } else { signals.light_left(g, c, t) };
         match light {
             Light::Red => return granted && need > hard,
             Light::Amber => {
-                if self.stops_at(g, c, dl, v, light, left) {
+                if self.stops_at(g, c, dl, back, v, light, left) {
                     return false;
                 }
                 if granted {
@@ -1782,6 +1836,8 @@ impl TrafficDriver {
             }
             Light::Green => {}
         }
+        // From here on measured from the line.
+        let dl = dl - back;
         if granted {
             return need > b || self.room(index, chain, k, me);
         }
@@ -2082,8 +2138,9 @@ impl TrafficDriver {
             }
         }
 
-        // Junctions, and a bus's stops.
+        // Junctions, crossings, and a bus's stops.
         acc = acc.min(self.junction(g, index, &chain, p, me, v, &idm, signals, t, dt));
+        acc = acc.min(self.crosswalks(g, index, &chain, v, &idm));
         acc = acc.min(self.bus_stop(g, p, v, &idm, dt));
 
         // Lane changes.
@@ -2124,6 +2181,48 @@ impl TrafficDriver {
         let curvature = curvature.clamp(-limit, limit);
         let command = (v + acc.max(-3.0 * b) * SPEED_LAG).max(0.0);
         GroundSetpoint::SpeedCurvature { speed: command, curvature }
+    }
+
+    /// Crossings ahead along `chain` with pedestrians on them (or committed to them) that have
+    /// not passed the lane yet: a standing obstacle [`CROSSWALK_GAP`] m before the band. The
+    /// acceleration they allow (infinite when none); a crossing the front has reached is
+    /// cleared while rolling (not when standing on it), but its users in the vehicle's path (within [`CROSSWALK_SIDE`] m of its sides)
+    /// remain obstacles [`CROSSWALK_GAP`] m ahead of them.
+    fn crosswalks(&self, g: &LaneGraph, index: &LaneIndex, chain: &[(Elem, f64)], v: f64, idm: &Idm) -> f64 {
+        let reach = v * v / (2.0 * self.idm.decel) + 30.0;
+        let mut acc = f64::INFINITY;
+        for &(e, base) in chain {
+            if base > reach {
+                break;
+            }
+            let Elem::Lane(l) = e else { continue };
+            let lane = &g.lanes()[l as usize];
+            for &(c, station) in &index.lane_crossings[l as usize] {
+                let users = &index.crossing_users[c as usize];
+                if users.is_empty() {
+                    continue;
+                }
+                // Users in the way: standing obstacles wherever the front is.
+                let side = self.geometry.half_width + CROSSWALK_SIDE;
+                for &(p, _) in users {
+                    let pr = lane.line.project(p);
+                    let ahead = base + pr.station - self.geometry.front;
+                    if pr.distance < side && ahead > -CROSSWALK_GAP && ahead < reach {
+                        acc = acc.min(idm.accel(v, Some(((ahead - CROSSWALK_GAP).max(0.0), v))));
+                    }
+                }
+                let gap = base + station - 0.5 * CROSSWALK - self.geometry.front - CROSSWALK_GAP;
+                if (gap < -CROSSWALK_GAP && v > CROSSWALK_ROLLING) || gap > reach {
+                    continue;
+                }
+                let at = lane.line.point_at(station).truncate();
+                let clear = 0.5 * lane.width + CROSSWALK_CLEAR;
+                if users.iter().any(|&(p, d)| (at - p).dot(d) > -clear) {
+                    acc = acc.min(idm.accel(v, Some((gap.max(0.0), v))));
+                }
+            }
+        }
+        acc
     }
 
     /// The point `ahead` m on along the chain, shifted towards the lane being left.

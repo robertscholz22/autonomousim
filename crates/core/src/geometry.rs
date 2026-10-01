@@ -36,6 +36,8 @@ pub enum HitKind {
     Foliage(u32),
     /// Another agent (resolved by the simulation, not by static geometry).
     Agent(u32),
+    /// A pedestrian, by index (resolved by the simulation; in the `AGENTS` class).
+    Pedestrian(u32),
 }
 
 /// Set of [`HitKind`] classes a query considers.
@@ -70,7 +72,7 @@ impl HitMask {
             HitKind::Water => Self::WATER,
             HitKind::Solid(_) => Self::SOLID,
             HitKind::Foliage(_) => Self::FOLIAGE,
-            HitKind::Agent(_) => Self::AGENTS,
+            HitKind::Agent(_) | HitKind::Pedestrian(_) => Self::AGENTS,
         }
     }
 }

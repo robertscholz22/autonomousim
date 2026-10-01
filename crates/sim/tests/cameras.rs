@@ -272,3 +272,36 @@ fn invalid_camera_setups_are_rejected() {
         assert!(Scenario::from_toml(&toml).unwrap().compile().is_err(), "{sensor} / {obs}");
     }
 }
+
+#[test]
+fn cameras_see_pedestrians() {
+    gpu();
+    let sc = compile(
+        r#"
+        physics_hz = 500
+        policy_hz = 50
+        map = { type = "urban", seed = 1, count = 1 }
+        [pedestrians]
+        count = 1
+        [[groups]]
+        name = "drone"
+        vehicle = "iris_like"
+        action_mode = "velocity"
+        spawn = { agl = [1.0, 1.0] }
+        sensors = [ { name = "front", type = "camera", width = 32, height = 24, rate_hz = 50, mount = { position = [0.4, 0.0, 0.0] } } ]
+        "#,
+    );
+    let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(1));
+    let p = w.crowd().peds[0].clone();
+    // 3 m behind the pedestrian along the walkway, looking at them.
+    let at = p.pos - 3.0 * glam::DVec2::from_angle(p.heading);
+    let pose = Pose::new(at.extend(p.z + 1.0), DQuat::from_rotation_z(p.heading));
+    w.place_agent(0, pose, DVec3::ZERO, DVec3::ZERO);
+    w.crowd_mut().peds[0].stand_at(p.pos, 100.0);
+    let mut cams = Cameras::new(camera::gpu().unwrap(), &sc);
+    cams.update(&mut w).unwrap();
+    let (_, img) = camera_image(&w, 0, 0).unwrap();
+    let seen = img.class.iter().filter(|&&c| c == SemanticClass::Pedestrian.id()).count();
+    assert!(seen >= 10, "{seen} pedestrian pixels");
+    assert_eq!(img.class[12 * 32 + 16], SemanticClass::Pedestrian.id());
+}

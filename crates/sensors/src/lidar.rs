@@ -143,6 +143,7 @@ pub enum ReturnKind {
     Solid = 3,
     Foliage = 4,
     Agent = 5,
+    Pedestrian = 6,
 }
 
 impl From<HitKind> for ReturnKind {
@@ -153,6 +154,7 @@ impl From<HitKind> for ReturnKind {
             HitKind::Solid(_) => ReturnKind::Solid,
             HitKind::Foliage(_) => ReturnKind::Foliage,
             HitKind::Agent(_) => ReturnKind::Agent,
+            HitKind::Pedestrian(_) => ReturnKind::Pedestrian,
         }
     }
 }

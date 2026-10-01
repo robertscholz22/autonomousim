@@ -7,6 +7,7 @@ use autonomousim_core::rng::Seed;
 use autonomousim_procgen::urban::{self, UrbanPreset};
 use autonomousim_world::lanes::Area;
 use autonomousim_world::signals::MIN_WALK;
+use autonomousim_world::walkways::CONNECTOR_CLEARANCE;
 use autonomousim_world::{Light, PlaceKind, StaticWorld, Turn, WalkKind};
 use glam::DVec3;
 
@@ -63,6 +64,18 @@ fn walkways_connect_the_city_off_the_carriageways() {
                 if e.kind != WalkKind::Path || along > 1.0 {
                     let clear = world.obstacle_clearance(*p + DVec3::Z, 1.0);
                     assert!(clear >= 0.3, "seed {seed}: {:?} {k} at {p}: {clear:.2} m from an obstacle", e.kind);
+                }
+            }
+        }
+
+        // Corners keep clear of the paths through their junctions.
+        for e in w.edges().iter().filter(|e| e.kind == WalkKind::Corner) {
+            let pts = e.line.points();
+            for p in &pts[1..pts.len() - 1] {
+                for c in g.connectors() {
+                    let clear = 0.5 * g.lanes()[c.from as usize].width + CONNECTOR_CLEARANCE;
+                    let d = c.line.project(p.truncate()).distance;
+                    assert!(d >= clear - 1e-6, "seed {seed}: corner at {p} {d:.2} m from a connector");
                 }
             }
         }

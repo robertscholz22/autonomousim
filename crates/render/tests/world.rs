@@ -72,7 +72,7 @@ fn cast(world: &StaticWorld, v: &View, u: f64, w: f64) -> (Thing, SemanticClass,
         HitKind::Solid(i) | HitKind::Foliage(i) => {
             (Thing::Obstacle(i), obstacle_class(&world.obstacle_set().obstacles()[i as usize]), depth)
         }
-        HitKind::Agent(_) => unreachable!("no agents in a static world"),
+        HitKind::Agent(_) | HitKind::Pedestrian(_) => unreachable!("no agents in a static world"),
     };
     (thing, class, depth, cos)
 }

@@ -402,7 +402,8 @@ fn junction_goals_cross_one_junction() {
             }
         }
         let mut done = [false; 3];
-        for _ in 0..800 {
+        // 60 s: time for a red light or two (stop lines are held back behind crossings).
+        for _ in 0..1200 {
             w.step();
             for (k, d) in done.iter_mut().enumerate() {
                 let e = w.agent(k).events;

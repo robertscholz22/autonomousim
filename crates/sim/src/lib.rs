@@ -21,6 +21,7 @@ pub mod interaction;
 pub mod junction;
 pub mod lane;
 pub mod obs;
+pub mod pedestrians;
 pub mod policy;
 pub mod record;
 pub mod rooftop;
@@ -34,6 +35,7 @@ pub use batch::BatchSim;
 pub use driver::{DriverSpec, RoadDriverSpec};
 pub use events::Events;
 pub use obs::{ObsTerm, TermKind};
+pub use pedestrians::{Crowd, PedestrianSpec};
 pub use scenario::{
     CompiledGroup, CompiledScenario, Goal, GroupSpec, HybridSpec, MapSource, PhysicsMode, Scenario, Testworld,
 };

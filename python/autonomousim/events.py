@@ -11,10 +11,10 @@ Event.__doc__ = (
     "Event bits: crashes, water, out of bounds, NaN (terminal), foliage, ground contact, landed, disabled,"
     " goal reached, finished (last goal reached), rollover (terminal), stuck and jackknife (terminal; ground"
     " vehicles), stall (fixed-wing aircraft), and red light, wrong way and off road (ground vehicles on urban"
-    " maps; not terminal)."
+    " maps; not terminal), and pedestrian hit (terminal; vehicles hitting a pedestrian)."
 )
 
-#: Bits that end an episode: crashes, water, out of bounds, NaN, rollover and jackknife.
+#: Bits that end an episode: crashes, water, out of bounds, NaN, rollover, jackknife and pedestrian hit.
 TERMINAL = Event(TERMINAL_EVENTS)
 
 

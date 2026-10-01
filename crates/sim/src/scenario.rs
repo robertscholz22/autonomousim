@@ -45,6 +45,7 @@ use crate::hybrid::CruiseTrim;
 use crate::junction::JunctionGoals;
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
+use crate::pedestrians::{PEDESTRIAN_PERIOD, PedestrianSpec};
 use crate::rooftop::RooftopGoals;
 use autonomousim_control::fixedwing::{FixedWingActionLimits, FixedWingConfig};
 use autonomousim_control::ground::{GroundActionLimits, GroundActionMode, GroundConfig};
@@ -114,6 +115,9 @@ pub struct Scenario {
     /// Per-episode changes to the environment; `None` keeps it fixed.
     pub randomize_environment: Option<EnvironmentRandomization>,
     pub events: EventConfig,
+    /// The crowd of pedestrians (none by default; on maps with a pedestrian network).
+    #[serde(skip_serializing_if = "is_default")]
+    pub pedestrians: PedestrianSpec,
     pub groups: Vec<GroupSpec>,
 }
 
@@ -128,6 +132,7 @@ impl Default for Scenario {
             environment: EnvironmentConfig::default(),
             randomize_environment: None,
             events: EventConfig::default(),
+            pedestrians: PedestrianSpec::default(),
             groups: vec![GroupSpec::default()],
         }
     }
@@ -1168,6 +1173,8 @@ pub struct CompiledScenario {
     pub environment_divider: u32,
     /// Physics steps per step of the kinematic model (see [`KINEMATIC_PERIOD`]).
     pub kinematic_divider: u32,
+    /// Physics steps per update of the crowd (see [`PEDESTRIAN_PERIOD`]).
+    pub pedestrian_divider: u32,
     /// The map pool (one map is drawn per episode) and the content hashes of its maps.
     pub maps: Vec<Arc<StaticWorld>>,
     pub map_hashes: Vec<MapHash>,
@@ -1373,12 +1380,18 @@ impl CompiledScenario {
             .rev()
             .find(|&k| decimation.is_multiple_of(k) && f64::from(k) * clock.dt() <= KINEMATIC_PERIOD + 1e-12)
             .unwrap_or(1);
+        // Likewise for the crowd.
+        let pedestrian_divider = (1..=decimation)
+            .rev()
+            .find(|&k| decimation.is_multiple_of(k) && f64::from(k) * clock.dt() <= PEDESTRIAN_PERIOD + 1e-12)
+            .unwrap_or(1);
         Ok(Self {
             spec,
             clock,
             decimation,
             environment_divider,
             kinematic_divider,
+            pedestrian_divider,
             maps,
             map_hashes,
             episode_maps,

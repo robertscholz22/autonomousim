@@ -59,6 +59,9 @@ pub struct Capture {
     pub image: CameraImage,
 }
 
+/// Colour of pedestrians in camera images (linear RGBA).
+const PEDESTRIAN_COLOR: [f32; 4] = [0.55, 0.32, 0.25, 1.0];
+
 /// Renders the cameras of the worlds of one scenario.
 pub struct Cameras {
     ctx: Arc<GpuContext>,
@@ -75,6 +78,8 @@ pub struct Cameras {
     pads: Vec<f64>,
     /// A pad of unit radius.
     pad: GpuMesh,
+    /// A pedestrian: an upright cylinder of unit radius and height, standing on the origin.
+    pedestrian: GpuMesh,
 }
 
 impl Cameras {
@@ -97,6 +102,11 @@ impl Cameras {
             placements: vec![Vec::new(); scenario.num_agents()],
             pads: scenario.groups.iter().map(|g| g.spec.goals.pad).collect(),
             pad: GpuMesh::new(&ctx, &autonomousim_scene::mesh::landing_pad(1.0), SemanticClass::Marker),
+            pedestrian: GpuMesh::new(
+                &ctx,
+                &autonomousim_scene::mesh::cylinder(1.0, 0.5, 12, PEDESTRIAN_COLOR),
+                SemanticClass::Pedestrian,
+            ),
             ctx,
         }
     }
@@ -140,7 +150,7 @@ impl Cameras {
                     && a.sensors.iter().enumerate().any(|(k, s)| matches!(s, Sensor::Camera(c) if wanted(w, i, k, c)))
             })
         };
-        let Self { ctx, renderer, options, shading, maps, rigs, placements, pads, pad } = self;
+        let Self { ctx, renderer, options, shading, maps, rigs, placements, pads, pad, pedestrian } = self;
         for (w, _) in worlds.iter().filter(|(w, _)| due(w)) {
             let map = &mut maps[w.map_index()];
             if map.is_none() {
@@ -164,6 +174,13 @@ impl Cameras {
                     let r = pads[a.group];
                     Draw::new(pad, DVec3::new(g.x, g.y, h) + 0.02 * n, DQuat::from_rotation_arc(DVec3::Z, n))
                         .with_scale(DVec3::new(r, r, 1.0))
+                })
+                .collect();
+            // Pedestrians: cylinders (the unit mesh is centred on its origin).
+            let pedestrian_draws: Vec<Draw> = (w.crowd().peds.iter())
+                .map(|p| {
+                    Draw::new(pedestrian, p.pos.extend(p.z + 0.5 * p.height), DQuat::from_rotation_z(p.heading))
+                        .with_scale(DVec3::new(p.radius, p.radius, p.height))
                 })
                 .collect();
             for (a, p) in agents.iter().zip(placements.iter_mut()) {
@@ -196,6 +213,7 @@ impl Cameras {
                         map.signal_draws(&view, |c| w.signals().light(lanes, c, t), &mut draws);
                     }
                     draws.extend(pad_draws.iter().copied());
+                    draws.extend(pedestrian_draws.iter().copied());
                     for (j, b) in agents.iter().enumerate().filter(|(_, b)| !b.disabled) {
                         let class = if j == i { SemanticClass::OwnVehicle } else { SemanticClass::Vehicle };
                         rigs[b.group].1.draws(b.vehicle.pose(), &placements[j], class, &mut draws);

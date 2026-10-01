@@ -12,6 +12,7 @@ use crate::events::Events;
 use crate::hybrid::CruiseTrim;
 use crate::interaction::{AgentContacts, AgentGrid, AgentShape, Body, SceneRays, Sphere};
 use crate::obs::{ObsInput, Seen};
+use crate::pedestrians::Pedestrian;
 use crate::scenario::{CompiledGroup, EventConfig, Goal, GroundEventConfig, PhysicsMode, Placement};
 use crate::traffic::{RoadTrack, Signals};
 use autonomousim_control::ground::{GroundEstimate, GroundSetpoint};
@@ -726,7 +727,7 @@ impl Agent {
                 HitKind::Terrain | HitKind::Solid(_) => e |= Events::GROUND_CONTACT,
                 HitKind::Foliage(_) => e |= Events::FOLIAGE,
                 HitKind::Water => e |= Events::WATER,
-                HitKind::Agent(_) => {}
+                HitKind::Agent(_) | HitKind::Pedestrian(_) => {}
             }
         }
         // Landed: at rest, relative to the agent carrying it if any.
@@ -800,13 +801,14 @@ impl Agent {
         world: &StaticWorld,
         env: &EnvState,
         shapes: &[AgentShape],
+        pedestrians: &[Pedestrian],
         index: usize,
     ) {
         if self.disabled || self.sensors.is_empty() {
             return;
         }
         let kin = self.kinematics();
-        let rays = SceneRays { world, agents: shapes, exclude: index };
+        let rays = SceneRays { world, agents: shapes, pedestrians, exclude: index };
         let senv = SensorEnv {
             world,
             rays: &rays,

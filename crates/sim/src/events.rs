@@ -53,6 +53,8 @@ impl Events {
     pub const WRONG_WAY: Self = Self(1 << 17);
     /// A ground vehicle drives on a sidewalk, a median or off the roads (not terminal).
     pub const OFF_ROAD: Self = Self(1 << 18);
+    /// A vehicle hit a pedestrian (see [`pedestrians`](crate::pedestrians)).
+    pub const PEDESTRIAN_HIT: Self = Self(1 << 19);
 
     /// Events after which the vehicle cannot continue.
     pub const TERMINAL: Self = Self(
@@ -63,10 +65,11 @@ impl Events {
             | Self::OUT_OF_BOUNDS.0
             | Self::NAN.0
             | Self::ROLLOVER.0
-            | Self::JACKKNIFE.0,
+            | Self::JACKKNIFE.0
+            | Self::PEDESTRIAN_HIT.0,
     );
 
-    pub const NAMES: [(&'static str, Events); 19] = [
+    pub const NAMES: [(&'static str, Events); 20] = [
         ("crash_terrain", Self::CRASH_TERRAIN),
         ("crash_obstacle", Self::CRASH_OBSTACLE),
         ("crash_agent", Self::CRASH_AGENT),
@@ -86,6 +89,7 @@ impl Events {
         ("red_light", Self::RED_LIGHT),
         ("wrong_way", Self::WRONG_WAY),
         ("off_road", Self::OFF_ROAD),
+        ("pedestrian_hit", Self::PEDESTRIAN_HIT),
     ];
 
     #[inline]

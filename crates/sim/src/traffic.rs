@@ -78,6 +78,13 @@ impl Signals {
         (p, c.light(p, local))
     }
 
+    /// Whether pedestrians may start over crossing `k` at time `t`, and how long that stays
+    /// so (s); None for unsignalized crossings (see [`LaneGraph::crossing_walk`]).
+    pub fn crossing_walk(&self, lanes: &LaneGraph, k: u32, t: f64) -> Option<(bool, f64)> {
+        let (ctl, _) = lanes.crossings()[k as usize].signal?;
+        lanes.crossing_walk(k, t + self.offsets.get(ctl as usize).copied().unwrap_or(0.0))
+    }
+
     /// The light for connector `c` at time `t` (green when it is not signalled).
     pub fn light(&self, lanes: &LaneGraph, c: u32, t: f64) -> Light {
         self.light_left(lanes, c, t).0

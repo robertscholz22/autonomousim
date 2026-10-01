@@ -37,6 +37,10 @@ const MIN_LINE: f64 = 2.0;
 /// Width (m) of paths to entrances and into parks.
 const PATH_WIDTH: f64 = 1.5;
 
+/// Clearance (m) of corners beyond the half width of the connectors through their junction
+/// (vehicles cut tight turns by up to about a metre).
+pub const CONNECTOR_CLEARANCE: f64 = 2.0;
+
 /// What a walkway is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WalkKind {
@@ -335,6 +339,12 @@ impl Walkways {
         // Corners: around each node, from the left walking line of each road end (seen
         // leaving the node) to the right one of the next road end counter-clockwise.
         let mut at_node: Vec<Vec<(f64, u32, bool)>> = vec![Vec::new(); net.nodes().len()];
+        // The connectors through each node, with the clearance kept from their lines.
+        let mut through: Vec<Vec<(u32, f64)>> = vec![Vec::new(); net.nodes().len()];
+        for (k, c) in g.connectors().iter().enumerate() {
+            let clear = 0.5 * g.lanes()[c.from as usize].width + CONNECTOR_CLEARANCE;
+            through[c.node as usize].push((k as u32, clear));
+        }
         for (i, r) in roads.iter().enumerate() {
             let len = r.line.length();
             at_node[r.start as usize].push((r.line.heading_at(0.0), i as u32, true));
@@ -359,19 +369,23 @@ impl Walkways {
                 let (pa, pb) = (out.nodes[na as usize].position.truncate(), out.nodes[nb as usize].position.truncate());
                 let turn = (hb - ha).rem_euclid(TAU);
                 let mut points = corner(centre, pa, ha, pb, hb, turn);
-                // Out of carriageways and the junction's area, away from the node.
+                // Out of carriageways and the junction's area, and clear of the paths through
+                // it (tight turns may cut a corner), away from the node.
                 let last = points.len() - 1;
+                let near = |p: DVec2| {
+                    through[n].iter().any(|&(c, clear)| g.connectors()[c as usize].line.project(p).distance < clear)
+                };
                 for p in &mut points[1..last] {
                     let out = (*p - centre).try_normalize().unwrap_or(DVec2::X);
                     for _ in 0..60 {
-                        if !blocked(net, *p) {
+                        if !blocked(net, *p) && !near(*p) {
                             break;
                         }
                         *p += out * 0.25;
                     }
                 }
                 let points = dense(&points);
-                if points[1..points.len() - 1].iter().any(|&p| blocked(net, p)) {
+                if points[1..points.len() - 1].iter().any(|&p| blocked(net, p) || near(p)) {
                     continue;
                 }
                 let line = Polyline::new(points.into_iter().map(lift).collect());

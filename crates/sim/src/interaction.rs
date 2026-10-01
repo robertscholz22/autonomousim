@@ -9,6 +9,7 @@
 //! goes to their unit's frame). The spheres of trailers and other units behind the towing
 //! unit move with their unit ([`AgentShape::bodies`]), and their forces act on it.
 
+use crate::pedestrians::Pedestrian;
 use autonomousim_core::contact::PenaltyParams;
 use autonomousim_core::geometry::{HitKind, HitMask, Ray, RayHit};
 use autonomousim_core::material::MaterialId;
@@ -537,18 +538,37 @@ impl AgentGrid {
     }
 }
 
-/// Ray targets for one agent's sensors: the static world plus all other active agents.
+/// Ray targets for one agent's sensors: the static world plus all other active agents and
+/// the pedestrians (vertical cylinders).
 pub struct SceneRays<'a> {
     pub world: &'a StaticWorld,
     pub agents: &'a [AgentShape],
+    pub pedestrians: &'a [Pedestrian],
     /// Index of the agent that is sensing (never hits itself).
     pub exclude: usize,
 }
 
 impl RayScene for SceneRays<'_> {
     fn raycast(&self, ray: &Ray, max_toi: f64, mask: HitMask) -> Option<RayHit> {
-        let hit = self.world.raycast(ray, max_toi, mask);
-        if !mask.intersects(HitMask::AGENTS) || self.agents.len() < 2 {
+        let mut hit = self.world.raycast(ray, max_toi, mask);
+        if !mask.intersects(HitMask::AGENTS) {
+            return hit;
+        }
+        for (k, p) in self.pedestrians.iter().enumerate() {
+            let best = hit.map_or(max_toi, |h| h.toi);
+            if let Some((toi, normal)) =
+                ray_cylinder(ray, p.pos.extend(p.z), p.radius, p.height).filter(|h| h.0 <= best)
+            {
+                hit = Some(RayHit {
+                    toi,
+                    point: ray.at(toi),
+                    normal,
+                    material: MaterialId::default(),
+                    kind: HitKind::Pedestrian(k as u32),
+                });
+            }
+        }
+        if self.agents.len() < 2 {
             return hit;
         }
         let mut best = hit.map_or(max_toi, |h| h.toi);
@@ -579,6 +599,43 @@ impl RayScene for SceneRays<'_> {
             None => hit,
         }
     }
+}
+
+/// Entry distance of a ray (unit direction) into an upright cylinder standing on `base`, and
+/// the surface normal there; distance 0 if it starts inside.
+fn ray_cylinder(ray: &Ray, base: DVec3, radius: f64, height: f64) -> Option<(f64, DVec3)> {
+    let (o, d) = (ray.origin - base, ray.dir);
+    let inside = |p: DVec3| p.truncate().length_squared() <= radius * radius;
+    if inside(o) && o.z >= 0.0 && o.z <= height {
+        return Some((0.0, -d));
+    }
+    let mut best: Option<(f64, DVec3)> = None;
+    // The side.
+    let a = d.x * d.x + d.y * d.y;
+    if a > 1e-12 {
+        let b = o.x * d.x + o.y * d.y;
+        let c = o.x * o.x + o.y * o.y - radius * radius;
+        let disc = b * b - a * c;
+        if disc >= 0.0 {
+            let t = (-b - disc.sqrt()) / a;
+            let z = o.z + t * d.z;
+            if t >= 0.0 && (0.0..=height).contains(&z) {
+                let p = o + t * d;
+                best = Some((t, DVec3::new(p.x, p.y, 0.0) / radius));
+            }
+        }
+    }
+    // The caps.
+    for (z, n) in [(height, DVec3::Z), (0.0, DVec3::NEG_Z)] {
+        if d.z.abs() < 1e-12 || (d.z > 0.0) == (n.z > 0.0) {
+            continue;
+        }
+        let t = (z - o.z) / d.z;
+        if t >= 0.0 && inside(o + t * d) && best.is_none_or(|b| t < b.0) {
+            best = Some((t, n));
+        }
+    }
+    best
 }
 
 /// Entry distance of a ray (unit direction) into a sphere; 0 if it starts inside.
@@ -617,7 +674,7 @@ mod tests {
     fn rays_see_other_agents_but_not_themselves() {
         let world = testworlds::flat(100.0);
         let shapes = vec![shape(7, DVec3::new(0.0, 0.0, 5.0)), shape(9, DVec3::new(10.0, 0.0, 5.0))];
-        let scene = SceneRays { world: &world, agents: &shapes, exclude: 0 };
+        let scene = SceneRays { world: &world, agents: &shapes, pedestrians: &[], exclude: 0 };
         let ray = Ray::new(DVec3::new(0.0, 0.0, 5.0), DVec3::X);
         let hit = scene.raycast(&ray, 50.0, HitMask::ALL).unwrap();
         assert_eq!(hit.kind, HitKind::Agent(9));
@@ -628,10 +685,18 @@ mod tests {
         assert!(scene.raycast(&ray, 9.0, HitMask::ALL).is_none());
         let mut off = shapes.clone();
         off[1].active = false;
-        assert!(SceneRays { world: &world, agents: &off, exclude: 0 }.raycast(&ray, 50.0, HitMask::ALL).is_none());
+        assert!(
+            SceneRays { world: &world, agents: &off, pedestrians: &[], exclude: 0 }
+                .raycast(&ray, 50.0, HitMask::ALL)
+                .is_none()
+        );
         // Terrain in front of the agent wins.
         let down = Ray::new(DVec3::new(10.0, 0.0, 20.0), -DVec3::Z);
-        let ground = SceneRays { world: &world, agents: &shapes, exclude: 0 }.raycast(&down, 50.0, HitMask::TERRAIN);
+        let ground = SceneRays { world: &world, agents: &shapes, pedestrians: &[], exclude: 0 }.raycast(
+            &down,
+            50.0,
+            HitMask::TERRAIN,
+        );
         assert_eq!(ground.unwrap().kind, HitKind::Terrain);
     }
 
@@ -731,5 +796,19 @@ mod tests {
         assert_eq!(ray_sphere(&r, DVec3::new(-5.0, 0.0, 0.0), 1.0), None);
         assert_eq!(ray_sphere(&r, DVec3::new(5.0, 2.0, 0.0), 1.0), None);
         assert_eq!(ray_sphere(&r, DVec3::new(0.5, 0.0, 0.0), 1.0), Some(0.0));
+    }
+
+    #[test]
+    fn ray_cylinder_hits_sides_and_caps() {
+        let base = DVec3::new(5.0, 0.0, 0.0);
+        let side = ray_cylinder(&Ray::new(DVec3::new(0.0, 0.0, 1.0), DVec3::X), base, 0.5, 1.8).unwrap();
+        assert!((side.0 - 4.5).abs() < 1e-12 && (side.1 - DVec3::NEG_X).length() < 1e-12);
+        let top = ray_cylinder(&Ray::new(DVec3::new(5.1, 0.0, 10.0), -DVec3::Z), base, 0.5, 1.8).unwrap();
+        assert!((top.0 - 8.2).abs() < 1e-12 && top.1 == DVec3::Z);
+        let under = ray_cylinder(&Ray::new(DVec3::new(5.1, 0.0, -1.0), DVec3::Z), base, 0.5, 1.8).unwrap();
+        assert!((under.0 - 1.0).abs() < 1e-12 && under.1 == DVec3::NEG_Z);
+        assert_eq!(ray_cylinder(&Ray::new(DVec3::new(0.0, 0.0, 2.0), DVec3::X), base, 0.5, 1.8), None);
+        assert_eq!(ray_cylinder(&Ray::new(DVec3::new(0.0, 0.0, 1.0), DVec3::NEG_X), base, 0.5, 1.8), None);
+        assert_eq!(ray_cylinder(&Ray::new(DVec3::new(5.0, 0.0, 1.0), DVec3::X), base, 0.5, 1.8).unwrap().0, 0.0);
     }
 }

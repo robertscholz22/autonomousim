@@ -28,6 +28,7 @@ use crate::interaction::{AgentContactState, AgentContacts, AgentGrid, AgentShape
 use crate::lane;
 use crate::lane::RoadSpawn;
 use crate::obs::{CLEARANCE_RANGE, Seen};
+use crate::pedestrians::Crowd;
 use crate::scenario::{
     CompiledScenario, FixedWingStart, Goal, GoalKind, HelicopterStart, PhysicsMode, SpawnSpec, TiltrotorStart,
 };
@@ -133,6 +134,10 @@ pub struct WorldInstance {
     lane_index: Option<LaneIndex>,
     /// Per group of ground vehicles: its footprint (for the `traffic` term).
     footprints: Vec<Option<DriverGeometry>>,
+    /// The pedestrians.
+    crowd: Crowd,
+    /// Per agent: whether its group learns (respawns keep clear of them).
+    learning: Vec<bool>,
 }
 
 impl WorldInstance {
@@ -160,6 +165,8 @@ impl WorldInstance {
             signals: Signals::default(),
             lane_index: None,
             footprints: scenario.groups.iter().map(|g| g.def.as_wheeled().map(|_| DriverGeometry::of(g))).collect(),
+            crowd: Crowd::default(),
+            learning: scenario.groups.iter().flat_map(|g| std::iter::repeat_n(g.learning(), g.spec.count)).collect(),
             map,
             map_index: 0,
             scenario,
@@ -531,6 +538,7 @@ impl WorldInstance {
             index.set_sweeps(Arc::new(Sweeps::new(lanes, &long)));
             self.lane_index = Some(index);
         }
+        self.crowd.reset(&sc.spec.pedestrians, world, es.child("pedestrians"), &self.shapes);
         self.grid.build(&self.shapes);
     }
 
@@ -681,6 +689,7 @@ impl WorldInstance {
                 }
             }
             index.sort();
+            index.set_crossing_users(self.crowd.crossing_users());
         }
         let mut others = Vec::with_capacity(traffic.len());
         for (i, a) in self.agents.iter_mut().enumerate().filter(|(_, a)| !a.disabled) {
@@ -793,7 +802,20 @@ impl WorldInstance {
 
     /// One physics tick.
     pub fn tick(&mut self) {
-        let Self { scenario, map, env, agents, shapes, contacts, clock, agent_contact_state, .. } = self;
+        let Self {
+            scenario,
+            map,
+            env,
+            agents,
+            shapes,
+            contacts,
+            clock,
+            agent_contact_state,
+            crowd,
+            signals,
+            learning,
+            ..
+        } = self;
         let sc = &**scenario;
         let world = &**map;
         let env = &*env;
@@ -823,12 +845,22 @@ impl WorldInstance {
         }
 
         clock.advance();
+        // The crowd moves at the end of every `pedestrian_divider` ticks.
+        if !crowd.peds.is_empty() && clock.tick.is_multiple_of(u64::from(sc.pedestrian_divider)) {
+            let mut events: Vec<Events> = agents.iter().map(|a| a.events).collect();
+            let dt = sc.dt() * f64::from(sc.pedestrian_divider);
+            crowd.update(&sc.spec.pedestrians, world, signals, clock.time(), dt, shapes, learning, &mut events);
+            for (a, e) in agents.iter_mut().zip(events) {
+                a.events |= e;
+            }
+        }
         if !sc.has_sensors() {
             return;
         }
         let (tick, time) = (clock.tick, clock.time());
         let shapes = &*shapes;
-        let sense = |(i, a): (usize, &mut Agent)| a.sense(tick, time, world, env, shapes, i);
+        let peds = &crowd.peds[..];
+        let sense = |(i, a): (usize, &mut Agent)| a.sense(tick, time, world, env, shapes, peds, i);
         if parallel {
             agents.par_iter_mut().enumerate().for_each(sense);
         } else {
@@ -1012,6 +1044,16 @@ impl WorldInstance {
         self.clock.time()
     }
 
+    /// The pedestrians.
+    pub fn crowd(&self) -> &Crowd {
+        &self.crowd
+    }
+
+    /// The pedestrians, to move by hand (tests, tools).
+    pub fn crowd_mut(&mut self) -> &mut Crowd {
+        &mut self.crowd
+    }
+
     /// The traffic signals of the current map and episode.
     pub fn signals(&self) -> &Signals {
         &self.signals
@@ -1166,6 +1208,7 @@ impl WorldInstance {
                 hash_sensor(s, &mut f);
             }
         }
+        self.crowd.hash_into(&mut f);
         *h.finalize().as_bytes()
     }
 }

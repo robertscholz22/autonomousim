@@ -172,8 +172,9 @@ def test_events():
     assert Event.CRASH_TERRAIN == 1 and Event.DISABLED == 1 << 9 and Event.FINISHED == 1 << 11
     assert Event.ROLLOVER == 1 << 12 and Event.STUCK == 1 << 13 and Event.JACKKNIFE == 1 << 14
     assert TERMINAL == Event.CRASH_TERRAIN | Event.CRASH_OBSTACLE | Event.CRASH_AGENT | Event.WATER | (
-        Event.OUT_OF_BOUNDS | Event.NAN | Event.ROLLOVER | Event.JACKKNIFE
+        Event.OUT_OF_BOUNDS | Event.NAN | Event.ROLLOVER | Event.JACKKNIFE | Event.PEDESTRIAN_HIT
     )
+    assert Event.PEDESTRIAN_HIT == 1 << 19
     assert autonomousim.events.names(int(Event.WATER | Event.LANDED)) == ["water", "landed"]
     # Falling from 2–3 m with the rotors off is a crash.
     sim = make(num_envs=2)
