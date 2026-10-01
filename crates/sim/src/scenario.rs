@@ -42,6 +42,7 @@ use crate::bay::BayGoals;
 use crate::drive::{self, DrivableSpec, DriveGrid};
 use crate::driver::DriverSpec;
 use crate::hybrid::CruiseTrim;
+use crate::junction::JunctionGoals;
 use crate::lane::RouteGoals;
 use crate::obs::{CompiledObs, ObsTerm, default_obs};
 use crate::rooftop::RooftopGoals;
@@ -993,6 +994,14 @@ pub enum GoalKind {
     /// [`RooftopGoals`]; the spawn spec's position settings are ignored, its height settings
     /// and `on_ground` apply). Aerial vehicles on maps with at least two rooftop pads.
     Rooftop,
+    /// One goal per agent: the agents of the group start on different entries of one
+    /// junction or roundabout of an urban map and are to cross it to an exit (see
+    /// [`JunctionGoals`]): each spawns in a lane `distance` m before the entry's end, facing
+    /// along it, and keeps its lane-level route through the junction for the `road` and
+    /// `route` terms (a `traffic` driver flying the group follows it). The spawn spec's
+    /// position settings are ignored. Wheeled single-unit vehicles, at most as many as the
+    /// junction has arms.
+    Junction,
 }
 
 /// Slot layout of `GoalKind::Formation`.
@@ -1037,6 +1046,9 @@ pub struct GoalSpec {
     /// Settings of `GoalKind::Rooftop`.
     #[serde(skip_serializing_if = "is_default")]
     pub rooftop: RooftopGoals,
+    /// Settings of `GoalKind::Junction`.
+    #[serde(skip_serializing_if = "is_default")]
+    pub junction: JunctionGoals,
     /// `Random` goals of ground vehicles: plan the cheapest drivable path from the spawn
     /// through the goals ([`DriveGrid::legs`](crate::drive::DriveGrid::legs), weighted by
     /// `drivable.resistance_cost`). The agent follows the leg to its current goal as its route,
@@ -1083,6 +1095,7 @@ impl Default for GoalSpec {
             route: RouteGoals::default(),
             bay: BayGoals::default(),
             rooftop: RooftopGoals::default(),
+            junction: JunctionGoals::default(),
             path: false,
             off_road: false,
             grade: None,
@@ -1273,9 +1286,11 @@ impl CompiledScenario {
                         g.name
                     )));
                 }
-                if g.spawn.on_road || matches!(g.goals.kind, GoalKind::Bay | GoalKind::Yard | GoalKind::Rooftop) {
+                if g.spawn.on_road
+                    || matches!(g.goals.kind, GoalKind::Bay | GoalKind::Yard | GoalKind::Rooftop | GoalKind::Junction)
+                {
                     return Err(SimError::Scenario(format!(
-                        "group {:?}: `spawn.near` does not go with `on_road` spawns or `bay`, `yard` and `rooftop` goals",
+                        "group {:?}: `spawn.near` does not go with `on_road` spawns or `bay`, `yard`, `rooftop` and `junction` goals",
                         g.name
                     )));
                 }
@@ -1317,6 +1332,16 @@ impl CompiledScenario {
             if episode_maps.is_empty() {
                 return Err(SimError::Scenario(format!(
                     "{parked} vehicles spawn `in_bays`, no map has as many parking bays"
+                )));
+            }
+        }
+        for g in groups.iter().filter(|g| g.spec.goals.kind == GoalKind::Junction) {
+            let (kinds, count) = (&g.spec.goals.junction.kinds, g.spec.count);
+            episode_maps.retain(|&k| crate::junction::sites(&maps[k], kinds).iter().any(|s| s.arms.len() >= count));
+            if episode_maps.is_empty() {
+                return Err(SimError::Scenario(format!(
+                    "group {:?}: `junction` goals for {count} agents need a junction of the kinds {kinds:?} with as many arms, no map has one",
+                    g.spec.name
                 )));
             }
         }
@@ -1518,13 +1543,14 @@ impl CompiledGroup {
             let towing = matches!(d, DriverSpec::Traffic(_));
             let fits = def.as_wheeled().is_some_and(|d| (towing || d.num_units() == 1) && !d.is_single_track());
             let parked = matches!(d, DriverSpec::Parked);
-            let placed = if parked { sp.in_bays } else { sp.on_road };
+            let junction = towing && spec.goals.kind == GoalKind::Junction;
+            let placed = if parked { sp.in_bays } else { sp.on_road || junction };
             if !fits || !placed || spec.goals.kind == GoalKind::Route {
                 return Err(fail(format!(
                     "the `{}` driver drives ground vehicles{} (not two-wheelers) spawned {}, without `route` goals",
                     d.name(),
                     if towing { "" } else { " without trailers" },
-                    if parked { "`in_bays`" } else { "`on_road`" }
+                    if parked { "`in_bays`" } else { "`on_road` (traffic: or with `junction` goals)" }
                 )));
             }
         }
@@ -1569,6 +1595,10 @@ impl CompiledGroup {
         }
         gl.bay.validate().map_err(&fail)?;
         gl.rooftop.validate().map_err(&fail)?;
+        gl.junction.validate().map_err(&fail)?;
+        if gl.kind == GoalKind::Junction && def.as_wheeled().is_none_or(|d| d.num_units() > 1) {
+            return Err(fail("`junction` goals need a ground vehicle without trailers".into()));
+        }
         if gl.kind == GoalKind::Bay && family != Family::Wheeled {
             return Err(fail("`bay` goals need a ground vehicle".into()));
         }
@@ -1985,7 +2015,8 @@ impl GoalSpec {
             | GoalKind::Route
             | GoalKind::Bay
             | GoalKind::Yard
-            | GoalKind::Rooftop => {
+            | GoalKind::Rooftop
+            | GoalKind::Junction => {
                 vec![Goal { position: spawn.pos, yaw: yaw(spawn.rot) }]
             }
             GoalKind::Random => {

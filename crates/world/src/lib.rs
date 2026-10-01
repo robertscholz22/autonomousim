@@ -18,7 +18,7 @@ pub use heightgrid::HeightGrid;
 pub use lanes::{Area, Connector, Junction, JunctionKind, Lane, LaneGraph, Turn};
 pub use mapfile::{MapFileError, MapHash};
 pub use obstacles::{Obstacle, ObstacleClass, ObstacleSet, ObstacleShape};
-pub use roads::{NodeKind, Polyline, Road, RoadClass, RoadNetwork, RoadNode, Route, Section};
+pub use roads::{NodeKind, Polyline, Road, RoadClass, RoadNetwork, RoadNode, RoadPoint, Route, Section};
 pub use signals::{Controller, Light, Phase};
 pub use sites::{BayKind, Building, Lot, Pad, ParkingBay, Roof, Sites, Zone};
 pub use static_world::{MapMeta, MapObstacles, MapTerrain, StaticWorld};

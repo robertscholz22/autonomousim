@@ -408,6 +408,29 @@ impl RoadNetwork {
         })
     }
 
+    /// The nearest point of every road within `max_dist` of `p`, in road order (into `out`,
+    /// cleared first).
+    pub fn nearest_each(&self, p: DVec2, max_dist: f64, out: &mut Vec<RoadPoint>) {
+        let mut best: Vec<(u32, u32, f64, f64)> = Vec::new();
+        self.grid.visit(p, max_dist, &mut |road, seg| {
+            let (s, d2) = self.roads[road as usize].line.project_segment(seg as usize, p);
+            if d2 <= max_dist * max_dist {
+                match best.iter_mut().find(|b| b.0 == road) {
+                    Some(b) if d2 < b.3 || (d2 == b.3 && seg < b.1) => *b = (road, seg, s, d2),
+                    Some(_) => {}
+                    None => best.push((road, seg, s, d2)),
+                }
+            }
+            max_dist
+        });
+        best.sort_unstable_by_key(|b| b.0);
+        out.clear();
+        out.extend(best.into_iter().map(|(road, seg, s, _)| RoadPoint {
+            road,
+            projection: self.roads[road as usize].line.projection(seg as usize, s, p),
+        }));
+    }
+
     /// The road whose surface contains `p`, if any (the nearest one when several do).
     pub fn on_road(&self, p: DVec2) -> Option<RoadPoint> {
         let max_half = self.roads.iter().map(|r| 0.5 * r.width).fold(0.0, f64::max);

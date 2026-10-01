@@ -18,6 +18,7 @@ pub mod driver;
 pub mod events;
 pub mod hybrid;
 pub mod interaction;
+pub mod junction;
 pub mod lane;
 pub mod obs;
 pub mod policy;

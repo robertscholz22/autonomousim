@@ -352,3 +352,71 @@ fn signals_offsets_terms_and_recording() {
     let r = Recording::read(&path).unwrap();
     assert_eq!(r.episodes[0].signal_offsets, first.offsets());
 }
+
+/// Junction goals: the agents spawn on different arms of one junction (or roundabout) in a
+/// lane facing along it, each with a route through the junction to a goal on another road; a
+/// traffic driver flying the group follows the routes and, giving way to the others, brings
+/// (nearly) every car to its goal without a crash. Sites leave out signals.
+#[test]
+fn junction_goals_cross_one_junction() {
+    let sc = compile(
+        r#"
+        policy_hz = 20
+        map = { type = "urban", seed = 2, count = 2 }
+        [[groups]]
+        name = "cars"
+        count = 3
+        vehicle = "sedan_like"
+        driver = { type = "traffic", respawn = 0.0 }
+        goals = { kind = "junction", distance = [15.0, 35.0], radius = 3.0 }
+        "#,
+    );
+    let maps = &sc.maps;
+    let sites: Vec<_> =
+        maps.iter().map(|m| autonomousim_sim::junction::sites(m, &sc.groups[0].spec.goals.junction.kinds)).collect();
+    assert!(sites.iter().all(|s| !s.is_empty()));
+    for s in sites.iter().flatten() {
+        assert!(s.arms.len() >= 2 && !s.exits.is_empty());
+    }
+    let (mut reached, mut total) = (0, 0);
+    for seed in 0..8 {
+        let mut w = WorldInstance::new(sc.clone(), Seed::from_u64(seed));
+        for k in 0..3 {
+            let a = w.agent(k);
+            let route = a.route.as_ref().expect("a route through the junction");
+            let p = a.vehicle.position().truncate();
+            let goal = a.goals[0].position.truncate();
+            // Starts on its route, facing along it; the goal ends it.
+            assert!(route.project(p).distance < 0.5, "seed {seed} agent {k}");
+            let heading = route.heading_at(0.0);
+            let yaw = autonomousim_core::math::quat::yaw(a.vehicle.pose().rot);
+            assert!(wrap_angle(yaw - heading).abs() < 0.1);
+            assert!(route.point_at(route.length()).truncate().distance(goal) < 1e-6);
+            assert!((15.0..120.0).contains(&p.distance(goal)), "seed {seed} agent {k}: {}", p.distance(goal));
+        }
+        // Apart, on different arms.
+        for i in 0..3 {
+            for j in i + 1..3 {
+                let (pi, pj) = (w.agent(i).vehicle.position(), w.agent(j).vehicle.position());
+                assert!(pi.distance(pj) > 5.0, "seed {seed}: agents {i} and {j} start {:.1} m apart", pi.distance(pj));
+            }
+        }
+        let mut done = [false; 3];
+        for _ in 0..800 {
+            w.step();
+            for (k, d) in done.iter_mut().enumerate() {
+                let e = w.agent(k).events;
+                assert!(*d || !e.is_terminal(), "seed {seed} agent {k}: {e:?}");
+                if e.contains(Events::FINISHED) && !*d {
+                    *d = true;
+                    reached += 1;
+                }
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+        }
+        total += 3;
+    }
+    assert!(reached * 10 >= total * 9, "{reached} of {total} reached their goals");
+}

@@ -190,15 +190,45 @@ fn check_invariants(c: &UrbanConfig, seed: u64) {
             let grade = (w2[1].z - w2[0].z).abs() / ds;
             assert!(grade <= class.max_grade + 1e-6, "seed {seed} road {k}: grade {grade:.3} at {}", w2[0]);
         }
-        // The terrain follows the carriageway, which is asphalt.
+        // The terrain follows the carriageway, which is asphalt (in and near junctions, where
+        // the surface turns from one road's height to another's, more loosely).
         for s in [0.3 * len, 0.5 * len, 0.7 * len] {
             let p = line.point_at(s);
-            assert!((t.height(p.x, p.y) - p.z).abs() < 0.1, "seed {seed} road {k}: surface off at {p}");
+            let near_junction = net
+                .lanes()
+                .junctions()
+                .iter()
+                .any(|j| nodes[j.node as usize].position.truncate().distance(p.truncate()) < j.radius + 10.0);
+            let tolerance = if near_junction { 1.0 } else { 0.1 };
+            assert!((t.height(p.x, p.y) - p.z).abs() < tolerance, "seed {seed} road {k}: surface off at {p}");
             if net.on_road(p.truncate()).is_some_and(|rp| rp.road as usize == k) {
                 assert_eq!(t.material(p.x, p.y), MaterialId::ASPHALT, "seed {seed} road {k} at {p}");
             }
         }
     }
+
+    // Through junctions the ground is smooth: hardly any steep stretches along the connectors
+    // and no steps (some remain where a road passes a junction's area at another height).
+    let (mut steep, mut samples) = (0, 0);
+    for (k, conn) in net.lanes().connectors().iter().enumerate() {
+        let line = &conn.line;
+        let n = (line.length() / 0.5).ceil() as usize;
+        let h = |i: usize| {
+            let p = line.point_at(line.length() * i as f64 / n as f64);
+            t.height(p.x, p.y)
+        };
+        for i in 0..n {
+            let grade = (h(i + 1) - h(i)).abs() / (line.length() / n as f64);
+            assert!(
+                grade < 0.8,
+                "seed {seed} connector {k}: grade {grade:.2} at {}",
+                line.point_at(line.length() * i as f64 / n as f64)
+            );
+            steep += usize::from(grade > 0.2);
+            samples += 1;
+        }
+    }
+    assert!(steep * 50 < samples, "seed {seed}: {steep} of {samples} connector samples steeper than 0.2");
 }
 
 #[test]

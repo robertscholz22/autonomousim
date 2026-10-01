@@ -9,6 +9,7 @@ from autonomousim.tasks.fixed_wing_waypoints import FixedWingWaypoints
 from autonomousim.tasks.heli_landing_zone import HeliLandingZone
 from autonomousim.tasks.hover import QuadHover
 from autonomousim.tasks.hover_pad import QuadHoverPad
+from autonomousim.tasks.intersection import IntersectionMulti, JunctionCar
 from autonomousim.tasks.land_on_car import DroneLandOnCar
 from autonomousim.tasks.motorcycle_road import MotorcycleRoadRural
 from autonomousim.tasks.multi import MultiAgentTask, Team
@@ -66,6 +67,8 @@ __all__ = [
     "FixedWingWaypoints",
     "FormationHover",
     "HeliLandingZone",
+    "IntersectionMulti",
+    "JunctionCar",
     "MotorcycleRoadRural",
     "MultiAgentTask",
     "ParkingPilot",

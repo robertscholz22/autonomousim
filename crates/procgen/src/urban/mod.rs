@@ -9,12 +9,15 @@
 //!    rural roads beyond the city) and a ring road, the grids, organic streets grown from the
 //!    arterials and collectors, a clean-up, roundabouts.
 //! 4. Roads: the graph's chains between junctions (and changes of class or street), smoothed
-//!    within their class's minimum radius, with a cross-section per street and class (lanes,
+//!    within their class's minimum radius (or, where that strays from the street graph,
+//!    with each corner filleted), with a cross-section per street and class (lanes,
 //!    median, bike and parking lanes, sidewalks) drawn from the street's own random stream.
 //! 5. Road profiles as for rural maps: terrain heights along each road, smoothed, pinned to the
 //!    node heights and limited to the class's maximum grade.
 //! 6. Terrain blending: carriageways (with a crown) and sidewalks (flat, level with the
-//!    carriageway's edge) are cut or filled into the terrain, with shoulders beyond.
+//!    carriageway's edge) are cut or filled into the terrain, with shoulders beyond. Junctions
+//!    are paved over as far as their lanes leave free (the area their connectors cross), and
+//!    where roads meet the surface turns smoothly from one road's height to the next.
 //! 7. Materials per cell: asphalt carriageways, concrete sidewalks, lake beds, rock on steep
 //!    slopes, grass in the city and field parcels in the countryside.
 //!
@@ -34,7 +37,7 @@ use autonomousim_core::material::{MaterialId, MaterialTable};
 use autonomousim_core::rng::{Seed, SimRng};
 use autonomousim_world::{
     BayKind, GeoOrigin, HeightGrid, MapMeta, NodeKind, ObstacleSet, Polyline, Road, RoadClass, RoadNetwork, RoadNode,
-    Section, StaticWorld, Zone,
+    RoadPoint, Section, StaticWorld, Zone,
 };
 use glam::DVec2;
 use graph::{Graph, NodeId};
@@ -46,7 +49,7 @@ use std::f64::consts::TAU;
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const URBAN_VERSION: u32 = 4;
+pub const URBAN_VERSION: u32 = 5;
 
 /// The city's outline and ground.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -820,13 +823,14 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
                 arc(ring, p.points[0], *p.points.last().expect("points"))
             } else if p.points.len() > 2 {
                 // Round the corners as widely as the smoothing stays near the graph's chain (it
-                // must not meet another street); tighter radii first, the raw chain last.
+                // must not meet another street); tighter radii first, then each corner on its
+                // own as widely as it may.
                 let r = k.class(p.class).min_radius;
                 [r, 0.5 * r, 0.25 * r, 8.0]
                     .into_iter()
                     .map(|r| smooth_path(&p.points, r))
-                    .find(|smooth| smooth.iter().all(|&q| distance_to(&p.points, q) < 2.5))
-                    .unwrap_or_else(|| resample(&p.points, 1.0))
+                    .find(|smooth| smooth.iter().all(|&q| distance_to(&p.points, q) < CHAIN_DEVIATION))
+                    .unwrap_or_else(|| resample(&fillet(&p.points, r, CHAIN_DEVIATION - 0.1), 1.0))
             } else {
                 resample(&p.points, 1.0)
             };
@@ -965,6 +969,40 @@ pub fn generate(config: &UrbanConfig, seed: u64) -> Result<(StaticWorld, UrbanSt
         .with_sites(built.sites);
     stats.stage("obstacle index", &mut t);
     Ok((world, stats))
+}
+
+/// Farthest a road's line may run from its chain in the street graph (m).
+const CHAIN_DEVIATION: f64 = 2.5;
+
+/// `path` with each corner rounded by a circular arc (points about 1 m apart) of radius
+/// `radius`, or less where the arc would come more than `deviation` from the corner or need
+/// more than half of a neighbouring segment.
+fn fillet(path: &[DVec2], radius: f64, deviation: f64) -> Vec<DVec2> {
+    let mut out = vec![path[0]];
+    for i in 1..path.len() - 1 {
+        let (a, p, b) = (path[i - 1], path[i], path[i + 1]);
+        let (d1, d2) = ((p - a).normalize_or_zero(), (b - p).normalize_or_zero());
+        let turn = d1.perp_dot(d2).atan2(d1.dot(d2));
+        let half = 0.5 * turn.abs();
+        if half < 1e-3 || half > 0.5 * std::f64::consts::PI - 1e-3 {
+            out.push(p);
+            continue;
+        }
+        // Deviation from the corner r(1/cos − 1); tangent length r·tan.
+        let room = 0.5 * a.distance(p).min(p.distance(b));
+        let r = radius.min(deviation / (1.0 / half.cos() - 1.0)).min(room / half.tan());
+        let t = r * half.tan();
+        let start = p - d1 * t;
+        let centre = start + d1.perp() * r * turn.signum();
+        let steps = ((r * turn.abs()).ceil() as usize).max(1);
+        let from = (start - centre).to_angle();
+        for k in 0..=steps {
+            let phi = from + turn * k as f64 / steps as f64;
+            out.push(centre + DVec2::from_angle(phi) * r);
+        }
+    }
+    out.push(*path.last().expect("a path"));
+    out
 }
 
 /// Distance from `q` to the polyline `line`.
@@ -1111,26 +1149,74 @@ fn reach_nodes(c: &UrbanConfig, pieces: &[Piece], lengths: &[f64], node_z: &mut 
 
 /// Cut and fill the roads into the terrain: the carriageway with its crown, the sidewalks
 /// flat at the carriageway's edge height, then a shoulder falling off to the terrain.
+/// Distance (m) beyond the nearest carriageway over which the surfaces of other roads blend
+/// into its own.
+const JUNCTION_BLEND: f64 = 8.0;
+
+/// Added to the distances (m) by which the road surfaces are weighted where roads meet: the
+/// larger, the more gently the surface turns from one road's height to another's.
+const JUNCTION_SOFTEN: f64 = 3.0;
+
 fn blend(c: &UrbanConfig, heights: &mut [f32], n: usize, origin: DVec2, net: &RoadNetwork, max_half: f64) {
     let s = &c.streets;
     let reach = max_half + 0.5 + s.shoulder.max(15.0);
+    // The junctions' areas (the discs the lanes leave free, crossed by their connectors) are
+    // kept at road level like the carriageways.
+    let junctions: Vec<(DVec2, f64)> = net
+        .lanes()
+        .junctions()
+        .iter()
+        .map(|j| (net.nodes()[j.node as usize].position.truncate(), j.radius + 1.0))
+        .collect();
+    // The surface of a road at a point, crowned.
+    let surface = |rp: &RoadPoint| {
+        let r = &net.roads()[rp.road as usize];
+        rp.projection.point.z - c.classes.class(r.class).crown * rp.projection.distance.min(0.5 * r.width)
+    };
     heights.par_chunks_mut(n).enumerate().for_each(|(iy, row)| {
         let y = origin.y + iy as f64 * c.cell;
+        let mut near = Vec::new();
         for (ix, h) in row.iter_mut().enumerate() {
             let p = DVec2::new(origin.x + ix as f64 * c.cell, y);
-            let Some(rp) = net.nearest(p, reach) else { continue };
-            let road = &net.roads()[rp.road as usize];
-            let section = net.section(rp.road as usize);
-            let crown = c.classes.class(road.class).crown;
-            let half = 0.5 * road.width;
-            let pr = rp.projection;
-            let target = pr.point.z - crown * pr.distance.min(half);
-            // Left of the road (positive offsets) is the right of travel against it.
-            let sidewalk = section.sidewalk[usize::from(pr.offset > 0.0)];
-            let flat = half + sidewalk + 0.5;
+            net.nearest_each(p, reach, &mut near);
+            if near.is_empty() {
+                continue;
+            }
+            // Distance beyond each road's carriageway, and beyond its flat band (carriageway,
+            // the sidewalk on that side and half a metre); the left of a road (positive
+            // offsets) is the right of travel against it.
+            let beyond = |q: &RoadPoint| q.projection.distance - 0.5 * net.roads()[q.road as usize].width;
+            let flat = |q: &RoadPoint| {
+                let sidewalk = net.section(q.road as usize).sidewalk[usize::from(q.projection.offset > 0.0)];
+                beyond(q) - sidewalk - 0.5
+            };
+            // The target: the nearest carriageway's surface; in and around junctions (fading
+            // out over `JUNCTION_BLEND` beyond their areas), the roads' surfaces weighted by
+            // the inverse square of the distance to their carriageways (plus
+            // `JUNCTION_SOFTEN`), each faded out from the nearest carriageway's distance to
+            // `JUNCTION_BLEND` beyond it, so that it runs smoothly from one road to the next.
+            let area = junctions.iter().map(|&(c, r)| p.distance(c) - r).fold(f64::INFINITY, f64::min);
+            let mix = 1.0 - smoothstep(0.0, JUNCTION_BLEND, area);
+            let nearest = near
+                .iter()
+                .min_by(|a, b| {
+                    (a.projection.distance, a.road).partial_cmp(&(b.projection.distance, b.road)).expect("finite")
+                })
+                .expect("a road");
+            let edge = beyond(nearest).max(0.0);
+            let (mut sum, mut total) = (0.0, 0.0);
+            for q in &near {
+                let b = beyond(q).max(0.0);
+                let share = if q.road == nearest.road { 1.0 } else { mix };
+                let w = share * (1.0 - smoothstep(0.0, JUNCTION_BLEND, b - edge)) / (b + JUNCTION_SOFTEN).powi(2);
+                sum += w * surface(q);
+                total += w;
+            }
+            let target = sum / total;
+            let inside = area.min(near.iter().map(flat).fold(f64::INFINITY, f64::min));
             let h0 = f64::from(*h);
             let shoulder = s.shoulder.max(1.5 * (target - h0).abs());
-            let w = 1.0 - smoothstep(flat, flat + shoulder, pr.distance);
+            let w = 1.0 - smoothstep(0.0, shoulder, inside);
             *h = (h0 + w * (target - h0)) as f32;
         }
     });

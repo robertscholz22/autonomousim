@@ -879,6 +879,8 @@ pub struct TrafficDriver {
     network: Option<Arc<Network>>,
     /// The next connectors to take (up to two).
     pub plan: Vec<u32>,
+    /// Connectors to take before choosing at random, in order (see [`TrafficDriver::take_route`]).
+    pub fixed: Vec<u32>,
     pub change: Option<LaneChange>,
     /// Time since the last lane change ended (s), and waiting at a lane's end (s).
     pub since_change: f64,
@@ -949,6 +951,7 @@ impl TrafficDriver {
             trail: Vec::new(),
             network: None,
             plan: Vec::new(),
+            fixed: Vec::new(),
             change: None,
             since_change: COOLDOWN,
             stuck: 0.0,
@@ -1016,6 +1019,7 @@ impl TrafficDriver {
         self.place = None;
         self.trail.clear();
         self.plan.clear();
+        self.fixed.clear();
         self.change = None;
         self.since_change = COOLDOWN;
         self.stuck = 0.0;
@@ -1037,6 +1041,15 @@ impl TrafficDriver {
             self.plan.clear();
             self.fill_plan(g, world);
         }
+    }
+
+    /// Take `connectors` next, in order (each, or the same movement from the lane it is
+    /// in; [`TrafficDriver::equivalent`]), then choose at random again (e.g. a junction
+    /// crossing's route; see [`GoalKind::Junction`](crate::scenario::GoalKind::Junction)).
+    pub fn take_route(&mut self, connectors: &[u32], world: &StaticWorld) {
+        self.fixed = connectors.to_vec();
+        self.plan.clear();
+        self.fill_plan(world.roads().lanes(), world);
     }
 
     /// A new loop for a bus from `lane` (see [`BusRoute`]).
@@ -1392,6 +1405,12 @@ impl TrafficDriver {
                     fresh = true;
                 }
             }
+        }
+        while self.plan.len() < 2 && !self.fixed.is_empty() {
+            let c = self.fixed.remove(0);
+            let c = Self::equivalent(g, c, lane, &|c| self.allowed(c)).unwrap_or(c);
+            self.plan.push(c);
+            lane = g.connectors()[c as usize].to;
         }
         while self.plan.len() < 2 {
             let Some(c) = self.choose(g, world, lane, false) else { break };

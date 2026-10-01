@@ -220,6 +220,7 @@ impl WorldInstance {
             }
             let mut bays = Vec::new();
             let mut trips = Vec::new();
+            let mut crossings = Vec::new();
             let (positions, mut road_spawns) = if bay_goals {
                 // Spawn and goal in a farm yard or at a parking bay.
                 let d = g.def.as_wheeled().expect("bay goals are for ground vehicles");
@@ -278,6 +279,26 @@ impl WorldInstance {
                 }
                 let n = p.len();
                 (p, (0..n).map(|_| None).collect::<Vec<_>>())
+            } else if g.spec.goals.kind == GoalKind::Junction {
+                // On different entries of one junction, routed through it.
+                let d = g.def.as_wheeled().expect("junction goals are for ground vehicles");
+                let sites = crate::junction::sites(world, &g.spec.goals.junction.kinds);
+                crossings = crate::junction::sample(world, &sites, &g.spec.goals, g.spec.count, lift, &mut goal_rng)
+                    .expect("maps of junction goals have a junction with enough arms");
+                let mut p = Vec::with_capacity(crossings.len());
+                let mut rs = Vec::with_capacity(crossings.len());
+                for c in &crossings {
+                    let pose = ground_pose(world, d, &g.rest, c.position.truncate(), c.yaw);
+                    placed.push(pose.pos);
+                    p.push(pose.pos);
+                    rs.push(Some(RoadSpawn {
+                        position: pose.pos,
+                        yaw: c.yaw,
+                        route: Some(c.route.clone()),
+                        walk: None,
+                    }));
+                }
+                (p, rs)
             } else if spawn.in_bays {
                 // Parked: centred in distinct random bays, facing along them.
                 let d = g.def.as_wheeled().expect("checked when compiled");
@@ -444,6 +465,7 @@ impl WorldInstance {
                 let goals = match (formation.next(), &route) {
                     _ if bay_goals => vec![bays[k].goal],
                     _ if !trips.is_empty() => vec![trips[k]],
+                    _ if !crossings.is_empty() => vec![crossings[k].goal],
                     (Some(slot), _) => vec![slot],
                     (None, Some(lane)) => lane::route_goals(world, lane, g.spec.goals.route.step, lift),
                     (None, None) => g.spec.goals.sample(world, &placement.pose, ground, &mut goal_rng),
@@ -491,6 +513,9 @@ impl WorldInstance {
                     Some(Driver::Traffic(d)) => {
                         d.set_network(network.clone());
                         d.reset(seed.child("driver"), world, &agent.vehicle.pose());
+                        if let Some(c) = crossings.get(k) {
+                            d.take_route(&c.connectors, world);
+                        }
                     }
                     Some(Driver::Parked) | None => {}
                 }
