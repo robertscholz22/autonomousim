@@ -27,8 +27,9 @@
 //!
 //! **Junctions**: from [`DECIDE`] m (or its braking distance) before the end of its lane, a
 //! driver asks whether it may enter its next connector; until it may, the stop line is a
-//! standing obstacle. It may not on red, on amber when it can stop comfortably or would not
-//! clear the line before red, at a stop sign before having stopped at the line, without
+//! standing obstacle (or, when it can no longer stop there, the junction's edge). It may not
+//! on red, on amber when it can stop comfortably or would not clear the line before red (at
+//! the speed it plans, bends beyond included), at a stop sign before having stopped at the line, without
 //! room for itself beyond the junction (unless the vehicle there moves on), or when a
 //! conflicting connector is taken: a vehicle on it, or one granted it, passes through the
 //! conflict zone (the conflict's stretch of both connectors, with a [`ZONE`] m margin) less
@@ -77,6 +78,26 @@
 //! [`CROSSWALK_CLEAR`] m; a crossing its front has reached is cleared once rolling (over
 //! [`CROSSWALK_ROLLING`]), but pedestrians in its path stay obstacles. Stop lines of lanes
 //! ending at a crossing are set back behind the band.
+//!
+//! **Cyclists** (single-track vehicles, M8c) keep right: in a bike lane where there is one,
+//! else [`CYCLIST_EDGE`] m from their lane's right edge ([`keep_right`]; on connectors blended
+//! from the lane before to the lane after), and take connectors from their own lane only,
+//! without discretionary lane changes. A cyclist and a car (or two cyclists) beside each other
+//! in a lane are no leader for each other when they lie clear by [`PASS_CLEAR`] m
+//! ([`CYCLIST_CLEAR`] m) and the lane does not end within [`PASS_END`] m. Cyclists, who lean
+//! late and cannot lean hard, also brake to each bend's speed (from the curvature of the
+//! offset path, with a margin, and by the speed loop's lag early), look farther ahead
+//! ([`CYCLIST_LOOKAHEAD`] + [`CYCLIST_PREVIEW`] s), ride off briskly from a standstill and take
+//! no bend slower than [`CYCLIST_START`] (at walking pace they ride on their feet, wobble and
+//! on grades roll back).
+//!
+//! **Overtaking**: on a road with one lane each way and no median, a car closing in on a
+//! cyclist shifts left by what it takes to pass it [`PASS_CLEAR`] m clear (at most a lane
+//! width) when the pass, simulated at its speed, ends [`PASS_END`] m before the lane's end
+//! without a crossing on the way, the oncoming lane (and the elements leading into it) stays
+//! clear of traffic at up to [`ONCOMING`] times the limit for the pass and [`PASS_MARGIN`] s
+//! more, and there is room ahead to return; it shifts back (at [`SHIFT_RATE`]) once
+//! [`PASS_GAP`] m past.
 //!
 //! **Buses** (`bus`) drive a loop with stops instead of at random (see [`BusRoute`]).
 //!
@@ -140,6 +161,9 @@ pub struct TrafficDriverSpec {
     /// Probability (0–1) that the driver notices a learning agent on the lanes, drawn per
     /// encounter; one not noticed is not there for it (0: oblivious).
     pub attention: f64,
+    /// Desired speed (m/s), where lower than `speed_factor` of the limit (cyclists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<[f64; 2]>,
 }
 
 /// A bus line of a `traffic` driver (see [`BusRoute`]).
@@ -181,6 +205,7 @@ impl Default for TrafficDriverSpec {
             respawn_clear: 100.0,
             bus: None,
             attention: 1.0,
+            speed: None,
         }
     }
 }
@@ -209,6 +234,7 @@ impl TrafficDriverSpec {
             && self.respawn >= 0.0
             && self.respawn_clear >= 0.0
             && (0.0..=1.0).contains(&self.attention)
+            && self.speed.is_none_or(|s| range(s, 0.0) && s[1] > 0.0)
             && self.bus.as_ref().is_none_or(|b| {
                 range(b.length, 0.0) && b.length[1] > 0.0 && b.stop_spacing > 0.0 && range(b.dwell, 0.0)
             });
@@ -331,6 +357,47 @@ pub struct Occupant {
     /// Whether this entry is its tail on an element behind its place (`station` counted on
     /// from there, past the element's end).
     pub tail: bool,
+    /// Its lateral offset from the element's line (m, positive to the left; drivers: where
+    /// they steer to), and whether it is a two-wheeler.
+    pub offset: f64,
+    pub cyclist: bool,
+}
+
+/// A driver's lateral extent, for passing occupants of its lane beside it (see
+/// [`LaneIndex::ahead`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Side {
+    offset: f64,
+    half_width: f64,
+    cyclist: bool,
+    /// Occupants from this station on are passed by no one (m), but the one being overtaken.
+    until: f64,
+    overtaken: Option<u32>,
+}
+
+impl Side {
+    /// Whether occupant `o` lies clear beside: by [`PASS_CLEAR`] m (two cyclists:
+    /// [`CYCLIST_CLEAR`] m) where one of the two is a cyclist; cars do not pass each other in
+    /// a lane.
+    fn passes(&self, o: &Occupant) -> bool {
+        let clear = match (self.cyclist, o.cyclist) {
+            (false, false) => return false,
+            (true, true) => CYCLIST_CLEAR,
+            _ => PASS_CLEAR,
+        };
+        !o.tail
+            && (o.station < self.until || self.overtaken == Some(o.agent))
+            && (o.offset - self.offset).abs() >= o.half_width + self.half_width + clear
+    }
+}
+
+/// Passing a slow cyclist on a road with one lane each way: shifted partly into the oncoming
+/// lane (see [`TrafficDriver::overtaking`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Overtake {
+    pub agent: u32,
+    /// Lateral offset (m, to the left of the lane line) passing it.
+    pub shift: f64,
 }
 
 /// A connector in [`Occupant::next`] that is not known.
@@ -347,6 +414,9 @@ pub struct Grant {
     pub length: f64,
     /// Whether it is a long vehicle (it sweeps a band; see [`Sweeps`]).
     pub long: bool,
+    /// Its acceleration (m/s²) and the speed it plans (m/s), for when it is through.
+    pub accel: f64,
+    pub v0: f64,
 }
 
 /// The agents on each lane and connector, sorted by station (then agent), rebuilt each
@@ -369,10 +439,45 @@ pub struct LaneIndex {
     crossing_users: Vec<Vec<(DVec2, DVec2)>>,
     /// Per lane: the setback of its stop line behind a crossing at its end (m).
     crosswalk_back: Vec<f64>,
+    /// Per lane that is the only one of its direction: the oncoming lane beside it (no median).
+    opposite: Vec<Option<u32>>,
 }
 
 /// Search range for leaders and followers (m).
 const SEARCH: f64 = 200.0;
+/// Clearance (m) of cars passing cyclists (and cyclists cars) beside them in a lane, and of
+/// cyclists passing each other.
+pub const PASS_CLEAR: f64 = 1.0;
+const CYCLIST_CLEAR: f64 = 0.3;
+/// No one passes beside others in a lane within this distance of its end (m), nor overtakes
+/// into it.
+pub const PASS_END: f64 = 30.0;
+/// A cyclist rides this far from its lane's right edge without a bike lane (m), and in a bike
+/// lane of at least `BIKE_LANE` m.
+const CYCLIST_EDGE: f64 = 0.75;
+/// Shortest distance (m) over which cyclists count on braking to a bend's speed.
+const BEND_BRAKE: f64 = 1.0;
+/// Fraction of a bend's squared speed that cyclists brake to.
+const BEND_MARGIN_CYCLIST: f64 = 0.8;
+/// Speed (m/s) up to which cyclists free to go ask for at least this speed.
+const CYCLIST_START: f64 = 2.5;
+/// Pure-pursuit look-ahead of cyclists, at least (m, plus s times the speed).
+const CYCLIST_LOOKAHEAD: f64 = 4.0;
+const CYCLIST_PREVIEW: f64 = 0.7;
+const BIKE_LANE: f64 = 1.0;
+/// Overtaking: a cyclist within this gap (m) and this much slower than the desired speed
+/// (m/s); the overtaken one is passed by this gap before shifting back (m); oncoming traffic
+/// is counted on at up to this factor of its lane's limit, with this margin (s); the shift
+/// changes at up to this rate (m/s).
+const OVERTAKE_REACH: f64 = 30.0;
+const OVERTAKE_DV: f64 = 2.0;
+const PASS_GAP: f64 = 5.0;
+const ONCOMING: f64 = 1.2;
+const PASS_MARGIN: f64 = 3.0;
+const SHIFT_RATE: f64 = 1.0;
+/// Time step (s) of the passing estimate, and the longest pass (s).
+const PASS_STEP: f64 = 0.1;
+const PASS_LONGEST: f64 = 20.0;
 /// Other agents count as on a lane within this much beyond its half width (m) and this
 /// height above the ground (m).
 const LANE_MARGIN: f64 = 0.5;
@@ -457,6 +562,31 @@ impl LaneIndex {
                         .fold(0.0, f64::max)
                 })
                 .collect(),
+            opposite: {
+                let lanes = g.lanes();
+                let mut by_road: Vec<Vec<u32>> = Vec::new();
+                for (k, l) in lanes.iter().enumerate() {
+                    let r = l.road as usize;
+                    if by_road.len() <= r {
+                        by_road.resize(r + 1, Vec::new());
+                    }
+                    by_road[r].push(k as u32);
+                }
+                (lanes.iter())
+                    .map(|l| {
+                        if l.left.is_some() || l.right.is_some() {
+                            return None;
+                        }
+                        by_road[l.road as usize].iter().copied().find(|&o| {
+                            let o = &lanes[o as usize];
+                            o.dir != l.dir
+                                && o.left.is_none()
+                                && o.right.is_none()
+                                && (l.offset + o.offset - 0.5 * (l.width + o.width)).abs() < 0.05
+                        })
+                    })
+                    .collect()
+            },
         }
     }
 
@@ -571,6 +701,8 @@ impl LaneIndex {
             via: ANY,
             learner,
             tail: false,
+            offset,
+            cyclist: false,
         };
         self.lanes[lane as usize].push(o);
         if learner {
@@ -587,8 +719,9 @@ impl LaneIndex {
 
     /// The first occupant other than `me` ahead of station `from` along `chain` (elements
     /// with the distance from the searcher to their start): (distance between reference
-    /// points, occupant).
-    fn ahead(&self, chain: &[(Elem, f64)], from: f64, me: u32) -> Option<(f64, Occupant)> {
+    /// points, occupant). With `side`, those on the first element (a lane) that it passes
+    /// beside ([`Side::passes`]) are left out.
+    fn ahead(&self, chain: &[(Elem, f64)], from: f64, me: u32, side: Option<Side>) -> Option<(f64, Occupant)> {
         for (k, &(e, base)) in chain.iter().enumerate() {
             if base > SEARCH {
                 break;
@@ -596,7 +729,8 @@ impl LaneIndex {
             let list = self.list(e);
             let start = if k == 0 { from } else { f64::NEG_INFINITY };
             let i = list.partition_point(|o| o.station <= start);
-            if let Some(o) = list[i..].iter().find(|o| !self.skips(o, me)) {
+            let beside = |o: &Occupant| k == 0 && matches!(e, Elem::Lane(_)) && side.is_some_and(|s| s.passes(o));
+            if let Some(o) = list[i..].iter().find(|o| !self.skips(o, me) && !beside(o)) {
                 return Some((base + o.station, *o));
             }
         }
@@ -952,6 +1086,15 @@ pub struct TrafficDriver {
     pub bus: Option<BusRoute>,
     /// Times a bus left its loop and took a new one since its (re)spawn.
     pub reroutes: u32,
+    /// Desired speed drawn from [`TrafficDriverSpec::speed`] (m/s).
+    pub cruise: Option<f64>,
+    /// Lateral offset it steers to from its line (m, positive to the left), as of its last
+    /// [`locate`](Self::locate); a car's shift out of its lane line while overtaking.
+    pub offset: f64,
+    pub shift: f64,
+    /// The cyclist it is passing, and the overtakes begun this episode.
+    pub overtake: Option<Overtake>,
+    pub overtakes: u32,
 }
 
 /// The loop of a bus: connectors (movements, made from the lane of each road nearest to the
@@ -1014,6 +1157,11 @@ impl TrafficDriver {
             respawns: 0,
             bus: None,
             reroutes: 0,
+            cruise: None,
+            offset: 0.0,
+            shift: 0.0,
+            overtake: None,
+            overtakes: 0,
         };
         d.draw();
         d
@@ -1056,7 +1204,9 @@ impl TrafficDriver {
         self.politeness = pick(s.politeness);
         self.change_time = pick(s.change_time);
         self.critical_gap = pick(s.critical_gap);
+        let cruise = s.speed.map(&mut pick);
         self.idm = Idm { v0: self.idm.v0, headway, min_gap: s.min_gap, accel, decel };
+        self.cruise = cruise;
     }
 
     /// Start an episode with a new random stream at `pose`.
@@ -1081,6 +1231,9 @@ impl TrafficDriver {
         self.respawns = 0;
         self.bus = None;
         self.reroutes = 0;
+        self.shift = 0.0;
+        self.overtake = None;
+        self.overtakes = 0;
         self.locate(world, pose);
         if self.spec.bus.is_some()
             && let Some(p) = self.place
@@ -1462,7 +1615,8 @@ impl TrafficDriver {
             lane = g.connectors()[c as usize].to;
         }
         while self.plan.len() < 2 {
-            let Some(c) = self.choose(g, world, lane, false) else { break };
+            // (Cyclists keep to their lane.)
+            let Some(c) = self.choose(g, world, lane, self.geometry.single_track) else { break };
             let c = Self::equivalent(g, c, lane, &|c| self.allowed(c)).unwrap_or(c);
             self.plan.push(c);
             lane = g.connectors()[c as usize].to;
@@ -1518,12 +1672,16 @@ impl TrafficDriver {
                 }
                 break;
             }
-            let off = p.elem.line(g).point_at(p.station).truncate().distance(xy);
+            // (From the path it steers to: cyclists ride off the line.)
+            let line = p.elem.line(g);
+            let side = self.lateral(world, p.elem, p.station) * DVec2::from_angle(line.heading_at(p.station)).perp();
+            let off = (line.point_at(p.station).truncate() + side).distance(xy);
             // (Long vehicles swing wide, and run wider still on bends beyond their lock.)
             let long = if self.geometry.tracking > SWING_LENGTH { SWING_MAX + LOST_WIDE } else { 0.0 };
             let allowed = LOST + self.change.map_or(0.0, |_| 4.0) + long;
             if off <= allowed {
                 self.place = Some(p);
+                self.offset = self.lateral(world, p.elem, p.station);
                 self.trail.extend(passed);
                 let extra = self.trail.len().saturating_sub(TRAIL);
                 self.trail.drain(..extra);
@@ -1536,7 +1694,38 @@ impl TrafficDriver {
         self.trail.clear();
         self.change = None;
         self.place = find(g, xy, yaw(pose.rot));
+        self.offset = self.place.map_or(0.0, |p| self.lateral(world, p.elem, p.station));
         self.fill_plan(g, world);
+    }
+
+    /// Lateral offset (m, positive to the left) it steers to from the line of `elem` at
+    /// `station`: cyclists keep right ([`keep_right`]; on connectors, blended from the lane
+    /// before to the lane after), cars by their overtaking shift.
+    fn lateral(&self, world: &StaticWorld, elem: Elem, station: f64) -> f64 {
+        if !self.geometry.single_track {
+            return self.shift;
+        }
+        match elem {
+            Elem::Lane(l) => keep_right(world, l),
+            Elem::Connector(c) => {
+                let g = world.roads().lanes();
+                let conn = &g.connectors()[c as usize];
+                let t = (station / conn.line.length().max(1e-9)).clamp(0.0, 1.0);
+                let w = t * t * (3.0 - 2.0 * t);
+                (1.0 - w) * keep_right(world, conn.from) + w * keep_right(world, conn.to)
+            }
+        }
+    }
+
+    /// Its extent across its lane, for passing beside others there (see [`Side`]).
+    fn side(&self, g: &LaneGraph, lane: Elem) -> Side {
+        Side {
+            offset: self.offset,
+            half_width: self.geometry.half_width,
+            cyclist: self.geometry.single_track,
+            until: lane.line(g).length() - PASS_END,
+            overtaken: self.overtake.map(|o| o.agent),
+        }
     }
 
     /// Its entries in the index: at its place, in the lane it is leaving while changing, and
@@ -1567,6 +1756,8 @@ impl TrafficDriver {
             },
             learner: false,
             tail: false,
+            offset: self.offset,
+            cyclist: geo.single_track,
         };
         index.insert(p.elem, o);
         // Its tail on the elements behind, as far back as it reaches.
@@ -1596,7 +1787,15 @@ impl TrafficDriver {
             if let Some(d) = distance {
                 index.grant(
                     c,
-                    Grant { agent, distance: d.max(0.0), speed, length: geo.front - geo.rear, long: self.is_long() },
+                    Grant {
+                        agent,
+                        distance: d.max(0.0),
+                        speed,
+                        length: geo.front - geo.rear,
+                        long: self.is_long(),
+                        accel: self.idm.accel,
+                        v0: self.idm.v0,
+                    },
                 );
             }
         }
@@ -1609,7 +1808,13 @@ impl TrafficDriver {
 
     /// Desired speed at the place, before the preview (m/s).
     pub fn desired(&self, g: &LaneGraph) -> f64 {
-        self.place.map_or(0.0, |p| self.factor * p.elem.speed_limit(g))
+        self.place.map_or(0.0, |p| self.limited(p.elem.speed_limit(g)))
+    }
+
+    /// Desired speed under speed limit `limit` (m/s).
+    fn limited(&self, limit: f64) -> f64 {
+        let v = self.factor * limit;
+        self.cruise.map_or(v, |c| c.min(v))
     }
 
     /// The lane to be in at the end of the current lane: where the next connector leaves.
@@ -1622,9 +1827,21 @@ impl TrafficDriver {
     }
 
     /// IDM acceleration at speed `v` behind the first occupant ahead along `chain` from
-    /// station `from` (the driver's own reference point there).
-    fn follow(&self, index: &LaneIndex, chain: &[(Elem, f64)], from: f64, me: u32, v: f64, idm: &Idm) -> f64 {
-        let leader = index.ahead(chain, from, me).map(|(d, o)| (d - self.geometry.front - o.rear, v - o.speed));
+    /// station `from` (the driver's own reference point there), but for those it passes
+    /// beside on its lane (see [`Side`]).
+    #[allow(clippy::too_many_arguments)]
+    fn follow(
+        &self,
+        g: &LaneGraph,
+        index: &LaneIndex,
+        chain: &[(Elem, f64)],
+        from: f64,
+        me: u32,
+        v: f64,
+        idm: &Idm,
+    ) -> f64 {
+        let side = chain.first().map(|&(e, _)| self.side(g, e));
+        let leader = index.ahead(chain, from, me, side).map(|(d, o)| (d - self.geometry.front - o.rear, v - o.speed));
         idm.accel(v, leader)
     }
 
@@ -1690,13 +1907,15 @@ impl TrafficDriver {
                         speed: v,
                         length: geo.front - geo.rear,
                         long: self.is_long(),
+                        accel: self.idm.accel,
+                        v0: self.idm.v0,
                     },
                 );
             }
             self.waiting = 0.0;
         } else {
             self.granted = None;
-            acc = acc.min(hold(idm, v, dl - STOP_LINE - back));
+            acc = acc.min(hold(idm, v, self.stop_distance(dl, back, v)));
             self.waiting = if v < STANDING && dl < 5.0 + back { self.waiting + dt } else { 0.0 };
         }
         if g.control(lane) == Control::Stop && v < STANDING && dl < 3.0 + back {
@@ -1727,7 +1946,7 @@ impl TrafficDriver {
                 let (d2, back) = (base - geo.front, index.hold_back(l));
                 let (light, left) = signals.light_left(g, c2, t);
                 if self.stops_at(g, c2, d2, back, v, light, left) {
-                    acc = acc.min(hold(idm, v, d2 - back - STOP_LINE));
+                    acc = acc.min(hold(idm, v, self.stop_distance(d2, back, v)));
                     break;
                 }
                 j += 2;
@@ -1746,18 +1965,28 @@ impl TrafficDriver {
         g.lanes()[lane as usize].line.length() - index.hold_back(lane) >= self.room_needed()
     }
 
+    /// Distance (m) to where a driver, its front `dl` m before a connector at `v`, stops for
+    /// it: at its line held `back` m, or, when it cannot stop there at `safe_decel` (and is
+    /// not standing at it), at the junction's edge.
+    fn stop_distance(&self, dl: f64, back: f64, v: f64) -> f64 {
+        let held = dl - back - STOP_LINE;
+        let hard = self.spec.safe_decel.max(self.idm.decel);
+        if v * v <= 2.0 * hard * held.max(0.0) + STANDING * STANDING { held } else { dl - STOP_LINE }
+    }
+
     /// Whether a driver not yet allowed into connector `c`, its front `dl` m before it, stops
-    /// for the `light` there (`left` s) at its line held `back` m: always at red; at amber if
-    /// comfortable, or when it would not get through before red (the reference point
-    /// crossing the line, no faster than the connector allows) and can stop.
+    /// for the `light` there (`left` s) at its line held `back` m (see
+    /// [`stop_distance`](Self::stop_distance)): always at red; at amber if comfortable, or
+    /// when it would not get through before red (the reference point crossing the line, no
+    /// faster than the connector and the speed it plans allow) and can stop.
     #[allow(clippy::too_many_arguments)]
     fn stops_at(&self, g: &LaneGraph, c: u32, dl: f64, back: f64, v: f64, light: Light, left: f64) -> bool {
-        let need = v * v / (2.0 * (dl - back - STOP_LINE).max(0.1));
+        let need = v * v / (2.0 * self.stop_distance(dl, back, v).max(0.1));
         match light {
             Light::Red => true,
             Light::Amber => {
-                let clears =
-                    dl + self.geometry.front < v.min(self.factor * g.connectors()[c as usize].speed) * left - 0.2;
+                let pass = v.min(self.idm.v0).min(self.factor * g.connectors()[c as usize].speed);
+                let clears = dl + self.geometry.front < pass * left - 0.2;
                 need <= self.idm.decel || !clears && need <= self.spec.safe_decel.max(self.idm.decel)
             }
             Light::Green => false,
@@ -1821,7 +2050,7 @@ impl TrafficDriver {
         let granted = self.granted == Some(c);
         // Deceleration to stop at the line.
         let back = index.hold_back(lane);
-        let need = v * v / (2.0 * (dl - back - STOP_LINE).max(0.1));
+        let need = v * v / (2.0 * self.stop_distance(dl, back, v).max(0.1));
         // (Asked ahead, the light is left out: it only delays.)
         let (light, left) = if ahead { (Light::Green, f64::INFINITY) } else { signals.light_left(g, c, t) };
         match light {
@@ -1881,7 +2110,9 @@ impl TrafficDriver {
                 if index.skips(o, me) || rear > eo || self.passes(line, other, eo, o) {
                     continue;
                 }
-                let ti = if front >= so { 0.0 } else { (so - front) / o.speed.max(1.0) };
+                // (It may speed up again: held for a zone, or setting off.)
+                let ti =
+                    if front >= so { 0.0 } else { travel_time(so - front, o.speed, Idm::OTHER.accel, Idm::OTHER.v0) };
                 let to = if o.speed < STANDING { f64::INFINITY } else { (eo - rear) / o.speed };
                 if clash(ti, to) {
                     return false;
@@ -1889,8 +2120,10 @@ impl TrafficDriver {
             }
             // Committed to it.
             for gr in index.grants[conf.other as usize].iter().filter(|gr| gr.agent != me) {
-                let ti = travel_time(gr.distance + so, gr.speed, Idm::OTHER.accel, Idm::OTHER.v0);
-                let to = travel_time(gr.distance + eo + gr.length, gr.speed, Idm::OTHER.accel, Idm::OTHER.v0);
+                // (In at the earliest, out at its own pace: a bus is through later than a car.)
+                let ti =
+                    travel_time(gr.distance + so, gr.speed, Idm::OTHER.accel.max(gr.accel), Idm::OTHER.v0.max(gr.v0));
+                let to = travel_time(gr.distance + eo + gr.length, gr.speed, gr.accel, gr.v0);
                 if clash(ti, to) {
                     return false;
                 }
@@ -1923,7 +2156,7 @@ impl TrafficDriver {
     fn room(&self, index: &LaneIndex, chain: &[(Elem, f64)], k: usize, me: u32) -> bool {
         let Some(&(_, after)) = chain.get(k + 1) else { return true };
         let need = self.room_needed();
-        index.ahead(&chain[k..], -1.0, me).is_none_or(|(d, o)| o.speed > 3.0 || d - o.rear - after >= need)
+        index.ahead(&chain[k..], -1.0, me, None).is_none_or(|(d, o)| o.speed > 3.0 || d - o.rear - after >= need)
     }
 
     /// IDM acceleration behind the vehicles ahead on connectors sharing a stretch with
@@ -2089,26 +2322,49 @@ impl TrafficDriver {
         let b = self.idm.decel;
         let reach = v0 * v0 / (2.0 * b) + 20.0;
         for &(e, base) in chain.iter().skip(1).take_while(|(_, base)| *base < reach) {
-            let lim = self.factor * e.speed_limit(g);
+            let lim = self.limited(e.speed_limit(g));
             v0 = v0.min((lim * lim + 2.0 * b * base).sqrt());
         }
+        // Cyclists, who cannot lean hard, also brake to each bend's speed by its start.
         let mut d = 0.0;
+        let mut bend = f64::INFINITY;
+        // (Cyclists, whose lean lags their steering, look farther ahead.)
+        let look = self.spec.lookahead[0] + self.spec.lookahead[1] * v;
+        let look = if self.geometry.single_track { look.max(CYCLIST_LOOKAHEAD + CYCLIST_PREVIEW * v) } else { look };
         while d < reach {
             if let Some((e, s)) = at_distance(g, &chain, d) {
-                let k = e.line(g).curvature_at(s).abs().max(1e-6);
-                v0 = v0.min((self.spec.lateral_accel / k + 2.0 * b * d).sqrt());
+                // (On the path at its lateral offset.)
+                let k = e.line(g).curvature_at(s);
+                let k = (k / (1.0 - self.lateral(world, e, s) * k).max(0.1)).abs().max(1e-6);
+                let v_bend2 = self.spec.lateral_accel / k;
+                // (Cyclists no slower than CYCLIST_START: crawling they cannot lean into it.)
+                let v_bend2 =
+                    if self.geometry.single_track { v_bend2.max(CYCLIST_START * CYCLIST_START) } else { v_bend2 };
+                v0 = v0.min((v_bend2 + 2.0 * b * d).sqrt());
+                // (By the speed loop's lag earlier, and with a margin.)
+                let v_bend2 = (BEND_MARGIN_CYCLIST * v_bend2).max(CYCLIST_START * CYCLIST_START);
+                if self.geometry.single_track && v * v > v_bend2 {
+                    bend = bend.min((v_bend2 - v * v) / (2.0 * (d - v * SPEED_LAG).max(BEND_BRAKE)));
+                }
             }
             d += PREVIEW_STEP;
         }
         let idm = Idm { v0, ..self.idm };
         self.idm.v0 = v0;
 
+        // Overtaking a cyclist: shifting out at up to SHIFT_RATE.
+        let want = self.overtaking(g, index, p, me, v, v0);
+        if !self.geometry.single_track {
+            self.shift += (want - self.shift).clamp(-SHIFT_RATE * dt, SHIFT_RATE * dt);
+            self.offset = self.shift;
+        }
+
         // Following: the vehicle ahead along the chain, and while changing, also in the lane
         // being left.
-        let mut acc = self.follow(index, &chain, p.station, me, v, &idm);
+        let mut acc = self.follow(g, index, &chain, p.station, me, v, &idm).min(bend);
         if let (Some(c), Elem::Lane(l)) = (self.change, p.elem) {
             let s = p.station * g.lanes()[c.from as usize].line.length() / g.lanes()[l as usize].line.length();
-            acc = acc.min(self.follow(index, &[(Elem::Lane(c.from), -s)], s, me, v, &idm));
+            acc = acc.min(self.follow(g, index, &[(Elem::Lane(c.from), -s)], s, me, v, &idm));
         }
         // The end of a dead end, or of a lane that must be left for the next connector: a
         // standing obstacle there.
@@ -2140,11 +2396,12 @@ impl TrafficDriver {
 
         // Junctions, crossings, and a bus's stops.
         acc = acc.min(self.junction(g, index, &chain, p, me, v, &idm, signals, t, dt));
-        acc = acc.min(self.crosswalks(g, index, &chain, v, &idm));
+        acc = acc.min(self.crosswalks(world, index, &chain, v, &idm));
         acc = acc.min(self.bus_stop(g, p, v, &idm, dt));
 
         // Lane changes.
         if self.change.is_none()
+            && self.overtake.is_none()
             && self.since_change >= COOLDOWN
             && let Elem::Lane(l) = p.elem
             && let Some(to) = self.mobil(g, index, me, l, p.station, v, &idm, required)
@@ -2163,8 +2420,7 @@ impl TrafficDriver {
         // Steering: pure pursuit on the lane line, blended across during a change.
         let place = self.place.expect("placed");
         let (chain, _) = self.chain(g);
-        let look = self.spec.lookahead[0] + self.spec.lookahead[1] * v;
-        let target = self.reference(g, &chain, place, look);
+        let target = self.reference(world, &chain, place, look);
         let heading = yaw(pose.rot);
         // Long vehicles from their rear axle (the look-ahead still counted from the front):
         // from the front, a look-ahead as short as their wheelbase and slow steering make
@@ -2179,7 +2435,12 @@ impl TrafficDriver {
         let curvature = if d2 > 1e-6 { 2.0 * local.y / d2 } else { 0.0 };
         let limit = self.geometry.max_curvature;
         let curvature = curvature.clamp(-limit, limit);
-        let command = (v + acc.max(-3.0 * b) * SPEED_LAG).max(0.0);
+        let mut command = (v + acc.max(-3.0 * b) * SPEED_LAG).max(0.0);
+        // Cyclists free to go ride off briskly: lingering at walking pace (on their feet, and
+        // on grades barely moving) they wobble and roll back.
+        if self.geometry.single_track && acc > 0.0 && v < CYCLIST_START {
+            command = command.max(CYCLIST_START.min(idm.v0));
+        }
         GroundSetpoint::SpeedCurvature { speed: command, curvature }
     }
 
@@ -2188,7 +2449,8 @@ impl TrafficDriver {
     /// acceleration they allow (infinite when none); a crossing the front has reached is
     /// cleared while rolling (not when standing on it), but its users in the vehicle's path (within [`CROSSWALK_SIDE`] m of its sides)
     /// remain obstacles [`CROSSWALK_GAP`] m ahead of them.
-    fn crosswalks(&self, g: &LaneGraph, index: &LaneIndex, chain: &[(Elem, f64)], v: f64, idm: &Idm) -> f64 {
+    fn crosswalks(&self, world: &StaticWorld, index: &LaneIndex, chain: &[(Elem, f64)], v: f64, idm: &Idm) -> f64 {
+        let g = world.roads().lanes();
         let reach = v * v / (2.0 * self.idm.decel) + 30.0;
         let mut acc = f64::INFINITY;
         for &(e, base) in chain {
@@ -2204,10 +2466,11 @@ impl TrafficDriver {
                 }
                 // Users in the way: standing obstacles wherever the front is.
                 let side = self.geometry.half_width + CROSSWALK_SIDE;
+                let off = self.lateral(world, e, station);
                 for &(p, _) in users {
                     let pr = lane.line.project(p);
                     let ahead = base + pr.station - self.geometry.front;
-                    if pr.distance < side && ahead > -CROSSWALK_GAP && ahead < reach {
+                    if (pr.offset - off).abs() < side && ahead > -CROSSWALK_GAP && ahead < reach {
                         acc = acc.min(idm.accel(v, Some(((ahead - CROSSWALK_GAP).max(0.0), v))));
                     }
                 }
@@ -2215,7 +2478,8 @@ impl TrafficDriver {
                 if (gap < -CROSSWALK_GAP && v > CROSSWALK_ROLLING) || gap > reach {
                     continue;
                 }
-                let at = lane.line.point_at(station).truncate();
+                let at = lane.line.point_at(station).truncate()
+                    + off * DVec2::from_angle(lane.line.heading_at(station)).perp();
                 let clear = 0.5 * lane.width + CROSSWALK_CLEAR;
                 if users.iter().any(|&(p, d)| (at - p).dot(d) > -clear) {
                     acc = acc.min(idm.accel(v, Some((gap.max(0.0), v))));
@@ -2225,11 +2489,14 @@ impl TrafficDriver {
         acc
     }
 
-    /// The point `ahead` m on along the chain, shifted towards the lane being left.
-    fn reference(&self, g: &LaneGraph, chain: &[(Elem, f64)], place: Place, ahead: f64) -> DVec2 {
+    /// The point `ahead` m on along the chain, shifted towards the lane being left and by
+    /// its lateral offset ([`TrafficDriver::lateral`]).
+    fn reference(&self, world: &StaticWorld, chain: &[(Elem, f64)], place: Place, ahead: f64) -> DVec2 {
+        let g = world.roads().lanes();
         let Some((e, s)) = at_distance(g, chain, ahead) else {
             return place.elem.line(g).point_at(place.station).truncate();
         };
+        let lateral = self.lateral(world, e, s) * DVec2::from_angle(e.line(g).heading_at(s)).perp();
         let line = e.line(g);
         let mut point = line.point_at(s).truncate();
         // Vehicles towing trailers swing wide in left bends: their towing unit's rear axle
@@ -2243,6 +2510,14 @@ impl TrafficDriver {
             let r = 1.0 / k.abs().max(1e-6);
             let off = if r > l { r - (r * r - l * l).sqrt() } else { r };
             point -= k.signum() * (0.5 * off).min(SWING_MAX) * DVec2::from_angle(line.heading_at(s)).perp();
+        } else if self.is_long() {
+            // Rigid long vehicles (buses), steered from the rear axle, keep it inside by half
+            // their front axle's swing (`wb²/2R`), which then runs only as far out: on the line,
+            // the front swings into the oncoming lane at a bend's end.
+            let k = (-5..=5).map(|d| line.curvature_at(s + f64::from(d))).sum::<f64>() / 11.0;
+            let wb = self.geometry.wheelbase;
+            point +=
+                k.signum() * (0.25 * wb * wb * k.abs()).min(SWING_MAX) * DVec2::from_angle(line.heading_at(s)).perp();
         }
         match (self.change, e) {
             (Some(c), Elem::Lane(l)) if e == place.elem => {
@@ -2250,10 +2525,130 @@ impl TrafficDriver {
                 let w = t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
                 let from = &g.lanes()[c.from as usize].line;
                 let sf = s * from.length() / g.lanes()[l as usize].line.length();
-                point + (1.0 - w) * (from.point_at(sf).truncate() - point)
+                point + (1.0 - w) * (from.point_at(sf).truncate() - point) + lateral
             }
-            _ => point,
+            _ => point + lateral,
         }
+    }
+
+    /// Overtaking (cars, not long vehicles): a cyclist ahead on a lane that is the only one
+    /// of its direction, with an oncoming lane beside it, is passed shifted out by
+    /// [`PASS_CLEAR`] m beyond it when the pass (at the desired speed `v0`, until the rear is
+    /// [`PASS_GAP`] m ahead of the cyclist) ends [`PASS_END`] m before the lane's end with
+    /// room there, no crossing lies on the way, and the oncoming lane stays clear meanwhile
+    /// ([`TrafficDriver::pass_clear`]). Given up before drawing level when the oncoming lane
+    /// no longer stays clear. The lateral offset to steer to.
+    fn overtaking(&mut self, g: &LaneGraph, index: &LaneIndex, p: Place, me: u32, v: f64, v0: f64) -> f64 {
+        let geo = self.geometry;
+        let lane = match p.elem {
+            Elem::Lane(l) if !geo.single_track && !self.is_long() && self.change.is_none() => l,
+            _ => {
+                self.overtake = None;
+                return 0.0;
+            }
+        };
+        let Some(opp) = index.opposite[lane as usize] else {
+            self.overtake = None;
+            return 0.0;
+        };
+        let list = &index.lanes[lane as usize];
+        if let Some(o) = self.overtake {
+            let Some(c) = list.iter().find(|x| x.agent == o.agent && !x.tail) else {
+                self.overtake = None;
+                return 0.0;
+            };
+            let passed = p.station + geo.rear > c.station + c.front + PASS_GAP;
+            let level = p.station + geo.front >= c.station - c.rear;
+            if passed || !level && !self.pass_clear(g, index, lane, opp, p, c, me, v, v0) {
+                self.overtake = None;
+                return 0.0;
+            }
+            return o.shift;
+        }
+        let i = list.partition_point(|x| x.station <= p.station);
+        let mut ahead = list[i..].iter().filter(|x| !index.skips(x, me) && !x.tail);
+        let Some(c) = ahead.next().copied() else { return 0.0 };
+        let gap = c.station - c.rear - p.station - geo.front;
+        let shift = c.offset + c.half_width + PASS_CLEAR + geo.half_width;
+        let width = g.lanes()[lane as usize].width;
+        if !c.cyclist || gap > OVERTAKE_REACH || v0 < c.speed + OVERTAKE_DV || shift <= 0.0 || shift > width {
+            return 0.0;
+        }
+        // Room after it.
+        let back_in = c.station + c.front + PASS_GAP + geo.front - geo.rear;
+        if ahead.next().is_some_and(|n| n.station - n.rear < back_in + self.idm.min_gap) {
+            return 0.0;
+        }
+        if !self.pass_clear(g, index, lane, opp, p, &c, me, v, v0) {
+            return 0.0;
+        }
+        self.overtake = Some(Overtake { agent: c.agent, shift });
+        self.overtakes += 1;
+        shift
+    }
+
+    /// Whether passing cyclist `c` on `lane` from place `p` at speed `v` up to `v0` ends
+    /// [`PASS_END`] m before the lane's end, crosses no crossing, and the oncoming lane `opp`
+    /// stays clear meanwhile (plus [`PASS_MARGIN`] s) of vehicles at up to [`ONCOMING`] times
+    /// its limit, coming down it or the connectors into it and the lanes before those.
+    #[allow(clippy::too_many_arguments)]
+    fn pass_clear(
+        &self,
+        g: &LaneGraph,
+        index: &LaneIndex,
+        lane: u32,
+        opp: u32,
+        p: Place,
+        c: &Occupant,
+        me: u32,
+        v: f64,
+        v0: f64,
+    ) -> bool {
+        let geo = self.geometry;
+        // Accelerating to `v0`, until it has gained the distance on the cyclist.
+        let u = v0.max(v);
+        let distance = (c.station + c.front + PASS_GAP - (p.station + geo.rear)).max(0.0);
+        let (mut x, mut vel, mut t) = (0.0, v, 0.0);
+        while x - c.speed * t < distance {
+            if t > PASS_LONGEST {
+                return false;
+            }
+            vel = (vel + self.idm.accel * PASS_STEP).min(u);
+            x += vel * PASS_STEP;
+            t += PASS_STEP;
+        }
+        let end = p.station + x + geo.front;
+        let len = g.lanes()[lane as usize].line.length();
+        if end + PASS_END > len {
+            return false;
+        }
+        if index.lane_crossings[lane as usize].iter().any(|&(_, s)| s > p.station - geo.front && s < end + CROSSWALK) {
+            return false;
+        }
+        // On the oncoming lane (stations running the other way).
+        let ol = &g.lanes()[opp as usize];
+        let olen = ol.line.length();
+        let at = olen * (1.0 - p.station / len);
+        let reach = (u + ONCOMING * ol.speed) * (t + PASS_MARGIN) + geo.front;
+        let (lo, hi) = (at - reach, at - geo.rear + PASS_GAP);
+        let blocks = |o: &Occupant, s: f64| !index.skips(o, me) && s + o.front > lo && s - o.rear < hi;
+        if index.lanes[opp as usize].iter().any(|o| blocks(o, o.station)) {
+            return false;
+        }
+        if lo < 0.0 {
+            for &k in &ol.predecessors {
+                let cl = g.connectors()[k as usize].line.length();
+                if index.connectors[k as usize].iter().any(|o| blocks(o, o.station - cl)) {
+                    return false;
+                }
+                let from = g.connectors()[k as usize].from;
+                let fl = g.lanes()[from as usize].line.length();
+                if index.lanes[from as usize].iter().any(|o| blocks(o, o.station - cl - fl)) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// MOBIL: the lane to change into, if any.
@@ -2278,9 +2673,9 @@ impl TrafficDriver {
         let must = required.filter(|&r| r != lane).map(|r| if pos(r) < pos(lane) { l.left } else { l.right });
         let (front, rear) = (geo.front, -geo.rear);
         let chain_here = self.lane_chain(g, lane, station);
-        let a_c = self.follow(index, &chain_here, station, me, v, idm);
+        let a_c = self.follow(g, index, &chain_here, station, me, v, idm);
         // The old follower (distances between reference points), now and with the driver gone.
-        let leader_here = index.ahead(&chain_here, station, me);
+        let leader_here = index.ahead(&chain_here, station, me, None);
         let mut da_o = 0.0;
         if let Some((d, o)) = index.behind(g, lane, station, me) {
             let now = o.idm.accel(o.speed, Some((d - o.front - rear, o.speed - v)));
@@ -2292,7 +2687,7 @@ impl TrafficDriver {
         for (side, target) in [(-1.0, l.left), (1.0, l.right)] {
             let Some(t) = target else { continue };
             let mandatory = must == Some(Some(t));
-            if must.is_some() && !mandatory {
+            if must.is_some() && !mandatory || !mandatory && geo.single_track {
                 continue;
             }
             // Discretionary changes only well before the lane's end, and not away from the
@@ -2309,7 +2704,7 @@ impl TrafficDriver {
             // Neighbours in the target lane: the first whose reference point lies ahead of
             // the driver's rear, and the last behind its front (distances from `s`).
             let chain_t = self.lane_chain(g, t, s);
-            let leader = index.ahead(&chain_t, s - rear, me);
+            let leader = index.ahead(&chain_t, s - rear, me, None);
             let follower = index.behind(g, t, s + front, me).map(|(d, o)| (d - front, o));
             let leader_gap = leader.map(|(d, o)| (d - o.rear - front, o));
             let follower_gap = follower.map(|(d, o)| (d - o.front - rear, d, o));
@@ -2443,6 +2838,17 @@ fn travel_time(d: f64, v: f64, a: f64, vmax: f64) -> f64 {
     if d <= d1 { ((v * v + 2.0 * a * d).sqrt() - v) / a } else { t1 + (d - d1) / vmax }
 }
 
+/// Where a cyclist rides on lane `lane` (m from its line, positive to the left): in the
+/// middle of the bike lane beside the rightmost lane of a road side with one, else
+/// [`CYCLIST_EDGE`] m from the lane's right edge.
+pub fn keep_right(world: &StaticWorld, lane: u32) -> f64 {
+    let l = &world.roads().lanes().lanes()[lane as usize];
+    let section = world.roads().section(l.road as usize);
+    let bike =
+        if l.right.is_none() { section.bike[if section.one_way() { 0 } else { usize::from(l.dir) }] } else { 0.0 };
+    if bike >= BIKE_LANE { -0.5 * (l.width + bike) } else { -(0.5 * l.width - CYCLIST_EDGE).max(0.0) }
+}
+
 /// Distance of `p` past the end of `line` along its final direction (m).
 fn beyond(line: &Polyline, p: DVec2) -> f64 {
     let end = line.point_at(line.length()).truncate();
@@ -2450,10 +2856,13 @@ fn beyond(line: &Polyline, p: DVec2) -> f64 {
 }
 
 /// Lanes long enough to spawn on (with their lengths), for [`draw_lane_point`]: a vehicle
-/// reaching `back` m behind its reference point, keeping to `only` lanes if given.
-fn spawn_lanes(g: &LaneGraph, back: f64, only: Option<&[bool]>) -> Vec<(u32, f64)> {
+/// reaching `back` m behind its reference point, keeping to `only` lanes if given (cyclists:
+/// to the rightmost lanes).
+fn spawn_lanes(g: &LaneGraph, back: f64, only: Option<&[bool]>, cyclist: bool) -> Vec<(u32, f64)> {
     (g.lanes().iter().enumerate())
-        .filter(|(k, l)| l.line.length() > spawn_start(back) + 7.0 && only.is_none_or(|o| o[*k]))
+        .filter(|(k, l)| {
+            l.line.length() > spawn_start(back) + 7.0 && only.is_none_or(|o| o[*k]) && (!cyclist || l.right.is_none())
+        })
         .map(|(k, l)| (k as u32, l.line.length()))
         .collect()
 }
@@ -2464,8 +2873,16 @@ fn spawn_start(back: f64) -> f64 {
 }
 
 /// A point of a random lane of `lanes` (drawn by length, 5 m clear of its end and
-/// [`spawn_start`] of its start) and the lane's heading there.
-fn draw_lane_point(g: &LaneGraph, lanes: &[(u32, f64)], back: f64, rng: &mut SimRng) -> (DVec2, f64) {
+/// [`spawn_start`] of its start; for a cyclist, where it rides: [`keep_right`]) and the
+/// lane's heading there.
+fn draw_lane_point(
+    world: &StaticWorld,
+    lanes: &[(u32, f64)],
+    back: f64,
+    cyclist: bool,
+    rng: &mut SimRng,
+) -> (DVec2, f64) {
+    let g = world.roads().lanes();
     let lo = spawn_start(back);
     let total: f64 = lanes.iter().map(|l| l.1 - lo - 5.0).sum();
     let mut x = rng.uniform() * total;
@@ -2478,11 +2895,13 @@ fn draw_lane_point(g: &LaneGraph, lanes: &[(u32, f64)], back: f64, rng: &mut Sim
         .unwrap_or(lanes.last().expect("lanes"));
     let s = lo + rng.uniform() * (len - lo - 5.0);
     let line = &g.lanes()[k as usize].line;
-    (line.point_at(s).truncate(), wrap_angle(line.heading_at(s)))
+    let off = if cyclist { keep_right(world, k) } else { 0.0 };
+    let heading = line.heading_at(s);
+    (line.point_at(s).truncate() + off * DVec2::from_angle(heading).perp(), wrap_angle(heading))
 }
 
 /// `count` spawns in random lanes ([`draw_lane_point`], for vehicles reaching `back` m behind
-/// their reference point, on `only` lanes if given) along their direction, at least
+/// their reference point, on `only` lanes if given, cyclists where they ride) along their direction, at least
 /// `min_separation` from `placed` where possible (appended to it); `lift` above the ground.
 /// `None` on maps without (such) lanes.
 #[allow(clippy::too_many_arguments)]
@@ -2491,13 +2910,13 @@ pub(crate) fn lane_spawns(
     count: usize,
     back: f64,
     only: Option<&[bool]>,
+    cyclist: bool,
     min_separation: f64,
     lift: f64,
     placed: &mut Vec<DVec3>,
     rng: &mut SimRng,
 ) -> Option<Vec<(DVec3, f64)>> {
-    let g = world.roads().lanes();
-    let lanes = spawn_lanes(g, back, only);
+    let lanes = spawn_lanes(world.roads().lanes(), back, only, cyclist);
     if lanes.is_empty() {
         return None;
     }
@@ -2505,7 +2924,7 @@ pub(crate) fn lane_spawns(
     for _ in 0..count {
         let mut best: Option<(f64, DVec3, f64)> = None;
         for _ in 0..64 {
-            let (xy, heading) = draw_lane_point(g, &lanes, back, rng);
+            let (xy, heading) = draw_lane_point(world, &lanes, back, cyclist, rng);
             let pos = xy.extend(world.terrain().height(xy.x, xy.y) + lift);
             let apart = placed.iter().map(|q| q.truncate().distance(xy)).fold(f64::INFINITY, f64::min);
             if best.is_none_or(|b| apart > b.0) {
@@ -2560,7 +2979,7 @@ const ZONE_STEP: f64 = 0.5;
 const RESPAWN_APART: f64 = 20.0;
 
 /// Where a driver respawns: a random lane point (and heading; [`draw_lane_point`], reaching
-/// `back` m behind it, on `only` lanes if given) at least `clear` m from every learning agent in `learners` and
+/// `back` m behind it, on `only` lanes if given, cyclists where they ride) at least `clear` m from every learning agent in `learners` and
 /// [`RESPAWN_APART`] m from `others`, or the draw of 64 that comes closest. `None` on maps
 /// without lanes.
 #[allow(clippy::too_many_arguments)]
@@ -2568,20 +2987,20 @@ pub(crate) fn respawn_spot(
     world: &StaticWorld,
     back: f64,
     only: Option<&[bool]>,
+    cyclist: bool,
     learners: &[DVec2],
     others: &[DVec2],
     clear: f64,
     rng: &mut SimRng,
 ) -> Option<(DVec2, f64)> {
-    let g = world.roads().lanes();
-    let lanes = spawn_lanes(g, back, only);
+    let lanes = spawn_lanes(world.roads().lanes(), back, only, cyclist);
     if lanes.is_empty() {
         return None;
     }
     let nearest = |set: &[DVec2], p: DVec2| set.iter().map(|q| q.distance(p)).fold(f64::INFINITY, f64::min);
     let mut best: Option<(f64, DVec2, f64)> = None;
     for _ in 0..64 {
-        let (xy, heading) = draw_lane_point(g, &lanes, back, rng);
+        let (xy, heading) = draw_lane_point(world, &lanes, back, cyclist, rng);
         let score = (nearest(learners, xy) / clear.max(1e-9)).min(1.0) + (nearest(others, xy) / RESPAWN_APART).min(1.0);
         if best.is_none_or(|b| score > b.0) {
             best = Some((score, xy, heading));

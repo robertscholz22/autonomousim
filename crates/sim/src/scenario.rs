@@ -1554,22 +1554,29 @@ impl CompiledGroup {
             d.validate().map_err(&fail)?;
             // (Only the traffic driver tows trailers.)
             let towing = matches!(d, DriverSpec::Traffic(_));
-            let fits = def.as_wheeled().is_some_and(|d| (towing || d.num_units() == 1) && !d.is_single_track());
+            // (Two-wheelers: only in traffic, as cyclists.)
+            let fits = def.as_wheeled().is_some_and(|d| {
+                (towing || d.num_units() == 1) && (towing || !d.is_single_track()) && d.supports_kinematic()
+            });
             let parked = matches!(d, DriverSpec::Parked);
             let junction = towing && spec.goals.kind == GoalKind::Junction;
             let placed = if parked { sp.in_bays } else { sp.on_road || junction };
             if !fits || !placed || spec.goals.kind == GoalKind::Route {
                 return Err(fail(format!(
-                    "the `{}` driver drives ground vehicles{} (not two-wheelers) spawned {}, without `route` goals",
+                    "the `{}` driver drives ground vehicles{} spawned {}, without `route` goals",
                     d.name(),
-                    if towing { "" } else { " without trailers" },
+                    if towing {
+                        " (two-wheelers with a steering head)"
+                    } else {
+                        " without trailers (not two-wheelers)"
+                    },
                     if parked { "`in_bays`" } else { "`on_road` (traffic: or with `junction` goals)" }
                 )));
             }
         }
         if spec.physics != PhysicsMode::Full {
             spec.hybrid.validate().map_err(&fail)?;
-            let wheeled = def.as_wheeled().is_some_and(|d| !d.is_single_track());
+            let wheeled = def.as_wheeled().is_some_and(|d| d.supports_kinematic());
             let commanded = spec.driver.is_some()
                 || matches!(
                     spec.action_mode,
@@ -1577,7 +1584,7 @@ impl CompiledGroup {
                 );
             if !wheeled || !commanded {
                 return Err(fail(
-                    "`kinematic` and `hybrid` physics need ground vehicles (not two-wheelers) with a driver or the `vk` or `vw` action mode".into(),
+                    "`kinematic` and `hybrid` physics need ground vehicles (two-wheelers with a steering head) with a driver or the `vk` or `vw` action mode".into(),
                 ));
             }
         }

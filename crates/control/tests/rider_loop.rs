@@ -1,6 +1,7 @@
 //! Closed-loop checks of the rider controller on the two-wheeler presets over flat asphalt:
 //! holding a straight line after a sideways push, curvature steps, the initial countersteer,
-//! launching from rest and stopping on the feet, and riding at walking pace.
+//! launching from rest and stopping on the feet, riding at walking pace, and setting off into
+//! a tight turn.
 
 use autonomousim_control::ground::*;
 use autonomousim_core::contact::StaticScene;
@@ -164,7 +165,8 @@ fn high_speed_weave_dies_out() {
 }
 
 /// Curvature steps into a turn, through to the opposite one and back to straight: each settles
-/// within 5 % of the step (plus 0.0005 1/m) within 6 s, the lean near the steady turn's.
+/// within 5 % of the step (plus 0.0005 1/m) within 6 s, the lean near the steady turn's and
+/// never far beyond it.
 #[test]
 fn curvature_steps_settle_without_falling() {
     for (name, speed, k) in [("motorcycle_sport", 15.0, 0.02), ("bicycle_city", 5.0, 0.05)] {
@@ -189,6 +191,9 @@ fn curvature_steps_settle_without_falling() {
             );
             assert!((lean - want).abs() < 0.05, "{name}: lean {lean} vs {want}");
             assert!(max_lean < 0.7, "{name}: lean {max_lean}");
+            // (No more than a quarter beyond the steadier of the turns before and after.)
+            let before = rig.ctrl.turn_lean(speed, from).unwrap();
+            assert!(max_lean < 1.25 * want.abs().max(before.abs()) + 0.02, "{name}: lean {max_lean} overshoots");
             assert!((tail.last().unwrap().speed - speed).abs() < 0.2, "{name}: speed");
             from = target;
         }
@@ -307,4 +312,24 @@ fn yaw_rate_and_raw_inputs() {
     let input = rig.ctrl.update(&raw, &GroundEstimate::of(&rig.v));
     assert_eq!((input.throttle, input.brake, input.steering, input.lean), (0.0, 0.5, 0.25, 0.5));
     assert!(!input.reverse);
+}
+
+/// The bicycle setting off from rest straight into a tight turn: crawling on its feet until
+/// they lift, then balancing, it settles on the turn without a large lean.
+#[test]
+fn bicycle_sets_off_into_a_tight_turn() {
+    for speed in [1.5, 2.0, 3.0] {
+        let k = 0.2;
+        let mut rig = Rig::new("bicycle_city", 0.0);
+        rig.run(&vk(0.0, 0.0), 1.0);
+        let trace = rig.run(&vk(speed, k), 8.0);
+        let tail = &trace[trace.len() - 1000..];
+        let curvature = mean(tail, |s| s.curvature);
+        let largest = worst(&trace, |s| s.lean);
+        println!("{speed} m/s, {k} 1/m from rest: curvature {curvature:.4}, largest lean {largest:.3} rad");
+        assert!((curvature - k).abs() < 0.01, "{speed} m/s: curvature {curvature}");
+        let steady = rig.ctrl.turn_lean(speed, k).unwrap().abs();
+        assert!(largest < 1.25 * steady + 0.05, "{speed} m/s: lean {largest} (steady turn {steady})");
+        assert!((tail.last().unwrap().speed - speed).abs() < 0.1, "{speed} m/s: speed");
+    }
 }

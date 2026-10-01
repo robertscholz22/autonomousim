@@ -13,7 +13,7 @@
 //! rear frame B (with the rider locked to it), the front frame H (fork and handlebar) and the
 //! wheels R and F, taken from a [`WheeledDef`] at its design pose.
 
-use super::{WheeledDef, inertia_tensor};
+use super::{STANDARD_GRAVITY, WheeledDef, inertia_tensor};
 use glam::{DMat3, DMat4, DVec3, DVec4};
 
 /// Parameters of the benchmark bicycle (Meijaard et al. 2007, Table 1), in the paper's frame.
@@ -199,6 +199,66 @@ impl WhippleParams {
             [-(mu * st + sf * cl), ialz / w * cl + mu * (sa + itzz / w * cl)],
         ];
         WhippleMatrices { m, c1, k0, k2 }
+    }
+}
+
+/// Steady turning of a single-track vehicle: the lean of a steady turn follows from the
+/// lateral acceleration `v²κ` with the wheels' gyroscopic moment and the contact points moving
+/// around the tyre crowns, `tan θ = v²κ/g·(1 + Σ I_spin/(r m h))`,
+/// `φ = θ + asin(ρ sin θ/(h − ρ))`; the steering angle and torque that hold it are the
+/// linear model's (no lean torque). Angles in the paper's frame: lean and steer positive to
+/// the right.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteadyTurn {
+    pub model: WhippleMatrices,
+    /// Wheelbase (m) and steering head angle from the vertical (rad).
+    pub wheelbase: f64,
+    pub head_angle: f64,
+    /// Gyroscopic factor `Σ I_spin/(r m h)`, centre-of-mass height `h` and the load-weighted
+    /// crown radius `ρ` (m).
+    pub gyro: f64,
+    pub height: f64,
+    pub crown: f64,
+}
+
+impl SteadyTurn {
+    /// Of a single-track `def` (see [`WhippleParams::from_def`]).
+    pub fn of(def: &WheeledDef) -> Result<Self, String> {
+        let params = WhippleParams::from_def(def)?;
+        let (head, _) = def.steering_head().ok_or("no steering head")?;
+        let (m, h) = (def.total_mass(), def.total_com().z);
+        let loads = def.rest_state().map_or(vec![1.0, 1.0], |s| s.loads.clone());
+        let crown = (0..2).map(|a| def.tire(a).crown_radius * loads[a]).sum::<f64>() / (loads[0] + loads[1]);
+        let spin: f64 = (0..2).map(|a| def.axles[a].wheel.inertia.y / def.tire(a).radius()).sum();
+        Ok(Self {
+            model: params.matrices(),
+            wheelbase: params.wheelbase,
+            head_angle: head.angle,
+            gyro: spin / (m * h),
+            height: h,
+            crown,
+        })
+    }
+
+    /// Lean (rad) of a steady turn of curvature `curvature` (1/m, positive left) at speed `v`.
+    pub fn lean(&self, v: f64, curvature: f64) -> f64 {
+        let theta = -(v * v * curvature / STANDARD_GRAVITY * (1.0 + self.gyro)).atan();
+        theta + (self.crown * theta.sin() / (self.height - self.crown)).asin()
+    }
+
+    /// The linear model's steady turn at lean `lean` and speed `v`: steering angle (rad) and
+    /// steering torque (N·m).
+    pub fn hold(&self, v: f64, lean: f64) -> (f64, f64) {
+        let g = STANDARD_GRAVITY;
+        let m = &self.model;
+        let k = |i: usize, j: usize| g * m.k0[i][j] + v * v * m.k2[i][j];
+        let delta = -k(0, 0) / k(0, 1) * lean;
+        (delta, k(1, 0) * lean + k(1, 1) * delta)
+    }
+
+    /// Kinematic steering angle (rad) for curvature `curvature` at a crawl, upright.
+    pub fn crawl_steer(&self, curvature: f64) -> f64 {
+        -(curvature * self.wheelbase).atan() / self.head_angle.cos()
     }
 }
 

@@ -362,6 +362,7 @@ impl WorldInstance {
                     g.spec.count,
                     -DriverGeometry::of(g).rear,
                     network.as_ref().map(|n| n.lanes.as_slice()),
+                    DriverGeometry::of(g).single_track,
                     spawn.min_separation,
                     lift,
                     &mut placed,
@@ -743,9 +744,10 @@ impl WorldInstance {
             let (clear, back) = (d.spec().respawn_clear, -d.geometry().rear);
             let only = d.network().map(|n| n.lanes.as_slice());
             let s = seed.child_index(i as u64);
-            let (Some(def), Some((xy, heading))) =
-                (g.def.as_wheeled(), respawn_spot(&world, back, only, &learners, &others, clear, &mut s.rng()))
-            else {
+            let (Some(def), Some((xy, heading))) = (
+                g.def.as_wheeled(),
+                respawn_spot(&world, back, only, d.geometry().single_track, &learners, &others, clear, &mut s.rng()),
+            ) else {
                 continue;
             };
             let pose = ground_pose(&world, def, &g.rest, xy, heading);

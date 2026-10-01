@@ -16,16 +16,20 @@
 //! turn follows from the lateral acceleration `v²κ` with the wheels' gyroscopic moment and the
 //! contact points moving around the tyre crowns: `tan θ = v²κ/g·(1 + Σ I_spin/(r m h))`,
 //! `φ = θ + asin(ρ sin θ/(h − ρ))`. An integral on the curvature error trims the lean for what
-//! the model misses (tyre slip and relaxation, suspension, the rider's own lean), and the lean
-//! is capped at `max_lean`.
+//! the model misses (tyre slip and relaxation, suspension, the rider's own lean); it runs only
+//! while the lean has settled (its rate below [`LEAN_SETTLED`] times the speed squared,
+//! as the lean of a turn grows with it), as through the countersteer and
+//! roll-in of a turn it would wind up and overshoot. The lean is capped at `max_lean`.
 //!
-//! Below `balance_speed` the rider crawls on their feet: a steering-angle servo to the
-//! kinematic angle `atan(κ w)/cos λ`, the feet holding the vehicle up. The rider's upper body
+//! Below `balance_speed`, and while the feet are down, the rider crawls on their feet: a
+//! steering-angle servo to the kinematic angle `atan(κ w)/cos λ`, the feet holding the vehicle
+//! up. (Balancing with the feet down, the regulator would steer against a lean the feet
+//! block, and in a turn wind the bars to the stop.) The rider's upper body
 //! stays neutral.
 
 use super::GroundEstimate;
 use crate::ControlError;
-use autonomousim_vehicles::ground::single_track::{WhippleMatrices, WhippleParams};
+use autonomousim_vehicles::ground::single_track::{SteadyTurn, WhippleMatrices};
 use autonomousim_vehicles::ground::{STANDARD_GRAVITY, WheeledDef};
 use glam::{DMat4, DVec4};
 
@@ -37,22 +41,20 @@ pub(super) struct Rider {
     /// steering torque positive to the right.
     speeds: Vec<f64>,
     gains: Vec<DVec4>,
-    model: WhippleMatrices,
-    /// Largest steering torque (N·m), wheelbase (m), head angle (rad).
+    /// Steady turns (lean, steering angle and torque).
+    turn: SteadyTurn,
+    /// Largest steering torque (N·m).
     max_torque: f64,
-    wheelbase: f64,
-    head_angle: f64,
     /// Steering-angle servo of the crawl: stiffness (N·m/rad) and damping (N·m·s/rad).
     crawl_kp: f64,
     crawl_kd: f64,
-    /// Steady-turn lean: gyroscopic factor `Σ I_spin/(r m h)`, centre-of-mass height `h` and
-    /// crown radius `ρ` (m).
-    gyro: f64,
-    height: f64,
-    crown: f64,
     /// Lean correction of the curvature integral (rad).
     lean_i: f64,
 }
+
+/// Lean rate per squared speed (rad·s/m²) below which the lean counts as settled for the
+/// curvature integral (0.05 rad/s at a bicycle's 5 m/s, 0.2 rad/s at 10 m/s).
+const LEAN_SETTLED: f64 = 0.002;
 
 /// Weights of the regulator: the state errors and steering torque (as a fraction of the
 /// largest) that cost the same.
@@ -74,8 +76,8 @@ impl Rider {
         if !def.is_single_track() {
             return Ok(None);
         }
-        let params = WhippleParams::from_def(def).map_err(ControlError::InvalidConfig)?;
-        let model = params.matrices();
+        let turn = SteadyTurn::of(def).map_err(ControlError::InvalidConfig)?;
+        let model = turn.model;
         let g = STANDARD_GRAVITY;
         let q = DMat4::from_diagonal(DVec4::new(
             LEAN_SCALE.powi(-2),
@@ -105,22 +107,13 @@ impl Rider {
         // about the axis.
         let inertia = model.m[1][1];
         let omega = 2.0 * std::f64::consts::PI * 5.0;
-        let (m, h) = (def.total_mass(), def.total_com().z);
-        let loads = def.rest_state().map_or(vec![1.0, 1.0], |s| s.loads.clone());
-        let crown = (0..2).map(|a| def.tire(a).crown_radius * loads[a]).sum::<f64>() / (loads[0] + loads[1]);
-        let spin: f64 = (0..2).map(|a| def.axles[a].wheel.inertia.y / def.tire(a).radius()).sum();
         Ok(Some(Self {
             speeds,
             gains,
-            model,
+            turn,
             max_torque: head.max_torque,
-            wheelbase: params.wheelbase,
-            head_angle: head.angle,
             crawl_kp: inertia * omega * omega,
             crawl_kd: 2.0 * inertia * omega,
-            gyro: spin / (m * h),
-            height: h,
-            crown,
             lean_i: 0.0,
         }))
     }
@@ -146,8 +139,7 @@ impl Rider {
     /// Lean of a steady turn of curvature `curvature` (1/m, positive left) at speed `v` (rad,
     /// positive right).
     pub(super) fn turn_lean(&self, v: f64, curvature: f64) -> f64 {
-        let theta = -(v * v * curvature / STANDARD_GRAVITY * (1.0 + self.gyro)).atan();
-        theta + (self.crown * theta.sin() / (self.height - self.crown)).asin()
+        self.turn.lean(v, curvature)
     }
 
     /// Steering input (`[−1, 1]`, positive turning left) for path curvature `curvature` at the
@@ -162,29 +154,26 @@ impl Rider {
         let v = est.speed();
         // Paper frame: steer positive to the right.
         let (delta, delta_rate) = (-est.steer_angle, -est.steer_rate);
-        if v.abs() < config.balance_speed {
+        if v.abs() < config.balance_speed || est.feet_down {
             self.lean_i = 0.0;
-            let target = -(curvature * self.wheelbase).atan() / self.head_angle.cos();
+            let target = self.turn.crawl_steer(curvature);
             let torque = -self.crawl_kp * (delta - target) - self.crawl_kd * delta_rate;
             return (-torque / self.max_torque).clamp(-1.0, 1.0);
         }
         let measured = est.yaw_rate / (v * est.roll.cos());
         let max = config.max_lean;
         let base = self.turn_lean(v, curvature);
-        // The integral runs while the lean is within its cap, and nudges it by the lean a
-        // steady turn needs per curvature.
-        if base.abs() < max {
+        // The integral runs while the lean is within its cap and settled, and nudges it by the
+        // lean a steady turn needs per curvature. (Through the countersteer and roll-in of a
+        // turn the curvature error is large but transient: integrated, it overshoots.)
+        if base.abs() < max && est.roll_rate.abs() < LEAN_SETTLED * v * v {
             let per_curvature = v * v / STANDARD_GRAVITY;
             self.lean_i = (self.lean_i - config.curvature_integral * per_curvature * (curvature - measured) * dt)
                 .clamp(-config.curvature_correction, config.curvature_correction);
         }
         let phi_ref = (base + self.lean_i).clamp(-max, max);
         // The linear model's steady turn at that lean: no lean torque, the steering torque.
-        let g = STANDARD_GRAVITY;
-        let m = &self.model;
-        let k = |i: usize, j: usize| g * m.k0[i][j] + v * v * m.k2[i][j];
-        let delta_ref = -k(0, 0) / k(0, 1) * phi_ref;
-        let torque_ref = k(1, 0) * phi_ref + k(1, 1) * delta_ref;
+        let (delta_ref, torque_ref) = self.turn.hold(v, phi_ref);
         let e = DVec4::new(est.roll - phi_ref, delta - delta_ref, est.roll_rate, delta_rate);
         let torque = torque_ref - self.gain(v).dot(e);
         (-torque / self.max_torque).clamp(-1.0, 1.0)
@@ -257,6 +246,7 @@ fn lqr(phi: DMat4, gamma: DVec4, q: DMat4, r: f64) -> Option<DVec4> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autonomousim_vehicles::ground::single_track::WhippleParams;
 
     #[test]
     fn regulator_stabilises_the_benchmark_bicycle() {

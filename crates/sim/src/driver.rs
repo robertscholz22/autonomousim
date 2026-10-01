@@ -225,6 +225,8 @@ pub struct DriverGeometry {
     pub tracking: f64,
     /// The reference point's distance ahead of the (towing unit's) rear axle (m).
     pub wheelbase: f64,
+    /// Whether it is a two-wheeler (a cyclist in traffic).
+    pub single_track: bool,
 }
 
 /// [`DriverGeometry::tracking`] of `d` (all units in line): the reference point's distance
@@ -279,6 +281,7 @@ impl DriverGeometry {
             articulated: d.num_units() > 1,
             tracking: tracking_length(d),
             wheelbase: -rear_axle_x(d, 0),
+            single_track: d.is_single_track(),
         }
     }
 }

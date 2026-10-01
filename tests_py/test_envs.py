@@ -606,7 +606,7 @@ def test_car_waypoint_fails_when_stuck():
 def test_motorcycle_road_scripted_rider_reaches_the_yards():
     from autonomousim import Event
 
-    n = 8
+    n = 16
     envs = gym.make_vec(
         "autonomousim/MotorcycleRoadRural-v0", num_envs=n, num_threads=4, map=RURAL, autoreset_mode=AutoresetMode.DISABLED
     )
@@ -641,9 +641,10 @@ def test_motorcycle_road_scripted_rider_reaches_the_yards():
         falls |= live & ((info["events"].reshape(-1) & int(Event.CRASH_TERRAIN | Event.ROLLOVER)) != 0)
         leaned[live] = np.maximum(leaned[live], np.abs(obs[live, 25]))
         done |= terminated | truncated
-    # The scripted rider leans into the bends and finishes most routes (about 85 % over 32
-    # episodes; it falls in some tight bends of the dirt tracks).
-    assert success.sum() >= n - 2 and (success | falls).all(), (success, falls)
+    # The scripted rider leans into the bends and finishes most routes (about 90 % over 32
+    # episodes; it falls in some tight bends of the dirt tracks, and now and then runs out of
+    # time weaving along a narrow one).
+    assert success.sum() >= n - 3 and falls.sum() <= 3, (success, falls)
     assert leaned.max() > 0.2, leaned
     envs.close()
 

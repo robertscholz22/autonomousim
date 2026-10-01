@@ -1081,6 +1081,14 @@ impl WheeledDef {
         self.axles.iter().filter(|a| a.unit == 0).all(AxleDef::is_single)
     }
 
+    /// Whether it can be driven kinematically: single-track vehicles only with a steering head
+    /// and the parameters of the linear lean model (see
+    /// [`SteadyTurn`](crate::ground::single_track::SteadyTurn)).
+    pub fn supports_kinematic(&self) -> bool {
+        !self.is_single_track()
+            || (self.steering_head().is_some() && crate::ground::single_track::SteadyTurn::of(self).is_ok())
+    }
+
     /// The axle with a steering head and its wheel, if any.
     pub fn steering_head(&self) -> Option<(&SteeringHeadDef, usize)> {
         let a = self.axles.iter().position(|a| a.steering_head.is_some())?;

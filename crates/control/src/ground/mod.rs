@@ -74,6 +74,8 @@ pub struct GroundEstimate {
     /// Steering head angle (rad, positive left) and rate (rad/s), for single-track vehicles.
     pub steer_angle: f64,
     pub steer_rate: f64,
+    /// Whether the rider's feet are down (single-track vehicles with feet).
+    pub feet_down: bool,
 }
 
 impl GroundEstimate {
@@ -95,6 +97,7 @@ impl GroundEstimate {
             roll_rate: v.ang_vel_body().x,
             steer_angle,
             steer_rate,
+            feet_down: v.feet_down(),
         }
     }
 

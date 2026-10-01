@@ -29,10 +29,18 @@
 //! its wheels, and the pitch about its joint that puts its axle at its rest height above the
 //! ground. Suspension travel stays at the static travel, the wheels roll with the ground.
 //!
+//! **Single-track vehicles** (with a steering head) follow the curvature in first order
+//! ([`SINGLE_TRACK_TURN`]) and yaw at `speed·κ`; they lean as in a steady turn of that
+//! curvature, about the line through the rear contact point, with the steering head at the
+//! angle that holds it ([`SteadyTurn`]) and the rider upright, so that the rider controller
+//! takes over without a jump. Below walking speed (the feet's) they stand upright on their
+//! feet, steered to the kinematic angle.
+//!
 //! No forces act on a kinematic vehicle and it computes no contacts.
 
 use super::{WheelState, Wheeled, wheel_angle};
 use crate::ground::def::SteerMode;
+use crate::ground::single_track::SteadyTurn;
 use crate::ground::units::{UnitJoint, yaw_pitch_roll};
 use autonomousim_core::dynamics::forward_kinematics;
 use autonomousim_core::math::Pose;
@@ -49,6 +57,9 @@ pub const DYNAMIC_SPEED: f64 = 1.0;
 
 /// Speed (m/s) above which the steering trim integrates (as the ground controller's).
 const TRIM_SPEED: f64 = 2.0;
+
+/// Time constant (s) of a single-track vehicle's curvature response.
+pub const SINGLE_TRACK_TURN: f64 = 0.3;
 
 /// Limits of the kinematic speed (and side drives' yaw-rate) response.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -89,7 +100,8 @@ pub struct KinematicState {
     pub speed: f64,
     pub lateral: f64,
     pub yaw_rate: f64,
-    /// Bicycle steering angle (rad), and the trim added to its target (rad).
+    /// Bicycle steering angle (rad), and the trim added to its target (rad); single-track
+    /// vehicles: the steering head's angle and the path curvature followed (1/m).
     pub steer: f64,
     pub trim: f64,
     /// Heading of each unit behind the towing unit (rad), unit 1 first.
@@ -126,6 +138,18 @@ pub(super) struct KinematicGeometry {
     radius: Vec<f64>,
     /// The single-track model's parameters (single-unit vehicles with steering).
     lateral: Option<Lateral>,
+    /// Single-track vehicles with a steering head.
+    single: Option<SingleTrack>,
+}
+
+/// Leaning of a single-track vehicle.
+#[derive(Clone, Debug)]
+struct SingleTrack {
+    turn: SteadyTurn,
+    /// Rear contact point at rest (chassis frame).
+    rear_contact: DVec3,
+    /// Below this speed (m/s) it stands on its feet.
+    feet_speed: f64,
 }
 
 /// Parameters of the linear single-track model.
@@ -172,6 +196,7 @@ impl KinematicGeometry {
             travel: Vec::new(),
             radius: Vec::new(),
             lateral: None,
+            single: None,
         }
     }
 
@@ -252,22 +277,37 @@ impl KinematicGeometry {
                 .collect();
             Lateral { mass, inertia, x_g: com.x - reference, wheels }
         });
+        let radius: Vec<f64> =
+            (0..n).map(|k| def.wheel_tire(k).radius() - st.map_or(0.0, |s| s.deflection[k].max(0.0))).collect();
+        let rest = w.pose();
+        let single =
+            (def.is_single_track() && w.head.is_some()).then(|| SteadyTurn::of(def).ok()).flatten().and_then(|turn| {
+                let rear = (0..n).min_by(|&i, &j| def.wheel_position(i).x.total_cmp(&def.wheel_position(j).x))?;
+                let contact = rest.transform_point(def.wheel_position(rear)) - DVec3::Z * radius[rear];
+                Some(SingleTrack {
+                    turn,
+                    rear_contact: rest.inverse_transform_point(contact),
+                    feet_speed: def.feet.map_or(0.0, |f| f.speed),
+                })
+            });
         Self {
-            rest: w.pose(),
+            rest,
             reference,
             steering,
             units,
             travel: (0..n).map(|k| st.map_or(0.0, |s| s.travel[k])).collect(),
-            radius: (0..n).map(|k| def.wheel_tire(k).radius() - st.map_or(0.0, |s| s.deflection[k].max(0.0))).collect(),
+            radius,
             lateral,
+            single,
         }
     }
 }
 
 impl Wheeled {
-    /// Whether the vehicle can be driven kinematically (not single-track).
+    /// Whether the vehicle can be driven kinematically (single-track vehicles only with a
+    /// steering head).
     pub fn supports_kinematic(&self) -> bool {
-        !self.def.is_single_track() && self.head.is_none()
+        if self.def.is_single_track() || self.head.is_some() { self.kinematic.single.is_some() } else { true }
     }
 
     /// The kinematic state of the vehicle as it is now (for driving it on kinematically):
@@ -281,14 +321,15 @@ impl Wheeled {
         let reference = pose.transform_point(DVec3::X * self.kinematic.reference);
         let v = self.lin_vel_world() + omega.cross(reference - pose.pos);
         let e = heading(psi);
+        let speed = v.truncate().dot(e);
         KinematicState {
             xy: pose.pos.truncate(),
             yaw: psi,
-            speed: v.truncate().dot(e),
+            speed,
             lateral: if self.kinematic.lateral.is_some() { v.truncate().dot(e.perp()) } else { 0.0 },
             yaw_rate: omega.z,
             steer: self.steer_angle,
-            trim: 0.0,
+            trim: if self.kinematic.single.is_some() && speed.abs() > CRAWL { omega.z / speed } else { 0.0 },
             unit_yaw: (1..self.units.len()).map(|u| yaw(poses.unit(u).rot)).collect(),
         }
     }
@@ -354,6 +395,16 @@ impl Wheeled {
         // Turning: steering (rate-limited to the bicycle angle for the curvature), or the yaw
         // rate of a side drive.
         let (yaw_rate, lateral) = match (self.kinematic.steering, self.def.steering) {
+            _ if self.kinematic.single.is_some() => {
+                let curvature = match target {
+                    KinematicTarget::SpeedCurvature { curvature, .. } => finite(curvature),
+                    KinematicTarget::SpeedYawRate { yaw_rate, .. } => {
+                        finite(yaw_rate) / speed.abs().max(v_ref.abs()).max(CRAWL)
+                    }
+                };
+                k.trim += (curvature - k.trim) * (1.0 - (-dt / SINGLE_TRACK_TURN).exp());
+                (speed * k.trim, 0.0)
+            }
             (Some((wheelbase, share)), Some(s)) => {
                 let curvature = match target {
                     KinematicTarget::SpeedCurvature { curvature, .. } => finite(curvature),
@@ -455,7 +506,24 @@ impl Wheeled {
         let forward = turn * DVec3::X;
         let x = (forward - normal * forward.dot(normal)).normalize();
         let frame = DQuat::from_mat3(&DMat3::from_cols(x, normal.cross(x), normal));
-        let pose0 = Pose::new(k.xy.extend(a) + frame * g.rest.pos, (frame * g.rest.rot).normalize());
+        let mut pose0 = Pose::new(k.xy.extend(a) + frame * g.rest.pos, (frame * g.rest.rot).normalize());
+        // Single-track: leaning into the turn, the steering holding it.
+        let single = g.single.as_ref().map(|st| {
+            let standing = k.speed.abs() < st.feet_speed.max(CRAWL);
+            let (lean, steer) = if standing {
+                (0.0, st.turn.crawl_steer(k.trim))
+            } else {
+                let lean = st.turn.lean(k.speed, k.trim);
+                (lean, st.turn.hold(k.speed, lean).0)
+            };
+            let contact = pose0.transform_point(st.rear_contact);
+            let turn = DQuat::from_axis_angle(x, lean);
+            let lift = normal * st.turn.crown * (1.0 - lean.cos());
+            pose0 = Pose::new(contact + turn * (pose0.pos - contact) + lift, (turn * pose0.rot).normalize());
+            // (Steering positive to the left.)
+            k.steer = -steer;
+            standing
+        });
         let v_xy = planar[0].velocity;
         let v0 = v_xy.extend(-(normal.x * v_xy.x + normal.y * v_xy.y) / normal.z);
         let omega0 = DVec3::Z * k.yaw_rate;
@@ -562,6 +630,13 @@ impl Wheeled {
                 ..WheelState::default()
             };
         }
+        if let (Some(standing), Some((_, head, _))) = (single, &self.head) {
+            (self.state.q[head.q], self.state.v[head.v]) = (k.steer, 0.0);
+            if let Some(r) = self.rider {
+                (self.state.q[r.q], self.state.v[r.v]) = (0.0, 0.0);
+            }
+            self.set_feet(standing);
+        }
         self.specific_force = pose0.rot.inverse() * DVec3::Z * super::super::def::STANDARD_GRAVITY;
         self.ang_acc = DVec3::ZERO;
         self.contacts.clear();
@@ -662,5 +737,34 @@ mod tests {
         assert!((k.yaw_rate - 0.2).abs() < 1e-4, "{}", k.yaw_rate);
         // The wheels roll without slip and the body velocity matches the state.
         assert!((w.kinematic_state().speed - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bicycle_leans_into_a_steady_turn() {
+        let mut w = Wheeled::new(std::sync::Arc::new(presets::wheeled("bicycle_city").expect("preset")), 1e-3);
+        assert!(w.supports_kinematic());
+        let turn = SteadyTurn::of(&w.def).expect("turn");
+        let mut k = w.kinematic_state();
+        w.place_kinematic(&mut k, &FLAT);
+        assert!(w.feet_down(), "standing at rest");
+        let target = KinematicTarget::SpeedCurvature { speed: 5.0, curvature: 0.1 };
+        for _ in 0..10_000 {
+            w.step_kinematic(&mut k, target, &KinematicLimits::default(), &FLAT, w.dt());
+        }
+        assert!(!w.feet_down());
+        assert!((k.yaw_rate - 0.5).abs() < 1e-6, "{}", k.yaw_rate);
+        let roll = yaw_pitch_roll(w.pose().rot)[2];
+        let lean = turn.lean(5.0, 0.1);
+        assert!(lean < -0.2 && (roll - lean).abs() < 1e-5, "{roll} {lean}");
+        // Steering into the turn (left, positive).
+        assert!(k.steer > 0.0 && (w.steer_angle - k.steer).abs() < 1e-12, "{}", k.steer);
+        // The rear contact stays on the ground.
+        let g = w.kinematic.clone();
+        let st = g.single.as_ref().expect("single track");
+        let contact = w.pose().transform_point(st.rear_contact);
+        let heading = DVec3::new(k.yaw.cos(), k.yaw.sin(), 0.0);
+        let centre = contact + DQuat::from_axis_angle(heading, lean) * DVec3::Z * st.turn.crown;
+        let lowest = centre - DVec3::Z * st.turn.crown;
+        assert!(lowest.z.abs() < 1e-9, "{}", lowest.z);
     }
 }

@@ -18,7 +18,8 @@
 //!
 //! Single-track vehicles: the steering head is a free joint, turned by the rider's steering
 //! torque (`DriveInput::steering`) against its damper and lock stops; the rider leans on a
-//! servo (`DriveInput::lean`); the feet go down below walking speed.
+//! servo (`DriveInput::lean`); the feet go down below walking speed, plant at a standstill and
+//! glide along while rolling.
 
 use super::def::{SteerMode, SteeringHeadDef, TrackSteering, WheeledDef, deflection_at};
 use super::powertrain::{Coupling, DriveInput, Powertrain, PowertrainStatus};
@@ -37,6 +38,11 @@ use autonomousim_core::math::{Pose, SpatialForce};
 use glam::{DQuat, DVec3};
 use kinematic::KinematicGeometry;
 use std::sync::Arc;
+
+/// Forward speed (m/s) below which the rider's feet plant (full friction); faster, they glide
+/// with friction coefficient [`FOOT_GLIDE`].
+const FOOT_PLANT: f64 = 0.3;
+const FOOT_GLIDE: f64 = 0.1;
 
 mod kinematic;
 
@@ -516,6 +522,13 @@ impl Wheeled {
             let down = v < f.speed || (self.feet_down && v < 1.25 * f.speed);
             if down != self.feet_down {
                 self.set_feet(down);
+            }
+            // A foot plants at a standstill but glides along while the vehicle rolls (the rider
+            // steps or skims): full grip would snag the rolling vehicle on a foot.
+            if let Some(k) = self.feet {
+                let grip = if v < FOOT_PLANT { 1.0 } else { FOOT_GLIDE };
+                self.colliders[k].friction = grip;
+                self.colliders[k + 1].friction = grip;
             }
         }
         // Suspension springs, stops, dampers and anti-roll bars.
