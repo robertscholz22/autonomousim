@@ -49,7 +49,7 @@ use std::f64::consts::TAU;
 use std::time::Instant;
 
 /// Bumped whenever the output for a given configuration and seed changes.
-pub const URBAN_VERSION: u32 = 5;
+pub const URBAN_VERSION: u32 = 6;
 
 /// The city's outline and ground.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -44,6 +44,13 @@ const LATERAL_ACCEL: f64 = 2.5;
 /// Extra route cost (m) of a lane change.
 const LANE_CHANGE_COST: f64 = 30.0;
 
+/// Length (m) of a crossing's band along its road ([`Area::Crosswalk`]).
+pub const CROSSWALK: f64 = 3.0;
+
+/// Spacing (m) of mid-block crossings: a street gets one per this length between the
+/// crosswalks at its ends.
+pub const MID_BLOCK_SPACING: f64 = 120.0;
+
 /// Speed limit (m/s) of a road class.
 pub fn speed_limit(class: RoadClass) -> f64 {
     match class {
@@ -204,6 +211,29 @@ pub struct Junction {
     pub connectors: Vec<u32>,
 }
 
+/// A marked pedestrian crossing over a road: a band [`CROSSWALK`] m long across its
+/// carriageway. Urban streets with sidewalks get one at each end that meets two or more other
+/// roads (ring roads of roundabouts excepted; at signals, only where some phase lets
+/// pedestrians walk), just beyond the lanes' ends, and streets with
+/// sidewalks on both sides and no parking lanes get mid-block crossings, one per
+/// [`MID_BLOCK_SPACING`] m between them (a third of the way into each stretch, away from the
+/// lanes' middles where buses stop).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Crossing {
+    pub road: u32,
+    /// Centre of the band (m along the road from its start).
+    pub station: f64,
+    /// The node of the junction it lies at; None mid-block.
+    pub node: Option<u32>,
+    /// Length (m) of the walk across: the carriageway's width.
+    pub length: f64,
+    /// The lanes it crosses, each with the station along it of the band's centre.
+    pub lanes: Vec<(u32, f64)>,
+    /// At a signalized junction: the controller and the phases (bit k for phase k) during
+    /// which pedestrians may start to cross ([`Controller::walk`]).
+    pub signal: Option<(u32, u32)>,
+}
+
 /// What lies at a point of the road surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Area {
@@ -248,6 +278,11 @@ pub struct LaneGraph {
     controllers: Vec<Controller>,
     connector_signals: Vec<Option<(u32, u8)>>,
     junction_controllers: Vec<Option<u32>>,
+    /// Pedestrian crossings, and per road the crossings over it (by station).
+    crossings: Vec<Crossing>,
+    road_crossings: Vec<Vec<u32>>,
+    /// Whether each road is a piece of a roundabout's ring.
+    rings: Vec<bool>,
 }
 
 /// One end of a road at a node.
@@ -650,7 +685,9 @@ impl LaneGraph {
             }
             last = grew;
             if !grown {
-                return g.with_signals();
+                let degree: Vec<usize> = ends.iter().map(Vec::len).collect();
+                let rings: Vec<bool> = (0..roads.len()).map(ring).collect();
+                return g.with_crossings(roads, &sections, &degree, rings).with_signals();
             }
         }
     }
@@ -960,16 +997,106 @@ impl LaneGraph {
         Self { lanes, connectors, junctions, setbacks, grid, ..Self::default() }
     }
 
-    /// With the signal controllers of its signalized junctions.
+    /// With the pedestrian crossings over its roads (`degree`: the number of road ends at
+    /// each node; `rings`: whether each road is a piece of a roundabout's ring).
+    fn with_crossings(mut self, roads: &[Road], sections: &[Section], degree: &[usize], rings: Vec<bool>) -> Self {
+        let mut crossings = Vec::new();
+        for (i, r) in roads.iter().enumerate() {
+            let s = &sections[i];
+            if !r.class.is_urban() || s.sidewalk[0].max(s.sidewalk[1]) <= 0.0 || rings[i] {
+                continue;
+            }
+            let len = r.line.length();
+            let [sa, sb] = self.setbacks[i];
+            let half = 0.5 * CROSSWALK;
+            let mut at = Vec::new();
+            let start = degree[r.start as usize] >= 3;
+            let end = degree[r.end as usize] >= 3;
+            if start {
+                at.push((sa + half, Some(r.start)));
+            }
+            if end && len - sb - half > sa + half + CROSSWALK {
+                at.push((len - sb - half, Some(r.end)));
+            }
+            if s.sidewalk[0].min(s.sidewalk[1]) > 0.0 && s.parking[0].max(s.parking[1]) <= 0.0 {
+                let a = sa + if start { CROSSWALK } else { 0.0 };
+                let b = len - sb - if end { CROSSWALK } else { 0.0 };
+                let n = ((b - a) / MID_BLOCK_SPACING).floor() as usize;
+                for k in 0..n {
+                    at.push((a + (b - a) * (k as f64 + 1.0 / 3.0) / n as f64, None));
+                }
+            }
+            for (station, node) in at {
+                if station < half || station > len - half {
+                    continue;
+                }
+                let centre = r.line.point_at(station).truncate();
+                let lanes = self
+                    .lanes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.road == i as u32)
+                    .map(|(k, l)| (k as u32, l.line.project(centre).station))
+                    .collect();
+                crossings.push(Crossing { road: i as u32, station, node, length: r.width, lanes, signal: None });
+            }
+        }
+        crossings.sort_by(|a, b| (a.road, a.station).partial_cmp(&(b.road, b.station)).expect("finite"));
+        self.road_crossings = vec![Vec::new(); roads.len()];
+        for (k, c) in crossings.iter().enumerate() {
+            self.road_crossings[c.road as usize].push(k as u32);
+        }
+        self.crossings = crossings;
+        self.rings = rings;
+        self
+    }
+
+    /// With the signal controllers of its signalized junctions, and the phases in which
+    /// pedestrians may walk over the crossings there.
     fn with_signals(mut self) -> Self {
         let (controllers, of) = signals::build(&self.lanes, &self.connectors, &self.junctions);
         self.junction_controllers = vec![None; self.junctions.len()];
         for (k, c) in controllers.iter().enumerate() {
             self.junction_controllers[c.junction as usize] = Some(k as u32);
         }
+        for c in &mut self.crossings {
+            let Some(k) = c.node.and_then(|n| self.junction_controllers[n as usize]) else { continue };
+            let lanes: Vec<u32> = c.lanes.iter().map(|l| l.0).collect();
+            c.signal = Some((k, signals::walk_phases(&controllers[k as usize], &self.connectors, &lanes)));
+        }
+        // No crossing where pedestrians would never walk.
+        self.crossings.retain(|c| c.signal.is_none_or(|s| s.1 != 0));
+        for list in &mut self.road_crossings {
+            list.clear();
+        }
+        for (k, c) in self.crossings.iter().enumerate() {
+            self.road_crossings[c.road as usize].push(k as u32);
+        }
         self.controllers = controllers;
         self.connector_signals = of;
         self
+    }
+
+    /// The pedestrian crossings, by road and station.
+    pub fn crossings(&self) -> &[Crossing] {
+        &self.crossings
+    }
+
+    /// The crossings over road `i`, by station.
+    pub fn road_crossings(&self, i: usize) -> &[u32] {
+        self.road_crossings.get(i).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether pedestrians may start over crossing `k` at time `t` (s), and how long that
+    /// stays so (s); None for unsignalized crossings.
+    pub fn crossing_walk(&self, k: u32, t: f64) -> Option<(bool, f64)> {
+        let c = &self.crossings[k as usize];
+        c.signal.map(|(ctl, phases)| self.controllers[ctl as usize].walk(phases, c.length, t))
+    }
+
+    /// Whether road `i` is a piece of a roundabout's ring.
+    pub fn is_ring(&self, i: usize) -> bool {
+        self.rings.get(i).copied().unwrap_or(false)
     }
 
     pub fn lanes(&self) -> &[Lane] {
@@ -1209,10 +1336,10 @@ impl LaneGraph {
             if near_start || near_end {
                 return Area::Junction;
             }
-            let crosswalk = urban
-                && section.sidewalk[0].max(section.sidewalk[1]) > 0.0
-                && ((station < sa + 3.0 && self.junctions[r.start as usize].approaches.len() >= 3)
-                    || (station > len - sb - 3.0 && self.junctions[r.end as usize].approaches.len() >= 3));
+            let crosswalk = self
+                .road_crossings(road as usize)
+                .iter()
+                .any(|&k| (station - self.crossings[k as usize].station).abs() <= 0.5 * CROSSWALK);
             if crosswalk {
                 return Area::Crosswalk;
             }

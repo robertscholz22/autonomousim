@@ -108,6 +108,73 @@ impl Controller {
     }
 }
 
+/// Least walk interval (s) of a pedestrian signal.
+pub const MIN_WALK: f64 = 5.0;
+
+/// Walking speed (m/s) by which pedestrians' clearance time is set.
+pub const CLEARANCE_SPEED: f64 = 1.2;
+
+impl Controller {
+    /// Whether pedestrians may start over a crossing `length` m long that walks in `phases`
+    /// (bit k: phase k) at time `t` (s), and how long that stays so (s). Each run of
+    /// consecutive walk phases is one window from the start of its first phase to the end of
+    /// its last one's amber; the walk light shows from the window's start until the
+    /// crossing's clearance time (`length / CLEARANCE_SPEED`) before its end, at least
+    /// [`MIN_WALK`] s. Never with no walk phases.
+    pub fn walk(&self, phases: u32, length: f64, t: f64) -> (bool, f64) {
+        let n = self.phases.len();
+        let cycle = self.cycle();
+        let walks = |k: usize| phases >> k & 1 == 1;
+        if (0..n).all(|k| !walks(k)) {
+            return (false, f64::INFINITY);
+        }
+        let all = (0..n).all(walks);
+        let u = t.rem_euclid(cycle);
+        let mut next = f64::INFINITY;
+        for k in 0..n {
+            // Windows start at a walk phase after one without (at phase 0 when all walk).
+            if !walks(k) || if all { k > 0 } else { walks((k + n - 1) % n) } {
+                continue;
+            }
+            let mut last = k;
+            while walks((last + 1) % n) && (last + 1) % n != k {
+                last = (last + 1) % n;
+            }
+            let start = self.start(k);
+            let mut end = self.start(last) + self.phases[last].green + self.amber;
+            if end <= start {
+                end += cycle;
+            }
+            let stop = (end - length / CLEARANCE_SPEED).max(start + MIN_WALK).min(end);
+            for v in [u, u + cycle] {
+                if v >= start && v < stop {
+                    return (true, stop - v);
+                }
+            }
+            next = next.min((start - u).rem_euclid(cycle));
+        }
+        (false, next)
+    }
+}
+
+/// The phases of `controller` (bit k: phase k) in which pedestrians may walk over a crossing
+/// of `lanes`: those whose connectors into or out of them all turn (left, right or U-turn;
+/// they yield to the pedestrians), and that are not protected phases moving any of them.
+pub(crate) fn walk_phases(controller: &Controller, connectors: &[Connector], lanes: &[u32]) -> u32 {
+    let mut mask = 0;
+    for (k, p) in controller.phases.iter().enumerate() {
+        let free = p.connectors.iter().all(|&c| {
+            let c = &connectors[c as usize];
+            let touches = lanes.contains(&c.from) || lanes.contains(&c.to);
+            !touches || (c.turn != Turn::Straight && !p.protected)
+        });
+        if free && k < 32 {
+            mask |= 1 << k;
+        }
+    }
+    mask
+}
+
 /// Target cycle length (s) for `n` phases.
 fn target_cycle(n: usize) -> f64 {
     match n {

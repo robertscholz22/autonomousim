@@ -2857,11 +2857,19 @@ M8 is split into three sub-milestones. Each ends with tests, its demo(s), a comm
 #### Implementation order
 | # | Step | Done when |
 |---|---|---|
-| 1 | Pedestrian network: sidewalks, crosswalks, pedestrian signal phases, mid-block crossings, entrances | Connected across each map; crosswalks meet sidewalks at both ends; pedestrian phases never conflict with green connectors |
+| 1 ✅ | Pedestrian network: sidewalks, crosswalks, pedestrian signal phases, mid-block crossings, entrances | Connected across each map; crosswalks meet sidewalks at both ends; pedestrian phases never conflict with green connectors |
 | 2 | Social-force pedestrians: the model, paths, crossing behaviour, vehicle avoidance, `PEDESTRIAN_HIT`, respawn, LiDAR and camera visibility | Bidirectional corridor flow forms lanes; the free speed distribution matches the draw; 30 min with NPC traffic: no pedestrian hit by an NPC vehicle, and no crossing on red unless jaywalking is enabled |
 | 3 | Cyclists: kinematic and hybrid (M5 bicycle), bike lanes, junction behaviour | Cyclists follow their routes without falls after promotion; cars overtake them safely; no collisions in 30 min |
 | 4 | Observations (`traffic` with types, `pedestrians`), viewer figures and animation, showcase performance | The showcase with 300 cars and 1,000 pedestrians runs at ≥ 60 fps at 1080p medium on the Iris Xe; 100 pedestrians add ≤ 20 % to a training world's step time |
 | 5 | `CarUrbanDrive-v0`: task, scripted baseline, short training, export, viewer, replay | As for the other demos |
+
+#### As built
+- **Step 1 (pedestrian network)**, `world::lanes::{Crossing, CROSSWALK, MID_BLOCK_SPACING}`, `LaneGraph::{crossings, road_crossings, crossing_walk, is_ring}`, `world::signals::{Controller::walk, MIN_WALK, CLEARANCE_SPEED}`, `world::walkways` (`Walkways`, `WalkNode`, `WalkEdge`, `WalkKind`, `Place`, `PlaceKind`, `WalkRoute`), `StaticWorld::walkways` (lazy), urban generator v6:
+  - **Crossings** are part of the lane graph (a pure function of the road network; no map-hash change): one 3 m band at each road end whose node joins ≥ 3 road ends (roundabout arms included, ring roads excluded) on urban roads with sidewalks, 1.5 m behind the junction area; mid-block crossings only on roads with sidewalks on both sides and no parking, one per 120 m of free length. Stop lines move back behind the bands; `Area::Crosswalk` comes from the crossings.
+  - **Pedestrian phases** (deviation: no exclusive walk phase): a crossing at a signalized junction walks in the phases where every connector from or to its lanes is a turn and the phase is not protected (permissive turns yield to pedestrians, M8c step 2). The walk light runs over each run of consecutive walk phases until the clearance time (road width / 1.2 m/s) before the run's end, at least 5 s; crossings that would never walk are removed.
+  - **Walkways**: walking lines on each sidewalk (clear of trees and lamps; ring roads only on the outer side), pulled back out of carriageways and junction areas at their ends (lines under 2 m dropped); corners join the lines of neighbouring roads around each node (concave by intersection, convex hugging the node), pushed out of blocked areas or dropped; crossings join the two sides; paths lead to building entrances (the lot-facing wall) and park centres when clear of obstacles; bus stops at the middle of right-hand lanes of ≥ 40 m. Only the largest connected part is kept; routes by A*. Built in about 35 ms per training map.
+  - **Generator v6**: trees and lamps keep clear of crossings (beyond the band).
+  - **Checks** (training seeds 1–3): one component, ≥ 95 % of streets walked, sidewalk/corner/path edges off carriageways, all ≥ 0.3 m from obstacles, crossing ends on the sidewalks and mid-points on the band, ≥ 80 % of buildings with an entrance; 280–330 crossings a map; the walk light never shows while a touching connector is green for a straight or protected movement.
 
 **To confirm while building**:
 - **Traffic side**: right-hand traffic only, or a `left_hand` map option.

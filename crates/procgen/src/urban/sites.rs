@@ -15,7 +15,7 @@ use crate::scatter::broadleaf;
 use autonomousim_core::material::MaterialId;
 use autonomousim_core::math::Pose;
 use autonomousim_core::rng::{Seed, SimRng};
-use autonomousim_world::lanes::Area;
+use autonomousim_world::lanes::{Area, CROSSWALK};
 use autonomousim_world::obstacles::tags;
 use autonomousim_world::{
     BayKind, Building, JunctionKind, Lot, Obstacle, ObstacleShape, Pad, ParkingBay, RoadNetwork, Roof, Sites, Zone,
@@ -976,7 +976,8 @@ fn building(
     (record, obstacles, pad)
 }
 
-/// Street trees, lamp posts, signal poles and on-street parking bays.
+/// Street trees, lamp posts (both clear of pedestrian crossings), signal poles and on-street
+/// parking bays.
 fn furniture(
     c: &UrbanConfig,
     net: &RoadNetwork,
@@ -1007,12 +1008,16 @@ fn furniture(
         };
         // Sides: 0 right of start → end (offset negative), 1 left.
         let sign = [-1.0, 1.0];
+        // Clear of the pedestrian crossings over the road by `d` beyond their bands.
+        let walk = |st: f64, d: f64| {
+            g.road_crossings(i).iter().all(|&k| (st - g.crossings()[k as usize].station).abs() > 0.5 * CROSSWALK + d)
+        };
         if s.sidewalk[0].min(s.sidewalk[1]) >= 2.5 && rng.chance(f.street_trees) {
             let mut st = from + 0.5 * f.tree_spacing;
             while st < to {
                 for side in 0..2 {
                     let p = at(st, sign[side] * (half + 1.2));
-                    if clear(p, i, 1.0) {
+                    if clear(p, i, 1.0) && walk(st, 1.0) {
                         let h = rng.range(8.0, 12.0);
                         obstacles.extend(broadleaf(p.extend(hs.at(p) - 0.2), h));
                     }
@@ -1025,7 +1030,7 @@ fn furniture(
             let mut side = 0;
             while st < to {
                 let p = at(st, sign[side] * (half + 0.4));
-                if clear(p, i, 0.5) {
+                if clear(p, i, 0.5) && walk(st, 0.5) {
                     let hh = 3.5;
                     let shape = ObstacleShape::Cylinder { half_height: hh, radius: 0.08 };
                     obstacles.push(

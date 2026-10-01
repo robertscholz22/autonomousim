@@ -10,7 +10,7 @@ use crate::mesh::srgb;
 use crate::props::chunk_index;
 use crate::roads::{Paint, Ribbons};
 use autonomousim_core::terrain::Terrain;
-use autonomousim_world::lanes::{Area, Control, JunctionKind, LaneGraph, Turn};
+use autonomousim_world::lanes::{Area, CROSSWALK, Control, JunctionKind, LaneGraph, Turn};
 use autonomousim_world::obstacles::tags;
 use autonomousim_world::{ObstacleShape, Polyline, RoadClass, RoadNetwork, StaticWorld};
 use glam::{DQuat, DVec2, DVec3, Vec3};
@@ -39,8 +39,6 @@ const DASH: f64 = 3.0;
 const DASH_PERIOD: f64 = 8.0;
 /// Width of a stop line (m); yield lines are dashed.
 const STOP_LINE: f64 = 0.4;
-/// Length of the crosswalk band before the lanes' ends (m; [`Area::Crosswalk`]).
-const CROSSWALK: f64 = 3.0;
 /// Width of a curb as drawn (m).
 const CURB_WIDTH: f64 = 0.2;
 /// Longest piece of a strip (m): pieces go to the chunk of their start.
@@ -333,26 +331,16 @@ fn crossing(g: &LaneGraph, n: u32) -> bool {
     g.junctions()[n as usize].approaches.len() >= 3
 }
 
-/// Zebra crossings at both ends of road `i` where it meets a junction and has sidewalks: the
-/// [`Area::Crosswalk`] band, 3 m beyond the setback.
+/// Zebra crossings over road `i`: the lane graph's crossings (at junctions, 3 m beyond the
+/// setback, and mid-block), each its [`Area::Crosswalk`] band.
 fn crosswalks(out: &mut Out, net: &RoadNetwork, i: usize) {
     let road = &net.roads()[i];
-    let section = net.section(i);
-    if section.sidewalk[0].max(section.sidewalk[1]) <= 0.0 {
-        return;
-    }
     let g = net.lanes();
-    let [sa, sb] = g.setbacks(i);
     let len = road.line.length();
     let half = 0.5 * road.width;
-    let mut bands = Vec::new();
-    if crossing(g, road.start) {
-        bands.push((sa + 0.3, sa + CROSSWALK - 0.3));
-    }
-    if crossing(g, road.end) {
-        bands.push((len - sb - CROSSWALK + 0.3, len - sb - 0.3));
-    }
-    for (s0, s1) in bands {
+    for &k in g.road_crossings(i) {
+        let c = &g.crossings()[k as usize];
+        let (s0, s1) = (c.station - 0.5 * CROSSWALK + 0.3, c.station + 0.5 * CROSSWALK - 0.3);
         if s0 < 0.0 || s1 > len || s1 <= s0 {
             continue;
         }
@@ -375,9 +363,8 @@ fn stop_lines(out: &mut Out, net: &RoadNetwork) {
             continue;
         }
         for a in &j.approaches {
-            let section = net.section(a.road as usize);
-            let urban = net.roads()[a.road as usize].class.is_urban();
-            let crosswalk = urban && section.sidewalk[0].max(section.sidewalk[1]) > 0.0 && j.approaches.len() >= 3;
+            let crosswalk =
+                g.road_crossings(a.road as usize).iter().any(|&k| g.crossings()[k as usize].node == Some(j.node));
             let (l, r) = (a.stop_line[0].truncate(), a.stop_line[1].truncate());
             let d = r - l;
             if d.length() < 0.5 {

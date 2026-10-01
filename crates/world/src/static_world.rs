@@ -6,12 +6,13 @@ use crate::obstacles::ObstacleSet;
 use crate::roads::RoadNetwork;
 use crate::sites::Sites;
 use crate::tiles::TiledMap;
+use crate::walkways::Walkways;
 use autonomousim_core::geometry::{HitMask, Ray, RayHit, StaticGeometry, SurfacePoint};
 use autonomousim_core::material::{Material, MaterialId, MaterialTable};
 use autonomousim_core::terrain::Terrain;
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Provenance and georeference of a map.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -178,6 +179,8 @@ pub struct StaticWorld {
     sites: Arc<Sites>,
     /// Content hash of a tiled map (fixed by its generator; grids are hashed from content).
     tiled_hash: Option<crate::MapHash>,
+    /// The pedestrian network, built when first asked for.
+    walkways: Arc<OnceLock<Walkways>>,
 }
 
 impl StaticWorld {
@@ -190,6 +193,7 @@ impl StaticWorld {
             roads: RoadNetwork::default(),
             sites: Arc::default(),
             tiled_hash: None,
+            walkways: Arc::default(),
         }
     }
 
@@ -203,6 +207,7 @@ impl StaticWorld {
             roads: RoadNetwork::default(),
             sites: Arc::default(),
             tiled_hash: Some(hash),
+            walkways: Arc::default(),
         }
     }
 
@@ -220,13 +225,20 @@ impl StaticWorld {
     /// The same map with a road network.
     pub fn with_roads(mut self, roads: RoadNetwork) -> Self {
         self.roads = roads;
+        self.walkways = Arc::default();
         self
     }
 
     /// The same map with lots, buildings, pads and bays.
     pub fn with_sites(mut self, sites: Sites) -> Self {
         self.sites = Arc::new(sites);
+        self.walkways = Arc::default();
         self
+    }
+
+    /// The pedestrian network (built on the first call; empty for maps without sidewalks).
+    pub fn walkways(&self) -> &Walkways {
+        self.walkways.get_or_init(|| Walkways::build(self))
     }
 
     /// Lots, buildings, pads and bays (empty for maps without).
