@@ -1,0 +1,35 @@
+# The bridge tests' street scenario: a car with a 16-ring LiDAR and a 640×480 camera at 10 Hz
+# on an urban map, with traffic, parked cars and pedestrians.
+policy_hz = 50
+map = { type = "urban", seed = 1, count = 1 }
+
+[pedestrians]
+count = 20
+
+[[groups]]
+name = "ego"
+vehicle = "sedan_like"
+spawn = { on_ground = true, on_road = true }
+goals = { kind = "route", distance = [150.0, 300.0], radius = 3.0, route = { destination = "lanes", step = 25.0 } }
+sensors = [
+    { name = "lidar", type = "lidar", rate_hz = 10, pattern = { type = "rings", elevations = [-15.0, -13.0, -11.0, -9.0, -7.0, -5.0, -3.0, -1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0], azimuths = 900, azimuth_fov = 360.0 }, mount = { position = [0.0, 0.0, 1.6] } },
+    { name = "front", type = "camera", width = 640, height = 480, fov_deg = 90.0, rate_hz = 10, mount = { position = [1.0, 0.0, 1.3] } },
+]
+
+[[groups]]
+name = "traffic"
+count = 10
+vehicle = "sedan_like"
+physics = "kinematic"
+driver = { type = "traffic" }
+spawn = { on_ground = true, on_road = true, min_separation = 20.0 }
+disable_on_terminal = false
+
+[[groups]]
+name = "parked"
+count = 5
+vehicle = "sedan_like"
+physics = "kinematic"
+driver = { type = "parked" }
+spawn = { on_ground = true, in_bays = true }
+disable_on_terminal = false

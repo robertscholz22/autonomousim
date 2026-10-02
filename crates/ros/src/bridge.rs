@@ -8,7 +8,14 @@
 //!   bits of each policy step that raised any) and one topic per sensor, published at the
 //!   sensor's own rate and stamped with its measurement time: `imu` (`sensor_msgs/Imu`), `gps`
 //!   (`NavSatFix`), `baro` (`FluidPressure`), `mag` (`MagneticField`), `range` (`Range`),
-//!   named after the sensor (`/agent0/<name>`), in the frame `agent<id>/<name>`.
+//!   named after the sensor (`/agent0/<name>`), in the frame `agent<id>/<name>`. A LiDAR
+//!   publishes `PointCloud2` (x, y, z and the return kind, returns only); a camera
+//!   `<name>/image` (`rgb8`), `<name>/depth` (`32FC1`, m along the optical axis, +inf where
+//!   nothing was hit), `<name>/semantic` (`mono8` class ids) and `<name>/camera_info`, in the
+//!   optical frame `agent<id>/<name>_optical` (z forward, x right, y down). `route`
+//!   (`nav_msgs/Path`, latched) is the agent's route each episode, if it has one.
+//! - `/autonomousim/{npcs, pedestrians, signals}` (`MarkerArray`, at `markers_hz`): scripted
+//!   agents as boxes, pedestrians as cylinders, signal heads in the colour of their light.
 //! - Commands, per bridged agent not flown by a policy: `cmd_vel` (`geometry_msgs/Twist`;
 //!   multirotors: velocity in the heading frame and heading rate; wheeled vehicles: forward
 //!   speed and yaw rate) and `action` (`std_msgs/Float32MultiArray`, the normalized action of
@@ -18,24 +25,31 @@
 //! - Services: `/autonomousim/reset` (`std_srvs/Trigger`: a new episode) and
 //!   `/autonomousim/pause` (`std_srvs/SetBool`: simulated time stands while paused).
 
+use crate::markers;
 use crate::msgs::builtin_interfaces::Time;
 use crate::msgs::geometry_msgs::{Quaternion, Transform, TransformStamped, Twist, Vector3};
-use crate::msgs::nav_msgs::Odometry;
+use crate::msgs::nav_msgs::{Odometry, Path};
 use crate::msgs::rosgraph_msgs::Clock;
-use crate::msgs::sensor_msgs::{FluidPressure, Imu, JointState, MagneticField, NavSatFix, NavSatStatus, Range};
+use crate::msgs::sensor_msgs::{
+    CameraInfo, FluidPressure, Image, Imu, JointState, MagneticField, NavSatFix, NavSatStatus, PointCloud2, PointField,
+    Range,
+};
 use crate::msgs::std_msgs::{Float32MultiArray, Header, StringMsg, UInt32};
 use crate::msgs::std_srvs::{SetBoolRequest, SetBoolResponse, TriggerRequest, TriggerResponse};
 use crate::msgs::tf2_msgs::TFMessage;
+use crate::msgs::visualization_msgs::MarkerArray;
 use crate::msgs::{Array, RosMessage};
 use crate::node::{Publisher, RosNode, Server, Subscription, qos};
 use autonomousim_control::Command;
 use autonomousim_control::ground::GroundSetpoint;
 use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::rng::Seed;
+use autonomousim_scene::streets::SignalHead;
 use autonomousim_sensors::Sensor;
+use autonomousim_sim::camera::{Cameras, has_cameras};
 use autonomousim_sim::policy::Policy;
 use autonomousim_sim::{CompiledScenario, WorldInstance};
-use glam::{DQuat, DVec3};
+use glam::{DMat3, DQuat, DVec3};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,6 +79,11 @@ pub struct BridgeConfig {
     /// Wait before each policy step for a command from every commanded agent, at most this
     /// long (wall clock, s); none: step without waiting.
     pub lockstep: Option<f64>,
+    /// Rate of the NPC, pedestrian and signal markers (Hz; 0: none). Must divide the policy
+    /// rate.
+    pub markers_hz: u32,
+    /// Render and publish cameras (needs a GPU).
+    pub cameras: bool,
 }
 
 impl Default for BridgeConfig {
@@ -77,6 +96,8 @@ impl Default for BridgeConfig {
             seed: 0,
             command_timeout: 0.5,
             lockstep: None,
+            markers_hz: 10,
+            cameras: true,
         }
     }
 }
@@ -95,7 +116,7 @@ pub fn quaternion(q: DQuat) -> Quaternion {
     Quaternion { x: q.x, y: q.y, z: q.z, w: q.w }
 }
 
-fn header(t: f64, frame: &str) -> Header {
+pub(crate) fn header(t: f64, frame: &str) -> Header {
     Header { stamp: Time::from_secs(t), frame_id: frame.to_string() }
 }
 
@@ -110,6 +131,45 @@ enum SensorTopic {
     Baro(Publisher<FluidPressure>),
     Mag(Publisher<MagneticField>),
     Range(Publisher<Range>, f32, f32),
+    Lidar(Publisher<PointCloud2>),
+    Camera(Box<CameraTopics>),
+}
+
+struct CameraTopics {
+    image: Publisher<Image>,
+    depth: Publisher<Image>,
+    semantic: Publisher<Image>,
+    info: Publisher<CameraInfo>,
+    /// Calibration (the header set per frame).
+    calibration: CameraInfo,
+}
+
+/// The rotation from a camera's optical frame (z forward, x right, y down) to its frame (FLU,
+/// optical axis +x).
+pub fn optical_rotation() -> DQuat {
+    DQuat::from_mat3(&DMat3::from_cols(DVec3::NEG_Y, DVec3::NEG_Z, DVec3::X))
+}
+
+/// The pinhole calibration of a `width` × `height` camera with horizontal field of view
+/// `fov_x` (rad), as the renderer projects (square pixels, principal point at the centre).
+pub fn camera_info(width: u32, height: u32, fov_x: f64) -> CameraInfo {
+    let f = 0.5 * f64::from(width) / (0.5 * fov_x).tan();
+    let (cx, cy) = (0.5 * f64::from(width), 0.5 * f64::from(height));
+    CameraInfo {
+        height,
+        width,
+        distortion_model: "plumb_bob".into(),
+        d: vec![0.0; 5],
+        k: Array([f, 0.0, cx, 0.0, f, cy, 0.0, 0.0, 1.0]),
+        r: Array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        p: Array([f, 0.0, cx, 0.0, 0.0, f, cy, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        ..Default::default()
+    }
+}
+
+/// An image message of `data` (row-major from the top-left pixel).
+fn image(header: Header, width: u32, height: u32, encoding: &str, bytes_per_pixel: u32, data: Vec<u8>) -> Image {
+    Image { header, height, width, encoding: encoding.into(), is_bigendian: 0, step: width * bytes_per_pixel, data }
 }
 
 struct SensorPub {
@@ -203,6 +263,58 @@ impl SensorPub {
                     },
                 );
             }
+            (SensorTopic::Lidar(p), Sensor::Lidar(s)) => {
+                let scan = fresh!(s);
+                // Returns only (unorganized): x, y, z (float32) and the return kind (uint8).
+                let mut data = Vec::with_capacity(16 * scan.ranges.len());
+                for ((&r, d), kind) in scan.ranges.iter().zip(s.directions()).zip(&scan.kinds) {
+                    if r.is_finite() {
+                        let q = *d * f64::from(r);
+                        for c in [q.x as f32, q.y as f32, q.z as f32] {
+                            data.extend(c.to_le_bytes());
+                        }
+                        data.extend([*kind as u8, 0, 0, 0]);
+                    }
+                }
+                let n = (data.len() / 16) as u32;
+                let field = |name: &str, offset: u32, datatype: u8| PointField {
+                    name: name.into(),
+                    offset,
+                    datatype,
+                    count: 1,
+                };
+                send(
+                    p,
+                    PointCloud2 {
+                        header: header(offset + scan.time, &self.frame),
+                        height: 1,
+                        width: n,
+                        fields: vec![
+                            field("x", 0, PointField::FLOAT32),
+                            field("y", 4, PointField::FLOAT32),
+                            field("z", 8, PointField::FLOAT32),
+                            field("kind", 12, PointField::UINT8),
+                        ],
+                        is_bigendian: false,
+                        point_step: 16,
+                        row_step: 16 * n,
+                        data,
+                        is_dense: true,
+                    },
+                );
+            }
+            (SensorTopic::Camera(c), Sensor::Camera(s)) => {
+                let r = fresh!(s);
+                let (img, h) = (&r.value, header(offset + r.time, &self.frame));
+                let (w, ht) = (img.width, img.height);
+                // Nothing hit: +inf ("too far", REP-118).
+                let depth =
+                    img.depth.iter().flat_map(|&d| if d > 0.0 { d } else { f32::INFINITY }.to_le_bytes()).collect();
+                send(&c.image, image(h.clone(), w, ht, "rgb8", 3, img.rgb.clone()));
+                send(&c.depth, image(h.clone(), w, ht, "32FC1", 4, depth));
+                send(&c.semantic, image(h.clone(), w, ht, "mono8", 1, img.class.clone()));
+                send(&c.info, CameraInfo { header: h, ..c.calibration.clone() });
+            }
             _ => unreachable!("sensor topics are built from the sensors"),
         }
     }
@@ -228,6 +340,7 @@ struct AgentPubs {
     joints: Option<Publisher<JointState>>,
     events: Publisher<UInt32>,
     sensors: Vec<SensorPub>,
+    route: Publisher<Path>,
     cmd_vel: Subscription<Twist>,
     action: Subscription<Float32MultiArray>,
     /// Flown by a policy (commands are ignored).
@@ -253,7 +366,9 @@ fn mount_transform(sensor: &Sensor) -> Option<(DVec3, DQuat)> {
             let c = s.config();
             return Some((c.mount.position, DQuat::from_rotation_arc(DVec3::X, c.direction.normalize())));
         }
-        Sensor::Pitot(_) | Sensor::Lidar(_) | Sensor::Camera(_) | Sensor::GroundTruth(_) => return None,
+        Sensor::Lidar(s) => (s.config().mount, DQuat::IDENTITY),
+        Sensor::Camera(s) => (s.config().mount, DQuat::IDENTITY),
+        Sensor::Pitot(_) | Sensor::GroundTruth(_) => return None,
     };
     Some((mount.position, mount.quat() * extra))
 }
@@ -286,6 +401,21 @@ pub struct Bridge {
     /// Any command received yet (lockstep waits without a time limit until then).
     commanded: bool,
     steps_total: u64,
+    /// Renders the cameras (scenarios with cameras, if enabled).
+    cameras: Option<Cameras>,
+    markers: MarkerPubs,
+    /// Policy steps per marker message (0: none).
+    markers_divider: u64,
+}
+
+struct MarkerPubs {
+    /// Scripted agents: index in the world and body box (centre, size).
+    npcs: Vec<(usize, (DVec3, DVec3))>,
+    npc_pub: Option<Publisher<MarkerArray>>,
+    pedestrians: Option<Publisher<MarkerArray>>,
+    signals: Option<Publisher<MarkerArray>>,
+    /// Signal heads of the map they were found on.
+    heads: (usize, Vec<SignalHead>),
 }
 
 impl Bridge {
@@ -295,7 +425,18 @@ impl Bridge {
         if odom_hz == 0 || !policy_hz.is_multiple_of(odom_hz) {
             anyhow::bail!("the odometry rate ({odom_hz} Hz) must divide the policy rate ({policy_hz} Hz)");
         }
-        let world = WorldInstance::new(scenario.clone(), Seed::from_u64(config.seed));
+        if config.markers_hz > 0 && !policy_hz.is_multiple_of(config.markers_hz) {
+            anyhow::bail!("the marker rate ({} Hz) must divide the policy rate ({policy_hz} Hz)", config.markers_hz);
+        }
+        let mut world = WorldInstance::new(scenario.clone(), Seed::from_u64(config.seed));
+        let mut cameras = None;
+        if config.cameras && has_cameras(&scenario) {
+            let ctx =
+                autonomousim_sim::camera::gpu().map_err(|e| anyhow::anyhow!("cameras: {e} (run without cameras?)"))?;
+            let mut c = Cameras::new(ctx, &scenario);
+            c.update(&mut world)?;
+            cameras = Some(c);
+        }
         let mut node = RosNode::new("/", "autonomousim", config.domain_id)?;
         let clock =
             node.publisher::<Clock>("/clock", qos::RELIABLE.history(ros2_client::qos::History::KeepLast { depth: 1 }))?;
@@ -317,16 +458,43 @@ impl Bridge {
                 vec![format!("{ns}/odom"), format!("{ns}/events"), format!("{ns}/cmd_vel"), format!("{ns}/action")];
             for (k, (s, spec)) in a.sensors.iter().zip(&g.spec.sensors).enumerate() {
                 let Some((position, rotation)) = mount_transform(s) else { continue };
+                if matches!(s, Sensor::Camera(_)) && cameras.is_none() {
+                    continue;
+                }
                 let topic = format!("{ns}/{}", spec.name);
                 let sensor_frame = format!("agent{}/{}", a.id, spec.name);
-                let t = match s {
-                    Sensor::Imu(_) => SensorTopic::Imu(node.publisher(&topic, qos::SENSOR)?),
-                    Sensor::Gps(_) => SensorTopic::Gps(node.publisher(&topic, qos::SENSOR)?),
-                    Sensor::Baro(_) => SensorTopic::Baro(node.publisher(&topic, qos::SENSOR)?),
-                    Sensor::Mag(_) => SensorTopic::Mag(node.publisher(&topic, qos::SENSOR)?),
+                // The topic, its frame and its topic names.
+                let (t, data_frame, names) = match s {
+                    Sensor::Imu(_) => (SensorTopic::Imu(node.publisher(&topic, qos::SENSOR)?), None, vec![topic]),
+                    Sensor::Gps(_) => (SensorTopic::Gps(node.publisher(&topic, qos::SENSOR)?), None, vec![topic]),
+                    Sensor::Baro(_) => (SensorTopic::Baro(node.publisher(&topic, qos::SENSOR)?), None, vec![topic]),
+                    Sensor::Mag(_) => (SensorTopic::Mag(node.publisher(&topic, qos::SENSOR)?), None, vec![topic]),
                     Sensor::Rangefinder(r) => {
                         let c = r.config();
-                        SensorTopic::Range(node.publisher(&topic, qos::SENSOR)?, c.min_range as f32, c.max_range as f32)
+                        let p = node.publisher(&topic, qos::SENSOR)?;
+                        (SensorTopic::Range(p, c.min_range as f32, c.max_range as f32), None, vec![topic])
+                    }
+                    Sensor::Lidar(_) => (SensorTopic::Lidar(node.publisher(&topic, qos::SENSOR)?), None, vec![topic]),
+                    Sensor::Camera(cam) => {
+                        let c = cam.config();
+                        let optical = format!("{sensor_frame}_optical");
+                        statics.push(TransformStamped {
+                            header: header(0.0, &sensor_frame),
+                            child_frame_id: optical.clone(),
+                            transform: Transform {
+                                translation: vector(DVec3::ZERO),
+                                rotation: quaternion(optical_rotation()),
+                            },
+                        });
+                        let names = ["image", "depth", "semantic", "camera_info"].map(|n| format!("{topic}/{n}"));
+                        let t = SensorTopic::Camera(Box::new(CameraTopics {
+                            image: node.publisher(&names[0], qos::SENSOR)?,
+                            depth: node.publisher(&names[1], qos::SENSOR)?,
+                            semantic: node.publisher(&names[2], qos::SENSOR)?,
+                            info: node.publisher(&names[3], qos::SENSOR)?,
+                            calibration: camera_info(c.width, c.height, c.fov_deg.to_radians()),
+                        }));
+                        (t, Some(optical), names.to_vec())
                     }
                     _ => unreachable!("mount_transform filters the others"),
                 };
@@ -335,8 +503,9 @@ impl Bridge {
                     child_frame_id: sensor_frame.clone(),
                     transform: Transform { translation: vector(position), rotation: quaternion(rotation) },
                 });
-                topics.push(topic);
-                sensors.push(SensorPub { sensor: k, frame: sensor_frame, topic: t, last: None });
+                topics.extend(names);
+                let frame = data_frame.unwrap_or(sensor_frame);
+                sensors.push(SensorPub { sensor: k, frame, topic: t, last: None });
             }
             let joints = if a.vehicle.as_wheeled().is_some() {
                 topics.push(format!("{ns}/joint_states"));
@@ -344,6 +513,7 @@ impl Bridge {
             } else {
                 None
             };
+            topics.push(format!("{ns}/route"));
             meta_agents.push(serde_json::json!({
                 "id": a.id, "group": g.spec.name, "frame": frame, "topics": topics,
             }));
@@ -355,6 +525,7 @@ impl Bridge {
                 joints,
                 frame,
                 sensors,
+                route: node.publisher(&format!("{ns}/route"), qos::LATCHED)?,
                 cmd_vel: node.subscription(&format!("{ns}/cmd_vel"), qos::RELIABLE)?,
                 action: node.subscription(&format!("{ns}/action"), qos::RELIABLE)?,
                 flown: false,
@@ -364,6 +535,30 @@ impl Bridge {
             });
         }
         send(&tf_static, TFMessage { transforms: statics });
+        // Markers: scripted agents, pedestrians and signals, where the scenario has them.
+        let on = config.markers_hz > 0;
+        let npcs: Vec<_> = (0..world.agents().len())
+            .filter(|&i| scenario.groups[world.agent(i).group].scripted())
+            .map(|i| (i, markers::body_box(&world, i)))
+            .collect();
+        let heads = markers::heads(&world);
+        let mut marker_topics = Vec::new();
+        let mut marker_pub = |name: &str, wanted: bool| -> anyhow::Result<Option<Publisher<MarkerArray>>> {
+            if !(on && wanted) {
+                return Ok(None);
+            }
+            let topic = format!("/autonomousim/{name}");
+            let p = node.publisher(&topic, qos::RELIABLE)?;
+            marker_topics.push(topic);
+            Ok(Some(p))
+        };
+        let markers = MarkerPubs {
+            npc_pub: marker_pub("npcs", !npcs.is_empty())?,
+            pedestrians: marker_pub("pedestrians", !world.crowd().peds.is_empty())?,
+            signals: marker_pub("signals", !heads.is_empty())?,
+            npcs,
+            heads: (world.map_index(), heads),
+        };
         let meta_json = serde_json::json!({
             "format": 1,
             "scenario": scenario.spec,
@@ -372,11 +567,14 @@ impl Bridge {
             "policy_hz": policy_hz,
             "odom_hz": odom_hz,
             "agents": meta_agents,
+            "markers": marker_topics,
+            "markers_hz": config.markers_hz,
         });
         send(&meta, StringMsg { data: meta_json.to_string() });
         let reset_server = node.server("/autonomousim/reset", "std_srvs/Trigger")?;
         let pause_server = node.server("/autonomousim/pause", "std_srvs/SetBool")?;
-        Ok(Self {
+        let markers_divider = if on { u64::from(policy_hz / config.markers_hz) } else { 0 };
+        let bridge = Self {
             world,
             config,
             _node: node,
@@ -398,7 +596,13 @@ impl Bridge {
             reset_requested: false,
             commanded: false,
             steps_total: 0,
-        })
+            cameras,
+            markers_divider,
+            markers,
+        };
+        bridge.publish_routes();
+        bridge.publish_markers();
+        Ok(bridge)
     }
 
     /// Let an exported policy fly the agents of `group`.
@@ -580,6 +784,51 @@ impl Bridge {
                 s.last = None;
             }
         }
+        if self.markers.heads.0 != self.world.map_index() {
+            self.markers.heads = (self.world.map_index(), markers::heads(&self.world));
+        }
+        self.render_cameras();
+        self.publish_routes();
+        self.publish_markers();
+    }
+
+    /// Render the cameras due and publish their frames (a failure stops the cameras).
+    fn render_cameras(&mut self) {
+        let Some(c) = &mut self.cameras else { return };
+        if let Err(e) = c.update(&mut self.world) {
+            eprintln!("cameras stopped: {e}");
+            self.cameras = None;
+            return;
+        }
+        for a in &mut self.agents {
+            let sensors = &self.world.agent(a.agent).sensors;
+            for s in a.sensors.iter_mut().filter(|s| matches!(s.topic, SensorTopic::Camera(_))) {
+                s.publish(&sensors[s.sensor], self.offset);
+            }
+        }
+    }
+
+    /// The routes of the bridged agents that have one (latched).
+    fn publish_routes(&self) {
+        let t = self.time();
+        for a in &self.agents {
+            if let Some(path) = markers::route(&self.world, a.agent, t) {
+                send(&a.route, path);
+            }
+        }
+    }
+
+    fn publish_markers(&self) {
+        let (m, w, t) = (&self.markers, &self.world, self.time());
+        if let Some(p) = &m.npc_pub {
+            send(p, markers::npcs(w, t, &m.npcs));
+        }
+        if let Some(p) = &m.pedestrians {
+            send(p, markers::pedestrians(w, t));
+        }
+        if let Some(p) = &m.signals {
+            send(p, markers::signals(w, t, &m.heads.1));
+        }
     }
 
     pub fn world(&self) -> &WorldInstance {
@@ -642,6 +891,10 @@ impl Bridge {
         self.steps_total += 1;
         for a in &mut self.agents {
             a.fresh = false;
+        }
+        self.render_cameras();
+        if self.markers_divider > 0 && self.world.steps().is_multiple_of(self.markers_divider) {
+            self.publish_markers();
         }
         let t = self.time();
         // State before the clock: a controller answering a tick has the state of that tick.

@@ -9,15 +9,20 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// A message type: its ROS name, `package/Name` (service parts: `package/Name_Request`).
 pub trait RosMessage: Serialize + DeserializeOwned + Send + 'static {
     const TYPE: &'static str;
+    /// A fixed-size type that is not a multiple of 4 bytes long: rmw serializes it with the
+    /// trailing padding of its C struct, to a multiple of 4 ([`to_cdr`]).
+    const PADDED: bool = false;
 }
 
 macro_rules! ros_message {
-    ($($t:ty => $name:literal),* $(,)?) => {$(
+    ($($t:ty => $name:literal $(, $padded:ident)?);* $(;)?) => {$(
         impl RosMessage for $t {
             const TYPE: &'static str = $name;
+            $(const PADDED: bool = ros_message!(@$padded);)?
         }
         impl ros2_client::Message for $t {}
     )*};
+    (@padded) => { true };
 }
 
 /// A fixed-size `float64[N]` array (CDR: no length prefix). serde's own arrays stop at 32.
@@ -344,6 +349,31 @@ pub mod sensor_msgs {
         pub data: Vec<u8>,
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RegionOfInterest {
+        pub x_offset: u32,
+        pub y_offset: u32,
+        pub height: u32,
+        pub width: u32,
+        pub do_rectify: bool,
+    }
+
+    /// Pinhole calibration (`k`: intrinsics, `r`: rectification, `p`: projection; row-major).
+    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    pub struct CameraInfo {
+        pub header: Header,
+        pub height: u32,
+        pub width: u32,
+        pub distortion_model: String,
+        pub d: Vec<f64>,
+        pub k: Array<9>,
+        pub r: Array<9>,
+        pub p: Array<12>,
+        pub binning_x: u32,
+        pub binning_y: u32,
+        pub roi: RegionOfInterest,
+    }
+
     #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
     pub struct CompressedImage {
         pub header: Header,
@@ -475,42 +505,44 @@ pub mod std_srvs {
 }
 
 ros_message! {
-    builtin_interfaces::Time => "builtin_interfaces/Time",
-    builtin_interfaces::Duration => "builtin_interfaces/Duration",
-    std_msgs::Header => "std_msgs/Header",
-    std_msgs::StringMsg => "std_msgs/String",
-    std_msgs::UInt32 => "std_msgs/UInt32",
-    std_msgs::ColorRGBA => "std_msgs/ColorRGBA",
-    std_msgs::Float32MultiArray => "std_msgs/Float32MultiArray",
-    geometry_msgs::Vector3 => "geometry_msgs/Vector3",
-    geometry_msgs::Point => "geometry_msgs/Point",
-    geometry_msgs::Quaternion => "geometry_msgs/Quaternion",
-    geometry_msgs::Pose => "geometry_msgs/Pose",
-    geometry_msgs::PoseStamped => "geometry_msgs/PoseStamped",
-    geometry_msgs::PoseWithCovariance => "geometry_msgs/PoseWithCovariance",
-    geometry_msgs::Twist => "geometry_msgs/Twist",
-    geometry_msgs::TwistWithCovariance => "geometry_msgs/TwistWithCovariance",
-    geometry_msgs::Transform => "geometry_msgs/Transform",
-    geometry_msgs::TransformStamped => "geometry_msgs/TransformStamped",
-    nav_msgs::Odometry => "nav_msgs/Odometry",
-    nav_msgs::Path => "nav_msgs/Path",
-    sensor_msgs::Imu => "sensor_msgs/Imu",
-    sensor_msgs::NavSatFix => "sensor_msgs/NavSatFix",
-    sensor_msgs::FluidPressure => "sensor_msgs/FluidPressure",
-    sensor_msgs::MagneticField => "sensor_msgs/MagneticField",
-    sensor_msgs::Range => "sensor_msgs/Range",
-    sensor_msgs::PointCloud2 => "sensor_msgs/PointCloud2",
-    sensor_msgs::Image => "sensor_msgs/Image",
-    sensor_msgs::CompressedImage => "sensor_msgs/CompressedImage",
-    sensor_msgs::JointState => "sensor_msgs/JointState",
-    tf2_msgs::TFMessage => "tf2_msgs/TFMessage",
-    rosgraph_msgs::Clock => "rosgraph_msgs/Clock",
-    visualization_msgs::Marker => "visualization_msgs/Marker",
-    visualization_msgs::MarkerArray => "visualization_msgs/MarkerArray",
-    std_srvs::TriggerRequest => "std_srvs/Trigger_Request",
-    std_srvs::TriggerResponse => "std_srvs/Trigger_Response",
-    std_srvs::SetBoolRequest => "std_srvs/SetBool_Request",
-    std_srvs::SetBoolResponse => "std_srvs/SetBool_Response",
+    builtin_interfaces::Time => "builtin_interfaces/Time";
+    builtin_interfaces::Duration => "builtin_interfaces/Duration";
+    std_msgs::Header => "std_msgs/Header";
+    std_msgs::StringMsg => "std_msgs/String";
+    std_msgs::UInt32 => "std_msgs/UInt32";
+    std_msgs::ColorRGBA => "std_msgs/ColorRGBA";
+    std_msgs::Float32MultiArray => "std_msgs/Float32MultiArray";
+    geometry_msgs::Vector3 => "geometry_msgs/Vector3";
+    geometry_msgs::Point => "geometry_msgs/Point";
+    geometry_msgs::Quaternion => "geometry_msgs/Quaternion";
+    geometry_msgs::Pose => "geometry_msgs/Pose";
+    geometry_msgs::PoseStamped => "geometry_msgs/PoseStamped";
+    geometry_msgs::PoseWithCovariance => "geometry_msgs/PoseWithCovariance";
+    geometry_msgs::Twist => "geometry_msgs/Twist";
+    geometry_msgs::TwistWithCovariance => "geometry_msgs/TwistWithCovariance";
+    geometry_msgs::Transform => "geometry_msgs/Transform";
+    geometry_msgs::TransformStamped => "geometry_msgs/TransformStamped";
+    nav_msgs::Odometry => "nav_msgs/Odometry";
+    nav_msgs::Path => "nav_msgs/Path";
+    sensor_msgs::Imu => "sensor_msgs/Imu";
+    sensor_msgs::NavSatFix => "sensor_msgs/NavSatFix";
+    sensor_msgs::FluidPressure => "sensor_msgs/FluidPressure";
+    sensor_msgs::MagneticField => "sensor_msgs/MagneticField";
+    sensor_msgs::Range => "sensor_msgs/Range";
+    sensor_msgs::PointCloud2 => "sensor_msgs/PointCloud2";
+    sensor_msgs::Image => "sensor_msgs/Image";
+    sensor_msgs::RegionOfInterest => "sensor_msgs/RegionOfInterest", padded;
+    sensor_msgs::CameraInfo => "sensor_msgs/CameraInfo";
+    sensor_msgs::CompressedImage => "sensor_msgs/CompressedImage";
+    sensor_msgs::JointState => "sensor_msgs/JointState";
+    tf2_msgs::TFMessage => "tf2_msgs/TFMessage";
+    rosgraph_msgs::Clock => "rosgraph_msgs/Clock";
+    visualization_msgs::Marker => "visualization_msgs/Marker";
+    visualization_msgs::MarkerArray => "visualization_msgs/MarkerArray";
+    std_srvs::TriggerRequest => "std_srvs/Trigger_Request";
+    std_srvs::TriggerResponse => "std_srvs/Trigger_Response";
+    std_srvs::SetBoolRequest => "std_srvs/SetBool_Request";
+    std_srvs::SetBoolResponse => "std_srvs/SetBool_Response";
 }
 
 /// The CDR encapsulation header for little-endian plain CDR (as rmw serializes messages).
@@ -518,11 +550,14 @@ pub const CDR_LE: [u8; 4] = [0x00, 0x01, 0x00, 0x00];
 
 /// A message serialized as rmw does (`rclpy.serialization.serialize_message`, rosbag2): the
 /// encapsulation header and little-endian CDR, padded to at least 4 bytes of payload.
-pub fn to_cdr<M: Serialize>(msg: &M) -> Vec<u8> {
+pub fn to_cdr<M: RosMessage>(msg: &M) -> Vec<u8> {
     let mut out = CDR_LE.to_vec();
     cdr_encoding::to_writer::<_, byteorder::LittleEndian, _>(&mut out, msg).expect("CDR encoding into a Vec");
     if out.len() < 8 {
         out.resize(8, 0);
+    }
+    if M::PADDED {
+        out.resize(out.len().next_multiple_of(4), 0);
     }
     out
 }

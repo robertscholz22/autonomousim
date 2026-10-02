@@ -56,6 +56,8 @@ fn every_message_encodes_as_ros_does() {
         + check::<sensor_msgs::Range>(&all)
         + check::<sensor_msgs::PointCloud2>(&all)
         + check::<sensor_msgs::Image>(&all)
+        + check::<sensor_msgs::RegionOfInterest>(&all)
+        + check::<sensor_msgs::CameraInfo>(&all)
         + check::<sensor_msgs::CompressedImage>(&all)
         + check::<sensor_msgs::JointState>(&all)
         + check::<tf2_msgs::TFMessage>(&all)

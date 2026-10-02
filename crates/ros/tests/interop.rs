@@ -191,3 +191,55 @@ fn ros_pauses_and_resets_the_bridge() {
     // The reset came while paused: the clock went on from where it stood.
     assert!(bridge.time() >= t && bridge.world().time() <= bridge.time() - t + 1e-9);
 }
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn a_street_car_with_lidar_and_camera_bridges_in_real_time() {
+    use autonomousim_ros::bridge::{Bridge, BridgeConfig, Pacing};
+    // The scenario of tests/bridge.rs: a 16×900 LiDAR and a 640×480 camera at 10 Hz on the
+    // machine's GPU, with 15 NPCs, 20 pedestrians and signals.
+    let sc = autonomousim_sim::Scenario::from_toml(include_str!("street_scenario.toml")).unwrap();
+    let config = BridgeConfig { domain_id: DOMAIN, pacing: Pacing::Realtime(1.0), ..Default::default() };
+    let mut bridge = Bridge::new(Arc::new(sc.compile().unwrap()), config).unwrap();
+    let probe = std::thread::spawn(|| ros("python3 tools/ros/street_probe.py --seconds 6 --agent 0"));
+    let (start, t0) = (std::time::Instant::now(), bridge.time());
+    while !probe.is_finished() {
+        bridge.step();
+    }
+    let (wall, sim) = (start.elapsed().as_secs_f64(), bridge.time() - t0);
+    let out: serde_json::Value = serde_json::from_str(probe.join().unwrap().trim()).unwrap();
+    eprintln!("{out:#}\nsim {sim:.2} s in {wall:.2} s");
+    // Real time: the bridge kept up, and ROS had every `/clock` (50 Hz).
+    assert!((sim / wall - 1.0).abs() < 0.05, "sim {sim} s in {wall} s");
+    let clock = &out["clock"];
+    let hz = (clock["count"].as_f64().unwrap() - 1.0) / clock["sim"].as_f64().unwrap();
+    assert!((hz / 50.0 - 1.0).abs() < 0.03, "clock: {clock}");
+    let topic = |t: &str| &out["topics"][t];
+    for t in ["/agent0/lidar", "/agent0/front/image", "/agent0/front/depth", "/agent0/front/semantic"] {
+        let r = topic(t)["rate"].as_f64().unwrap_or_else(|| panic!("{t}: {}", topic(t)));
+        assert!((r / 10.0 - 1.0).abs() < 0.05, "{t}: {r} Hz");
+    }
+    let cloud = &topic("/agent0/lidar")["last"];
+    let width = cloud["width"].as_u64().unwrap();
+    assert!(width > 1000 && width <= 16 * 900 && cloud["bytes"].as_u64() == Some(16 * width), "{cloud}");
+    assert_eq!(cloud["fields"], serde_json::json!(["x", "y", "z", "kind"]));
+    for (t, enc, bpp) in [("image", "rgb8", 3), ("depth", "32FC1", 4), ("semantic", "mono8", 1)] {
+        let i = &topic(&format!("/agent0/front/{t}"))["last"];
+        assert_eq!(
+            (i["width"].as_u64(), i["height"].as_u64(), i["encoding"].as_str()),
+            (Some(640), Some(480), Some(enc))
+        );
+        assert_eq!(i["bytes"].as_u64(), Some(640 * 480 * bpp));
+        assert_eq!(i["frame"], "agent0/front_optical");
+    }
+    assert_eq!(topic("/agent0/front/camera_info")["last"]["k"][2], 320.0);
+    for (t, n) in [("npcs", Some(15)), ("pedestrians", Some(20)), ("signals", None)] {
+        let m = topic(&format!("/autonomousim/{t}"));
+        let r = m["rate"].as_f64().unwrap_or_else(|| panic!("{t}: {m}"));
+        assert!((r / 10.0 - 1.0).abs() < 0.1, "{t}: {r} Hz");
+        let count = m["last"]["markers"].as_u64().unwrap();
+        assert!(n.map_or(count > 0, |n| count == n), "{t}: {m}");
+    }
+    let route = &topic("/agent0/route")["last"];
+    assert!(route["poses"].as_u64().unwrap() > 5 && route["frame"] == "map", "{route}");
+}

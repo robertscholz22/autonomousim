@@ -234,3 +234,97 @@ fn pause_and_reset() {
     assert_eq!((bridge.episodes(), bridge.world().time()), (2, 0.0));
     assert!((bridge.time() - 1.04).abs() < 1e-9);
 }
+
+/// A car with LiDAR and camera in a street with traffic, pedestrians and signals (rendered
+/// on lavapipe).
+#[test]
+fn the_street_scenario_bridges_lidar_camera_markers_and_route() {
+    use autonomousim_ros::msgs::nav_msgs::Path;
+    use autonomousim_ros::msgs::sensor_msgs::{CameraInfo, Image, PointCloud2};
+    use autonomousim_ros::msgs::visualization_msgs::MarkerArray;
+    autonomousim_sim::camera::use_adapter(&autonomousim_render::AdapterChoice::Software);
+    // A 160×120 camera: RustDDS readers drop parts of the 640×480 stream (Fast DDS's, with large
+    // enough socket buffers, do not: tests/interop.rs).
+    let toml = include_str!("street_scenario.toml").replace("width = 640, height = 480", "width = 160, height = 120");
+    let sc = Arc::new(Scenario::from_toml(&toml).unwrap().compile().unwrap());
+    let mut rx = RosNode::new("/", "street_test", DOMAIN + 4).unwrap();
+    const KEEP_ALL: ros2_client::QosProfile = qos::SENSOR.history(ros2_client::qos::History::KeepAll);
+    let cloud = rx.subscription::<PointCloud2>("/agent0/lidar", KEEP_ALL).unwrap();
+    let image = rx.subscription::<Image>("/agent0/front/image", KEEP_ALL).unwrap();
+    let depth = rx.subscription::<Image>("/agent0/front/depth", KEEP_ALL).unwrap();
+    let semantic = rx.subscription::<Image>("/agent0/front/semantic", KEEP_ALL).unwrap();
+    let info = rx.subscription::<CameraInfo>("/agent0/front/camera_info", KEEP_ALL).unwrap();
+    let npcs = rx.subscription::<MarkerArray>("/autonomousim/npcs", qos::RELIABLE).unwrap();
+    let peds = rx.subscription::<MarkerArray>("/autonomousim/pedestrians", qos::RELIABLE).unwrap();
+    let signals = rx.subscription::<MarkerArray>("/autonomousim/signals", qos::RELIABLE).unwrap();
+    let config = BridgeConfig { domain_id: DOMAIN + 4, pacing: Pacing::Realtime(1.0), ..Default::default() };
+    let mut bridge = Bridge::new(sc, config).unwrap();
+    let route = rx.subscription::<Path>("/agent0/route", qos::LATCHED).unwrap();
+    let tf_static = rx.subscription::<TFMessage>("/tf_static", qos::LATCHED).unwrap();
+    let (mut clouds, mut images, mut depths, mut sems, mut infos) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut npc, mut ped, mut sig, mut routes, mut statics) = (vec![], vec![], vec![], vec![], vec![]);
+    // Until every topic has arrived (RustDDS discovery takes seconds) and 1 s more.
+    let mut all_since = None;
+    while all_since.is_none_or(|t0| bridge.time() < t0 + 1.0) {
+        assert!(bridge.time() < 20.0, "topics missing after 20 s");
+        bridge.step();
+        drain(&cloud, &mut clouds);
+        drain(&image, &mut images);
+        drain(&depth, &mut depths);
+        drain(&semantic, &mut sems);
+        drain(&info, &mut infos);
+        drain(&npcs, &mut npc);
+        drain(&peds, &mut ped);
+        drain(&signals, &mut sig);
+        drain(&route, &mut routes);
+        drain(&tf_static, &mut statics);
+        let all = [clouds.len(), images.len(), depths.len(), sems.len(), infos.len(), npc.len(), ped.len(), sig.len()];
+        if all_since.is_none() && all.iter().all(|&n| n > 0) {
+            all_since = Some(bridge.time());
+        }
+    }
+    // LiDAR: returns only, 16 bytes a point, at most the beam count, in the sensor frame.
+    let c = clouds.last().expect("no point cloud");
+    assert_eq!((c.header.frame_id.as_str(), c.height, c.point_step), ("agent0/lidar", 1, 16));
+    assert!(c.width > 1000 && c.width <= 16 * 900 && c.data.len() == 16 * c.width as usize, "{} points", c.width);
+    let fields: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(fields, ["x", "y", "z", "kind"]);
+    let max = (0..c.width as usize)
+        .map(|k| {
+            let f = |o: usize| f32::from_le_bytes(c.data[16 * k + o..16 * k + o + 4].try_into().unwrap());
+            (f(0).powi(2) + f(4).powi(2) + f(8).powi(2)).sqrt()
+        })
+        .fold(0.0f32, f32::max);
+    assert!(max <= 40.01, "a point {max} m away");
+    // Camera: at 10 Hz, in the optical frame, with its calibration.
+    for (imgs, enc, bpp) in [(&images, "rgb8", 3), (&depths, "32FC1", 4), (&sems, "mono8", 1)] {
+        let i = imgs.last().unwrap_or_else(|| panic!("no {enc} image"));
+        assert_eq!((i.width, i.height, i.encoding.as_str(), i.step), (160, 120, enc, 160 * bpp));
+        assert_eq!(i.data.len(), 160 * 120 * bpp as usize);
+        assert_eq!(i.header.frame_id, "agent0/front_optical");
+    }
+    // Frames at the camera's 10 Hz (a loaded machine may drop some: best effort).
+    let stamps: Vec<f64> = images.iter().map(|i| i.header.stamp.as_secs()).collect();
+    assert!(stamps.windows(2).all(|w| w[1] > w[0]), "{stamps:?}");
+    assert!(stamps.iter().all(|t| (t * 10.0 - (t * 10.0).round()).abs() < 1e-6), "{stamps:?}");
+    let k = &infos.last().unwrap().k.0;
+    assert!((k[0] - 80.0).abs() < 1e-9 && k[2] == 80.0 && k[5] == 60.0, "{k:?}");
+    // The optical frame: z along the camera's x (forward), x along its −y (right).
+    let st = &statics.last().expect("no /tf_static").transforms;
+    let opt = st.iter().find(|t| t.child_frame_id == "agent0/front_optical").expect("no optical frame");
+    assert_eq!(opt.header.frame_id, "agent0/front");
+    let q = opt.transform.rotation;
+    let q = glam::DQuat::from_xyzw(q.x, q.y, q.z, q.w);
+    assert!((q * glam::DVec3::Z - glam::DVec3::X).length() < 1e-12);
+    assert!((q * glam::DVec3::X + glam::DVec3::Y).length() < 1e-12);
+    // Markers: 15 NPC boxes the size of a sedan, 20 pedestrians, signal heads.
+    let n = npc.last().expect("no NPC markers");
+    assert_eq!(n.markers.len(), 15);
+    let s = &n.markers[0].scale;
+    assert!((3.5..6.0).contains(&s.x) && (1.4..2.5).contains(&s.y), "NPC box {s:?}");
+    assert_eq!(ped.last().expect("no pedestrian markers").markers.len(), 20);
+    assert!(!sig.last().expect("no signal markers").markers.is_empty());
+    // The route of the ego car (latched).
+    let r = routes.last().expect("no route");
+    assert!(r.poses.len() > 5 && r.header.frame_id == "map", "{} route points", r.poses.len());
+}

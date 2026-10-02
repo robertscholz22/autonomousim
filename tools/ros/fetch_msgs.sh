@@ -12,7 +12,7 @@ geometry_msgs/msg/TwistWithCovariance geometry_msgs/msg/Transform geometry_msgs/
 nav_msgs/msg/Odometry nav_msgs/msg/Path
 sensor_msgs/msg/Imu sensor_msgs/msg/NavSatFix sensor_msgs/msg/NavSatStatus sensor_msgs/msg/FluidPressure
 sensor_msgs/msg/MagneticField sensor_msgs/msg/Range sensor_msgs/msg/PointCloud2 sensor_msgs/msg/PointField
-sensor_msgs/msg/Image sensor_msgs/msg/CompressedImage sensor_msgs/msg/JointState
+sensor_msgs/msg/Image sensor_msgs/msg/CompressedImage sensor_msgs/msg/CameraInfo sensor_msgs/msg/RegionOfInterest sensor_msgs/msg/JointState
 tf2_msgs/msg/TFMessage rosgraph_msgs/msg/Clock
 visualization_msgs/msg/Marker visualization_msgs/msg/MarkerArray visualization_msgs/msg/MeshFile
 visualization_msgs/msg/UVCoordinate

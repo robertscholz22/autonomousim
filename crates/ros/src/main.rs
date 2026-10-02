@@ -60,6 +60,12 @@ struct RunArgs {
     /// last /clock (at most this many wall-clock seconds; 0: no lockstep).
     #[arg(long, default_value_t = 0.0, value_name = "TIMEOUT")]
     lockstep: f64,
+    /// Rate of the NPC, pedestrian and signal markers (Hz; 0: none).
+    #[arg(long, default_value_t = 10)]
+    markers_hz: u32,
+    /// Do not render cameras (no GPU needed).
+    #[arg(long)]
+    no_cameras: bool,
     /// Stop after this much simulated time (s; default: run until interrupted).
     #[arg(long)]
     duration: Option<f64>,
@@ -91,6 +97,8 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         seed: args.seed,
         command_timeout: args.command_timeout,
         lockstep: (args.lockstep > 0.0).then_some(args.lockstep),
+        markers_hz: args.markers_hz,
+        cameras: !args.no_cameras,
     };
     eprintln!("compiling the scenario (maps are generated or loaded from the cache)...");
     let compiled = Arc::new(scenario.compile()?);

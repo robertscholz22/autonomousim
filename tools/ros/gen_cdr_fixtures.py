@@ -40,6 +40,8 @@ TYPES = [
     "sensor_msgs/msg/Range",
     "sensor_msgs/msg/PointCloud2",
     "sensor_msgs/msg/Image",
+    "sensor_msgs/msg/RegionOfInterest",
+    "sensor_msgs/msg/CameraInfo",
     "sensor_msgs/msg/CompressedImage",
     "sensor_msgs/msg/JointState",
     "tf2_msgs/msg/TFMessage",

@@ -6,5 +6,6 @@
 //! - [`node`]: a DDS node with typed publishers and subscriptions, QoS profiles.
 
 pub mod bridge;
+pub mod markers;
 pub mod msgs;
 pub mod node;
