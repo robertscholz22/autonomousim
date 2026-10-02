@@ -34,7 +34,8 @@ from autonomousim.tasks.multi import MultiAgentTask, make_multi_task
 
 class AutonomousimParallelEnv(_ParallelEnv):
     """One world of a multi-agent task (a ``MultiAgentTask`` or a registered name with its
-    keyword arguments); ``seed`` is the base seed before the first ``reset``."""
+    keyword arguments); ``seed`` is the base seed before the first ``reset``; ``stream`` streams
+    it to ``autonomousim-viewer attach`` (see ``MultiAgentVectorEnv``)."""
 
     metadata = {"name": "autonomousim_v0", "render_modes": [], "is_parallelizable": True}
 
@@ -45,15 +46,17 @@ class AutonomousimParallelEnv(_ParallelEnv):
         seed: int = 0,
         num_threads: int = 1,
         render_mode: str | None = None,
+        stream: str | None = None,
         **task_kwargs: Any,
     ):
         if render_mode is not None:
             raise ValueError("rendering is done by the viewer (autonomousim-viewer)")
         self.render_mode = None
         self._venv = MultiAgentVectorEnv(
-            1, make_multi_task(task, **task_kwargs), seed=seed, num_threads=num_threads, autoreset=False
+            1, make_multi_task(task, **task_kwargs), seed=seed, num_threads=num_threads, autoreset=False, stream=stream
         )
         v = self._venv
+        self.stream_addr = v.stream_addr
         self._slots = {f"{g}_{k}": (g, k) for g in v.groups for k in range(v.count[g])}
         self.possible_agents = list(self._slots)
         self.agents: list[str] = []

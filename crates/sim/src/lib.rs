@@ -26,6 +26,7 @@ pub mod policy;
 pub mod record;
 pub mod rooftop;
 pub mod scenario;
+pub mod stream;
 pub mod traffic;
 pub mod traffic_driver;
 pub mod world;

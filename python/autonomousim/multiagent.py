@@ -46,7 +46,7 @@ import numpy as np
 
 from autonomousim._native import BatchSim
 from autonomousim.tasks.multi import MultiAgentTask, make_multi_task
-from autonomousim.vector_env import _seeds, copy_obs, obs_space
+from autonomousim.vector_env import _seeds, copy_obs, obs_space, start_stream
 
 
 class MultiAgentVectorEnv:
@@ -54,7 +54,8 @@ class MultiAgentVectorEnv:
     keyword arguments), stepped in parallel on ``num_threads``
     threads (0: one per logical CPU). ``seed`` sets the worlds' base seeds before the first
     ``reset``. With ``copy=False``, ``reset`` and ``step`` return views of the observation
-    buffers, which the next call overwrites."""
+    buffers, which the next call overwrites. ``stream="127.0.0.1:7447"`` streams world 0 to
+    ``autonomousim-viewer attach`` (the address is ``stream_addr``)."""
 
     def __init__(
         self,
@@ -65,6 +66,7 @@ class MultiAgentVectorEnv:
         num_threads: int = 0,
         autoreset: bool = True,
         copy: bool = True,
+        stream: str | None = None,
         **task_kwargs: Any,
     ):
         if task is None:
@@ -108,6 +110,7 @@ class MultiAgentVectorEnv:
         self._return = {g: np.zeros(shape[g]) for g in self.groups}
         self._success = {g: np.zeros(shape[g], dtype=bool) for g in self.groups}
         self._length = np.zeros(num_envs, dtype=np.int64)
+        self.stream_addr = start_stream(self.sim, stream)
         self._actions = {g: np.zeros((*shape[g], self.act_dim[g]), dtype=np.float32) for g in self.groups}
 
     # ------------------------------------------------------------------ spaces

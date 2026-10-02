@@ -11,16 +11,19 @@
 //! cargo run -p autonomousim-viewer --release -- --preset large --demo --demo-speed 30 --demo-agl 200 --demo-turn 0
 //! cargo run -p autonomousim-viewer --release -- --scenario assets/scenarios/forest.toml
 //! cargo run -p autonomousim-viewer --release -- replay recordings/run.mcap --episode 2
+//! cargo run -p autonomousim-viewer --release -- attach 127.0.0.1:7447
 //! cargo run -p autonomousim-viewer --release -- policy runs/run/policy.json --agents 4
 //! ```
 //!
 //! Live, the simulation runs in-process at its physics rate from a fixed-step accumulator and
 //! the first agent is flown or driven from the keyboard (or a gamepad), optionally recorded to
 //! MCAP; a replay rebuilds the recorded
-//! maps, checks their hashes and puts the agents where the recording has them; `policy` flies
+//! maps, checks their hashes and puts the agents where the recording has them (`attach`: the
+//! recording a running simulation streams, as it grows); `policy` flies
 //! the agents with a trained policy (from `examples/export_policy.py`) in its task's scenario
 //! on a new map. F1 shows the keys.
 
+mod attach;
 mod autopilot;
 mod camera;
 mod camera_view;
@@ -91,6 +94,15 @@ enum Command {
         /// Stop at the end of the last episode instead of starting over.
         #[arg(long)]
         once: bool,
+        #[command(flatten)]
+        display: DisplayArgs,
+    },
+    /// Watch a running simulation that streams its recording (`Recorder::stream`, Python
+    /// `stream=`): follows its latest state, keeps the last episodes for scrubbing back and
+    /// reconnects when the connection ends.
+    Attach {
+        /// Address of the stream (`host:port`).
+        addr: String,
         #[command(flatten)]
         display: DisplayArgs,
     },
@@ -472,6 +484,19 @@ fn main() -> anyhow::Result<()> {
             replay.looping = !once;
             let title = format!("autonomousim · replay {}", file.file_name().unwrap_or_default().to_string_lossy());
             (sim::Sim::replay(world, replay), display, None, None, title)
+        }
+        Some(Command::Attach { addr, display }) => {
+            println!("attaching to {addr}");
+            let (recording, live) = attach::connect(&addr)?;
+            let compiled = Arc::new(recording.compile().context("rebuilding the streamed scenario")?);
+            let world = WorldInstance::new(compiled, Seed::from_u64(0));
+            println!(
+                "{addr}: {} agents, {} maps rebuilt and checked",
+                recording.agents.len(),
+                recording.map_hashes.len()
+            );
+            let title = format!("autonomousim · attached to {addr}");
+            (sim::Sim::replay(world, replay::Replay::attached(recording, live)), display, None, None, title)
         }
         Some(Command::Policy { file, map_seed, agents, episode_seed, no_cache, record, display }) => {
             let policy = PolicyFile::read(&file)?;
@@ -926,6 +951,10 @@ mod tests {
         assert!(!display.lidar_view);
         let cli = Cli::try_parse_from(["viewer", "replay", "a.mcap", "--lidar-view", "--plots"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Replay { display, .. }) if display.lidar_view && display.plots));
+        let cli = Cli::try_parse_from(["viewer", "attach", "127.0.0.1:7447", "--plots"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Attach { addr, display }) if addr == "127.0.0.1:7447" && display.plots)
+        );
         // Live options do not apply to a replay.
         assert!(Cli::try_parse_from(["viewer", "--seed", "3", "replay", "a.mcap"]).is_err());
         assert!(Cli::try_parse_from(["viewer", "replay", "a.mcap", "--seed", "3"]).is_err());

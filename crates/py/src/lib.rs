@@ -455,6 +455,31 @@ impl BatchSim {
         }
     }
 
+    /// Stream world `env` live to viewers (`autonomousim-viewer attach <addr>`) from now on,
+    /// as `attach_recorder` records it (a recording or stream of the world ends first); viewers
+    /// may connect and leave at any time and never slow the simulation down. `addr` is
+    /// `host:port` (port 0: any free port); returns the address listened on.
+    #[pyo3(signature = (env, addr = "127.0.0.1:7447", state_hz = 50, lidar = false, camera_hz = 0))]
+    fn attach_stream(
+        &mut self,
+        env: usize,
+        addr: &str,
+        state_hz: u32,
+        lidar: bool,
+        camera_hz: u32,
+    ) -> PyResult<String> {
+        let i = self.env(env)?;
+        let config = RecorderConfig { state_hz, lidar, camera_hz, ..Default::default() };
+        let sim = self.sim.get_mut().unwrap_or_else(PoisonError::into_inner);
+        // First, so that a stream of the world frees its address.
+        if let Some(old) = sim.detach_recorder(i) {
+            old.finish().map_err(sim_err)?;
+        }
+        let (recorder, bound) = Recorder::stream(addr, config).map_err(sim_err)?;
+        sim.attach_recorder(i, recorder);
+        Ok(bound.to_string())
+    }
+
     /// Stop recording world `env` and finish the file; returns whether it was recording.
     fn detach_recorder(&mut self, env: usize) -> PyResult<bool> {
         let i = self.env(env)?;

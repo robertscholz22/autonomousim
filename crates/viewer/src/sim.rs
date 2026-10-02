@@ -338,7 +338,10 @@ impl Sim {
     /// Episode number (from 1) and the number of episodes if known.
     pub fn episode(&self) -> (u64, Option<usize>) {
         match &self.replay {
-            Some(r) => (r.episode as u64 + 1, Some(r.recording.episodes.len())),
+            Some(r) => {
+                let (number, of) = r.episode_number();
+                (number, Some(of))
+            }
             None => (self.episodes, None),
         }
     }
@@ -643,9 +646,7 @@ impl Sim {
     /// Advance by `real_dt` seconds of wall-clock time.
     pub fn advance(&mut self, real_dt: f64) {
         if let Some(r) = &mut self.replay {
-            if !self.paused {
-                r.advance(real_dt * self.time_scale);
-            }
+            r.update(real_dt * self.time_scale, self.paused);
             r.apply(&mut self.world);
             for (i, l) in self.latched.iter_mut().enumerate() {
                 *l = r.latched(i);
@@ -848,7 +849,7 @@ pub fn pilot_input(
 }
 
 /// Replay keys: ←/→ one second back/forward (with Shift: one sample), N/B (or PageDown/PageUp)
-/// next/previous episode, Home start of the episode.
+/// next/previous episode, Home start of the episode, End follow the latest state (attached).
 pub fn replay_input(keys: Res<ButtonInput<KeyCode>>, mut egui: EguiContexts, mut sim: ResMut<Sim>) {
     if egui.ctx_mut().is_ok_and(|c| c.egui_wants_keyboard_input()) {
         return;
@@ -873,6 +874,9 @@ pub fn replay_input(keys: Res<ButtonInput<KeyCode>>, mut egui: EguiContexts, mut
     }
     if keys.just_pressed(KeyCode::Home) {
         r.seek(0.0);
+    }
+    if keys.just_pressed(KeyCode::End) {
+        r.follow_latest();
     }
 }
 

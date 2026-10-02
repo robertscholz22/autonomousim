@@ -67,6 +67,15 @@ def learning_group(sim: BatchSim) -> tuple[int, dict[str, Any]]:
     return learning[0], sim.group_info(learning[0])
 
 
+def start_stream(sim: BatchSim, stream: str | None) -> str | None:
+    """Stream world 0 of ``sim`` live at ``stream`` (``host:port``, port 0: any free one) at the
+    policy rate, for ``autonomousim-viewer attach <addr>``; returns the address (None without
+    ``stream``). Viewers may come and go; they never slow the simulation down."""
+    if stream is None:
+        return None
+    return sim.attach_stream(0, stream, state_hz=round(1.0 / sim.policy_dt))
+
+
 def copy_obs(obs: np.ndarray | dict[str, np.ndarray]) -> np.ndarray | dict[str, np.ndarray]:
     """A copy of an observation array or dict of arrays."""
     return {k: v.copy() for k, v in obs.items()} if isinstance(obs, dict) else obs.copy()
@@ -89,7 +98,8 @@ class AutonomousimVectorEnv(VectorEnv):
     threads (0: one per logical CPU). ``seed`` sets the worlds' base seeds before the first
     ``reset``. Other keyword arguments go to the task (see ``autonomousim.tasks``). With
     ``copy=False``, ``reset`` and ``step`` return views of the observation buffers. The next
-    call overwrites those views."""
+    call overwrites those views. ``stream="127.0.0.1:7447"`` streams world 0 to
+    ``autonomousim-viewer attach`` (the address is ``stream_addr``)."""
 
     metadata = {"autoreset_mode": AutoresetMode.SAME_STEP, "render_modes": []}
 
@@ -103,6 +113,7 @@ class AutonomousimVectorEnv(VectorEnv):
         autoreset_mode: AutoresetMode | str = AutoresetMode.SAME_STEP,
         copy: bool = True,
         render_mode: str | None = None,
+        stream: str | None = None,
         **task_kwargs: Any,
     ):
         if render_mode is not None:
@@ -134,6 +145,7 @@ class AutonomousimVectorEnv(VectorEnv):
         self._events = self.sim.events(self.group)[:, 0]
         self.task.attach(self.sim)
         self.task.bind(num_envs, self.sim.policy_dt, self.act_dim)
+        self.stream_addr = start_stream(self.sim, stream)
         self._return = np.zeros(num_envs, dtype=np.float64)
         self._length = np.zeros(num_envs, dtype=np.int64)
 

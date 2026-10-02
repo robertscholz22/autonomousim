@@ -49,6 +49,11 @@ pub trait TelemetrySink: Send {
     fn add_channel(&mut self, topic: &str, schema_name: &str, schema: &str) -> Result<u16, SimError>;
     fn write(&mut self, channel: u16, log_time_ns: u64, data: &[u8]) -> Result<(), SimError>;
     fn finish(&mut self) -> Result<(), SimError>;
+    /// Whether messages reach anyone now; if not, the recorder writes only `/meta`, `/episode`
+    /// and `/route` (a stream without viewers).
+    fn live(&self) -> bool {
+        true
+    }
 }
 
 /// Writes an MCAP file (zstd chunks, JSON messages with `jsonschema` schemas).
@@ -263,6 +268,17 @@ impl Recorder {
         Ok(Self::new(Box::new(McapSink::create(path)?), config))
     }
 
+    /// Serve the recording live to viewers on `addr` (`autonomousim-viewer attach`; port 0:
+    /// any free port); returns the address they connect to.
+    pub fn stream(
+        addr: impl std::net::ToSocketAddrs,
+        config: RecorderConfig,
+    ) -> Result<(Self, std::net::SocketAddr), SimError> {
+        let sink = crate::stream::StreamSink::bind(addr)?;
+        let addr = sink.local_addr();
+        Ok((Self::new(Box::new(sink), config), addr))
+    }
+
     fn keep<T>(&mut self, r: Result<T, SimError>) -> Option<T> {
         match r {
             Ok(x) => Some(x),
@@ -471,7 +487,7 @@ impl Recorder {
 
     /// After new actions were set.
     pub fn on_actions(&mut self, w: &WorldInstance) {
-        if self.meta.is_none() {
+        if self.meta.is_none() || !self.sink.live() {
             return;
         }
         let time = w.time();
@@ -487,9 +503,10 @@ impl Recorder {
         let Some((_, _, events)) = self.meta else { return };
         self.ticks += 1;
         let time = w.time();
+        let live = self.sink.live();
         for a in w.agents() {
             let i = a.id as usize;
-            let bits = a.events.0;
+            let bits = if live { a.events.0 } else { 0 };
             if bits & self.seen[i] != self.seen[i] {
                 // A new policy step cleared the bits.
                 self.seen[i] = 0;
@@ -500,6 +517,7 @@ impl Recorder {
                 self.send(events, &json!({"time": time, "agent": a.id, "events": names}));
             }
             if let Some(ch) = self.agents[i].lidar
+                && live
                 && let Some(scan) = a.sensors.iter().find_map(|s| match s {
                     Sensor::Lidar(l) => l.latest().filter(|s| s.tick == w.clock().tick),
                     _ => None,
@@ -517,6 +535,9 @@ impl Recorder {
                 self.routes[i] = Some(route.clone());
                 self.send(ch, &json!({"time": time, "agent": a.id, "route": route.points()}));
             }
+        }
+        if !live {
+            return;
         }
         self.write_signals(w);
         self.on_frames(w);
@@ -1106,6 +1127,21 @@ impl Recording {
 
     /// Parse an MCAP file written by [`Recorder`]; messages are taken in file order.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SimError> {
+        let mut rec: Option<Recording> = None;
+        for m in mcap::MessageStream::new(bytes).map_err(mcap_err)? {
+            let m = m.map_err(mcap_err)?;
+            let topic = m.channel.topic.as_str();
+            match &mut rec {
+                _ if topic == "/meta" => rec = Some(Self::from_meta(&m.data)?),
+                Some(r) => r.push(topic, m.log_time, &m.data)?,
+                None => return Err(record_err(format!("{topic} before /meta"))),
+            }
+        }
+        rec.ok_or_else(|| record_err("no /meta message"))
+    }
+
+    /// A recording without episodes from its `/meta` message.
+    pub fn from_meta(data: &[u8]) -> Result<Self, SimError> {
         #[derive(Deserialize)]
         struct Meta {
             format: u32,
@@ -1122,6 +1158,27 @@ impl Recording {
         struct MapMeta {
             hash: String,
         }
+        let meta: Value = parse("/meta", data)?;
+        let parsed: Meta = serde_json::from_value(meta.clone()).map_err(|e| record_err(format!("/meta: {e}")))?;
+        if parsed.format != 1 {
+            return Err(record_err(format!("unsupported recording format {}", parsed.format)));
+        }
+        Ok(Recording {
+            scenario: parsed.scenario,
+            map_hashes: parsed.maps.into_iter().map(|m| m.hash).collect(),
+            physics_hz: parsed.physics_hz,
+            policy_hz: parsed.policy_hz,
+            state_hz: parsed.state_hz,
+            pedestrian_hz: parsed.pedestrian_hz,
+            agents: parsed.agents,
+            episodes: Vec::new(),
+            meta,
+        })
+    }
+
+    /// Add a message that follows `/meta` (`/episode` starts an episode; the others need
+    /// one); topics a recording does not keep are skipped.
+    pub fn push(&mut self, topic: &str, log_time_ns: u64, data: &[u8]) -> Result<(), SimError> {
         #[derive(Deserialize)]
         struct Episode {
             episode: u64,
@@ -1138,106 +1195,77 @@ impl Recording {
             #[serde(default)]
             route: Option<Vec<DVec3>>,
         }
-
-        let mut rec: Option<Recording> = None;
-        for m in mcap::MessageStream::new(bytes).map_err(mcap_err)? {
-            let m = m.map_err(mcap_err)?;
-            let topic = m.channel.topic.as_str();
-            if topic == "/meta" {
-                let meta: Value = parse(topic, &m.data)?;
-                let parsed: Meta =
-                    serde_json::from_value(meta.clone()).map_err(|e| record_err(format!("/meta: {e}")))?;
-                if parsed.format != 1 {
-                    return Err(record_err(format!("unsupported recording format {}", parsed.format)));
+        #[derive(Deserialize)]
+        struct Route {
+            time: f64,
+            agent: usize,
+            route: Vec<DVec3>,
+        }
+        let n = self.agents.len();
+        if topic == "/episode" {
+            let e: Episode = parse(topic, data)?;
+            let mut goals = vec![Vec::new(); n];
+            let mut routes = vec![None; n];
+            for a in e.agents {
+                if a.id < n {
+                    goals[a.id] = a.goals;
+                    routes[a.id] = a.route.map(|p| Arc::new(Polyline::new(p)));
                 }
-                rec = Some(Recording {
-                    scenario: parsed.scenario,
-                    map_hashes: parsed.maps.into_iter().map(|m| m.hash).collect(),
-                    physics_hz: parsed.physics_hz,
-                    policy_hz: parsed.policy_hz,
-                    state_hz: parsed.state_hz,
-                    pedestrian_hz: parsed.pedestrian_hz,
-                    agents: parsed.agents,
-                    episodes: Vec::new(),
-                    meta,
-                });
-                continue;
             }
-            let Some(r) = rec.as_mut() else { return Err(record_err(format!("{topic} before /meta"))) };
-            let n = r.agents.len();
-            if topic == "/episode" {
-                let e: Episode = parse(topic, &m.data)?;
-                let mut goals = vec![Vec::new(); n];
-                let mut routes = vec![None; n];
-                for a in e.agents {
-                    if a.id < n {
-                        goals[a.id] = a.goals;
-                        routes[a.id] = a.route.map(|p| Arc::new(Polyline::new(p)));
-                    }
-                }
-                r.episodes.push(RecordedEpisode {
-                    number: e.episode,
-                    seed: e.seed,
-                    map: e.map,
-                    start: m.log_time as f64 * 1e-9,
-                    goals,
-                    routes,
-                    route_updates: vec![Vec::new(); n],
-                    states: vec![Vec::new(); n],
-                    actions: vec![Vec::new(); n],
-                    scans: vec![Vec::new(); n],
-                    events: Vec::new(),
-                    signal_offsets: e.signals,
-                    pedestrians: Vec::new(),
-                });
-                continue;
-            }
-            let Some(ep) = r.episodes.last_mut() else { return Err(record_err(format!("{topic} before /episode"))) };
-            if topic == "/events" {
-                ep.events.push(parse(topic, &m.data)?);
-                continue;
-            }
-            if topic == "/pedestrians" {
-                ep.pedestrians.push(parse(topic, &m.data)?);
-                continue;
-            }
-            if topic == "/npcs" {
-                let npcs: RecordedNpcs = parse(topic, &m.data)?;
+            self.episodes.push(RecordedEpisode {
+                number: e.episode,
+                seed: e.seed,
+                map: e.map,
+                start: log_time_ns as f64 * 1e-9,
+                goals,
+                routes,
+                route_updates: vec![Vec::new(); n],
+                states: vec![Vec::new(); n],
+                actions: vec![Vec::new(); n],
+                scans: vec![Vec::new(); n],
+                events: Vec::new(),
+                signal_offsets: e.signals,
+                pedestrians: Vec::new(),
+            });
+            return Ok(());
+        }
+        let Some(ep) = self.episodes.last_mut() else { return Err(record_err(format!("{topic} before /episode"))) };
+        match topic {
+            "/events" => ep.events.push(parse(topic, data)?),
+            "/pedestrians" => ep.pedestrians.push(parse(topic, data)?),
+            "/npcs" => {
+                let npcs: RecordedNpcs = parse(topic, data)?;
                 for (id, state) in npcs.states() {
                     if id >= n {
                         return Err(record_err(format!("{topic}: no agent {id} in /meta")));
                     }
                     ep.states[id].push(state);
                 }
-                continue;
             }
-            if topic == "/route" {
-                #[derive(Deserialize)]
-                struct Route {
-                    time: f64,
-                    agent: usize,
-                    route: Vec<DVec3>,
-                }
-                let u: Route = parse(topic, &m.data)?;
+            "/route" => {
+                let u: Route = parse(topic, data)?;
                 if u.agent >= n {
                     return Err(record_err(format!("{topic}: no agent {} in /meta", u.agent)));
                 }
                 ep.route_updates[u.agent].push((u.time, Arc::new(Polyline::new(u.route))));
-                continue;
             }
-            let Some((id, kind)) = topic.strip_prefix("/agent/").and_then(|t| t.split_once('/')) else { continue };
-            let id: usize = id.parse().map_err(|_| record_err(format!("bad topic {topic}")))?;
-            if id >= n {
-                return Err(record_err(format!("{topic}: no agent {id} in /meta")));
-            }
-            match kind {
-                "state" => ep.states[id].push(parse(topic, &m.data)?),
-                "action" => ep.actions[id].push(parse(topic, &m.data)?),
-                "lidar" => ep.scans[id].push(parse(topic, &m.data)?),
-                _ => {}
+            _ => {
+                let Some((id, kind)) = topic.strip_prefix("/agent/").and_then(|t| t.split_once('/')) else {
+                    return Ok(());
+                };
+                let id: usize = id.parse().map_err(|_| record_err(format!("bad topic {topic}")))?;
+                if id >= n {
+                    return Err(record_err(format!("{topic}: no agent {id} in /meta")));
+                }
+                match kind {
+                    "state" => ep.states[id].push(parse(topic, data)?),
+                    "action" => ep.actions[id].push(parse(topic, data)?),
+                    "lidar" => ep.scans[id].push(parse(topic, data)?),
+                    _ => {}
+                }
             }
         }
-        rec.ok_or_else(|| record_err("no /meta message"))
+        Ok(())
     }
 
     /// Compile the recorded scenario (maps come from the cache or are generated again) and

@@ -82,7 +82,7 @@ const POLICY_HELP: &str = "T  take over the followed agent / hand it back";
 const REPLAY_HELP: &str = "P  play/pause         [/]  speed\n\
                            ←/→  ∓1 s   Shift+←/→  one sample\n\
                            N/B  next/previous episode\n\
-                           Home/R  start of episode\n\
+                           Home/R  start of episode  End  follow (attach)\n\
                            Tab  next agent       C  camera\n\
                            mouse drag  look      wheel  zoom\n\
                            O  goals/trails/lanes G  plots   I/K  camera image/output\n\
@@ -763,14 +763,15 @@ fn timeline(ctx: &egui::Context, sim: &mut Sim) {
                     r.set_episode((r.episode + 1) % n);
                 }
                 let mut episode = r.episode;
-                egui::ComboBox::from_id_salt("episode").selected_text(format!("episode {}", episode + 1)).show_ui(
-                    ui,
-                    |ui| {
+                egui::ComboBox::from_id_salt("episode")
+                    .selected_text(format!("episode {}", r.episode_number().0))
+                    .show_ui(ui, |ui| {
+                        let dropped = r.live.as_ref().map_or(0, |l| l.dropped);
                         for (i, ep) in r.recording.episodes.iter().enumerate() {
-                            ui.selectable_value(&mut episode, i, format!("{} · {:.1} s", i + 1, ep.duration()));
+                            let label = format!("{} · {:.1} s", i + dropped + 1, ep.duration());
+                            ui.selectable_value(&mut episode, i, label);
                         }
-                    },
-                );
+                    });
                 if episode != r.episode {
                     r.set_episode(episode);
                 }
@@ -783,7 +784,25 @@ fn timeline(ctx: &egui::Context, sim: &mut Sim) {
                         }
                     },
                 );
-                ui.checkbox(&mut r.looping, "loop");
+                match r.live.as_ref().map(|l| (l.status.clone(), l.addr.clone())) {
+                    Some((status, addr)) => {
+                        let mut follow = r.follow;
+                        if ui.checkbox(&mut follow, "follow").on_hover_text("follow the latest state (End)").changed() {
+                            if follow {
+                                r.follow_latest();
+                            } else {
+                                r.follow = false;
+                            }
+                        }
+                        match status {
+                            Some(s) => ui.colored_label(egui::Color32::from_rgb(230, 190, 60), s),
+                            None => ui.label(format!("● {addr}")),
+                        };
+                    }
+                    None => {
+                        ui.checkbox(&mut r.looping, "loop");
+                    }
+                }
             });
             let mut t = r.time;
             let duration = r.duration();

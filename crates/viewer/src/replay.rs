@@ -1,7 +1,9 @@
 //! Playback of an MCAP recording: the recorded states drive the agents of a world built from
 //! the recorded scenario (its maps checked against their hashes), so the rest of the viewer
-//! draws a replay exactly like a live simulation.
+//! draws a replay exactly like a live simulation. Attached to a running simulation
+//! ([`Live`]), the recording grows as it plays and the playback follows its end.
 
+use crate::attach::{LAG, Live, MAX_BEHIND};
 use autonomousim_core::math::Pose;
 use autonomousim_sim::record::{RecordedEpisode, RecordedState, RecordedWheel, Recording};
 use autonomousim_sim::traffic::Signals;
@@ -21,6 +23,11 @@ pub struct Replay {
     pub time: f64,
     /// Start over after the last episode.
     pub looping: bool,
+    /// The running simulation the recording comes from (`attach`).
+    pub live: Option<Live>,
+    /// Attached: play the latest episode a little behind its latest state (until the
+    /// playback is moved by hand).
+    pub follow: bool,
 }
 
 /// A recorded state interpolated between two samples.
@@ -44,7 +51,60 @@ pub struct Sample {
 impl Replay {
     pub fn new(recording: Recording, episode: usize) -> Self {
         let episode = episode.min(recording.episodes.len().saturating_sub(1));
-        Self { recording, episode, time: 0.0, looping: true }
+        Self { recording, episode, time: 0.0, looping: true, live: None, follow: false }
+    }
+
+    /// Follow `recording` as `live` adds to it.
+    pub fn attached(recording: Recording, live: Live) -> Self {
+        let mut r = Self { looping: false, live: Some(live), ..Self::new(recording, 0) };
+        r.follow_latest();
+        r.update(0.0, false);
+        r
+    }
+
+    /// Go back to following the latest state (attached).
+    pub fn follow_latest(&mut self) {
+        self.follow = self.live.is_some();
+    }
+
+    /// Take in what arrived (attached) and advance the playback by `dt` of recorded time
+    /// (none while `paused`): following, within [`LAG`] to [`MAX_BEHIND`] of the latest state
+    /// of the latest episode; otherwise as [`Replay::advance`].
+    pub fn update(&mut self, dt: f64, paused: bool) {
+        if let Some(live) = &mut self.live {
+            let dropped = live.poll(&mut self.recording);
+            if dropped > self.episode {
+                (self.episode, self.time) = (0, 0.0);
+            } else {
+                self.episode -= dropped;
+            }
+        }
+        if !self.follow {
+            if !paused {
+                self.advance(dt);
+            }
+            return;
+        }
+        let has_states = |e: &RecordedEpisode| e.states.iter().any(|s| !s.is_empty());
+        let Some(last) = self.recording.episodes.iter().rposition(has_states) else { return };
+        let ep = &self.recording.episodes[last];
+        let start = ep.states.iter().filter_map(|s| s.first()).map(|s| s.time).fold(f64::INFINITY, f64::min);
+        let end = ep.duration();
+        if self.episode != last {
+            (self.episode, self.time) = (last, start);
+        }
+        if paused {
+            return;
+        }
+        let hi = (end - LAG).max(start);
+        let lo = (end - MAX_BEHIND).max(start).min(hi);
+        self.time = (self.time + dt).clamp(lo, hi);
+    }
+
+    /// Number of the episode shown (from 1) and of the episodes so far.
+    pub fn episode_number(&self) -> (u64, usize) {
+        let dropped = self.live.as_ref().map_or(0, |l| l.dropped);
+        ((self.episode + dropped) as u64 + 1, self.recording.episodes.len() + dropped)
     }
 
     pub fn current(&self) -> &RecordedEpisode {
@@ -71,10 +131,12 @@ impl Replay {
     }
 
     pub fn seek(&mut self, time: f64) {
+        self.follow = false;
         self.time = time.clamp(0.0, self.duration());
     }
 
     pub fn set_episode(&mut self, episode: usize) {
+        self.follow = false;
         self.episode = episode.min(self.recording.episodes.len() - 1);
         self.time = 0.0;
     }

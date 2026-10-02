@@ -10,7 +10,7 @@ import numpy as np
 
 from autonomousim._native import BatchSim
 from autonomousim.tasks import Task, make_task
-from autonomousim.vector_env import copy_obs, learning_group, obs_space
+from autonomousim.vector_env import copy_obs, learning_group, obs_space, start_stream
 
 
 class AutonomousimEnv(gym.Env):
@@ -20,7 +20,13 @@ class AutonomousimEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(
-        self, task: str | Task = "hover", *, render_mode: str | None = None, num_threads: int = 1, **task_kwargs: Any
+        self,
+        task: str | Task = "hover",
+        *,
+        render_mode: str | None = None,
+        num_threads: int = 1,
+        stream: str | None = None,
+        **task_kwargs: Any,
     ):
         if render_mode is not None:
             raise ValueError("rendering is done by the viewer (autonomousim-viewer)")
@@ -41,6 +47,7 @@ class AutonomousimEnv(gym.Env):
         self._events = self.sim.events(self.group)[:, 0]
         self.task.attach(self.sim)
         self.task.bind(1, self.sim.policy_dt, self.act_dim)
+        self.stream_addr = start_stream(self.sim, stream)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
