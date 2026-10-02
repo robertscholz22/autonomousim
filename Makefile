@@ -1,7 +1,7 @@
 # Development tasks for autonomousim. Cargo lives in ~/.cargo/bin, which is not always on PATH.
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
-.PHONY: check fmt test test-rust test-py test-viewer bench dev-py train-deps viewer clean fixtures-mfeval fixtures-chrono fixtures-jsbsim
+.PHONY: check fmt test test-rust test-py test-viewer test-ros fixtures-ros bench dev-py train-deps viewer clean fixtures-mfeval fixtures-chrono fixtures-jsbsim
 
 check:            ## rustfmt + clippy (whole workspace, incl. viewer and bindings)
 	cargo fmt --all --check
@@ -17,6 +17,9 @@ test-rust:
 
 test-viewer:      ## the viewer's headless tests (builds Bevy)
 	cargo test -p autonomousim-viewer
+
+test-ros:         ## ROS 2 interop (Docker, ros:lyrical-ros-base; see tools/ros/run.sh)
+	cargo test -p autonomousim-ros -- --ignored
 
 test-py: dev-py
 	uv run pytest -q
@@ -71,6 +74,10 @@ JSBSIM_PY ?= $(ORACLES)/jsbsim-venv/bin/python
 fixtures-jsbsim:  ## c172_like preset and c172p trim, mode, doublet and takeoff references from JSBSim (fixtures/jsbsim/)
 	$(JSBSIM_PY) tools/gen_c172_like.py
 	$(JSBSIM_PY) tools/gen_jsbsim_fixtures.py
+
+fixtures-ros:     ## ROS 2 message definitions (crates/ros/msg/) and CDR reference encodings (fixtures/ros/) from ROS 2 Lyrical (Docker)
+	tools/ros/fetch_msgs.sh
+	tools/ros/run.sh python3 tools/ros/gen_cdr_fixtures.py
 
 clean:
 	cargo clean

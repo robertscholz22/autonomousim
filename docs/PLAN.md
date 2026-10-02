@@ -2914,6 +2914,44 @@ M8 is split into three sub-milestones. Each ends with tests, its demo(s), a comm
 - **Contacts**: whether one-sided kinematic contacts ever matter for learning agents outside the promotion radius (LiDAR range versus `promote`).
 - **Performance**: the kinematic NPC update in structure-of-arrays form if 50 NPCs per world cost more than planned.
 
+## Milestone 9: ROS 2 bridge, rosbag2 export, live viewer attach
+
+Planned 2026-10-02. Decided with the user at the start:
+- **ROS 2 for checks**: ROS 2 **Lyrical** (LTS) runs **in Docker** (`ros:lyrical-ros-base`: Fast DDS default RMW, rclpy, rosbag2 with MCAP storage, `nav_msgs`, `sensor_msgs`, `tf2_msgs`, `visualization_msgs`, `rosgraph_msgs`, `std_srvs`); nothing is installed on the host. The container uses host networking; tests that need Docker are ignored by default and run with `make test-ros`.
+- **Transport**: **DDS through `ros2-client` 0.11 (RustDDS)**, which talks to stock ROS 2 installs with no extra setup. Zenoh stays an option for later.
+- **Training**: as before, the user trains the agents; ROS is for running policies and external stacks against the simulation.
+
+The rest of this section is proposed and open to change.
+
+#### Design
+- **Crate `ros`** (`autonomousim-ros`, a library and the binary `autonomousim-ros`): depends on `sim` and `ros2-client`; nothing else depends on it, so the core, the Python package and the viewer stay free of DDS. A default workspace member (its tests without Docker run with `cargo test`).
+- **Messages**: our own serde structs for the standard messages we use (`builtin_interfaces/Time`, `std_msgs/Header`, `geometry_msgs` (Pose, Twist, Transform, Vector3, Quaternion, *Stamped, *WithCovariance), `nav_msgs/Odometry` and `Path`, `sensor_msgs` (Imu, NavSatFix, FluidPressure, MagneticField, Range, PointCloud2, Image, JointState), `tf2_msgs/TFMessage`, `rosgraph_msgs/Clock`, `visualization_msgs/MarkerArray`, `std_msgs` (String, UInt32, Float32MultiArray), `std_srvs/Trigger`), with their `.msg` definition text (for rosbag2 schemas). Only standard types, so `ros2 topic echo` and rosbag2 work without custom packages. CDR encodings are checked byte for byte against bytes ROS writes (captured once in Docker with rosbag2 and committed as fixtures).
+- **Frames and names**: our conventions are REP-103 already (ENU world, FLU body; m, rad). World frame `map`; each agent `agent<id>/base_link`, sensors `agent<id>/<sensor>` as static transforms; topics under `/agent<id>/` (`odom`, `imu`, `gps/fix`, `baro`, `mag`, `range`, `lidar/points`, `camera/<name>/{image,depth,semantic}`, `joint_states`, `cmd_vel`, `action`); `/clock`; `/autonomousim/{meta,events,npcs,pedestrians,signals,route}`. Meta (map config, seed and hash, scenario) is latched (transient local), as is `/tf_static`.
+- **QoS**: sensors best effort, depth 5; `/tf`, `/clock`, odometry, commands reliable; meta and static transforms reliable + transient local.
+- **Time**: the bridge owns the clock: `/clock` at the policy rate (or a set rate) in sim time; stamps are sim time (`use_sim_time:=true` on the ROS side). Pacing: `realtime` (scaled by a factor), `fast` (as fast as possible), `lockstep` (each policy tick waits until every commanded agent has sent an action stamped for that tick, with a timeout), so external controllers get deterministic runs.
+- **Commands**: per agent `cmd_vel` (`geometry_msgs/Twist`) for the modes with a velocity meaning (multirotor `velocity`, ground (v, ω) and (v, κ)), and `action` (`std_msgs/Float32MultiArray`, the normalized action vector) for every mode. Commands are held; after `command_timeout` (default 0.5 s sim time) an agent gets its mode's neutral action (hover, brake). Agents can instead be flown by an exported policy (`--policy policy.json`) or the scenario's scripted drivers, so ROS can watch.
+- **Services**: `/autonomousim/reset` and `/autonomousim/pause` (`std_srvs/Trigger`, `SetBool`).
+- **rosbag2 export**: `autonomousim-ros bag <recording.mcap> -o <dir>` converts a recording (JSON channels) into a rosbag2 directory (`metadata.yaml` + one MCAP with `ros2msg` schemas and CDR messages), reusing the bridge's conversions; pure Rust, no ROS needed.
+- **Live attach** (moved from M3): the recorder's `TelemetrySink` gets a TCP sink streaming the same channels as a recording (length-prefixed MCAP records); `viewer attach <host:port>` renders them with the replay code, following the stream. A simulation started with `stream = "<addr>"` (scenario recorder settings; Python `stream=` on the env, world 0 only) accepts viewers at any time; the meta is resent on connect. No new dependencies, and it works for training runs without ROS.
+
+#### Implementation order
+| # | Step | Done when |
+|---|---|---|
+| 1 ✅ | `ros` crate, `ros2-client`, message structs and definitions, Docker harness (`tools/ros/`, `make test-ros`) | CDR bytes of every message type match ROS's fixtures; a Rust publisher's `Odometry` is echoed by `ros2 topic echo` in the container and a `ros2 topic pub` `Twist` reaches a Rust subscriber |
+| 2 | Bridge: scenario/policy runner, `/clock`, odometry, TF and static TF, IMU/GPS/baro/mag/range, joint states, meta, events; pacing modes | In Docker with `use_sim_time`: `ros2 topic hz` matches the configured rates; `tf2_echo map agent0/base_link` matches the simulated pose; `fast` runs faster than real time |
+| 3 | Commands, timeouts, lockstep, reset/pause services | An rclpy node in the container drives a car around a square with `cmd_vel` and flies a drone through waypoints; a lockstep run with recorded commands reproduces the in-process state hash; reset and pause work |
+| 4 | LiDAR `PointCloud2`, camera images, NPCs, pedestrians and signals as markers, route as `Path` | Point counts and image sizes match the sensors; a car with LiDAR and a 640×480 camera at 10 Hz bridges in real time; messages echo in the container |
+| 5 | rosbag2 export | `ros2 bag info` lists every topic with the right counts; `ros2 bag play` replays odometry that `ros2 topic echo` shows equal to the recording |
+| 6 | Live attach: TCP sink, `viewer attach`, Python `stream=` | The viewer attaches mid-run to a training process, follows resets, detaches and reattaches; training throughput drops by ≤ 5 % |
+| 7 | Demo and docs: `examples/ros/` (bridge on the host, an rclpy waypoint follower in the container, rosbag2 of the run), README section | Works from a clean checkout as documented |
+
+#### As built
+- **Step 1 (crate, messages, Docker harness)**, `autonomousim-ros` (`msgs`, `node::{RosNode, qos}`), `crates/ros/msg/`, `tools/ros/{run.sh, fetch_msgs.sh, gen_cdr_fixtures.py}`, `fixtures/ros/cdr.json`, `make test-ros`, `make fixtures-ros`:
+  - **Dependencies**: `ros2-client` 0.11.0 (released 2026-09-30; features `dds` + `lyrical`, RustDDS 0.14), `cdr-encoding` 0.11 (the CDR serde codec RustDDS uses) for encoding outside DDS (rosbag2), `serde_bytes` for `uint8[]` fields. The crate builds in about 2 min from scratch.
+  - **Messages** (`msgs`): 36 types (32 messages and the request/response parts of `std_srvs/Trigger` and `SetBool`) as serde structs, field order and names as in ROS's `.msg` files; fixed `float64[N]` arrays as `Array<N>` (a tuple, no length prefix; serde's arrays stop at 32); `RosMessage::TYPE` gives `package/Name`. `to_cdr`/`from_cdr` write and read what rmw serializes (encapsulation header `00 01 00 00`, little-endian CDR, at least 4 payload bytes: a lone `bool` is padded to 4). The `.msg`/`.srv` definitions are copied from the container into `crates/ros/msg/` (for the rosbag2 schemas of step 5).
+  - **Fixtures**: `gen_cdr_fixtures.py` runs in the container, fills one message of each type with distinct values (sequences of 2–4 elements, nested messages included) and writes the values (JSON) and rclpy's serialization. The test decodes the values into our structs, encodes and compares: same length, equal bytes except alignment padding, which rmw leaves uninitialized (a `0x38` where we write 0), and decoding ROS's bytes gives the same message.
+  - **Docker harness**: `tools/ros/run.sh <cmd>` runs a command in `ros:lyrical-ros-base` (Fast DDS default RMW) with host networking and IPC, the repository at `/ws`, the caller's user id and `ROS_DOMAIN_ID`. **Interop** (ignored test, `make test-ros`, domain 42, 6 s): `ros2 topic echo` prints a Rust-published `nav_msgs/Odometry` with the right frames and values, and the `geometry_msgs/Twist` messages of `ros2 topic pub` reach a Rust subscription. Discovery takes about 1–2 s. `examples/ros_ping.rs` does the same by hand.
+
 ## Roadmap after M1
 | M | Content | Validation |
 |---|---|---|
@@ -2924,7 +2962,7 @@ M8 is split into three sub-milestones. Each ends with tests, its demo(s), a comm
 | M6 ✅ | (Detailed above; split into M6a/b/c; done 2026-09-29.) Fixed-wing (coefficient tables), helicopter (BEMT + first-order flapping), VTOL transition; large coarse maps with floating origin | Trim, phugoid/short-period checks; hover power vs momentum theory |
 | M7 | (Detailed above.) Cameras: headless wgpu RGB/depth/semantic via `scene` | FPS on Iris Xe and 7900 XT |
 | M8 ✅ | (Detailed above; split into M8a/b/c; done 2026-10-01.) Urban maps (roads, blocks, lots, buildings, lane graph, traffic lights) + NPCs (IDM + MOBIL traffic, social-force pedestrians) | Traffic sanity checks; no NPC collisions |
-| M9 | ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export; live viewer attach to a running simulation (moved from M3, 2026-09-25) | Round trip with `ros2 topic echo` |
+| M9 | (Detailed above.) ROS 2 bridge (`ros2-client`/RustDDS first, zenoh as an option; Lyrical LTS); rosbag2 export; live viewer attach to a running simulation (moved from M3, 2026-09-25) | Round trip with `ros2 topic echo` |
 
 ### Tracked vehicles (M4; added 2026-09-24)
 - **Scope and presets**:

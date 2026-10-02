@@ -13,6 +13,7 @@ members = [
     "crates/py",
     "crates/viewer",
     "crates/cli",
+    "crates/ros",
 ]
 # The Bevy viewer is excluded so that `cargo test` / `cargo check` never compile Bevy.
 default-members = [
@@ -26,6 +27,7 @@ default-members = [
     "crates/scene",
     "crates/render",
     "crates/cli",
+    "crates/ros",
 ]
 
 [workspace.package]

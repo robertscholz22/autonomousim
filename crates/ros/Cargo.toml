@@ -1,0 +1,29 @@
+[package]
+name = "autonomousim-ros"
+description = "ROS 2 bridge for autonomousim (DDS through ros2-client), rosbag2 export."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "autonomousim-ros"
+path = "src/main.rs"
+
+[dependencies]
+autonomousim-sim.workspace = true
+ros2-client = { version = "0.11", default-features = false, features = ["dds", "lyrical"] }
+cdr-encoding = "0.11"
+byteorder = "1"
+serde_bytes = "0.11"
+futures = "0.3"
+serde.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
