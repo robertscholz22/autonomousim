@@ -87,8 +87,18 @@ LQR) that balances them behind `vk`/`vw` actions, or `raw` actions for agents th
 themselves; riders in the viewer. **MotorcycleRoadRural-v0** rides a route over the rural
 roads to a farm yard; a scripted rider finishes about 85 % of the routes.
 
-Next up (Milestone 7, in progress): camera sensors, scripted traffic and a drone that lands on a moving car. The full plan, the design decisions and as-built notes for
-every step are in [docs/PLAN.md](docs/PLAN.md).
+Milestones 6–8 (aircraft and large maps, camera sensors, urban maps with traffic and
+pedestrians) are built too.
+
+**Milestone 9 (ROS 2) is done**: a ROS 2 bridge (`autonomousim-ros run`, DDS via
+`ros2-client`, tested against ROS 2 Lyrical in Docker) publishes `/clock`, TF, odometry, every
+sensor (LiDAR as `PointCloud2`, cameras as images with camera info), traffic, pedestrians and
+signals as markers, and takes `cmd_vel` commands, optionally in lockstep. Recordings export as
+rosbag2 bags. The viewer attaches to a running training process and follows it live
+(`stream=` in Python). See [examples/ros](examples/ros/README.md).
+
+The full plan, the design decisions and as-built notes for every step are in
+[docs/PLAN.md](docs/PLAN.md).
 
 ![The 2 km showcase map in the viewer](docs/images/showcase.jpg)
 
@@ -173,6 +183,15 @@ uv run python examples/export_policy.py runs/<run>/policy.pt
 cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json --agents 4 --lidar-view
 ```
 
+Watch a training run live: any environment streams its world 0 with `stream=`, and the viewer
+attaches mid-run, follows resets, and reconnects if the run restarts. Throughput drops by about
+1 %:
+
+```bash
+uv run python examples/ppo_continuous.py --env-kwargs '{"stream": "127.0.0.1:7447"}' 
+cargo run -p autonomousim-viewer --release -- attach 127.0.0.1:7447
+```
+
 `eval_record.py` checks that the recording reproduces every recorded state bit for bit when
 re-simulated from the file. The viewer relies on this for replay.
 
@@ -202,7 +221,9 @@ cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json --ca
 | `crates/viewer` | The Bevy viewer (live, replay and trained policies) |
 | `crates/cli` | `autonomousim mapgen / map-hash / map-info / version` |
 | `python/autonomousim` | Gymnasium environments, tasks, RL helpers, benchmarks |
-| `examples/` | PPO, SAC, evaluation and recording, policy export |
+| `crates/ros` | ROS 2 bridge and rosbag2 export (`autonomousim-ros run / bag`) |
+| `examples/` | PPO, SAC, evaluation and recording, policy export; `examples/ros/` the ROS 2 example |
+| `tools/ros/` | The ROS 2 container harness (`run.sh`) and its helper nodes |
 | `assets/` | Vehicle presets and scenarios |
 | `docs/PLAN.md` | Architecture, roadmap and as-built notes |
 
@@ -214,6 +235,7 @@ cargo run -p autonomousim-viewer --release -- policy runs/<run>/policy.json --ca
 | `make test` | Rust tests + Python tests |
 | `make test-viewer` | The viewer's headless tests (builds Bevy) |
 | `make bench` | Criterion benchmarks + Python throughput benchmark |
+| `make test-ros` | ROS 2 interop tests in Docker (`ros:lyrical-ros-base`), the ROS example included |
 
 `cargo` lives in `~/.cargo/bin`. If your shell doesn't have it on `PATH`, run
 `source ~/.cargo/env` (the Makefile adds it itself).

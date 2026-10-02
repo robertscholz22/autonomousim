@@ -271,7 +271,6 @@ fn ros2_bag_records_the_bridge_with_our_schemas() {
     }
     record.join().unwrap();
     // rosbag2 wrote the bridge's types with the definitions it has: ours are the same text.
-    // (`--all-topics` leaves out `/clock`.)
     let file = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -296,6 +295,7 @@ fn ros2_bag_records_the_bridge_with_our_schemas() {
         "visualization_msgs/MarkerArray",
         "nav_msgs/Path",
         "tf2_msgs/TFMessage",
+        "rosgraph_msgs/Clock",
     ] {
         assert!(checked.iter().any(|c| c == ty), "{ty} not recorded");
     }
@@ -336,4 +336,38 @@ fn ros2_bag_reads_and_plays_an_exported_recording() {
     assert_eq!(echoed, s.position.to_array(), "{echo}");
     assert_eq!(value("sec:", "stamp:") + value("nanosec:", "stamp:") * 1e-9, s.time);
     assert!(echo.contains("child_frame_id: agent0/base_link"), "{echo}");
+}
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn the_ros_example_runs_as_documented() {
+    // examples/ros/demo.sh (bridge on the host, rclpy waypoint follower and rosbag2 recorder in
+    // the container), into a directory under the repository the container sees.
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let out = "target/tmp/ros_example";
+    let run = Command::new(format!("{root}/examples/ros/demo.sh"))
+        .arg(out)
+        .env("ROS_DOMAIN_ID", DOMAIN.to_string())
+        .output()
+        .expect("examples/ros/demo.sh");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+    // Every waypoint; the square's sides (24 m at 3 m/s) about 8.5 s each.
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{root}/{out}/waypoints.json")).unwrap()).unwrap();
+    let reached = report["reached"].as_array().unwrap();
+    assert_eq!(reached.len(), 6, "{report}");
+    let t: Vec<f64> = reached.iter().map(|r| r[1].as_f64().unwrap()).collect();
+    assert!(t.windows(2).take(4).all(|w| (w[1] - w[0] - 8.5).abs() < 1.0), "{t:?}");
+    // The bag: `ros2 bag info` lists the bridge's topics (/clock too), on simulated time.
+    let count = |topic: &str| {
+        let line =
+            stdout.lines().find(|l| l.contains(&format!("Topic: {topic} |"))).unwrap_or_else(|| panic!("{topic}"));
+        let n = line.split("Count: ").nth(1).unwrap().split(' ').next().unwrap();
+        n.parse::<u64>().unwrap()
+    };
+    for (topic, min) in [("/clock", 2500), ("/agent0/odom", 2500), ("/agent0/lidar", 500), ("/agent0/cmd_vel", 1500)] {
+        assert!(count(topic) >= min, "{topic}: {}", count(topic));
+    }
+    assert!(stdout.contains("End:               Jan  1 1970 00:01:00"), "{stdout}");
 }

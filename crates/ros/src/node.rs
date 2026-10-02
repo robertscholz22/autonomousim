@@ -2,7 +2,7 @@
 //! [`RosMessage`] types, and the bridge's QoS profiles.
 
 use crate::msgs::RosMessage;
-use anyhow::{Context as _, anyhow};
+use anyhow::anyhow;
 use ros2_client::qos::{Durability, History, WhenFull};
 use ros2_client::{
     Context, ContextOptions, MessageTypeName, Name, Node, NodeName, NodeOptions, QosProfile, ServiceMapping,
@@ -29,7 +29,7 @@ pub mod qos {
         .history(History::KeepLast { depth: 1 });
 }
 
-/// A node in a DDS domain; its spinner (graph, parameters) runs on its own thread.
+/// A node in a DDS domain.
 pub struct RosNode {
     node: Node,
     _context: Context,
@@ -41,14 +41,13 @@ impl RosNode {
         let context = Context::with_options(ContextOptions::new().domain_id(domain_id))
             .map_err(|e| anyhow!("DDS participant on domain {domain_id}: {e:?}"))?;
         let node_name = NodeName::new(namespace, name).map_err(|e| anyhow!("node name {namespace}/{name}: {e:?}"))?;
-        let mut node = context
+        // No spinner: ros2-client 0.11's subscribes to `/clock` typed `builtin_interfaces/Time`
+        // (ROS's is `rosgraph_msgs/Clock`), and with two types on `/clock` rosbag2 refuses to
+        // record it. Its other duties (parameter services, sim time, graph tracking for
+        // `wait_for_*`) are not used here.
+        let node = context
             .new_node(node_name, NodeOptions::new().enable_rosout(true))
             .map_err(|e| anyhow!("node {name}: {e:?}"))?;
-        let spinner = node.spinner().map_err(|e| anyhow!("spinner: {e:?}"))?;
-        std::thread::Builder::new()
-            .name("ros-spinner".into())
-            .spawn(move || futures::executor::block_on(spinner.spin()))
-            .context("spinner thread")?;
         Ok(Self { node, _context: context })
     }
 

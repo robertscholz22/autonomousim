@@ -82,10 +82,16 @@ fn the_bridge_publishes_the_simulation() {
     // The clock ticks at the policy rate and never jumps back across the reset.
     let t: Vec<f64> = clocks.iter().map(|c| c.clock.as_secs()).collect();
     assert!(t.len() > 75, "{} clock messages", t.len());
+    // (Our RustDDS reader loses a run of samples while discovery settles, up to about a dozen
+    // in a row, depending on the endpoints matched; ROS's readers get every one, see the
+    // Docker tests.)
+    let mut lost = 0.0;
     for w in t.windows(2) {
-        let k = (w[1] - w[0]) / 0.02; // policy steps (1, or a few after a lost sample)
-        assert!(k > 0.5 && (k - k.round()).abs() < 1e-6 && k < 5.5, "clock step {} -> {}", w[0], w[1]);
+        let k = (w[1] - w[0]) / 0.02; // policy steps (1, or more after lost samples)
+        assert!(k > 0.5 && (k - k.round()).abs() < 1e-6, "clock step {} -> {}", w[0], w[1]);
+        lost += k.round() - 1.0;
     }
+    assert!(lost <= 25.0, "{lost} clock messages lost");
     assert!(*t.last().unwrap() > 3.4);
 
     // Sensors at their rates, stamped with their measurement times (after discovery: 1.5–3.5 s).
