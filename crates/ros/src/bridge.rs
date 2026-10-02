@@ -265,43 +265,11 @@ impl SensorPub {
             }
             (SensorTopic::Lidar(p), Sensor::Lidar(s)) => {
                 let scan = fresh!(s);
-                // Returns only (unorganized): x, y, z (float32) and the return kind (uint8).
-                let mut data = Vec::with_capacity(16 * scan.ranges.len());
-                for ((&r, d), kind) in scan.ranges.iter().zip(s.directions()).zip(&scan.kinds) {
-                    if r.is_finite() {
-                        let q = *d * f64::from(r);
-                        for c in [q.x as f32, q.y as f32, q.z as f32] {
-                            data.extend(c.to_le_bytes());
-                        }
-                        data.extend([*kind as u8, 0, 0, 0]);
-                    }
-                }
-                let n = (data.len() / 16) as u32;
-                let field = |name: &str, offset: u32, datatype: u8| PointField {
-                    name: name.into(),
-                    offset,
-                    datatype,
-                    count: 1,
-                };
-                send(
-                    p,
-                    PointCloud2 {
-                        header: header(offset + scan.time, &self.frame),
-                        height: 1,
-                        width: n,
-                        fields: vec![
-                            field("x", 0, PointField::FLOAT32),
-                            field("y", 4, PointField::FLOAT32),
-                            field("z", 8, PointField::FLOAT32),
-                            field("kind", 12, PointField::UINT8),
-                        ],
-                        is_bigendian: false,
-                        point_step: 16,
-                        row_step: 16 * n,
-                        data,
-                        is_dense: true,
-                    },
-                );
+                let points: Vec<(DVec3, u8)> = (scan.ranges.iter().zip(s.directions()).zip(&scan.kinds))
+                    .filter(|((r, _), _)| r.is_finite())
+                    .map(|((&r, d), &kind)| (*d * f64::from(r), kind as u8))
+                    .collect();
+                send(p, point_cloud(header(offset + scan.time, &self.frame), &points, true));
             }
             (SensorTopic::Camera(c), Sensor::Camera(s)) => {
                 let r = fresh!(s);
@@ -353,9 +321,45 @@ struct AgentPubs {
     fresh: bool,
 }
 
+/// An unorganized point cloud (one row): x, y, z (`float32`) and, `with_kind`, the return
+/// kind (`uint8`, [`ReturnKind`](autonomousim_sensors::lidar::ReturnKind) as a number).
+pub(crate) fn point_cloud(header: Header, points: &[(DVec3, u8)], with_kind: bool) -> PointCloud2 {
+    let step: u32 = if with_kind { 16 } else { 12 };
+    let mut data = Vec::with_capacity(step as usize * points.len());
+    for (q, kind) in points {
+        for c in [q.x as f32, q.y as f32, q.z as f32] {
+            data.extend(c.to_le_bytes());
+        }
+        if with_kind {
+            data.extend([*kind, 0, 0, 0]);
+        }
+    }
+    let field = |name: &str, offset: u32, datatype: u8| PointField { name: name.into(), offset, datatype, count: 1 };
+    let mut fields = vec![
+        field("x", 0, PointField::FLOAT32),
+        field("y", 4, PointField::FLOAT32),
+        field("z", 8, PointField::FLOAT32),
+    ];
+    if with_kind {
+        fields.push(field("kind", 12, PointField::UINT8));
+    }
+    let n = points.len() as u32;
+    PointCloud2 {
+        header,
+        height: 1,
+        width: n,
+        fields,
+        is_bigendian: false,
+        point_step: step,
+        row_step: step * n,
+        data,
+        is_dense: true,
+    }
+}
+
 /// A sensor's static transform from the body (`base_link`); a rangefinder's frame has its x
 /// axis along the beam, as `sensor_msgs/Range` expects.
-fn mount_transform(sensor: &Sensor) -> Option<(DVec3, DQuat)> {
+pub(crate) fn mount_transform(sensor: &Sensor) -> Option<(DVec3, DQuat)> {
     let (mount, extra) = match sensor {
         Sensor::Imu(s) => (s.config().mount, DQuat::IDENTITY),
         Sensor::Gps(s) => (s.config().mount, DQuat::IDENTITY),

@@ -243,3 +243,97 @@ fn a_street_car_with_lidar_and_camera_bridges_in_real_time() {
     let route = &topic("/agent0/route")["last"];
     assert!(route["poses"].as_u64().unwrap() > 5 && route["frame"] == "map", "{route}");
 }
+
+mod common;
+
+/// A path under the repository as the container sees it (the repository is at `/ws`).
+fn in_container(path: &std::path::Path) -> String {
+    let root = std::fs::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).unwrap();
+    format!("/ws/{}", std::fs::canonicalize(path).unwrap().strip_prefix(&root).unwrap().display())
+}
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn ros2_bag_records_the_bridge_with_our_schemas() {
+    use autonomousim_ros::bridge::{Bridge, BridgeConfig, Pacing};
+    let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let dir = tmp.join("ros_recorded_bag");
+    let _ = std::fs::remove_dir_all(&dir);
+    let sc = autonomousim_sim::Scenario::from_toml(include_str!("street_scenario.toml")).unwrap();
+    let config = BridgeConfig { domain_id: DOMAIN, pacing: Pacing::Realtime(1.0), ..Default::default() };
+    let mut bridge = Bridge::new(Arc::new(sc.compile().unwrap()), config).unwrap();
+    let target = format!("{}/ros_recorded_bag", in_container(tmp));
+    let record = std::thread::spawn(move || {
+        ros(&format!("timeout -s INT 8 ros2 bag record -s mcap -o {target} --all-topics > /dev/null 2>&1; true"))
+    });
+    while !record.is_finished() {
+        bridge.step();
+    }
+    record.join().unwrap();
+    // rosbag2 wrote the bridge's types with the definitions it has: ours are the same text.
+    // (`--all-topics` leaves out `/clock`.)
+    let file = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "mcap"))
+        .expect("rosbag2's MCAP file");
+    let bytes = std::fs::read(file).unwrap();
+    let summary = mcap::Summary::read(&bytes).unwrap().unwrap();
+    let mut checked = Vec::new();
+    for s in summary.schemas.values() {
+        let ty = s.name.replace("/msg/", "/");
+        let Ok(ours) = autonomousim_ros::definitions::schema(&ty) else { continue };
+        assert_eq!(ours, String::from_utf8_lossy(&s.data), "{ty}");
+        checked.push(ty);
+    }
+    checked.sort();
+    eprintln!("schemas equal rosbag2's: {checked:?}");
+    for ty in [
+        "nav_msgs/Odometry",
+        "sensor_msgs/PointCloud2",
+        "sensor_msgs/Image",
+        "sensor_msgs/CameraInfo",
+        "visualization_msgs/MarkerArray",
+        "nav_msgs/Path",
+        "tf2_msgs/TFMessage",
+    ] {
+        assert!(checked.iter().any(|c| c == ty), "{ty} not recorded");
+    }
+}
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn ros2_bag_reads_and_plays_an_exported_recording() {
+    use autonomousim_ros::bag::{ExportConfig, export};
+    let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let (path, dir) = (tmp.join("interop_street.mcap"), tmp.join("interop_street_bag"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rec = common::record_street(&path);
+    let bag = export(&rec, &path, &dir, &ExportConfig::default()).unwrap();
+    let target = in_container(&dir);
+    // `ros2 bag info`: every topic, its type and count.
+    let info = ros(&format!("ros2 bag info {target}"));
+    eprintln!("{info}");
+    for (topic, ty, count) in &bag.topics {
+        let line = info
+            .lines()
+            .find(|l| l.contains(&format!("Topic: {topic} |")))
+            .unwrap_or_else(|| panic!("{topic} not in\n{info}"));
+        assert!(line.contains(&format!("Type: {ty} |")) && line.contains(&format!("Count: {count} |")), "{line}");
+    }
+    // `ros2 bag play`: the first odometry `ros2 topic echo` sees is the first recorded state.
+    let echo = ros(&format!(
+        "ros2 topic echo --once /agent0/odom nav_msgs/msg/Odometry & E=$!; sleep 3; \
+         ros2 bag play --delay 2 {target} > /dev/null 2>&1; wait $E"
+    ));
+    let value = |key: &str, after: &str| -> f64 {
+        let rest = &echo[echo.find(after).unwrap_or_else(|| panic!("{after} not in\n{echo}"))..];
+        let line = rest.lines().find(|l| l.trim_start().starts_with(key)).unwrap();
+        line.split(':').nth(1).unwrap().trim().parse().unwrap()
+    };
+    let s = &rec.episodes[0].states[0][0];
+    let echoed = [value("x:", "position:"), value("y:", "position:"), value("z:", "position:")];
+    assert_eq!(echoed, s.position.to_array(), "{echo}");
+    assert_eq!(value("sec:", "stamp:") + value("nanosec:", "stamp:") * 1e-9, s.time);
+    assert!(echo.contains("child_frame_id: agent0/base_link"), "{echo}");
+}

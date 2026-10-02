@@ -1,7 +1,8 @@
-//! `autonomousim-ros`: runs a simulation as a ROS 2 node.
+//! `autonomousim-ros`: runs a simulation as a ROS 2 node; exports recordings as rosbag2 bags.
 //!
 //!   autonomousim-ros run --scenario assets/scenarios/hover.toml
 //!   autonomousim-ros run --policy runs/<run>/policy.json --map-seed 1000 --fast
+//!   autonomousim-ros bag recordings/flight.mcap -o recordings/flight_bag
 
 use anyhow::Context;
 use autonomousim_ros::bridge::{Bridge, BridgeConfig, Pacing};
@@ -22,6 +23,32 @@ struct Cli {
 enum Command {
     /// Run a scenario (or a trained policy's scenario, flown by the policy) as a ROS 2 node.
     Run(RunArgs),
+    /// Export a recording (MCAP) as a rosbag2 bag (`ros2 bag info`/`play`).
+    Bag(BagArgs),
+}
+
+#[derive(clap::Args)]
+struct BagArgs {
+    /// The recording (MCAP, as written by `autonomousim run --record` or `eval_record.py`).
+    recording: PathBuf,
+    /// Output directory (must not exist).
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Rate of the NPC and signal markers (Hz; 0: none).
+    #[arg(long, default_value_t = 10)]
+    markers_hz: u32,
+}
+
+fn bag(args: BagArgs) -> anyhow::Result<()> {
+    use autonomousim_ros::bag::{ExportConfig, export};
+    let rec = autonomousim_sim::record::Recording::read(&args.recording)
+        .with_context(|| format!("reading {}", args.recording.display()))?;
+    let info = export(&rec, &args.recording, &args.output, &ExportConfig { markers_hz: args.markers_hz })?;
+    println!("{}: {:.2} s", info.dir.display(), info.duration);
+    for (topic, ty, count) in &info.topics {
+        println!("  {topic} ({ty}): {count}");
+    }
+    Ok(())
 }
 
 #[derive(clap::Args)]
@@ -134,5 +161,6 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args),
+        Command::Bag(args) => bag(args),
     }
 }
