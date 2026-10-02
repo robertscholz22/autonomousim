@@ -488,6 +488,7 @@ name = "autonomousim-ros"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autonomousim-control",
  "autonomousim-core",
  "autonomousim-sensors",
  "autonomousim-sim",

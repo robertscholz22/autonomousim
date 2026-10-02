@@ -19,7 +19,7 @@ test-viewer:      ## the viewer's headless tests (builds Bevy)
 	cargo test -p autonomousim-viewer
 
 test-ros:         ## ROS 2 interop (Docker, ros:lyrical-ros-base; see tools/ros/run.sh)
-	cargo test -p autonomousim-ros -- --ignored
+	cargo test -p autonomousim-ros -- --ignored --test-threads=1
 
 test-py: dev-py
 	uv run pytest -q

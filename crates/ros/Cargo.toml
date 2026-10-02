@@ -12,6 +12,7 @@ name = "autonomousim-ros"
 path = "src/main.rs"
 
 [dependencies]
+autonomousim-control.workspace = true
 autonomousim-core.workspace = true
 autonomousim-sensors.workspace = true
 autonomousim-sim.workspace = true

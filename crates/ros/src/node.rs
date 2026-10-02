@@ -4,9 +4,12 @@
 use crate::msgs::RosMessage;
 use anyhow::{Context as _, anyhow};
 use ros2_client::qos::{Durability, History, WhenFull};
-use ros2_client::{Context, ContextOptions, MessageTypeName, Name, Node, NodeName, NodeOptions, QosProfile};
+use ros2_client::{
+    Context, ContextOptions, MessageTypeName, Name, Node, NodeName, NodeOptions, QosProfile, ServiceMapping,
+    ServiceTypeName,
+};
 
-pub use ros2_client::{Publisher, Subscription};
+pub use ros2_client::{Publisher, Server, Subscription};
 
 /// QoS profiles (ROS's presets: sensor data, reliable, latched).
 pub mod qos {
@@ -69,6 +72,32 @@ impl RosNode {
     pub fn subscription<M: RosMessage>(&mut self, topic: &str, qos: QosProfile) -> anyhow::Result<Subscription<M>> {
         let t = self.topic::<M>(topic, &qos)?;
         self.node.create_subscription(&t, Some(qos)).map_err(|e| anyhow!("subscription {topic}: {e:?}"))
+    }
+
+    /// A service server for `srv_type` (`package/Name`; requests and responses as
+    /// `<srv_type>_Request` and `_Response`), with the enhanced request/reply mapping ROS 2's
+    /// DDS implementations use.
+    pub fn server<
+        Req: RosMessage + ros2_client::Message + Clone + 'static,
+        Resp: RosMessage + ros2_client::Message + 'static,
+    >(
+        &mut self,
+        service: &str,
+        srv_type: &str,
+    ) -> anyhow::Result<Server<Req, Resp>> {
+        assert_eq!(Req::TYPE, format!("{srv_type}_Request"));
+        assert_eq!(Resp::TYPE, format!("{srv_type}_Response"));
+        let (package, name) = srv_type.split_once('/').expect("package/Name");
+        let service_name = Name::parse(service).map_err(|e| anyhow!("service name {service}: {e:?}"))?;
+        self.node
+            .create_server(
+                ServiceMapping::Enhanced,
+                &service_name,
+                &ServiceTypeName::new(package, name),
+                qos::RELIABLE,
+                qos::RELIABLE,
+            )
+            .map_err(|e| anyhow!("service {service}: {e:?}"))
     }
 
     pub fn inner(&mut self) -> &mut Node {

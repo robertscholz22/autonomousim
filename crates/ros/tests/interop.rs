@@ -6,7 +6,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// A DDS domain of its own, so other ROS traffic on the machine does not interfere.
+/// A DDS domain of its own, so other ROS traffic on the machine does not interfere. The tests
+/// share it: run them one at a time (`make test-ros` does).
 const DOMAIN: u16 = 42;
 
 /// Runs a shell command in the ROS container; returns its standard output.
@@ -97,9 +98,10 @@ fn ros_sees_the_bridge_at_its_rates_with_sim_time_and_tf() {
     }
     // Reliable odometry arrives without gaps.
     assert!(topic("/agent0/odom")["max_gap"].as_f64().unwrap() < 0.021, "{}", topic("/agent0/odom"));
-    // The node runs on sim time (the /clock), and tf2 has the odometry's pose at its stamp.
+    // The node runs on sim time (the /clock; its time source and the probe's own /clock
+    // subscription may be a tick apart), and tf2 has the odometry's pose at its stamp.
     let now = out["sim_time_now"].as_f64().unwrap();
-    assert!((now - out["clock"]["last"].as_f64().unwrap()).abs() < 1e-6, "sim time {now}");
+    assert!((now - out["clock"]["last"].as_f64().unwrap()).abs() < 0.041, "sim time {now}");
     let pos = &out["odom_last"]["position"];
     let tf = out["tf_lookup"].as_array().unwrap_or_else(|| panic!("tf2: {}", out["tf_lookup"]));
     for k in 0..3 {
@@ -107,4 +109,85 @@ fn ros_sees_the_bridge_at_its_rates_with_sim_time_and_tf() {
     }
     assert_eq!(out["tf_static"].as_array().unwrap().len(), 5);
     assert_eq!(out["meta"]["agents"][0]["frame"], "agent0/base_link");
+}
+
+/// The bridge on the test scenario, in lockstep (at most 5 s per step) or as fast as it goes.
+fn test_bridge(lockstep: bool) -> autonomousim_ros::bridge::Bridge {
+    use autonomousim_ros::bridge::{Bridge, BridgeConfig, Pacing};
+    let sc = autonomousim_sim::Scenario::from_toml(include_str!("bridge_scenario.toml")).unwrap();
+    let lockstep = lockstep.then_some(5.0);
+    let config = BridgeConfig { domain_id: DOMAIN, pacing: Pacing::Fast, lockstep, ..Default::default() };
+    Bridge::new(Arc::new(sc.compile().unwrap()), config).unwrap()
+}
+
+/// `pattern()` of tools/ros/drive.py: (linear x, y, z, angular z) at step `k`.
+fn pattern(k: i64, car: bool) -> Twist {
+    let c = |x: i64| x as f64;
+    let (x, y, z, w) = if car {
+        (0.5 * c((k / 25) % 4), 0.0, 0.0, 0.25 * c((k / 40) % 3 - 1))
+    } else {
+        (0.25 * c((k / 30) % 3), 0.125 * c((k / 20) % 3 - 1), 0.25 * c((k / 50) % 2), 0.125 * c((k / 35) % 2))
+    };
+    let mut t = Twist::default();
+    (t.linear.x, t.linear.y, t.linear.z, t.angular.z) = (x, y, z, w);
+    t
+}
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn an_rclpy_driver_steers_the_bridge_in_lockstep() {
+    use autonomousim_ros::bridge::AgentCommand;
+    // Closed loop: the car drives a 12 m square, the drone flies four waypoints.
+    let mut bridge = test_bridge(true);
+    let driver = std::thread::spawn(|| ros("python3 tools/ros/drive.py square --car 1 --drone 0 --timeout 90"));
+    while !driver.is_finished() {
+        bridge.step();
+    }
+    let out: serde_json::Value = serde_json::from_str(driver.join().unwrap().trim()).unwrap();
+    eprintln!("square: {out}, {:.1} s simulated", bridge.time());
+    assert_eq!(out["car"]["reached"], 4, "{out}");
+    assert_eq!(out["drone"]["reached"], 4, "{out}");
+    drop(bridge);
+
+    // Open loop: 300 steps of commands that depend on the step only, replayed in-process.
+    let mut bridge = test_bridge(true);
+    let driver = std::thread::spawn(|| ros("python3 tools/ros/drive.py pattern --car 1 --drone 0 --steps 300"));
+    while bridge.steps() < 300 {
+        bridge.step();
+    }
+    let hash = bridge.world().state_hash();
+    driver.join().unwrap();
+    drop(bridge);
+    let mut replay = test_bridge(false);
+    for k in 0..300 {
+        replay.command(1, AgentCommand::Twist(pattern(k, true))).unwrap();
+        replay.command(0, AgentCommand::Twist(pattern(k, false))).unwrap();
+        replay.step();
+    }
+    assert_eq!(replay.world().state_hash(), hash, "the lockstep run differs from its replay");
+}
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn ros_pauses_and_resets_the_bridge() {
+    let mut bridge = test_bridge(false);
+    let calls = std::thread::spawn(|| {
+        ros("ros2 service call /autonomousim/pause std_srvs/srv/SetBool '{data: true}' \
+             && ros2 service call /autonomousim/reset std_srvs/srv/Trigger \
+             && ros2 service call /autonomousim/pause std_srvs/srv/SetBool '{data: false}'")
+    });
+    let mut paused_at = None;
+    while !calls.is_finished() {
+        bridge.step();
+        if bridge.paused() && paused_at.is_none() {
+            paused_at = Some(bridge.time());
+        }
+    }
+    let out = calls.join().unwrap();
+    assert_eq!(out.matches("success=True").count(), 3, "{out}");
+    assert!(out.contains("message='paused'") && out.contains("message='running'"), "{out}");
+    let t = paused_at.expect("never paused");
+    assert_eq!(bridge.episodes(), 1);
+    // The reset came while paused: the clock went on from where it stood.
+    assert!(bridge.time() >= t && bridge.world().time() <= bridge.time() - t + 1e-9);
 }

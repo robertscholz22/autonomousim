@@ -53,6 +53,13 @@ struct RunArgs {
     /// Episode length (s; default: the policy's episode time, else until every agent is disabled).
     #[arg(long)]
     episode_time: Option<f64>,
+    /// Simulated time (s) without a command after which an agent holds still.
+    #[arg(long, default_value_t = 0.5)]
+    command_timeout: f64,
+    /// Wait before each policy step until every commanded agent has sent a command since the
+    /// last /clock (at most this many wall-clock seconds; 0: no lockstep).
+    #[arg(long, default_value_t = 0.0, value_name = "TIMEOUT")]
+    lockstep: f64,
     /// Stop after this much simulated time (s; default: run until interrupted).
     #[arg(long)]
     duration: Option<f64>,
@@ -82,6 +89,8 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         odom_hz: args.odom_hz,
         episode_time: args.episode_time.or(policy.as_ref().map(|p| p.episode_time)),
         seed: args.seed,
+        command_timeout: args.command_timeout,
+        lockstep: (args.lockstep > 0.0).then_some(args.lockstep),
     };
     eprintln!("compiling the scenario (maps are generated or loaded from the cache)...");
     let compiled = Arc::new(scenario.compile()?);
@@ -99,6 +108,9 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         compiled.spec.policy_hz,
         if policy.is_some() { ", flown by the policy" } else { "" }
     );
+    if args.lockstep > 0.0 {
+        eprintln!("lockstep: each step waits for the commands of every agent not flown by the policy");
+    }
     let until = args.duration.unwrap_or(f64::INFINITY);
     let mut report = 10.0;
     while bridge.time() < until - 1e-9 {

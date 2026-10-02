@@ -9,16 +9,28 @@
 //!   sensor's own rate and stamped with its measurement time: `imu` (`sensor_msgs/Imu`), `gps`
 //!   (`NavSatFix`), `baro` (`FluidPressure`), `mag` (`MagneticField`), `range` (`Range`),
 //!   named after the sensor (`/agent0/<name>`), in the frame `agent<id>/<name>`.
+//! - Commands, per bridged agent not flown by a policy: `cmd_vel` (`geometry_msgs/Twist`;
+//!   multirotors: velocity in the heading frame and heading rate; wheeled vehicles: forward
+//!   speed and yaw rate) and `action` (`std_msgs/Float32MultiArray`, the normalized action of
+//!   the group's mode). Commands are held; an agent without one for `command_timeout` holds
+//!   still (hovers where it is, brakes). In lockstep each policy step waits until every
+//!   commanded agent has sent a command since the last `/clock`.
+//! - Services: `/autonomousim/reset` (`std_srvs/Trigger`: a new episode) and
+//!   `/autonomousim/pause` (`std_srvs/SetBool`: simulated time stands while paused).
 
 use crate::msgs::builtin_interfaces::Time;
-use crate::msgs::geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3};
+use crate::msgs::geometry_msgs::{Quaternion, Transform, TransformStamped, Twist, Vector3};
 use crate::msgs::nav_msgs::Odometry;
 use crate::msgs::rosgraph_msgs::Clock;
 use crate::msgs::sensor_msgs::{FluidPressure, Imu, JointState, MagneticField, NavSatFix, NavSatStatus, Range};
-use crate::msgs::std_msgs::{Header, StringMsg, UInt32};
+use crate::msgs::std_msgs::{Float32MultiArray, Header, StringMsg, UInt32};
+use crate::msgs::std_srvs::{SetBoolRequest, SetBoolResponse, TriggerRequest, TriggerResponse};
 use crate::msgs::tf2_msgs::TFMessage;
 use crate::msgs::{Array, RosMessage};
-use crate::node::{Publisher, RosNode, qos};
+use crate::node::{Publisher, RosNode, Server, Subscription, qos};
+use autonomousim_control::Command;
+use autonomousim_control::ground::GroundSetpoint;
+use autonomousim_control::multirotor::{Frame, Setpoint, YawCommand};
 use autonomousim_core::rng::Seed;
 use autonomousim_sensors::Sensor;
 use autonomousim_sim::policy::Policy;
@@ -48,11 +60,24 @@ pub struct BridgeConfig {
     pub episode_time: Option<f64>,
     /// Episode seed of the first episode.
     pub seed: u64,
+    /// Simulated time (s) after an agent's last command when it is made to hold still.
+    pub command_timeout: f64,
+    /// Wait before each policy step for a command from every commanded agent, at most this
+    /// long (wall clock, s); none: step without waiting.
+    pub lockstep: Option<f64>,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
-        Self { domain_id: 0, pacing: Pacing::Realtime(1.0), odom_hz: 0, episode_time: None, seed: 0 }
+        Self {
+            domain_id: 0,
+            pacing: Pacing::Realtime(1.0),
+            odom_hz: 0,
+            episode_time: None,
+            seed: 0,
+            command_timeout: 0.5,
+            lockstep: None,
+        }
     }
 }
 
@@ -183,14 +208,36 @@ impl SensorPub {
     }
 }
 
+/// A command for one agent, as the bridge receives it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentCommand {
+    /// `cmd_vel`: multirotors fly `linear` (heading frame: x forward, y left, z up; m/s) and
+    /// turn at `angular.z` (rad/s); wheeled vehicles drive at `linear.x` and yaw at
+    /// `angular.z` (a steered vehicle turns on the path curvature `angular.z / linear.x`).
+    Twist(Twist),
+    /// The normalized action of the group's action mode.
+    Action(Vec<f32>),
+}
+
 struct AgentPubs {
     /// Index in the world.
     agent: usize,
+    id: u32,
     frame: String,
     odom: Publisher<Odometry>,
     joints: Option<Publisher<JointState>>,
     events: Publisher<UInt32>,
     sensors: Vec<SensorPub>,
+    cmd_vel: Subscription<Twist>,
+    action: Subscription<Float32MultiArray>,
+    /// Flown by a policy (commands are ignored).
+    flown: bool,
+    /// Bridge time of the last command; none since the episode began.
+    last_command: Option<f64>,
+    /// Holding still (no command for `command_timeout`).
+    holding: bool,
+    /// A command arrived since the last policy step.
+    fresh: bool,
 }
 
 /// A sensor's static transform from the body (`base_link`); a rangefinder's frame has its x
@@ -232,6 +279,13 @@ pub struct Bridge {
     /// Wall-clock time and simulated time at which pacing started.
     paced_from: Option<(Instant, f64)>,
     episodes: u64,
+    reset_server: Server<TriggerRequest, TriggerResponse>,
+    pause_server: Server<SetBoolRequest, SetBoolResponse>,
+    paused: bool,
+    reset_requested: bool,
+    /// Any command received yet (lockstep waits without a time limit until then).
+    commanded: bool,
+    steps_total: u64,
 }
 
 impl Bridge {
@@ -259,7 +313,8 @@ impl Bridge {
             let ns = format!("/agent{}", a.id);
             let frame = base_frame(a.id);
             let mut sensors = Vec::new();
-            let mut topics = vec![format!("{ns}/odom"), format!("{ns}/events")];
+            let mut topics =
+                vec![format!("{ns}/odom"), format!("{ns}/events"), format!("{ns}/cmd_vel"), format!("{ns}/action")];
             for (k, (s, spec)) in a.sensors.iter().zip(&g.spec.sensors).enumerate() {
                 let Some((position, rotation)) = mount_transform(s) else { continue };
                 let topic = format!("{ns}/{}", spec.name);
@@ -294,11 +349,18 @@ impl Bridge {
             }));
             agents.push(AgentPubs {
                 agent: i,
+                id: a.id,
                 odom: node.publisher(&format!("{ns}/odom"), qos::RELIABLE)?,
                 events: node.publisher(&format!("{ns}/events"), qos::RELIABLE)?,
                 joints,
                 frame,
                 sensors,
+                cmd_vel: node.subscription(&format!("{ns}/cmd_vel"), qos::RELIABLE)?,
+                action: node.subscription(&format!("{ns}/action"), qos::RELIABLE)?,
+                flown: false,
+                last_command: None,
+                holding: false,
+                fresh: false,
             });
         }
         send(&tf_static, TFMessage { transforms: statics });
@@ -312,6 +374,8 @@ impl Bridge {
             "agents": meta_agents,
         });
         send(&meta, StringMsg { data: meta_json.to_string() });
+        let reset_server = node.server("/autonomousim/reset", "std_srvs/Trigger")?;
+        let pause_server = node.server("/autonomousim/pause", "std_srvs/SetBool")?;
         Ok(Self {
             world,
             config,
@@ -328,6 +392,12 @@ impl Bridge {
             action: Vec::new(),
             paced_from: None,
             episodes: 0,
+            reset_server,
+            pause_server,
+            paused: false,
+            reset_requested: false,
+            commanded: false,
+            steps_total: 0,
         })
     }
 
@@ -344,8 +414,172 @@ impl Bridge {
                 policy.act_dim()
             );
         }
+        let first = g.first_agent..g.first_agent + g.spec.count;
+        for a in &mut self.agents {
+            a.flown |= first.contains(&a.agent);
+        }
         self.policies.push((group, policy));
         Ok(())
+    }
+
+    /// Command bridged agent `id` (what its `cmd_vel` or `action` topic does).
+    pub fn command(&mut self, id: u32, command: AgentCommand) -> anyhow::Result<()> {
+        let t = self.time();
+        let k =
+            self.agents.iter().position(|a| a.id == id).ok_or_else(|| anyhow::anyhow!("agent {id} is not bridged"))?;
+        let a = &mut self.agents[k];
+        if a.flown {
+            anyhow::bail!("agent {id} is flown by a policy");
+        }
+        let agent = self.world.agent(a.agent);
+        match command {
+            AgentCommand::Action(action) => {
+                let dim = self.world.scenario().groups[agent.group].act_dim();
+                if action.len() != dim {
+                    anyhow::bail!("agent {id} takes {dim} action values, not {}", action.len());
+                }
+                self.world.set_action(a.agent, &action);
+            }
+            AgentCommand::Twist(twist) => {
+                let (v, w) = (twist.linear, twist.angular.z);
+                let command: Command = if agent.controller.as_multirotor().is_some() {
+                    Setpoint::Velocity {
+                        velocity: DVec3::new(v.x, v.y, v.z),
+                        frame: Frame::Heading,
+                        yaw: YawCommand::Rate(w),
+                    }
+                    .into()
+                } else if let Some(c) = agent.controller.as_ground() {
+                    if c.is_side_drive() {
+                        GroundSetpoint::SpeedYawRate { speed: v.x, yaw_rate: w }.into()
+                    } else {
+                        // The curvature of that yaw rate; near standstill, that of a crawl.
+                        let speed = if v.x.abs() < 0.1 { 0.1 } else { v.x };
+                        GroundSetpoint::SpeedCurvature { speed: v.x, curvature: w / speed }.into()
+                    }
+                } else {
+                    anyhow::bail!("cmd_vel drives multirotors and wheeled vehicles; agent {id} takes `action`");
+                };
+                self.world.set_command(a.agent, command);
+            }
+        }
+        a.last_command = Some(t);
+        a.holding = false;
+        a.fresh = true;
+        self.commanded = true;
+        Ok(())
+    }
+
+    /// Simulated time stands still.
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// Start a new episode after the next step (or now, while paused).
+    pub fn request_reset(&mut self) {
+        self.reset_requested = true;
+    }
+
+    /// Take the commands that arrived (the latest of each agent) and answer service calls.
+    fn poll(&mut self) {
+        let mut received = Vec::new();
+        for a in &self.agents {
+            let mut last = None;
+            while let Ok(Some((t, _))) = a.cmd_vel.take() {
+                last = Some(AgentCommand::Twist(t));
+            }
+            while let Ok(Some((m, _))) = a.action.take() {
+                last = Some(AgentCommand::Action(m.data));
+            }
+            if let Some(c) = last.filter(|_| !a.flown) {
+                received.push((a.id, c));
+            }
+        }
+        for (id, c) in received {
+            if let Err(e) = self.command(id, c) {
+                eprintln!("command ignored: {e}");
+            }
+        }
+        while let Ok(Some((id, _))) = self.reset_server.receive_request() {
+            self.reset_requested = true;
+            let message = format!("episode {} begins after this step", self.episodes + 2);
+            let _ = self.reset_server.send_response(id, TriggerResponse { success: true, message });
+        }
+        while let Ok(Some((id, req))) = self.pause_server.receive_request() {
+            self.paused = req.data;
+            let message = if req.data { "paused" } else { "running" }.to_string();
+            let _ = self.pause_server.send_response(id, SetBoolResponse { success: true, message });
+        }
+    }
+
+    /// Lockstep: wait until every commanded agent has a fresh command (at most `limit` s once
+    /// any command has come; until then, without a limit), sending state and clock again now
+    /// and then for controllers that join late.
+    fn wait_for_commands(&mut self, limit: f64) {
+        let start = Instant::now();
+        let mut resent = start;
+        let mut hinted = false;
+        loop {
+            self.poll();
+            let waiting = self.agents.iter().any(|a| !a.flown && !a.fresh);
+            if !waiting || self.paused || self.reset_requested {
+                return;
+            }
+            let now = Instant::now();
+            if self.commanded && (now - start).as_secs_f64() > limit {
+                let late: Vec<String> =
+                    self.agents.iter().filter(|a| !a.flown && !a.fresh).map(|a| format!("agent{}", a.id)).collect();
+                eprintln!("lockstep: no command from {} within {limit} s; stepping", late.join(", "));
+                return;
+            }
+            if !self.commanded && !hinted && (now - start).as_secs_f64() > 2.0 {
+                eprintln!("lockstep: waiting for commands (cmd_vel or action) of every bridged agent");
+                hinted = true;
+            }
+            if now - resent > Duration::from_millis(500) {
+                self.resend();
+                resent = now;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    /// The current state and clock again (for controllers that joined after they were sent).
+    fn resend(&self) {
+        let t = self.time();
+        self.publish_state(t);
+        send(&self.clock, Clock { clock: Time::from_secs(t) });
+    }
+
+    /// Agents without a recent command hold still.
+    fn hold_idle(&mut self) {
+        let t = self.time();
+        for a in &mut self.agents {
+            let idle = a.last_command.is_none_or(|c| t - c > self.config.command_timeout + 1e-9);
+            if !a.flown && !a.holding && idle {
+                let hold = Command::hold(&self.world.agent(a.agent).vehicle);
+                self.world.set_command(a.agent, hold);
+                a.holding = true;
+            }
+        }
+    }
+
+    fn new_episode(&mut self) {
+        self.offset = self.time();
+        self.world.reset(None);
+        self.episodes += 1;
+        self.reset_requested = false;
+        for a in &mut self.agents {
+            a.last_command = None;
+            a.holding = false;
+            for s in &mut a.sensors {
+                s.last = None;
+            }
+        }
     }
 
     pub fn world(&self) -> &WorldInstance {
@@ -361,10 +595,29 @@ impl Bridge {
         self.episodes
     }
 
-    /// One policy step: policies act, the world steps (sensors published as their readings
-    /// come), then the clock, odometry, transforms, joints and events; an episode that ended
-    /// is reset. Paces to wall-clock time when asked.
+    /// One policy step: commands and service calls are taken (in lockstep, after waiting for
+    /// them), policies act, idle agents hold, the world steps (sensors published as their
+    /// readings come), then odometry, transforms, joints, events and the clock; an episode
+    /// that ended is reset. Paces to wall-clock time when asked. While paused, it only answers
+    /// service calls (and returns after a few milliseconds).
     pub fn step(&mut self) {
+        if self.steps_total == 0 && self.config.lockstep.is_some() {
+            // The state and clock the controllers answer for the first step.
+            self.resend();
+        }
+        match self.config.lockstep {
+            Some(limit) if !self.paused => self.wait_for_commands(limit),
+            _ => self.poll(),
+        }
+        if self.paused {
+            if self.reset_requested {
+                self.new_episode();
+                send(&self.clock, Clock { clock: Time::from_secs(self.time()) });
+            }
+            self.paced_from = None;
+            std::thread::sleep(Duration::from_millis(5));
+            return;
+        }
         for (group, policy) in &mut self.policies {
             let g = &self.world.scenario().groups[*group];
             let (n, od, ad) = (g.spec.count, g.obs_dim(), g.act_dim());
@@ -376,6 +629,7 @@ impl Bridge {
             }
             self.world.set_actions(*group, &self.action);
         }
+        self.hold_idle();
         let (agents, offset) = (&mut self.agents, self.offset);
         self.world.step_with(&mut |w| {
             for a in agents.iter_mut() {
@@ -385,8 +639,12 @@ impl Bridge {
                 }
             }
         });
+        self.steps_total += 1;
+        for a in &mut self.agents {
+            a.fresh = false;
+        }
         let t = self.time();
-        send(&self.clock, Clock { clock: Time::from_secs(t) });
+        // State before the clock: a controller answering a tick has the state of that tick.
         if self.world.steps().is_multiple_of(self.odom_divider) {
             self.publish_state(t);
         }
@@ -396,15 +654,16 @@ impl Bridge {
                 send(&a.events, UInt32 { data: events.0 });
             }
         }
-        if self.episode_over() {
-            self.offset = t;
-            self.world.reset(None);
-            self.episodes += 1;
-            for s in self.agents.iter_mut().flat_map(|a| &mut a.sensors) {
-                s.last = None;
-            }
+        if self.episode_over() || self.reset_requested {
+            self.new_episode();
         }
+        send(&self.clock, Clock { clock: Time::from_secs(t) });
         self.pace();
+    }
+
+    /// Policy steps taken, across episodes.
+    pub fn steps(&self) -> u64 {
+        self.steps_total
     }
 
     fn episode_over(&self) -> bool {
