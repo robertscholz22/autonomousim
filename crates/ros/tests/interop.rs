@@ -65,3 +65,46 @@ fn ros_echoes_our_odometry_and_we_receive_its_twists() {
         assert_eq!((t.linear.x, t.linear.y, t.angular.z), (1.5, -2.0, -0.25));
     }
 }
+
+#[test]
+#[ignore = "needs Docker with ros:lyrical-ros-base (make test-ros)"]
+fn ros_sees_the_bridge_at_its_rates_with_sim_time_and_tf() {
+    use autonomousim_ros::bridge::{Bridge, BridgeConfig, Pacing};
+    let sc = autonomousim_sim::Scenario::from_toml(include_str!("bridge_scenario.toml")).unwrap();
+    let config = BridgeConfig { domain_id: DOMAIN, pacing: Pacing::Realtime(1.0), ..Default::default() };
+    let mut bridge = Bridge::new(Arc::new(sc.compile().unwrap()), config).unwrap();
+    // The probe starts with the container (some seconds) and listens for 6 s.
+    let probe = std::thread::spawn(|| {
+        ros("python3 tools/ros/probe.py --seconds 6 --agent 0 \
+             --sensors imu:Imu,gps:NavSatFix,baro:FluidPressure,mag:MagneticField,down:Range")
+    });
+    while !probe.is_finished() {
+        bridge.step();
+    }
+    let out: serde_json::Value = serde_json::from_str(probe.join().unwrap().trim()).unwrap();
+    eprintln!("{out:#}");
+    let topic = |t: &str| &out["topics"][t];
+    for (t, hz) in [
+        ("/agent0/odom", 50.0),
+        ("/agent0/imu", 250.0),
+        ("/agent0/gps", 10.0),
+        ("/agent0/baro", 50.0),
+        ("/agent0/mag", 50.0),
+        ("/agent0/down", 50.0),
+    ] {
+        let r = topic(t)["rate"].as_f64().unwrap_or_else(|| panic!("{t}: {}", topic(t)));
+        assert!((r / hz - 1.0).abs() < 0.03, "{t}: {r} Hz, expected {hz}");
+    }
+    // Reliable odometry arrives without gaps.
+    assert!(topic("/agent0/odom")["max_gap"].as_f64().unwrap() < 0.021, "{}", topic("/agent0/odom"));
+    // The node runs on sim time (the /clock), and tf2 has the odometry's pose at its stamp.
+    let now = out["sim_time_now"].as_f64().unwrap();
+    assert!((now - out["clock"]["last"].as_f64().unwrap()).abs() < 1e-6, "sim time {now}");
+    let pos = &out["odom_last"]["position"];
+    let tf = out["tf_lookup"].as_array().unwrap_or_else(|| panic!("tf2: {}", out["tf_lookup"]));
+    for k in 0..3 {
+        assert_eq!(tf[k].as_f64(), pos[k].as_f64());
+    }
+    assert_eq!(out["tf_static"].as_array().unwrap().len(), 5);
+    assert_eq!(out["meta"]["agents"][0]["frame"], "agent0/base_link");
+}

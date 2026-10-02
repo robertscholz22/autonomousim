@@ -1,0 +1,22 @@
+# The bridge tests' scenario: a hovering drone with the bridged sensors and a car (wheels).
+physics_hz = 1000
+policy_hz = 50
+map = { type = "testworld", kind = "flat", size = 200.0 }
+
+[[groups]]
+name = "drone"
+vehicle = "iris_like"
+action_mode = "velocity"
+spawn = { agl = [2.0, 2.0], margin = 20.0 }
+sensors = [
+    { name = "imu", type = "imu", rate_hz = 250 },
+    { name = "gps", type = "gps" },
+    { name = "baro", type = "baro" },
+    { name = "mag", type = "mag" },
+    { name = "down", type = "rangefinder", mount = { position = [0.1, 0.0, -0.05] } },
+]
+
+[[groups]]
+name = "car"
+vehicle = "sedan_like"
+spawn = { on_ground = true, margin = 20.0 }

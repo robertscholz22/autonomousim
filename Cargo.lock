@@ -488,11 +488,14 @@ name = "autonomousim-ros"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autonomousim-core",
+ "autonomousim-sensors",
  "autonomousim-sim",
  "byteorder",
  "cdr-encoding",
  "clap",
  "futures",
+ "glam 0.33.8",
  "ros2-client",
  "serde",
  "serde_bytes",

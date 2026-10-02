@@ -12,7 +12,11 @@ name = "autonomousim-ros"
 path = "src/main.rs"
 
 [dependencies]
+autonomousim-core.workspace = true
+autonomousim-sensors.workspace = true
 autonomousim-sim.workspace = true
+glam.workspace = true
+serde_json.workspace = true
 ros2-client = { version = "0.11", default-features = false, features = ["dds", "lyrical"] }
 cdr-encoding = "0.11"
 byteorder = "1"
@@ -21,9 +25,6 @@ futures = "0.3"
 serde.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true
